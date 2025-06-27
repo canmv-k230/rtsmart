@@ -87,6 +87,10 @@ menuconfig RT_USING_TOUCH
             bool "Enable Touch FT5316"
             default n
 
+        config TOUCH_TYPE_FT5406
+            bool "Enable Touch FT5406"
+            default n
+
         config TOUCH_TYPE_CST128
             bool "Enable Touch CST128 - FT5316 Compatible"
             default n

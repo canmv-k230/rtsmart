@@ -122,3 +122,4 @@ int drv_touch_probe_ft5x16(struct drv_touch_dev *dev);
 int drv_touch_probe_cst128(struct drv_touch_dev *dev);
 int drv_touch_probe_chsc5xxx(struct drv_touch_dev *dev);
 int drv_touch_probe_gt911(struct drv_touch_dev *dev);
+int drv_touch_probe_ft5x06(struct drv_touch_dev *dev);

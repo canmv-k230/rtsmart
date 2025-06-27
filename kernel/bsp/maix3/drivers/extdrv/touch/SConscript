@@ -11,6 +11,9 @@ src += Glob('drv_touch.c')
 if GetDepend(['TOUCH_TYPE_FT5316']):
     src += Glob('ft5316.c')
 
+if GetDepend(['TOUCH_TYPE_FT5406']):
+    src += Glob('ft5406.c')
+
 if GetDepend(['TOUCH_TYPE_CST128']):
     src += Glob('cst128.c')
 
