@@ -272,6 +272,14 @@ static rt_size_t drv_touch_read(struct rt_touch_device *touch, void *buf, rt_siz
     rt_size_t req_finger_num = len / sizeof(struct rt_touch_data);
     struct rt_touch_data *req_point = (struct rt_touch_data *)buf;
 
+    static int last_finger_num = 0;
+    static struct rt_touch_data last_point[TOUCH_MAX_POINT_NUMBER];
+
+    rt_tick_t timestamp = 0;
+
+    int return_point_num = 0;
+    struct rt_touch_data *current_point;
+
     while(1) {
         // if we can't recv reg buffer from mq, return 0 as no touch data
         if(RT_EOK != rt_mq_recv(&dev->thr.read_mq, &reg, sizeof(reg), rt_tick_from_millisecond(3))) {
@@ -290,10 +298,68 @@ static rt_size_t drv_touch_read(struct rt_touch_device *touch, void *buf, rt_siz
             LOG_E("Touch parse register failed.");
             return 0;
         }
-        req_finger_num = (req_finger_num > point.point_num) ? point.point_num : req_finger_num;
+
+        current_point = &point.point[0];
+        return_point_num = point.point_num;
+        timestamp =  rt_tick_get();
+
+        // Process the current touch point
+        for (int i = 0; i < return_point_num; i++) {
+            rt_bool_t is_new_finger = RT_TRUE;
+            struct rt_touch_data *new_touch = &current_point[i];
+            
+            // Check if it is a new finger (event down)
+            for (int j = 0; j < last_finger_num; j++) {
+                if (last_point[j].track_id == new_touch->track_id) {
+                    is_new_finger = RT_FALSE;
+                    break;
+                }
+            }
+            
+            // Set the event type
+            if (is_new_finger) {
+                new_touch->event = RT_TOUCH_EVENT_DOWN;  // new finger: down event
+                LOG_D("Finger %d: Down, Timestamp = %ld", 
+                      new_touch->track_id, timestamp);
+            } else {
+                new_touch->event = RT_TOUCH_EVENT_MOVE;  // old finger: move event
+            }
+        }
+
+        // up event
+        for (int i = 0; i < last_finger_num; i++) {
+            struct rt_touch_data *last_touch = &last_point[i];
+            rt_bool_t finger_lifted = RT_TRUE;
+            
+            // Check if the finger still exists
+            for (int j = 0; j < return_point_num; j++) {
+                if (current_point[j].track_id == last_touch->track_id) {
+                    finger_lifted = RT_FALSE;
+                    break;
+                }
+            }
+            
+            // if not exist. Generate a up event
+            if (finger_lifted) {
+                if (return_point_num < TOUCH_MAX_POINT_NUMBER) {
+                    struct rt_touch_data *up_event = &current_point[return_point_num];
+                    rt_memcpy(up_event, last_touch, sizeof(struct rt_touch_data));
+                    up_event->event = RT_TOUCH_EVENT_UP;
+                    up_event->timestamp = timestamp;
+                    return_point_num++;
+                }
+            }
+        }
+
+        // update last point data
+        last_finger_num = point.point_num;
+        rt_memcpy(last_point, current_point, sizeof(struct rt_touch_data) * point.point_num);
+        
+        // copy data to user buffer
+        req_finger_num = (req_finger_num > return_point_num) ? return_point_num : req_finger_num;
         req_buffer_size = req_finger_num * sizeof(struct rt_touch_data);
 
-        memcpy(req_point, &point.point[0], req_buffer_size);
+        memcpy(req_point, current_point, req_buffer_size);
 
         return req_buffer_size;
     } else {
