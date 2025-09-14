@@ -1,5 +1,3 @@
-#include "canmv_usb.h"
-
 #include "netif/etharp.h"
 #include "lwip/netif.h"
 #include "lwip/pbuf.h"
@@ -15,6 +13,7 @@
 #include <netif/ethernetif.h>
 #include <netdev.h>
 
+#include "usbh_core.h"
 #include "usbh_cdc_ecm.h"
 
 struct netif g_cdc_ecm_netif;

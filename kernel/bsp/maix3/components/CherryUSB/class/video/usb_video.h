@@ -1090,7 +1090,7 @@ struct video_autoexposure_mode {
     WBVAL(0x0000),           /* wOcularFocalLength */                                                                                                                              \
     0x03,                    /* bControlSize */                                                                                                                                    \
     0x00, 0x00, 0x00,        /* bmControls */                                                                                                                                      \
-    0x0c,                                                                                                                                                                          \
+    0x0B,                                                                                                                                                                          \
     0x24,                                                                                                                                                                          \
     VIDEO_VC_PROCESSING_UNIT_DESCRIPTOR_SUBTYPE,                                                                                                                                   \
     0x02,       /* bUnitID  */                                                                                                                                                     \
@@ -1099,7 +1099,7 @@ struct video_autoexposure_mode {
     0x02,       /* bControlSize   */                                                                                                                                               \
     0x00, 0x00, /* bmControls */                                                                                                                                                   \
     0x00,       /* iProcessing */                                                                                                                                                  \
-    0x00,       /* bmVideoStandards */                                                                                                                                             \
+    /* 0x00,       bmVideoStandards */                                                                                                                                             \
     0x09,                                                                                                                                                                          \
     0x24,                                                                                                                                                                          \
     VIDEO_VC_OUTPUT_TERMINAL_DESCRIPTOR_SUBTYPE,                                                                                                                                   \

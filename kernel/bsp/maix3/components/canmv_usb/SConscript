@@ -7,13 +7,15 @@ src     = []
 
 CPPPATH = [cwd]
 
-if GetDepend(['ENABLE_CANMV_USB_DEV']):
-    src += Glob('canmv_usbd.c')
+if GetDepend(['ENABLE_CHERRY_USB_DEVICE']):
+    src += Glob('usbd_desc.c')
 
     if GetDepend(['CHERRY_USB_DEVICE_ENABLE_CLASS_CDC_ACM']):
         src += Glob('usbd_cdc.c')
     if GetDepend(['CHERRY_USB_DEVICE_ENABLE_CLASS_MTP']):
         src += Glob('usbd_mtp.c')
+    if GetDepend(['CHERRY_USB_DEVICE_ENABLE_CLASS_UVC']):
+        src += Glob('usbd_uvc.c')
 
 if GetDepend(['ENABLE_CHERRY_USB_HOST']):
 

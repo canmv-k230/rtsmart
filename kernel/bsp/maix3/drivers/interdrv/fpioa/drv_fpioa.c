@@ -22,10 +22,13 @@
  * NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+
 #include "rtthread.h"
 
 #include <ioremap.h>
-#include <stdint.h>
 
 #include "riscv_io.h"
 

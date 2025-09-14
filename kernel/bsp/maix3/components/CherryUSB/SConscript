@@ -48,6 +48,9 @@ if GetDepend(['ENABLE_CHERRY_USB_DEVICE']):
         src += Glob('class/mtp/uMTP-Responder/src/*.c')
         src += Glob('class/mtp/uMTP-Responder/src/mtp_operations/*.c')
 
+    if GetDepend(['CHERRY_USB_DEVICE_ENABLE_CLASS_UVC']):
+        src += Glob('class/video/usbd_video.c')
+
 if GetDepend(['ENABLE_CHERRY_USB_HOST']):
     src += Glob('core/usbh_core.c')
 

@@ -61,17 +61,48 @@ menu "Components Configuration"
                                     bool "Use file stat in uMTP-Responder"
                                     default n
                                 endif
+                            menuconfig CHERRY_USB_DEVICE_ENABLE_CLASS_UVC
+                                bool "Enable UVC"
+
+                                if CHERRY_USB_DEVICE_ENABLE_CLASS_UVC
+
+                                    config USB_DEVICE_UVC_IMG_WIDTH
+                                        int "UVC Image Width"
+                                        default 1920
+
+                                    config USB_DEVICE_UVC_IMG_HEIGHT
+                                        int "UVC Image Height"
+                                        default 1080
+                                    
+                                    config USB_DEVICE_UVC_IMG_FPS
+                                        int "UVC Image FrameRate"
+                                        default 30
+                                endif
                         endif
 
-                    config ENABLE_CANMV_USB_DEV
-                        bool "Enable USB Device for CanMV"
-                        default n
-                        select CHERRY_USB_DEVICE_ENABLE_CLASS_CDC_ACM
-                        select CHERRY_USB_DEVICE_ENABLE_CLASS_MTP
-                        help
-                            CanMV USB Device Select class CDC_ACM and MSC MTP
+                    config CHERRY_USB_DEVICE_VID
+                        hex "USB Device VID"
+                        default 0x1209
+                    config CHERRY_USB_DEVICE_PID
+                        hex "USB Device PID"
+                        default 0xABD1
 
-                        endif
+                    choice
+                        prompt "USB Device Function"
+                        default CHERRY_USB_DEVICE_FUNC_CDC_MTP
+
+                        config CHERRY_USB_DEVICE_FUNC_CDC
+                            bool "CDC"
+                            select CHERRY_USB_DEVICE_ENABLE_CLASS_CDC_ACM
+                        config CHERRY_USB_DEVICE_FUNC_CDC_MTP
+                            bool "CDC + MTP"
+                            select CHERRY_USB_DEVICE_ENABLE_CLASS_CDC_ACM
+                            select CHERRY_USB_DEVICE_ENABLE_CLASS_MTP
+                        config CHERRY_USB_DEVICE_FUNC_UVC
+                            bool "UVC"
+                            select CHERRY_USB_DEVICE_ENABLE_CLASS_UVC
+                    endchoice
+                endif
 
             menuconfig ENABLE_CHERRY_USB_HOST
                 bool "Enable CherryUSB Host"
@@ -163,21 +194,21 @@ menu "Components Configuration"
 
                         endif
 
-                    config ENABLE_CANMV_USB_HOST
+                    menuconfig ENABLE_CANMV_USB_HOST
                         bool "Enable USB Host for CanMV(Some USB Host Drivers)"
                         default n
                         select CHERRY_USB_HOST_ENABLE_CLASS_NET_RTL8152
                         help
                             CanMV USB Host support for class net/rtl8152 and etc.
 
-                    if ENABLE_CANMV_USB_HOST
-                        config CANMV_USB_PWR_PIN
-                            int "CanMV USB Host Power Control GPIO"
-                            default -1
-                        config CANMV_USB_PWR_PIN_VALID_VAL
-                            int "CanMV USB Host Power Vaild PIN Value"
-                            default 1
-                    endif
+                        if ENABLE_CANMV_USB_HOST
+                            config CANMV_USB_PWR_PIN
+                                int "CanMV USB Host Power Control GPIO"
+                                default -1
+                            config CANMV_USB_PWR_PIN_VALID_VAL
+                                int "CanMV USB Host Power Vaild PIN Value"
+                                default 1
+                        endif
 
                     config CANMV_USB_HOST_NET_RTL8152_DEV_NAME
                         string

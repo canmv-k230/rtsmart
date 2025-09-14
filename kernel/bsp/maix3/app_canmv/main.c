@@ -34,10 +34,8 @@
 
 #ifdef ENABLE_CHERRY_USB
 
-#include "canmv_usb.h"
-
 #ifdef ENABLE_CHERRY_USB_DEVICE
-#include "usbd_core.h"
+#include "usbd_desc.h"
 #endif // ENABLE_CHERRY_USB_DEVICE
 
 #ifdef ENABLE_CHERRY_USB_HOST
@@ -53,9 +51,7 @@
 
 #endif // ENABLE_CHERRY_USB
 
-#ifndef CHERRY_USB_DEVICE_ENABLE_CLASS_MTP
 bool g_fs_mount_data_succ = false;
-#endif
 
 static const struct dfs_mount_tbl* const auto_mount_table[SYSCTL_BOOT_MAX] = {
     (const struct dfs_mount_tbl[]) {
@@ -211,14 +207,7 @@ int main(void) {
   /* Strange BUG, ​​USB Host must be initialized first */
 #if defined (ENABLE_CHERRY_USB_HOST) && defined (ENABLE_CANMV_USB_HOST)
   usb_base = (void *)rt_ioremap((void *)usb_dev_addr[CHERRY_USB_HOST_USING_DEV], 0x10000);
-
   usbh_initialize(0, (uint32_t)(long)usb_base);
-#endif // ENABLE_CHERRY_USB_HOST
-
-#if defined (ENABLE_CHERRY_USB_DEVICE) && defined (ENABLE_CANMV_USB_DEV)
-  usb_base = (void *)rt_ioremap((void *)usb_dev_addr[CHERRY_USB_DEVICE_USING_DEV], 0x10000);
-
-  board_usb_device_init(usb_base);
 
 #ifdef CANMV_USB_PWR_PIN
   int usb_host_pin = CANMV_USB_PWR_PIN;
@@ -228,6 +217,11 @@ int main(void) {
   }
 #endif
 
+#endif // ENABLE_CHERRY_USB_HOST
+
+#if defined (ENABLE_CHERRY_USB_DEVICE)
+  usb_base = (void *)rt_ioremap((void *)usb_dev_addr[CHERRY_USB_DEVICE_USING_DEV], 0x10000);
+  board_usb_device_init(usb_base);
 #endif // ENABLE_CHERRY_USB_DEVICE
 
 #endif //ENABLE_CHERRY_USB

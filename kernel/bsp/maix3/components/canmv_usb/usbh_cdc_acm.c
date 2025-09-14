@@ -1,18 +1,18 @@
-#include "canmv_usb.h"
+#include <stdint.h>
+#include <stdio.h>
 
 #include "rtdef.h"
-
-#include "cache.h"
+#include "rtthread.h"
 
 #include <dfs.h>
 #include <dfs_fs.h>
 #include <dfs_file.h>
 
-#include "rtthread.h"
-#include "usb_util.h"
+#include "cache.h"
+
+#include "usbh_core.h"
 #include "usbh_cdc_acm.h"
-#include <stdint.h>
-#include <stdio.h>
+#include "usb_util.h"
 
 #define DBG_SECTION_NAME    "USBH_CDC_ACM"
 #define DBG_LEVEL           DBG_LOG

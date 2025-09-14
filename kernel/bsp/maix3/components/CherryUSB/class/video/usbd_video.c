@@ -28,8 +28,14 @@ static int usbd_video_control_request_handler(uint8_t busid, struct usb_setup_pa
         case VIDEO_VC_VIDEO_POWER_MODE_CONTROL:
             switch (setup->bRequest) {
                 case VIDEO_REQUEST_SET_CUR:
+                    // not impl
                     break;
                 case VIDEO_REQUEST_GET_CUR:
+                    // not impl
+                    break;
+                case VIDEO_REQUEST_GET_MIN:
+                    break;
+                case VIDEO_REQUEST_GET_MAX:
                     break;
                 case VIDEO_REQUEST_GET_INFO:
                     break;
