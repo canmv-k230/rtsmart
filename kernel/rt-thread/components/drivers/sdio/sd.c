@@ -197,8 +197,13 @@ static rt_int32_t mmcsd_switch(struct rt_mmcsd_card *card)
         goto err1;
     }
 
-    if (buf[13] & 0x02)
-        card->hs_max_data_rate = 50000000;
+    if ((buf[13] & 0x02) != 0x02)
+    {
+        LOG_I("high speed is not support by card.");
+        goto err;
+    }
+
+    card->hs_max_data_rate = 50000000;
 
     rt_memset(&cmd, 0, sizeof(struct rt_mmcsd_cmd));
 
