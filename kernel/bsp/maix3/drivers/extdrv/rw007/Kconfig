@@ -1,0 +1,28 @@
+menuconfig RT_USING_RW007
+    bool "Enable Rw007 Driver"
+    depends on RT_USING_SPI
+    default n
+
+    if RT_USING_RW007
+
+        config RW007_SPI_MAX_HZ
+            int "RW007_SPI_MAX_HZ"
+            default  25000000
+
+        config RW007_SPI_BUS_NAME
+            string "RW007_RST_PIN"
+            default "spi0"
+
+        config RW007_RST_PIN
+            int "RW007_RST_PIN"
+            default 20
+
+        config RW007_CS_PIN
+            int "RW007_CS_PIN"
+            default 63
+
+        config RW007_INT_BUSY_PIN
+            int "RW007_INT_BUSY_PIN"
+            default  62
+
+    endif

@@ -7,4 +7,5 @@ menu "Ext Driver"
     source "drivers/extdrv/touch/Kconfig"
     source "drivers/extdrv/ws2812/Kconfig"
     source "drivers/extdrv/onewire/Kconfig"
+    source "drivers/extdrv/rw007/Kconfig"
 endmenu
