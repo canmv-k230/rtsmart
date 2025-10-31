@@ -925,7 +925,17 @@ static void handle_sync_send(const uint8_t *data, uint32_t len)
                     return;
                 }
                 sync_ctx.bytes_received += written;
-                SYNC_DBG("Wrote %d bytes, total=%u", (int)written, sync_ctx.bytes_received);
+                
+                /* Update current_data_remaining if data doesn't fit in one packet */
+                if (data_size > actual_data_len) {
+                    sync_ctx.current_data_remaining = data_size - actual_data_len;
+                    SYNC_DBG("Wrote %d bytes, %u remaining in DATA chunk", (int)written, sync_ctx.current_data_remaining);
+                } else {
+                    sync_ctx.current_data_remaining = 0;
+                    SYNC_DBG("Wrote %d bytes, DATA chunk complete", (int)written);
+                }
+                
+                SYNC_DBG("Total received: %u bytes", sync_ctx.bytes_received);
 
                 /* Check for DONE in same packet (after actual data written) */
                 uint32_t done_offset = file_data_offset + actual_data_len;
@@ -937,10 +947,17 @@ static void handle_sync_send(const uint8_t *data, uint32_t len)
                         close(sync_ctx.file_fd);
                         sync_ctx.file_fd = -1;
                         sync_ctx.state = SYNC_IDLE;
+                        sync_ctx.current_data_remaining = 0;
                         /* Send OKAY with 4 bytes of 0, matching QUIT/DONE format */
                         send_sync_response(ID_OKAY, &zero, 4);
                         return;
                     }
+                }
+            } else {
+                /* No data in this packet, but DATA header indicates more data coming */
+                if (data_size > 0) {
+                    sync_ctx.current_data_remaining = data_size;
+                    SYNC_DBG("DATA header only, %u bytes remaining", data_size);
                 }
             }
         }
