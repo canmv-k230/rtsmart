@@ -1375,6 +1375,11 @@ lwip_netconn_do_connect(void *m)
         } else if (msg->conn->state != NETCONN_NONE) {
           err = ERR_ISCONN;
         } else {
+          if ((msg->conn->pcb.tcp != NULL) && (ESTABLISHED == msg->conn->pcb.tcp->state)){
+            /* nonBlocking, has been connected */
+            err = ERR_OK;
+            break;
+          }
           setup_tcp(msg->conn);
           err = tcp_connect(msg->conn->pcb.tcp, API_EXPR_REF(msg->msg.bc.ipaddr),
                             msg->msg.bc.port, lwip_netconn_do_connected);
