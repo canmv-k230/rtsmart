@@ -17,6 +17,9 @@ if GetDepend(['TOUCH_TYPE_FT5406']):
 if GetDepend(['TOUCH_TYPE_CST128']):
     src += Glob('cst128.c')
 
+if GetDepend(['TOUCH_TYPE_CST328']):
+    src += Glob('cst328.c')
+
 if GetDepend(['TOUCH_TYPE_CHSC5XXX']):
     src += Glob('chsc5xxx.c')
 

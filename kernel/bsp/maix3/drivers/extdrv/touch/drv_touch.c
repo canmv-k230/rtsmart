@@ -39,6 +39,11 @@
 #define TOUCH_THREAD_MQ_INT_FLAG    0x01
 #define TOUCH_THREAD_MQ_RST_FLAG    0x02
 
+/* Device management system */
+static struct touch_device_entry touch_device_table[TOUCH_MAX_USER_DEVICES + 1]; // +1 for default device
+static struct rt_mutex touch_device_mutex;
+static rt_bool_t touch_device_manager_initialized = RT_FALSE;
+
 static struct drv_touch_dev touch_dev = {
     .touch = {
         .range_x = TOUCH_RANGE_X,
@@ -471,6 +476,9 @@ static const drv_touch_probe touch_probes[] = {
 #if defined TOUCH_TYPE_CST128
     drv_touch_probe_cst128,
 #endif // TOUCH_TYPE_CST128
+#if defined TOUCH_TYPE_CST328
+    drv_touch_probe_cst328,
+#endif // TOUCH_TYPE_CST328
 #if defined TOUCH_TYPE_CHSC5XXX
     drv_touch_probe_chsc5xxx,
 #endif // TOUCH_TYPE_CHSC5XXX
@@ -480,33 +488,123 @@ static const drv_touch_probe touch_probes[] = {
     NULL
 };
 
-static int drv_touch_init(void) {
-    int ret;
-    struct drv_touch_dev *dev = &touch_dev;
+/* Initialize device manager */
+static int drv_touch_device_manager_init(void)
+{
+    if (touch_device_manager_initialized) {
+        return RT_EOK;
+    }
 
+    rt_memset(&touch_device_table, 0, sizeof(touch_device_table));
+
+    if (rt_mutex_init(&touch_device_mutex, "touch_dev", RT_IPC_FLAG_FIFO) != RT_EOK) {
+        LOG_E("Failed to initialize touch device mutex");
+        return -RT_ERROR;
+    }
+
+    touch_device_manager_initialized = RT_TRUE;
+    return RT_EOK;
+}
+
+/* Find device entry by name */
+static struct touch_device_entry *drv_touch_find_device_entry(const char *name)
+{
+    if (!name || !touch_device_manager_initialized) {
+        return RT_NULL;
+    }
+
+    for (int i = 0; i < TOUCH_MAX_USER_DEVICES + 1; i++) {
+        if (touch_device_table[i].in_use && 
+            rt_strcmp(touch_device_table[i].name, name) == 0) {
+            return &touch_device_table[i];
+        }
+    }
+
+    return RT_NULL;
+}
+
+/* Find free device entry */
+static struct touch_device_entry *drv_touch_find_free_entry(void)
+{
+    if (!touch_device_manager_initialized) {
+        return RT_NULL;
+    }
+
+    for (int i = 1; i < TOUCH_MAX_USER_DEVICES + 1; i++) {  // Start from 1, 0 is for default device
+        if (!touch_device_table[i].in_use) {
+            return &touch_device_table[i];
+        }
+    }
+
+    return RT_NULL;
+}
+
+/* Common device initialization function */
+int drv_touch_init_device(struct drv_touch_dev *dev, const char *name, rt_bool_t is_default)
+{
+    int ret;
+
+    if (!dev || !name) {
+        return -RT_EINVAL;
+    }
+
+    /* Initialize device manager if not already done */
+    if (drv_touch_device_manager_init() != RT_EOK) {
+        return -RT_ERROR;
+    }
+
+    rt_mutex_take(&touch_device_mutex, RT_WAITING_FOREVER);
+
+    /* Check if device already exists */
+    struct touch_device_entry *existing = drv_touch_find_device_entry(name);
+    if (existing) {
+        rt_mutex_release(&touch_device_mutex);
+        LOG_W("Touch device %s already exists", name);
+        return -RT_ERROR;
+    }
+
+    /* Find free entry for user devices */
+    struct touch_device_entry *entry;
+    if (is_default) {
+        entry = &touch_device_table[0];  // Default device always at index 0
+    } else {
+        entry = drv_touch_find_free_entry();
+        if (!entry) {
+            rt_mutex_release(&touch_device_mutex);
+            LOG_E("No free touch device slots available");
+            return -RT_ENOMEM;
+        }
+    }
+
+    /* Initialize I2C */
     dev->i2c.reg_width = 1;
-    if(NULL == (dev->i2c.bus = rt_i2c_bus_device_find(dev->i2c.name))) {
+    if (NULL == (dev->i2c.bus = rt_i2c_bus_device_find(dev->i2c.name))) {
+        rt_mutex_release(&touch_device_mutex);
         LOG_E("Can't find Touch Device I2C Bus %s", dev->i2c.name);
         return -1;
     }
 
     if (RT_EOK != (ret = rt_device_open((rt_device_t)dev->i2c.bus, RT_DEVICE_FLAG_RDWR))) {
+        rt_mutex_release(&touch_device_mutex);
         LOG_E("Open Touch Device I2C dev %s failed: %d", dev->i2c.name, ret);
         return -2;
     }
 
 #if defined (TOUCH_DEV_I2C_SET_SPEED)
     if(RT_EOK != (ret = rt_device_control((rt_device_t)dev->i2c.bus, RT_I2C_DEV_CTRL_CLK, (uint32_t *)&dev->i2c.speed))) {
+        rt_mutex_release(&touch_device_mutex);
         LOG_E("Set Touch Device I2C dev clock %s failed: %d", dev->i2c.name, ret);
         return -3;
     }
 #endif
 
+    /* Initialize GPIO */
     if((0 <= dev->pin.rst) && (63 >= dev->pin.rst)) {
         kd_pin_mode(dev->pin.rst, GPIO_DM_OUTPUT);
         kd_pin_write(dev->pin.rst, 1 - dev->pin.rst_valid);
     }
 
+    /* Probe for touch controller */
     for(int i = 0; touch_probes[i]; i++) {
         if(0x00 == touch_probes[i](dev)) {
             break;
@@ -517,23 +615,24 @@ static int drv_touch_init(void) {
         (0x00 >= rt_strlen(dev->dev.drv_name)) || \
         (sizeof(dev->dev.drv_name) <= rt_strlen(dev->dev.drv_name)))
     {
+        rt_mutex_release(&touch_device_mutex);
         LOG_E("touch probe failed.");
         return -4;
     }
-    rt_kprintf("probe touch %s\n", dev->dev.drv_name);
 
+    LOG_D("probe touch %s", dev->dev.drv_name);
+
+    /* Setup interrupt */
     if((0 <= dev->pin.intr) && (63 >= dev->pin.intr)) {
         kd_pin_mode(dev->pin.intr, GPIO_DM_INPUT);
         kd_pin_attach_irq(dev->pin.intr, GPIO_PE_FALLING, touch_int_irq, dev);
     }
 
 #ifdef TOUCH_DRV_MODEL_INT_WITH_THREAD
+    /* Initialize thread resources */
     rt_sem_init(&dev->thr.ctrl_sem, "touch_ctrl", 0, RT_IPC_FLAG_FIFO);
-
     rt_mq_init(&dev->thr.ctrl_mq, "touch_int", &dev->thr.ctrl_mq_pool[0], sizeof(uint32_t), sizeof(dev->thr.ctrl_mq_pool), RT_IPC_FLAG_FIFO);
-
     rt_mq_init(&dev->thr.read_mq, "touch_read", &dev->thr.read_mq_pool[0], sizeof(touch_read_mq_msg_type), sizeof(dev->thr.read_mq_pool), RT_IPC_FLAG_FIFO);
-
     rt_thread_init(&dev->thr.thr, "touch_read", touch_read_thread, dev, &dev->thr.thread_stack[0], sizeof(dev->thr.thread_stack), TOUCH_DRV_THREAD_PRIO, 5);
     rt_thread_startup(&dev->thr.thr);
 #endif
@@ -542,7 +641,8 @@ static int drv_touch_init(void) {
         kd_pin_irq_enable(dev->pin.intr, KD_GPIO_IRQ_ENABLE);
     }
 
-    dev->dev.touch.config.dev_name = "touch0";
+    /* Register touch device */
+    dev->dev.touch.config.dev_name = (char *)name;
     dev->dev.touch.config.user_data = dev;
 
     dev->dev.touch.info.type = RT_TOUCH_TYPE_CAPACITANCE;
@@ -554,11 +654,113 @@ static int drv_touch_init(void) {
 
     dev->dev.touch.ops = &drv_touch_ops;
 
-    if(RT_EOK != (ret= rt_hw_touch_register(&dev->dev.touch, dev->dev.touch.config.dev_name, 0, RT_NULL))) {
+    if(RT_EOK != (ret = rt_hw_touch_register(&dev->dev.touch, dev->dev.touch.config.dev_name, 0, RT_NULL))) {
+        rt_mutex_release(&touch_device_mutex);
         LOG_E("Register Touch Device failed %d.", ret);
         return -5;
     }
+
+    /* Add to device table */
+    entry->dev = dev;
+    rt_strncpy(entry->name, name, TOUCH_DEVICE_NAME_LEN - 1);
+    entry->name[TOUCH_DEVICE_NAME_LEN - 1] = '\0';
+    entry->is_default = is_default;
+    entry->in_use = RT_TRUE;
+
+    rt_mutex_release(&touch_device_mutex);
+
+    LOG_I("Touch device %s registered successfully", name);
+    return RT_EOK;
+}
+
+/* User API: Register a new touch device */
+int drv_touch_register_device(const char *name, struct drv_touch_dev *dev)
+{
+    if (!name || !dev) {
+        return -RT_EINVAL;
+    }
+
+    /* Check if trying to register default device */
+    if (rt_strcmp(name, "touch0") == 0) {
+        LOG_E("Cannot register default device touch0");
+        return -RT_ERROR;
+    }
+
+    return drv_touch_init_device(dev, name, RT_FALSE);
+}
+
+/* User API: Unregister a touch device */
+int drv_touch_unregister_device(const char *name)
+{
+    if (!name) {
+        return -RT_EINVAL;
+    }
+
+    /* Cannot unregister default device */
+    if (rt_strcmp(name, "touch0") == 0) {
+        LOG_E("Cannot unregister default device touch0");
+        return -RT_ERROR;
+    }
+
+    if (!touch_device_manager_initialized) {
+        return -RT_ERROR;
+    }
+
+    rt_mutex_take(&touch_device_mutex, RT_WAITING_FOREVER);
+
+    struct touch_device_entry *entry = drv_touch_find_device_entry(name);
+    if (!entry) {
+        rt_mutex_release(&touch_device_mutex);
+        LOG_W("Touch device %s not found", name);
+        return -RT_ERROR;
+    }
+
+    if (entry->is_default) {
+        rt_mutex_release(&touch_device_mutex);
+        LOG_E("Cannot unregister default device");
+        return -RT_ERROR;
+    }
+
+    /* TODO: Properly cleanup device resources */
+    /* For now, just mark as unused */
+    entry->in_use = RT_FALSE;
+    entry->dev = RT_NULL;
+
+    rt_mutex_release(&touch_device_mutex);
+
+    LOG_I("Touch device %s unregistered successfully", name);
+    return RT_EOK;
+}
+
+/* User API: Get touch device by name */
+struct drv_touch_dev *drv_touch_get_device(const char *name)
+{
+    if (!name) {
+        return RT_NULL;
+    }
+
+    if (!touch_device_manager_initialized) {
+        return RT_NULL;
+    }
+
+    rt_mutex_take(&touch_device_mutex, RT_WAITING_FOREVER);
     
-    return 0;
+    struct touch_device_entry *entry = drv_touch_find_device_entry(name);
+    struct drv_touch_dev *dev = entry ? entry->dev : RT_NULL;
+    
+    rt_mutex_release(&touch_device_mutex);
+    
+    return dev;
+}
+
+/* Initialize default device */
+int drv_touch_init_default_device(void)
+{
+    return drv_touch_init_device(&touch_dev, "touch0", RT_TRUE);
+}
+
+static int drv_touch_init(void) {
+    /* Initialize the default touch device using the new device management system */
+    return drv_touch_init_default_device();
 }
 INIT_COMPONENT_EXPORT(drv_touch_init);

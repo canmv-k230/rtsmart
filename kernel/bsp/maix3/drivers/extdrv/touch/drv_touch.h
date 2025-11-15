@@ -38,6 +38,8 @@
 #define TOUCH_READ_REG_MAX_SIZE     128
 #define TOUCH_READ_MQ_MSG_COUNT     3
 #define TOUCH_TIMEOUT_MS            1000
+#define TOUCH_MAX_USER_DEVICES      10  // Maximum user touch devices (touch1, touch2, etc.)
+#define TOUCH_DEVICE_NAME_LEN       16
 
 struct touch_register {
     rt_tick_t time;
@@ -120,6 +122,20 @@ typedef int (*drv_touch_probe)(struct drv_touch_dev *);
 
 int drv_touch_probe_ft5x16(struct drv_touch_dev *dev);
 int drv_touch_probe_cst128(struct drv_touch_dev *dev);
+int drv_touch_probe_cst328(struct drv_touch_dev *dev);
 int drv_touch_probe_chsc5xxx(struct drv_touch_dev *dev);
 int drv_touch_probe_gt911(struct drv_touch_dev *dev);
 int drv_touch_probe_ft5x06(struct drv_touch_dev *dev);
+
+/* Touch device management */
+struct touch_device_entry {
+    struct drv_touch_dev *dev;
+    char name[TOUCH_DEVICE_NAME_LEN];
+    rt_bool_t is_default;  // TRUE for touch0, FALSE for user devices
+    rt_bool_t in_use;
+};
+
+/* User API functions */
+int drv_touch_register_device(const char *name, struct drv_touch_dev *dev);
+int drv_touch_unregister_device(const char *name);
+struct drv_touch_dev *drv_touch_get_device(const char *name);
