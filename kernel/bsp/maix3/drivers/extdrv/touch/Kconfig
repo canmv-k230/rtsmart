@@ -21,68 +21,7 @@ menuconfig RT_USING_TOUCH
                 default 4096
         endif
 
-        config TOUCH_DEV_INT_PIN
-            int "Touch Device INT Pin"
-            default -1
-
-        choice TOUCH_DEV_INT_EDGE
-            bool "Touch Device INT Edge"
-            default TOUCH_DEV_INT_EDGE_FALLING
-
-            config TOUCH_DEV_INT_EDGE_RISING
-                bool "RISING"
-            config TOUCH_DEV_INT_EDGE_FALLING
-                bool "FALLING"
-            config TOUCH_DEV_INT_EDGE_BOTH
-                bool "BOTH"
-            config TOUCH_DEV_INT_EDGE_HIGH
-                bool "HIGH"
-            config TOUCH_DEV_INT_EDGE_LOW
-                bool "LOW"
-        endchoice
-
-        config TOUCH_DEV_INT_EDGE
-            int
-            default GPIO_PE_RISING if TOUCH_DEV_INT_EDGE_RISING
-            default GPIO_PE_FALLING if TOUCH_DEV_INT_EDGE_FALLING
-            default GPIO_PE_BOTH if TOUCH_DEV_INT_EDGE_BOTH
-            default GPIO_PE_HIGH if TOUCH_DEV_INT_EDGE_HIGH
-            default GPIO_PE_LOW if TOUCH_DEV_INT_EDGE_LOW
-
-        config TOUCH_DEV_RST_PIN
-            int "Touch Device RST Pin"
-            default -1
-
-        config TOUCH_DEV_RST_PIN_VALID_VALUE
-            int "Touch Device RST Pin Valid Value"
-            default 0
-
-        config TOUCH_DEV_I2C_BUS
-            string "Touch Device I2C Bus Name"
-            default "i2c3"
-        
-        menuconfig TOUCH_DEV_I2C_SET_SPEED
-            bool "Touch Device Change I2C Speed"
-            default n
-
-            if TOUCH_DEV_I2C_SET_SPEED
-                config TOUCH_DEV_I2C_BUS_SPEED
-                    int "Touch Device I2C Bus Speed"
-                    default 400000
-            endif
-
-        config TOUCH_RANGE_X
-            int "Touch Range X, Origin of Touch Output"
-            default 480
-
-        config TOUCH_RANGE_Y
-            int "Touch Range Y, Origin of Touch Output"
-            default 800
-
-        config TOUCH_POINT_NUM
-            int "Touch Point Number"
-            default 5
-
+        comment "Touch Device Drivers"
         config TOUCH_TYPE_FT5316
             bool "Enable Touch FT5316"
             default n
@@ -109,11 +48,71 @@ menuconfig RT_USING_TOUCH
                 default 5
         endif
 
-        menuconfig TOUCH_TYPE_GT911
+        config TOUCH_TYPE_GT911
             bool "Enable Touch GT911"
             default n
 
-            if TOUCH_TYPE_GT911
+        comment "Touch Default Device"
 
+        menuconfig TOUCH_DEFAULT_DEVICE
+            bool "Enable Defautl Touch Device"
+            default y
+
+            if TOUCH_DEFAULT_DEVICE
+                config TOUCH_DEV_INT_PIN
+                    int "Touch Device INT Pin"
+                    default -1
+
+                choice
+                    bool "Touch Device INT Edge"
+                    default TOUCH_DEV_INT_EDGE_FALLING
+
+                    config TOUCH_DEV_INT_EDGE_RISING
+                        bool "RISING"
+                    config TOUCH_DEV_INT_EDGE_FALLING
+                        bool "FALLING"
+                    config TOUCH_DEV_INT_EDGE_BOTH
+                        bool "BOTH"
+                    config TOUCH_DEV_INT_EDGE_HIGH
+                        bool "HIGH"
+                    config TOUCH_DEV_INT_EDGE_LOW
+                        bool "LOW"
+                endchoice
+
+                config TOUCH_DEV_INT_EDGE
+                    int
+                    default GPIO_PE_RISING if TOUCH_DEV_INT_EDGE_RISING
+                    default GPIO_PE_FALLING if TOUCH_DEV_INT_EDGE_FALLING
+                    default GPIO_PE_BOTH if TOUCH_DEV_INT_EDGE_BOTH
+                    default GPIO_PE_HIGH if TOUCH_DEV_INT_EDGE_HIGH
+                    default GPIO_PE_LOW if TOUCH_DEV_INT_EDGE_LOW
+
+                config TOUCH_DEV_RST_PIN
+                    int "Touch Device RST Pin"
+                    default -1
+
+                config TOUCH_DEV_RST_PIN_VALID_VALUE
+                    int "Touch Device RST Pin Valid Value"
+                    default 0
+
+                config TOUCH_DEV_I2C_BUS
+                    string "Touch Device I2C Bus Name"
+                    default "i2c3"
+
+                config TOUCH_DEV_I2C_BUS_SPEED
+                    int "Touch Device I2C Bus Speed"
+                    default 400000
+
+                config TOUCH_RANGE_X
+                    int "Touch Range X, Origin of Touch Output"
+                    default 480
+
+                config TOUCH_RANGE_Y
+                    int "Touch Range Y, Origin of Touch Output"
+                    default 800
+
+                config TOUCH_POINT_NUM
+                    int "Touch Point Number"
+                    default 5
             endif
     endif
