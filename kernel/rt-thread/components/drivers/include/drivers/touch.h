@@ -56,6 +56,7 @@ extern "C" {
 #define  RT_TOUCH_CTRL_GET_STATUS        (RT_DEVICE_CTRL_BASE(Touch) + 10)  /* Get Touch Power Status */
 #define  RT_TOUCH_CTRL_RESET             (RT_DEVICE_CTRL_BASE(Touch) + 11)  /* Hard or Soft Reset Touch Device */
 #define  RT_TOUCH_CTRL_GET_DFT_ROTATE    (RT_DEVICE_CTRL_BASE(Touch) + 12)  /* Get Default Rotate set */
+#define  RT_TOUCH_CTRL_GET_DEVICE_CFG    (RT_DEVICE_CTRL_BASE(Touch) + 13)  /* Get Default Rotate set */
 
 /* Touch event */
 #define RT_TOUCH_EVENT_NONE              (0)   /* Touch none */

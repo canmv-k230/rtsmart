@@ -153,7 +153,6 @@ static int misc_close(struct dfs_fd *file) { return 0; }
 #define MISC_DEV_CMD_DELETE_ROTARY_ENC_DEV    _IOWR('M', 0x0f, void *)
 #define MISC_DEV_CMD_REGISTER_TOUCH_DEVICE    _IOWR('M', 0x10, void *)
 #define MISC_DEV_CMD_UNREGISTER_TOUCH_DEVICE  _IOWR('M', 0x11, void *)
-#define MISC_DEV_CMD_GET_TOUCH_DEVICE         _IOWR('M', 0x12, void *)
 
 struct meminfo_t {
   size_t total_size;
@@ -566,147 +565,29 @@ static int misc_delete_rotary_encoder_dev(void* args)
 }
 #endif
 
-#if 0 // defined (RT_USING_TOUCH)
-
-// Local definitions for touch HAL structures to avoid circular dependencies
-#define TOUCH_DEVICE_NAME_LEN       16
-
-struct canmv_touch_pin_cfg_t {
-    int intr;
-    int intr_edge;
-    int rst;
-    int rst_valid;
-};
-
-struct canmv_touch_i2c_cfg_t {
-    char name[32];
-    uint32_t speed;
-    uint16_t addr;
-    uint16_t reg_width;
-};
-
-struct canmv_touch_cfg_t {
-    struct canmv_touch_pin_cfg_t pin;
-    struct canmv_touch_i2c_cfg_t i2c;
-    int range_x;
-    int range_y;
-    int point_num;
-};
-
-struct canmv_touch_device_info_t {
-    char name[TOUCH_DEVICE_NAME_LEN];
-    struct canmv_touch_cfg_t config;
-    int is_registered;
-};
-
+#if defined(RT_USING_TOUCH)
 static int misc_register_touch_device(void* args)
 {
-    struct {
-        char name[TOUCH_DEVICE_NAME_LEN];
-        struct canmv_touch_cfg_t config;
-    } touch_args;
-    
-    struct drv_touch_dev *dev;
+    struct drv_touch_config cfg;
 
-    if (sizeof(touch_args) != lwp_get_from_user(&touch_args, args, sizeof(touch_args))) {
+    if (sizeof(cfg) != lwp_get_from_user(&cfg, args, sizeof(cfg))) {
         rt_kprintf("%s get_from_user failed\n", __func__);
         return -1;
     }
 
-    dev = rt_malloc(sizeof(struct drv_touch_dev));
-    if (!dev) {
-        rt_kprintf("%s malloc failed\n", __func__);
-        return -1;
-    }
-
-    rt_memset(dev, 0, sizeof(struct drv_touch_dev));
-
-    dev->i2c.bus = rt_i2c_bus_device_find(touch_args.config.i2c.name);
-    if (!dev->i2c.bus) {
-        rt_kprintf("Cannot find I2C bus %s\n", touch_args.config.i2c.name);
-        rt_free(dev);
-        return -1;
-    }
-
-    dev->i2c.addr = touch_args.config.i2c.addr;
-    dev->i2c.reg_width = touch_args.config.i2c.reg_width;
-
-    dev->touch.range_x = touch_args.config.range_x;
-    dev->touch.range_y = touch_args.config.range_y;
-    dev->touch.point_num = touch_args.config.point_num;
-
-    int result = drv_touch_register_device(touch_args.name, dev);
-    if (result != 0) {
-        rt_free(dev);
-        return result;
-    }
-
-    return 0;
+    return drv_touch_mgmt_create_device(&cfg);
 }
 
 static int misc_unregister_touch_device(void* args)
 {
-    char device_name[TOUCH_DEVICE_NAME_LEN];
-    
-    if (sizeof(device_name) != lwp_get_from_user(&device_name, args, sizeof(device_name))) {
+    int index = -1;
+
+    if (sizeof(index) != lwp_get_from_user(&index, args, sizeof(index))) {
         rt_kprintf("%s get_from_user failed\n", __func__);
         return -1;
     }
-    
-    return drv_touch_unregister_device(device_name);
-}
 
-static int misc_get_touch_device(void* args)
-{
-    struct {
-        char name[TOUCH_DEVICE_NAME_LEN];
-        struct canmv_touch_device_info_t info;
-    } touch_args;
-    
-    struct drv_touch_dev *dev;
-    
-    if (sizeof(touch_args.name) != lwp_get_from_user(&touch_args.name, args, sizeof(touch_args.name))) {
-        rt_kprintf("%s get_from_user failed\n", __func__);
-        return -1;
-    }
-    
-    dev = drv_touch_get_device(touch_args.name);
-    if (!dev) {
-        // Device not found, return empty info with is_registered = 0
-        rt_memset(&touch_args.info, 0, sizeof(touch_args.info));
-        touch_args.info.is_registered = 0;
-    } else {
-        // Copy device information
-        rt_strncpy(touch_args.info.name, touch_args.name, TOUCH_DEVICE_NAME_LEN - 1);
-        touch_args.info.name[TOUCH_DEVICE_NAME_LEN - 1] = '\0';
-        
-        // Copy pin configuration
-        touch_args.info.config.pin.intr = dev->pin.intr;
-        touch_args.info.config.pin.intr_edge = dev->pin.intr_edge;
-        touch_args.info.config.pin.rst = dev->pin.rst;
-        touch_args.info.config.pin.rst_valid = dev->pin.rst_valid;
-        
-        // Copy I2C configuration
-        rt_strncpy(touch_args.info.config.i2c.name, (char*)dev->i2c.name, sizeof(touch_args.info.config.i2c.name) - 1);
-        touch_args.info.config.i2c.name[sizeof(touch_args.info.config.i2c.name) - 1] = '\0';
-        touch_args.info.config.i2c.speed = dev->i2c.speed;
-        touch_args.info.config.i2c.addr = dev->i2c.addr;
-        touch_args.info.config.i2c.reg_width = dev->i2c.reg_width;
-
-        // Copy touch configuration
-        touch_args.info.config.range_x = dev->touch.range_x;
-        touch_args.info.config.range_y = dev->touch.range_y;
-        touch_args.info.config.point_num = dev->touch.point_num;
-
-        touch_args.info.is_registered = 1;
-    }
-
-    if (sizeof(touch_args) != lwp_put_to_user(args, &touch_args, sizeof(touch_args))) {
-        rt_kprintf("%s put_to_user failed\n", __func__);
-        return -1;
-    }
-    
-    return 0;
+    return drv_touch_mgmt_delete_device(index);
 }
 #endif
 
@@ -774,7 +655,7 @@ static const struct misc_dev_handle misc_handles[] = {
     .func = misc_delete_rotary_encoder_dev,
   },
 #endif
-#if 0 // defined (RT_USING_TOUCH)
+#if defined (RT_USING_TOUCH)
   {
     .cmd = MISC_DEV_CMD_REGISTER_TOUCH_DEVICE,
     .func = misc_register_touch_device,
@@ -782,10 +663,6 @@ static const struct misc_dev_handle misc_handles[] = {
   {
     .cmd = MISC_DEV_CMD_UNREGISTER_TOUCH_DEVICE,
     .func = misc_unregister_touch_device,
-  },
-  {
-    .cmd = MISC_DEV_CMD_GET_TOUCH_DEVICE,
-    .func = misc_get_touch_device,
   },
 #endif
 

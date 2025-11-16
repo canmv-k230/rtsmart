@@ -38,7 +38,6 @@
 #define TOUCH_MAX_POINT_NUMBER  10
 #define TOUCH_READ_REG_MAX_SIZE 128
 #define TOUCH_READ_MQ_MSG_COUNT 3
-#define TOUCH_TIMEOUT_MS        1000
 
 struct touch_register {
     rt_tick_t time;
@@ -99,6 +98,7 @@ struct drv_touch_dev {
     struct {
         struct rt_touch_device touch;
 
+        int  dev_index;
         char drv_name[16];
 
         int (*read_register)(struct drv_touch_dev* dev, struct touch_register* reg);
@@ -122,6 +122,9 @@ struct drv_touch_dev {
         char read_mq_pool[(sizeof(void*) + RT_ALIGN(sizeof(touch_read_mq_msg_type), RT_ALIGN_SIZE)) * TOUCH_READ_MQ_MSG_COUNT];
     } thr;
 #endif
+
+    struct drv_touch_config config;
+    rt_list_t               list;
 };
 
 /**
@@ -144,3 +147,6 @@ int drv_touch_probe_cst328(struct drv_touch_dev* dev);
 int drv_touch_probe_chsc5xxx(struct drv_touch_dev* dev);
 int drv_touch_probe_gt911(struct drv_touch_dev* dev);
 int drv_touch_probe_ft5x06(struct drv_touch_dev* dev);
+
+int drv_touch_mgmt_create_device(struct drv_touch_config* cfg);
+int drv_touch_mgmt_delete_device(int index);

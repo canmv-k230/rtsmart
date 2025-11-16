@@ -28,6 +28,7 @@
 #include "rtconfig.h"
 #include "rtdef.h"
 #include "rthw.h"
+#include "rtservice.h"
 #include "rtthread.h"
 
 #include <ioremap.h>
@@ -37,6 +38,8 @@
 #define DBG_LVL DBG_WARNING
 #define DBG_COLOR
 #include <rtdbg.h>
+
+#define TOUCH_TIMEOUT_MS 1000
 
 #define TOUCH_THREAD_MQ_INT_FLAG 0x01
 #define TOUCH_THREAD_MQ_RST_FLAG 0x02
@@ -394,6 +397,10 @@ static rt_err_t drv_touch_control(struct rt_touch_device* touch, int cmd, void* 
         return RT_EOK;
     } break;
     case RT_TOUCH_CTRL_RESET: {
+        if (!dev) {
+            return RT_EINVAL;
+        }
+
         if (dev->dev.reset) {
 #ifdef TOUCH_DRV_MODEL_INT_WITH_THREAD
             // push command to thread
@@ -415,6 +422,10 @@ static rt_err_t drv_touch_control(struct rt_touch_device* touch, int cmd, void* 
         }
     } break;
     case RT_TOUCH_CTRL_GET_DFT_ROTATE: {
+        if (!dev) {
+            return RT_EINVAL;
+        }
+
         int rotate = RT_TOUCH_ROTATE_DEGREE_0;
 
         if (dev->dev.get_default_rotate) {
@@ -427,6 +438,31 @@ static rt_err_t drv_touch_control(struct rt_touch_device* touch, int cmd, void* 
 
         return RT_EOK;
     } break;
+    case RT_TOUCH_CTRL_GET_DEVICE_CFG: {
+        if (!dev) {
+            return RT_EINVAL;
+        }
+
+        lwp_put_to_user(arg, &dev->config, sizeof(struct drv_touch_config));
+
+        return RT_EOK;
+    } break;
+    case RT_TOUCH_CTRL_DISABLE_INT: {
+        if (!dev) {
+            return RT_EINVAL;
+        }
+
+        if (0x00 == dev->pin.fake_intr) {
+            dev->pin.fake_intr = 1;
+
+            kd_pin_detach_irq(dev->pin.intr);
+        }
+
+        return RT_EOK;
+    } break;
+    default: {
+        LOG_E("touch not support cmd 0x%08X", cmd);
+    } break;
     }
 
     return -RT_ENOSYS;
@@ -438,6 +474,7 @@ static struct rt_touch_ops drv_touch_ops = {
 };
 
 static const drv_touch_probe touch_probes[] = {
+
 #if defined TOUCH_TYPE_FT5316
     drv_touch_probe_ft5x16,
 #endif // TOUCH_TYPE_FT5316
@@ -590,18 +627,20 @@ static struct drv_touch_dev* drv_touch_create_device(struct drv_touch_config* cf
         goto _err_register_device;
     }
 
-    LOG_I("Touch device %s registered successfully", name);
+    dev->dev.dev_index = cfg->touch_dev_index;
+    rt_memcpy(&dev->config, cfg, sizeof(dev->config));
 
 #ifdef TOUCH_DRV_MODEL_INT_WITH_THREAD
     rt_thread_startup(&dev->thr.thr);
 #endif
+
+    LOG_I("Touch device %s registered successfully", name);
 
     return dev;
 
 _err_register_device:
     if (0x00 == dev->pin.fake_intr) {
         kd_pin_detach_irq(cfg->pin_intr);
-        kd_pin_irq_enable(cfg->pin_intr, KD_GPIO_IRQ_DISABLE);
     }
 
 #ifdef TOUCH_DRV_MODEL_INT_WITH_THREAD
@@ -622,10 +661,207 @@ _err_invalid_cfg:
     return NULL;
 }
 
-#if defined(TOUCH_DEFAULT_DEVICE)
-static struct drv_touch_dev* dft_touch = NULL;
+static int drv_touch_destroy_device(struct drv_touch_dev* dev)
+{
+    if (NULL == dev) {
+        return -1;
+    }
 
-static int drv_touch_init(void)
+    rt_device_unregister(&dev->dev.touch.parent);
+
+    rt_device_close((rt_device_t)dev->i2c.bus);
+
+    if (0x00 == dev->pin.fake_intr) {
+        kd_pin_detach_irq(dev->pin.intr);
+    }
+
+#ifdef TOUCH_DRV_MODEL_INT_WITH_THREAD
+    rt_mq_detach(&dev->thr.ctrl_mq);
+    rt_mq_detach(&dev->thr.read_mq);
+    rt_sem_detach(&dev->thr.ctrl_sem);
+    rt_thread_detach(&dev->thr.thr);
+#endif
+
+    rt_free_align(dev);
+
+    return 0;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////////////
+struct drv_touch_mgmt_t {
+    int inited;
+
+    struct rt_mutex mutex;
+
+    rt_list_t dev_list;
+};
+
+static struct drv_touch_mgmt_t drv_touch_mgmt = { .inited = 0 };
+
+static int drv_touch_mgmt_init(void)
+{
+    if (drv_touch_mgmt.inited) {
+        return 0;
+    }
+
+    rt_list_init(&drv_touch_mgmt.dev_list);
+
+    if (RT_EOK != rt_mutex_init(&drv_touch_mgmt.mutex, "touch_mgmt", RT_IPC_FLAG_FIFO)) {
+        return -1;
+    }
+
+    drv_touch_mgmt.inited = 1;
+
+    return 0;
+}
+
+static int drv_touch_mgmt_add_device(struct drv_touch_dev* dev)
+{
+    if (!dev) {
+        LOG_E("Invalid dev");
+        return -1;
+    }
+
+    if (!drv_touch_mgmt.inited) {
+        LOG_E("drv touch mgmt not init");
+        return -1;
+    }
+
+    rt_mutex_take_interruptible(&drv_touch_mgmt.mutex, RT_WAITING_FOREVER);
+
+    rt_list_init(&dev->list);
+    rt_list_insert_after(&drv_touch_mgmt.dev_list, &dev->list);
+
+    rt_mutex_release(&drv_touch_mgmt.mutex);
+
+    return 0;
+}
+
+static int drv_touch_mgmt_remove_device(struct drv_touch_dev* dev)
+{
+    struct drv_touch_dev *node, *temp;
+
+    if (!dev) {
+        LOG_E("Invalid dev");
+        return -1;
+    }
+
+    if (!drv_touch_mgmt.inited) {
+        LOG_E("drv touch mgmt not init");
+        return -1;
+    }
+
+    rt_mutex_take_interruptible(&drv_touch_mgmt.mutex, RT_WAITING_FOREVER);
+
+    rt_list_for_each_entry_safe(node, temp, &drv_touch_mgmt.dev_list, list)
+    {
+        if (dev->dev.dev_index == node->dev.dev_index) {
+            rt_list_remove(&node->list);
+            break;
+        }
+    }
+
+    rt_mutex_release(&drv_touch_mgmt.mutex);
+
+    return 0;
+}
+
+static struct drv_touch_dev* drv_touch_mgmt_find_by_index(int index)
+{
+    struct drv_touch_dev *node = NULL, *dev = NULL;
+
+    if (!drv_touch_mgmt.inited) {
+        LOG_E("drv touch mgmt not init");
+        return NULL;
+    }
+
+    rt_mutex_take_interruptible(&drv_touch_mgmt.mutex, RT_WAITING_FOREVER);
+
+    rt_list_for_each_entry(node, &drv_touch_mgmt.dev_list, list)
+    {
+        if (index == node->dev.dev_index) {
+            dev = node;
+            break;
+        }
+        node = NULL;
+    }
+
+    rt_mutex_release(&drv_touch_mgmt.mutex);
+
+    return dev;
+}
+
+int drv_touch_mgmt_create_device(struct drv_touch_config* cfg)
+{
+    struct drv_touch_dev* dev = NULL;
+
+    if (!cfg) {
+        return -1;
+    }
+
+    if (0x00 == cfg->touch_dev_index) {
+        LOG_E("can not add new touch0");
+        return -1;
+    }
+
+    if (NULL != (dev = drv_touch_mgmt_find_by_index(cfg->touch_dev_index))) {
+        LOG_E("touch device already created");
+        return -1;
+    }
+
+    if (NULL == (dev = drv_touch_create_device(cfg))) {
+        LOG_E("drv touch mgmt create device failed");
+
+        return -1;
+    }
+
+    if (0x00 != drv_touch_mgmt_add_device(dev)) {
+        drv_touch_destroy_device(dev);
+
+        LOG_E("drv touch mgmt add device failed");
+
+        return -1;
+    }
+
+    return 0;
+}
+
+int drv_touch_mgmt_delete_device(int index)
+{
+    int ret = 0;
+
+    struct drv_touch_dev* dev = NULL;
+
+    if (0x00 == index) {
+        LOG_E("can not remove touch0");
+        return -1;
+    }
+
+    if (NULL == (dev = drv_touch_mgmt_find_by_index(index))) {
+        LOG_E("drv touch mgmt can not find device with index %d\n", index);
+
+        return -1;
+    }
+
+    if (0x00 != drv_touch_mgmt_remove_device(dev)) {
+        ret--;
+
+        LOG_E("drv touch mgmt remove failed");
+    }
+
+    if (0x00 != drv_touch_destroy_device(dev)) {
+        ret--;
+
+        LOG_E("drv touch mgmt destroy failed");
+    }
+
+    return 0;
+}
+
+#if defined(TOUCH_DEFAULT_DEVICE)
+static int drv_touch_register_default(void)
 {
     const struct drv_touch_config default_touch = {
         .touch_dev_index = 0,
@@ -643,14 +879,30 @@ static int drv_touch_init(void)
         .i2c_bus_speed = TOUCH_DEV_I2C_BUS_SPEED,
     };
 
-    if (NULL == dft_touch) {
-        if (NULL == (dft_touch = drv_touch_create_device((struct drv_touch_config*)&default_touch))) {
-            LOG_E("Register default touch failed");
-            return -1;
-        }
+    struct drv_touch_dev* dev = NULL;
+
+    if (NULL == (dev = drv_touch_create_device((struct drv_touch_config*)&default_touch))) {
+        LOG_E("Register default touch failed");
+        return -1;
     }
+
+    drv_touch_mgmt_add_device(dev);
+
+    return 0;
+}
+#endif
+
+static int drv_touch_init(void)
+{
+    if (0x00 != drv_touch_mgmt_init()) {
+        LOG_E("touch mgmt init failed");
+        return -1;
+    }
+
+#if defined(TOUCH_DEFAULT_DEVICE)
+    drv_touch_register_default();
+#endif
 
     return 0;
 }
 INIT_COMPONENT_EXPORT(drv_touch_init);
-#endif
