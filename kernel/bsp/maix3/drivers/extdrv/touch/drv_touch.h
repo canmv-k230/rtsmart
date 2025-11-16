@@ -55,7 +55,6 @@ struct drv_touch_config {
 
     int range_x;
     int range_y;
-    int point_num;
 
     int pin_intr;
     int intr_value;

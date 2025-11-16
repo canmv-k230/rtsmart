@@ -588,9 +588,6 @@ static struct drv_touch_dev* drv_touch_create_device(struct drv_touch_config* cf
     if (0x00 == dev->touch.range_y) {
         dev->touch.range_y = cfg->range_y;
     }
-    if (0x00 == dev->touch.point_num) {
-        dev->touch.point_num = cfg->point_num;
-    }
 
 #ifdef TOUCH_DRV_MODEL_INT_WITH_THREAD
     /* Initialize thread resources */
@@ -868,7 +865,6 @@ static int drv_touch_register_default(void)
 
         .range_x   = TOUCH_RANGE_X,
         .range_y   = TOUCH_RANGE_Y,
-        .point_num = TOUCH_POINT_NUM,
 
         .pin_intr    = TOUCH_DEV_INT_PIN,
         .intr_value  = TOUCH_DEV_INT_EDGE,

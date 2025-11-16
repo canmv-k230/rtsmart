@@ -214,6 +214,7 @@ int drv_touch_probe_gt911(struct drv_touch_dev* dev)
     dev->dev.reset              = reset;
     dev->dev.get_default_rotate = get_default_rotate;
 
+    dev->touch.point_num = 10;
     dev->touch.range_x = info.xResolution;
     dev->touch.range_y = info.yResolution;
 

@@ -130,9 +130,5 @@ menuconfig RT_USING_TOUCH
                 config TOUCH_RANGE_Y
                     int "Touch Range Y, Origin of Touch Output"
                     default 800
-
-                config TOUCH_POINT_NUM
-                    int "Touch Point Number"
-                    default 5
             endif
     endif

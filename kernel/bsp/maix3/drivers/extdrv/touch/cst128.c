@@ -154,5 +154,7 @@ int drv_touch_probe_cst128(struct drv_touch_dev *dev) {
     dev->touch.range_y = 640;
 #endif
 
+    dev->touch.point_num = 5;
+
     return 0;
 }

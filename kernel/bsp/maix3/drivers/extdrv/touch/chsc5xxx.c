@@ -207,5 +207,7 @@ int drv_touch_probe_chsc5xxx(struct drv_touch_dev *dev) {
     dev->dev.reset = reset;
     dev->dev.get_default_rotate = get_default_rotate;
 
+    dev->touch.point_num = 5;
+
     return 0;
 }
