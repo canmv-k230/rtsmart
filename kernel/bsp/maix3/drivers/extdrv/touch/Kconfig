@@ -95,10 +95,30 @@ menuconfig RT_USING_TOUCH
                     int "Touch Device RST Pin Valid Value"
                     default 0
 
-                config TOUCH_DEV_I2C_BUS
-                    string "Touch Device I2C Bus Name"
-                    default "i2c3"
+                choice
+                    bool "Touch Device I2C Bus"
+                    default TOUCH_DEV_I2C_BUS_3
 
+                    config TOUCH_DEV_I2C_BUS_0
+                        bool "I2C 0"
+                    config TOUCH_DEV_I2C_BUS_1
+                        bool "I2C 1"
+                    config TOUCH_DEV_I2C_BUS_2
+                        bool "I2C 2"
+                    config TOUCH_DEV_I2C_BUS_3
+                        bool "I2C 3"
+                    config TOUCH_DEV_I2C_BUS_4
+                        bool "I2C 4"
+                endchoice
+
+                config TOUCH_DEV_I2C_BUS
+                    int
+                    default 0 if TOUCH_DEV_I2C_BUS_0
+                    default 1 if TOUCH_DEV_I2C_BUS_1
+                    default 2 if TOUCH_DEV_I2C_BUS_2
+                    default 3 if TOUCH_DEV_I2C_BUS_3
+                    default 4 if TOUCH_DEV_I2C_BUS_4
+                
                 config TOUCH_DEV_I2C_BUS_SPEED
                     int "Touch Device I2C Bus Speed"
                     default 400000

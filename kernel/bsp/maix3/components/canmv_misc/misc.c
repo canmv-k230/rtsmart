@@ -566,7 +566,7 @@ static int misc_delete_rotary_encoder_dev(void* args)
 }
 #endif
 
-#if defined (RT_USING_TOUCH)
+#if 0 // defined (RT_USING_TOUCH)
 
 // Local definitions for touch HAL structures to avoid circular dependencies
 #define TOUCH_DEVICE_NAME_LEN       16
@@ -774,7 +774,7 @@ static const struct misc_dev_handle misc_handles[] = {
     .func = misc_delete_rotary_encoder_dev,
   },
 #endif
-#if defined (RT_USING_TOUCH)
+#if 0 // defined (RT_USING_TOUCH)
   {
     .cmd = MISC_DEV_CMD_REGISTER_TOUCH_DEVICE,
     .func = misc_register_touch_device,
