@@ -142,7 +142,6 @@ int drv_touch_probe_cst128(struct drv_touch_dev* dev)
     if (0x00 != touch_dev_read_reg(dev, 0xA3, &chip_id, 1)) {
         return -2;
     }
-    rt_kprintf("cst128 id: 0x%02X\n", chip_id);
 
     rt_strncpy(dev->dev.drv_name, "cst128", sizeof(dev->dev.drv_name));
 

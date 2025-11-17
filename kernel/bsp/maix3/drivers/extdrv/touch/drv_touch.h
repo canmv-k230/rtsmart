@@ -133,6 +133,9 @@ int touch_dev_write_reg(struct drv_touch_dev* dev, rt_uint8_t* buffer, rt_size_t
 
 int touch_dev_read_reg(struct drv_touch_dev* dev, rt_uint16_t addr, rt_uint8_t* buffer, rt_size_t length);
 
+int touch_dev_write_read_reg(struct drv_touch_dev* dev, uint8_t* send_buffer, uint32_t send_len, uint8_t* read_buffer,
+                             uint32_t read_len);
+
 /**
  * For some touch device, which have no hardware event generate, such as CST128-A.
  */

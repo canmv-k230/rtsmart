@@ -93,6 +93,37 @@ int touch_dev_read_reg(struct drv_touch_dev* dev, rt_uint16_t addr, rt_uint8_t* 
     }
 }
 
+int touch_dev_write_read_reg(struct drv_touch_dev* dev, uint8_t* send_buffer, uint32_t send_len, uint8_t* read_buffer,
+                             uint32_t read_len)
+{
+    struct rt_i2c_msg msgs[2];
+    int               msg_count = 0;
+
+    if (send_buffer && send_len) {
+        msgs[msg_count].addr  = dev->i2c.addr;
+        msgs[msg_count].flags = RT_I2C_WR;
+        msgs[msg_count].buf   = send_buffer;
+        msgs[msg_count].len   = send_len;
+
+        msg_count++;
+    }
+
+    if (read_buffer && read_len) {
+        msgs[msg_count].addr  = dev->i2c.addr;
+        msgs[msg_count].flags = RT_I2C_RD;
+        msgs[msg_count].buf   = read_buffer;
+        msgs[msg_count].len   = read_len;
+
+        msg_count++;
+    }
+
+    if (msg_count == rt_i2c_transfer(dev->i2c.bus, msgs, msg_count)) {
+        return 0;
+    } else {
+        return -1;
+    }
+}
+
 void touch_dev_update_event(int finger_num, struct rt_touch_data* point)
 {
     static int                  last_finger_num = 0;
@@ -327,6 +358,7 @@ static rt_size_t drv_touch_read(struct rt_touch_device* touch, void* buf, rt_siz
     if (dev->pin.fake_intr) {
         uint32_t flag = TOUCH_THREAD_MQ_INT_FLAG;
         rt_mq_send(&dev->thr.ctrl_mq, &flag, sizeof(uint32_t));
+        rt_thread_mdelay(1);
     }
 
     while (1) {

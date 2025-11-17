@@ -50,6 +50,18 @@ struct chsc5xxx_reg {
 
 _Static_assert(CHSC5XXX_READ_REG_SIZE <= TOUCH_READ_REG_MAX_SIZE, "CHSC5XXX_READ_REG_SIZE > TOUCH_READ_REG_MAX_SIZE");
 
+struct chsc5xxx_info {
+    uint8_t ictype; // 0x20000080
+    uint8_t cfg_version; // 0x20000081
+    uint8_t proj_id[2]; // 0x20000082
+    uint8_t vendor_id; // 0x20000084
+    uint8_t resv_85;
+    uint8_t lcd_res_x[2]; // 0x20000086
+    uint8_t lcd_res_y[2]; // 0x20000088
+    uint8_t resv_8A_8D[4];
+    uint8_t lcd_finger; // 0x2000008e
+};
+
 static int chsc5xxx_read_reg(struct drv_touch_dev* dev, rt_uint32_t addr, rt_uint8_t* buffer, rt_size_t length)
 {
     rt_uint32_t _addr
@@ -102,11 +114,7 @@ static int parse_register(struct drv_touch_dev* dev, struct touch_register* reg,
         return 0;
     }
 
-    for (result_index = 0; result_index < TOUCH_CHSC5XXX_MAX_POINTS; result_index++) {
-        if (chsc5xxx_reg->pos[result_index].id < TOUCH_CHSC5XXX_MAX_POINTS) {
-            finger_num++;
-        }
-    }
+    finger_num = chsc5xxx_reg->finger_num;
 
     if (finger_num > TOUCH_MAX_POINT_NUMBER) {
         LOG_W("CHSC5xxx touch point %d > max %d", finger_num, TOUCH_MAX_POINT_NUMBER);
@@ -170,7 +178,7 @@ static int get_default_rotate(struct drv_touch_dev* dev) { return RT_TOUCH_ROTAT
 
 int drv_touch_probe_chsc5xxx(struct drv_touch_dev* dev)
 {
-    rt_uint8_t data[8];
+    struct chsc5xxx_info info;
 
     const char* chip_type[] = {
         /*00H*/ "CHSC5472",
@@ -187,13 +195,13 @@ int drv_touch_probe_chsc5xxx(struct drv_touch_dev* dev)
 
     rt_thread_mdelay(100);
 
-    if (0 != chsc5xxx_read_reg(dev, 0x20000080, data, sizeof(data))) {
+    if (0 != chsc5xxx_read_reg(dev, 0x20000080, (uint8_t*)&info, sizeof(info))) {
         return -1;
     }
 
-    switch (data[0]) {
+    switch (info.ictype) {
     case 0 ... 5:
-        rt_strncpy(dev->dev.drv_name, chip_type[data[0]], sizeof(dev->dev.drv_name));
+        rt_strncpy(dev->dev.drv_name, chip_type[info.ictype], sizeof(dev->dev.drv_name));
         break;
     case 0x10:
         rt_strncpy(dev->dev.drv_name, chip_type[6], sizeof(dev->dev.drv_name));
@@ -211,9 +219,9 @@ int drv_touch_probe_chsc5xxx(struct drv_touch_dev* dev)
     dev->dev.reset              = reset;
     dev->dev.get_default_rotate = get_default_rotate;
 
-    dev->touch.range_x   = TOUCH_CHCS5XXX_DFT_RANGE_X;
-    dev->touch.range_y   = TOUCH_CHCS5XXX_DFT_RANGE_Y;
-    dev->touch.point_num = TOUCH_CHSC5XXX_MAX_POINTS;
+    dev->touch.range_x   = (info.lcd_res_x[1] << 8) | info.lcd_res_x[0];
+    dev->touch.range_y   = (info.lcd_res_y[1] << 8) | info.lcd_res_y[0];
+    dev->touch.point_num = info.lcd_finger;
 
     return 0;
 }

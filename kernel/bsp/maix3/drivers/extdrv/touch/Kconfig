@@ -23,19 +23,9 @@ menuconfig RT_USING_TOUCH
 
         comment "Touch Device Drivers"
 
-        menuconfig TOUCH_TYPE_CHSC5XXX
+        config TOUCH_TYPE_CHSC5XXX
             bool "Enable Touch CHSC5xxx"
             default n
-
-            if TOUCH_TYPE_CHSC5XXX
-                config TOUCH_CHCS5XXX_DFT_RANGE_X
-                    int "CHCS5XXX Default Range X"
-                config TOUCH_CHCS5XXX_DFT_RANGE_Y
-                    int "CHCS5XXX Default Range Y"
-                config TOUCH_CHSC5XXX_MAX_POINTS
-                    int "Maximum touch points supported by CHSC5xxx"
-                    default 5
-            endif
 
         menuconfig TOUCH_TYPE_CST128
             bool "Enable Touch CST128 - FT5316 Compatible"
@@ -48,16 +38,9 @@ menuconfig RT_USING_TOUCH
                     int "CST128 Default Range Y"
             endif
 
-        menuconfig TOUCH_TYPE_CST328
+        config TOUCH_TYPE_CST328
             bool "Enable Touch CST328"
             default n
-
-            if TOUCH_TYPE_CST328
-                config TOUCH_CST328_DFT_RANGE_X
-                    int "CST328 Default Range X"
-                config TOUCH_CST328_DFT_RANGE_Y
-                    int "CST328 Default Range Y"
-            endif
 
         menuconfig TOUCH_TYPE_FT5316
             bool "Enable Touch FT5316"

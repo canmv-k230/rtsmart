@@ -1,4 +1,4 @@
-/* Copyright (c) 2025, Canaan Bright Sight Co., Ltd
+/* Copyright (c) 2023, Canaan Bright Sight Co., Ltd
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are met:
@@ -26,7 +26,7 @@
 #include "rtthread.h"
 #include <stdint.h>
 
-#define DBG_TAG "cst_mutcap"
+#define DBG_TAG "cst3xx"
 #define DBG_LVL DBG_WARNING
 #define DBG_COLOR
 #include <rtdbg.h>
@@ -46,41 +46,69 @@ struct cst3xx_reg {
     struct cst3xx_point point2_5[4];
 };
 
-_Static_assert(sizeof(struct cst3xx_reg) < TOUCH_READ_REG_MAX_SIZE, "CST3XX reg data size > TOUCH_READ_REG_MAX_SIZE");
+_Static_assert(sizeof(struct cst3xx_reg) < TOUCH_READ_REG_MAX_SIZE, "CST3xx reg data size > TOUCH_READ_REG_MAX_SIZE");
+
+struct cst3xx_info {
+    // 0xD1F4
+    uint8_t tp_ntx;
+    uint8_t resv0;
+    uint8_t tp_nrx;
+    uint8_t key_num;
+    // 0xD1F8
+    uint8_t tp_resx[2];
+    uint8_t tp_resy[2];
+    // 0xD1FC
+    uint8_t boot_timer[2];
+    uint8_t CACA[2];
+    // 0xD200
+    uint8_t project_id[2];
+    uint8_t ic_type[2];
+    // 0xD204
+    uint8_t fw_build[2];
+    uint8_t fw_minor;
+    uint8_t fw_major;
+    // 0xD208
+    uint32_t checksum;
+};
 
 // APIs ///////////////////////////////////////////////////////////////////////
 static int read_register(struct drv_touch_dev* dev, struct touch_register* reg)
 {
-    uint8_t  temp;
-    uint8_t* reg_data = (uint8_t*)&reg->reg[0];
-    int      pt_num;
+    int     ret;
+    uint8_t temp;
+    uint8_t cmd[4];
 
     reg->time = rt_tick_get();
 
-    // Read point number from register 0x05
-    if (0x00 != touch_dev_read_reg(dev, 0x05, &temp, 1)) {
+    cmd[0] = 0xD0;
+    cmd[1] = 0x05;
+    if (0x00 != (ret = touch_dev_write_read_reg(dev, cmd, 2, &temp, 1))) {
+        LOG_E("CST3xx read reg failed");
         return -1;
     }
 
-    pt_num = (temp & 0x0F);
+    int pt_num = temp & 0x0F;
+    if ((pt_num == 0) || (pt_num > 5)) {
+        rt_memset(reg, 0x00, sizeof(*reg));
 
-    if ((0x00 == pt_num) || (5 < pt_num)) {
-        // Clear the flag
-        uint8_t clear_cmd[] = { 0x05, 0x00 };
-        touch_dev_write_reg(dev, clear_cmd, sizeof(clear_cmd));
-        reg->reg[0] = 0;
-        return 0;
+        goto _clear;
     }
 
-    // Read touch data starting from register 0x00
-    int read_size = pt_num * sizeof(struct cst3xx_point) + 2;
-    if (0x00 != touch_dev_read_reg(dev, 0x00, reg_data, read_size)) {
+    cmd[0] = 0xD0;
+    cmd[1] = 0x00;
+    if (0x00 != touch_dev_write_read_reg(dev, cmd, 2, (uint8_t*)&reg->reg[0], pt_num * sizeof(struct cst3xx_point) + 2)) {
+        LOG_E("CST3xx read reg failed");
         return -1;
     }
 
-    // Clear the flag
-    uint8_t clear_cmd[] = { 0x05, 0x00 };
-    touch_dev_write_reg(dev, clear_cmd, sizeof(clear_cmd));
+_clear:
+    cmd[0] = 0xD0;
+    cmd[1] = 0x05;
+    cmd[2] = 0x00;
+    if (0x00 != touch_dev_write_read_reg(dev, cmd, 3, NULL, 0)) {
+        LOG_E("CST3xx read reg failed");
+        return -1;
+    }
 
     return 0;
 }
@@ -91,76 +119,59 @@ static int parse_register(struct drv_touch_dev* dev, struct touch_register* reg,
     rt_tick_t             time       = reg->time;
     struct rt_touch_data* point      = NULL;
     struct cst3xx_reg*    cst3xx_reg = (struct cst3xx_reg*)reg->reg;
-    uint8_t               temp;
-    int                   result_index = 0, point_index = 0;
 
-    if ((0xAB != cst3xx_reg->const_0xab) || (0x80 == (cst3xx_reg->point_num & 0x80))) {
+    // Check constant value and key report
+    if ((cst3xx_reg->const_0xab != 0xAB) || ((cst3xx_reg->point_num & 0x80) == 0x80)) {
         result->point_num = 0;
         return 0;
     }
 
     finger_num = cst3xx_reg->point_num & 0x7F;
+    if (finger_num > 5) {
+        result->point_num = 0;
+        return 0;
+    }
+
     if (finger_num > TOUCH_MAX_POINT_NUMBER) {
-        LOG_W("CST3XX touch point %d > max %d", finger_num, TOUCH_MAX_POINT_NUMBER);
+        LOG_W("CST3xx touch point %d > max %d", finger_num, TOUCH_MAX_POINT_NUMBER);
         finger_num = TOUCH_MAX_POINT_NUMBER;
     }
     result->point_num = finger_num;
 
-    if (finger_num) {
+    if (finger_num > 0) {
         // Parse first point
-        temp                = cst3xx_reg->point1.id_stat;
-        point               = &result->point[point_index];
-        point->event        = (temp & 0x0F) == 0x06 ? RT_TOUCH_EVENT_DOWN : RT_TOUCH_EVENT_NONE;
+        point = &result->point[0];
+
+        uint8_t temp        = cst3xx_reg->point1.id_stat;
+        point->event        = ((temp & 0x0F) == 0x06) ? RT_TOUCH_EVENT_DOWN : RT_TOUCH_EVENT_NONE;
         point->track_id     = (temp & 0xF0) >> 4;
         point->width        = cst3xx_reg->point1.z;
-        point->x_coordinate = (cst3xx_reg->point1.xh << 4) | (cst3xx_reg->point1.xl_yl & 0xF0) >> 4;
+        point->x_coordinate = (cst3xx_reg->point1.xh << 4) | ((cst3xx_reg->point1.xl_yl & 0xF0) >> 4);
         point->y_coordinate = (cst3xx_reg->point1.yh << 4) | (cst3xx_reg->point1.xl_yl & 0x0F);
         point->timestamp    = time;
 
-        if (point->x_coordinate > dev->touch.range_x || point->y_coordinate > dev->touch.range_y) {
-            point_index--;
-        } else {
-            point_index++;
+        // Parse additional points (2-5)
+        for (int i = 1; i < finger_num; i++) {
+            point                          = &result->point[i];
+            struct cst3xx_point* cst_point = &cst3xx_reg->point2_5[i - 1];
+
+            temp                = cst_point->id_stat;
+            point->event        = ((temp & 0x0F) == 0x06) ? RT_TOUCH_EVENT_DOWN : RT_TOUCH_EVENT_NONE;
+            point->track_id     = (temp & 0xF0) >> 4;
+            point->width        = cst_point->z;
+            point->x_coordinate = (cst_point->xh << 4) | ((cst_point->xl_yl & 0xF0) >> 4);
+            point->y_coordinate = (cst_point->yh << 4) | (cst_point->xl_yl & 0x0F);
+            point->timestamp    = time;
         }
-
-        // Parse remaining points if any
-        if (finger_num > 1) {
-            for (result_index = 1; result_index < finger_num; result_index++) {
-                if (point_index >= TOUCH_MAX_POINT_NUMBER) {
-                    break;
-                }
-
-                struct cst3xx_point* cst_point = &cst3xx_reg->point2_5[result_index - 1];
-
-                temp                = cst_point->id_stat;
-                point               = &result->point[point_index];
-                point->event        = (temp & 0x0F) == 0x06 ? RT_TOUCH_EVENT_DOWN : RT_TOUCH_EVENT_NONE;
-                point->track_id     = (temp & 0xF0) >> 4;
-                point->width        = cst_point->z;
-                point->x_coordinate = (cst_point->xh << 4) | (cst_point->xl_yl & 0xF0) >> 4;
-                point->y_coordinate = (cst_point->yh << 4) | (cst_point->xl_yl & 0x0F);
-                point->timestamp    = time;
-
-                if (point->x_coordinate > dev->touch.range_x || point->y_coordinate > dev->touch.range_y) {
-                    point_index--;
-                } else {
-                    point_index++;
-                }
-            }
-        }
-
-        result->point_num = point_index;
     }
 
-    touch_dev_update_event(result->point_num, result->point);
+    touch_dev_update_event(finger_num, result->point);
 
     return 0;
 }
 
 static int reset(struct drv_touch_dev* dev)
 {
-    uint8_t cmd[3];
-
     if ((0 <= dev->pin.rst) && (63 >= dev->pin.rst)) {
         kd_pin_write(dev->pin.rst, 1 - dev->pin.rst_valid);
         rt_thread_mdelay(20);
@@ -170,73 +181,80 @@ static int reset(struct drv_touch_dev* dev)
         rt_thread_mdelay(50);
     }
 
+    return 0;
+}
+
+static int init_chip(struct drv_touch_dev* dev)
+{
+    int     ret;
+    uint8_t cmd[4];
+    uint8_t data[4];
+
+    struct cst3xx_info info;
+
     // HYN_REG_MUT_DEBUG_INFO_MODE
     cmd[0] = 0xd1;
     cmd[1] = 0x01;
-    cmd[2] = 0x01;
-    if (0x00 != touch_dev_write_reg(dev, cmd, 3)) {
+    if (0x00 != touch_dev_write_read_reg(dev, cmd, 2, NULL, 0)) {
+        LOG_E("CST3xx init step 1 failed");
         return -1;
     }
     rt_thread_mdelay(1);
 
+    cmd[0] = 0xd1;
+    cmd[1] = 0xF4;
+    if (0x00 != (ret = touch_dev_write_read_reg(dev, cmd, 2, (uint8_t*)&info, sizeof(info)))) {
+        LOG_E("CST3xx init step 2 failed");
+        return -1;
+    }
+
+    if ((0xCA != info.CACA[0]) || (0xCA != info.CACA[1])) {
+        LOG_E("CST3xx read error flag\n");
+
+        return -1;
+    }
+
+    dev->touch.point_num = 5;
+    dev->touch.range_x   = (info.tp_resx[1] << 8) | info.tp_resx[0];
+    dev->touch.range_y   = (info.tp_resy[1] << 8) | info.tp_resy[0];
+
+    LOG_I("CST3xx Resoltion %dx%d", dev->touch.range_x, dev->touch.range_y);
+
     // HYN_REG_MUT_NORMAL_MODE
     cmd[0] = 0xd1;
     cmd[1] = 0x09;
-    if (0x00 != touch_dev_write_reg(dev, cmd, 2)) {
+    ret    = touch_dev_write_read_reg(dev, cmd, 2, NULL, 0);
+    if (ret != 0) {
+        LOG_E("CST3xx init step 3 failed");
         return -1;
     }
 
     return 0;
 }
 
-static int get_default_rotate(struct drv_touch_dev* dev)
-{
-    // Default rotate based on chip type
-    if (dev->i2c.addr == 0x1A) {
-        // CST328
-        return RT_TOUCH_ROTATE_SWAP_XY;
-    } else if (dev->i2c.addr == 0x5A) {
-        // CST226SE
-        return RT_TOUCH_ROTATE_DEGREE_0;
-    }
-    return RT_TOUCH_ROTATE_DEGREE_0;
-}
+static int get_default_rotate(struct drv_touch_dev* dev) { return RT_TOUCH_ROTATE_SWAP_XY; }
 
 int drv_touch_probe_cst328(struct drv_touch_dev* dev)
 {
-    uint8_t  data[4];
-    uint16_t chip, proj;
-    int      ret;
+    uint8_t chip_id[4];
+    int     ret;
 
-    // Try CST328 first (address 0x1A)
+    // probe CST328
     dev->i2c.addr      = 0x1A;
     dev->i2c.reg_width = 1;
-
-    rt_thread_mdelay(50); // wait touch startup.
-
-    // Check if CST328 is present
-    uint8_t cmd_d1[] = { 0xd1, 0x01, 0x01 };
-    if (0x00 != touch_dev_write_reg(dev, cmd_d1, sizeof(cmd_d1))) {
-        // Try CST226SE (address 0x5A)
-        dev->i2c.addr = 0x5A;
-        if (0x00 != touch_dev_write_reg(dev, cmd_d1, sizeof(cmd_d1))) {
+    if (0x00 != (ret = init_chip(dev))) {
+        // probe CST226SE
+        dev->i2c.addr      = 0x5A;
+        dev->i2c.reg_width = 1;
+        if (0x00 != (ret = init_chip(dev))) {
+            LOG_E("CST3xx init failed");
             return -2;
         }
     }
 
-    // HYN_REG_MUT_DEBUG_INFO_FW_VERSION
-    uint8_t cmd_d2[] = { 0xd2, 0x04 };
-    if (0x00 != touch_dev_read_reg(dev, 0xd2, data, 4)) {
-        return -3;
-    }
-    proj = (data[0] << 8) | data[1];
-    chip = (data[2] << 8) | data[3];
-
-    rt_kprintf("CST3XX, ChipID: 0x%04X, ProjectID: 0x%04X, I2C addr: 0x%02X\n", chip, proj, dev->i2c.addr);
-
-    if (dev->i2c.addr == 0x1A) {
+    if (0x1A == dev->i2c.addr) {
         rt_strncpy(dev->dev.drv_name, "cst328", sizeof(dev->dev.drv_name));
-    } else if (dev->i2c.addr == 0x5A) {
+    } else if (0x5A == dev->i2c.addr) {
         rt_strncpy(dev->dev.drv_name, "cst226se", sizeof(dev->dev.drv_name));
     } else {
         rt_strncpy(dev->dev.drv_name, "cst3xx", sizeof(dev->dev.drv_name));
@@ -247,9 +265,7 @@ int drv_touch_probe_cst328(struct drv_touch_dev* dev)
     dev->dev.reset              = reset;
     dev->dev.get_default_rotate = get_default_rotate;
 
-    dev->touch.range_x   = TOUCH_CST328_DFT_RANGE_X;
-    dev->touch.range_y   = TOUCH_CST328_DFT_RANGE_Y;
-    dev->touch.point_num = 5;
+    LOG_I("CST3xx touch driver initialized successfully");
 
     return 0;
 }
