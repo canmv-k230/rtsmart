@@ -582,10 +582,11 @@ static struct drv_touch_dev* drv_touch_create_device(struct drv_touch_config* cf
     }
     rt_kprintf("find touch %s on i2c%d\n", dev->dev.drv_name, dev->i2c.index);
 
-    if (0x00 == dev->touch.range_x) {
+    // apply user range_x and range_y
+    if (0x00 != cfg->range_x) {
         dev->touch.range_x = cfg->range_x;
     }
-    if (0x00 == dev->touch.range_y) {
+    if (0x00 != cfg->range_y) {
         dev->touch.range_y = cfg->range_y;
     }
 
@@ -626,6 +627,9 @@ static struct drv_touch_dev* drv_touch_create_device(struct drv_touch_config* cf
 
     dev->dev.dev_index = cfg->touch_dev_index;
     rt_memcpy(&dev->config, cfg, sizeof(dev->config));
+
+    dev->config.range_x = dev->touch.range_x;
+    dev->config.range_y = dev->touch.range_y;
 
 #ifdef TOUCH_DRV_MODEL_INT_WITH_THREAD
     rt_thread_startup(&dev->thr.thr);
@@ -863,8 +867,8 @@ static int drv_touch_register_default(void)
     const struct drv_touch_config default_touch = {
         .touch_dev_index = 0,
 
-        .range_x   = TOUCH_RANGE_X,
-        .range_y   = TOUCH_RANGE_Y,
+        .range_x = 0,
+        .range_y = 0,
 
         .pin_intr    = TOUCH_DEV_INT_PIN,
         .intr_value  = TOUCH_DEV_INT_EDGE,

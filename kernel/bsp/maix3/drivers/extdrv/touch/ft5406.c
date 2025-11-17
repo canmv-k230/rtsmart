@@ -28,8 +28,8 @@
 #include "rtthread.h"
 #include <stdint.h>
 
-#define DBG_TAG          "ft5406"
-#define DBG_LVL          DBG_WARNING
+#define DBG_TAG "ft5406"
+#define DBG_LVL DBG_WARNING
 #define DBG_COLOR
 #include <rtdbg.h>
 
@@ -38,10 +38,10 @@ struct ft5x06_reg {
 
     struct {
         uint8_t xh; // 0x03
-        uint8_t xl;     // 0x04
+        uint8_t xl; // 0x04
         uint8_t yh; // 0x05
-        uint8_t yl;     // 0x06
-        uint8_t weight; //0x07
+        uint8_t yl; // 0x06
+        uint8_t weight; // 0x07
         uint8_t resv;
     } pos[10];
 };
@@ -49,48 +49,50 @@ struct ft5x06_reg {
 _Static_assert(sizeof(struct ft5x06_reg) < TOUCH_READ_REG_MAX_SIZE, "FT5x06 reg data size > TOUCH_READ_REG_MAX_SIZE");
 
 // APIs ///////////////////////////////////////////////////////////////////////
-static int read_register(struct drv_touch_dev *dev, struct touch_register *reg) {
+static int read_register(struct drv_touch_dev* dev, struct touch_register* reg)
+{
     reg->time = rt_tick_get();
 
-    return touch_dev_read_reg(dev, 0x02, (uint8_t *)&reg->reg[0], 0x1F - 0x02);
+    return touch_dev_read_reg(dev, 0x02, (uint8_t*)&reg->reg[0], 0x1F - 0x02);
 }
 
-static int parse_register(struct drv_touch_dev *dev, struct touch_register *reg, struct touch_point *result) {
-    const uint8_t event[4] = {RT_TOUCH_EVENT_DOWN, RT_TOUCH_EVENT_UP, RT_TOUCH_EVENT_MOVE, RT_TOUCH_EVENT_NONE};
+static int parse_register(struct drv_touch_dev* dev, struct touch_register* reg, struct touch_point* result)
+{
+    const uint8_t event[4] = { RT_TOUCH_EVENT_DOWN, RT_TOUCH_EVENT_UP, RT_TOUCH_EVENT_MOVE, RT_TOUCH_EVENT_NONE };
 
-    int finger_num;
-    uint8_t xh, xl, yh, yl, flg, id, wight;
+    int      finger_num;
+    uint8_t  xh, xl, yh, yl, flg, id, wight;
     uint16_t point_x, point_y;
-    int result_index = 0, point_index = 0;
+    int      result_index = 0, point_index = 0;
 
     rt_tick_t time = reg->time;
 
-    struct rt_touch_data *point = NULL;
-    struct ft5x06_reg *ft5x06_reg = (struct ft5x06_reg *)reg->reg;
+    struct rt_touch_data* point      = NULL;
+    struct ft5x06_reg*    ft5x06_reg = (struct ft5x06_reg*)reg->reg;
 
     finger_num = ft5x06_reg->finger_num & 0x0F;
 
-    if(finger_num > 10) {
+    if (finger_num > 10) {
         result->point_num = 0;
         return 0;
     }
 
-    if(finger_num > TOUCH_MAX_POINT_NUMBER) {
+    if (finger_num > TOUCH_MAX_POINT_NUMBER) {
         LOG_W("FT5x06 touch point %d > max %d", finger_num, TOUCH_MAX_POINT_NUMBER);
 
         finger_num = TOUCH_MAX_POINT_NUMBER;
     }
     result->point_num = finger_num;
 
-    if(finger_num) {
-        for(result_index = 0, point_index = 0; result_index < finger_num; result_index++, point_index++) {
+    if (finger_num) {
+        for (result_index = 0, point_index = 0; result_index < finger_num; result_index++, point_index++) {
             point = &result->point[point_index];
 
             xh = ft5x06_reg->pos[result_index].xh & 0x0F;
             xl = ft5x06_reg->pos[result_index].xl;
 
             point_x = (xh << 8) | xl;
-            if(point_x > dev->touch.range_x) {
+            if (point_x > dev->touch.range_x) {
                 point_index--;
                 continue;
             }
@@ -99,30 +101,31 @@ static int parse_register(struct drv_touch_dev *dev, struct touch_register *reg,
             yl = ft5x06_reg->pos[result_index].yl;
 
             point_y = (yh << 8) | yl;
-            if(point_y > dev->touch.range_y) {
+            if (point_y > dev->touch.range_y) {
                 point_index--;
                 continue;
             }
 
             flg = ft5x06_reg->pos[result_index].xh >> 6;
-            id = ft5x06_reg->pos[result_index].yh >> 4;
+            id  = ft5x06_reg->pos[result_index].yh >> 4;
 
             wight = ft5x06_reg->pos[result_index].weight;
 
-            point->event = event[flg];
-            point->track_id = id;
-            point->width = wight;
+            point->event        = event[flg];
+            point->track_id     = id;
+            point->width        = wight;
             point->x_coordinate = point_x;
             point->y_coordinate = point_y;
-            point->timestamp = time;
+            point->timestamp    = time;
         }
     }
 
     return 0;
 }
 
-static int reset(struct drv_touch_dev *dev) {
-    if((0 <= dev->pin.rst) && (63 >= dev->pin.rst)) {
+static int reset(struct drv_touch_dev* dev)
+{
+    if ((0 <= dev->pin.rst) && (63 >= dev->pin.rst)) {
         kd_pin_write(dev->pin.rst, 1 - dev->pin.rst_valid);
         rt_thread_mdelay(20);
         kd_pin_write(dev->pin.rst, dev->pin.rst_valid);
@@ -134,31 +137,32 @@ static int reset(struct drv_touch_dev *dev) {
     return 0;
 }
 
-static int get_default_rotate(struct drv_touch_dev *dev) {
-    return RT_TOUCH_ROTATE_DEGREE_270;
-}
+static int get_default_rotate(struct drv_touch_dev* dev) { return RT_TOUCH_ROTATE_DEGREE_270; }
 
-int drv_touch_probe_ft5x06(struct drv_touch_dev *dev) {
+int drv_touch_probe_ft5x06(struct drv_touch_dev* dev)
+{
     uint8_t vendor;
 
-    dev->i2c.addr = 0x38;
+    dev->i2c.addr      = 0x38;
     dev->i2c.reg_width = 1;
 
-    if(0x00 != touch_dev_read_reg(dev, 0xA8, &vendor, 1)) {
+    if (0x00 != touch_dev_read_reg(dev, 0xA8, &vendor, 1)) {
         return -1;
     }
 
-    if(0x5A != vendor) {
+    if (0x5A != vendor) {
         return -2;
     }
 
     rt_strncpy(dev->dev.drv_name, "ft5x06", sizeof(dev->dev.drv_name));
 
-    dev->dev.read_register = read_register;
-    dev->dev.parse_register = parse_register;
-    dev->dev.reset = reset;
+    dev->dev.read_register      = read_register;
+    dev->dev.parse_register     = parse_register;
+    dev->dev.reset              = reset;
     dev->dev.get_default_rotate = get_default_rotate;
 
+    dev->touch.range_x   = TOUCH_FT5406_DFT_RANGE_X;
+    dev->touch.range_y   = TOUCH_FT5406_DFT_RANGE_Y;
     dev->touch.point_num = 10;
 
     return 0;

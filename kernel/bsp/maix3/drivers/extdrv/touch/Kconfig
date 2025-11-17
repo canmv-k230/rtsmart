@@ -22,31 +22,64 @@ menuconfig RT_USING_TOUCH
         endif
 
         comment "Touch Device Drivers"
-        config TOUCH_TYPE_FT5316
-            bool "Enable Touch FT5316"
-            default n
 
-        config TOUCH_TYPE_FT5406
-            bool "Enable Touch FT5406"
-            default n
-
-        config TOUCH_TYPE_CST128
-            bool "Enable Touch CST128 - FT5316 Compatible"
-            default n
-
-        config TOUCH_TYPE_CST328
-            bool "Enable Touch CST328"
-            default n
-
-        config TOUCH_TYPE_CHSC5XXX
+        menuconfig TOUCH_TYPE_CHSC5XXX
             bool "Enable Touch CHSC5xxx"
             default n
 
-        if TOUCH_TYPE_CHSC5XXX
-            config TOUCH_CHSC5XXX_MAX_POINTS
-                int "Maximum touch points supported by CHSC5xxx"
-                default 5
-        endif
+            if TOUCH_TYPE_CHSC5XXX
+                config TOUCH_CHCS5XXX_DFT_RANGE_X
+                    int "CHCS5XXX Default Range X"
+                config TOUCH_CHCS5XXX_DFT_RANGE_Y
+                    int "CHCS5XXX Default Range Y"
+                config TOUCH_CHSC5XXX_MAX_POINTS
+                    int "Maximum touch points supported by CHSC5xxx"
+                    default 5
+            endif
+
+        menuconfig TOUCH_TYPE_CST128
+            bool "Enable Touch CST128 - FT5316 Compatible"
+            default n
+
+            if TOUCH_TYPE_CST128
+                config TOUCH_CST128_DFT_RANGE_X
+                    int "CST128 Default Range X"
+                config TOUCH_CST128_DFT_RANGE_Y
+                    int "CST128 Default Range Y"
+            endif
+
+        menuconfig TOUCH_TYPE_CST328
+            bool "Enable Touch CST328"
+            default n
+
+            if TOUCH_TYPE_CST328
+                config TOUCH_CST328_DFT_RANGE_X
+                    int "CST328 Default Range X"
+                config TOUCH_CST328_DFT_RANGE_Y
+                    int "CST328 Default Range Y"
+            endif
+
+        menuconfig TOUCH_TYPE_FT5316
+            bool "Enable Touch FT5316"
+            default n
+
+            if TOUCH_TYPE_FT5316
+                config TOUCH_FT5316_DFT_RANGE_X
+                    int "FT5316 Default Range X"
+                config TOUCH_FT5316_DFT_RANGE_Y
+                    int "FT5316 Default Range Y"
+            endif
+
+        menuconfig TOUCH_TYPE_FT5406
+            bool "Enable Touch FT5406"
+            default n
+
+            if TOUCH_TYPE_FT5406
+                config TOUCH_FT5406_DFT_RANGE_X
+                    int "FT5406 Default Range X"
+                config TOUCH_FT5406_DFT_RANGE_Y
+                    int "FT5406 Default Range Y"
+            endif
 
         config TOUCH_TYPE_GT911
             bool "Enable Touch GT911"

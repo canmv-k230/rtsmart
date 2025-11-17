@@ -24,11 +24,11 @@
  */
 #include "drivers/touch.h"
 #include "drv_touch.h"
-#include <rtthread.h>
 #include <rtdevice.h>
+#include <rtthread.h>
 
-#define DBG_TAG          "chsc5xxx"
-#define DBG_LVL          DBG_WARNING
+#define DBG_TAG "chsc5xxx"
+#define DBG_LVL DBG_WARNING
 #define DBG_COLOR
 #include <rtdbg.h>
 
@@ -39,10 +39,10 @@ struct chsc5xxx_reg {
         rt_uint8_t xl;
         rt_uint8_t yl;
         rt_uint8_t resv;
-        rt_uint8_t xh:4;
-        rt_uint8_t yh:4;
-        rt_uint8_t id:4;
-        rt_uint8_t event:4;
+        rt_uint8_t xh : 4;
+        rt_uint8_t yh : 4;
+        rt_uint8_t id : 4;
+        rt_uint8_t event : 4;
     } pos[TOUCH_CHSC5XXX_MAX_POINTS];
 };
 
@@ -50,48 +50,52 @@ struct chsc5xxx_reg {
 
 _Static_assert(CHSC5XXX_READ_REG_SIZE <= TOUCH_READ_REG_MAX_SIZE, "CHSC5XXX_READ_REG_SIZE > TOUCH_READ_REG_MAX_SIZE");
 
-static int chsc5xxx_read_reg(struct drv_touch_dev *dev, rt_uint32_t addr, rt_uint8_t *buffer, rt_size_t length) {
-    rt_uint32_t _addr = ((addr & 0xFF000000) >> 24) | ((addr & 0x00FF0000) >> 8) | ((addr & 0x0000FF00) << 8) | ((addr & 0x000000FF) << 24);
+static int chsc5xxx_read_reg(struct drv_touch_dev* dev, rt_uint32_t addr, rt_uint8_t* buffer, rt_size_t length)
+{
+    rt_uint32_t _addr
+        = ((addr & 0xFF000000) >> 24) | ((addr & 0x00FF0000) >> 8) | ((addr & 0x0000FF00) << 8) | ((addr & 0x000000FF) << 24);
     struct rt_i2c_msg msgs[2] = {
         {
-            .addr   = dev->i2c.addr,
-            .flags  = RT_I2C_WR,
-            .buf    = (rt_uint8_t *)&_addr,
-            .len    = sizeof(addr),
+            .addr  = dev->i2c.addr,
+            .flags = RT_I2C_WR,
+            .buf   = (rt_uint8_t*)&_addr,
+            .len   = sizeof(addr),
         },
         {
-            .addr   = dev->i2c.addr,
-            .flags  = RT_I2C_RD,
-            .buf    = buffer,
-            .len    = length,
+            .addr  = dev->i2c.addr,
+            .flags = RT_I2C_RD,
+            .buf   = buffer,
+            .len   = length,
         },
     };
 
-    if(2 == rt_i2c_transfer(dev->i2c.bus, msgs, 2)) {
+    if (2 == rt_i2c_transfer(dev->i2c.bus, msgs, 2)) {
         return 0;
     } else {
         return -1;
     }
 }
 
-static int read_register(struct drv_touch_dev *dev, struct touch_register *reg) {
+static int read_register(struct drv_touch_dev* dev, struct touch_register* reg)
+{
     reg->time = rt_tick_get();
 
-    return chsc5xxx_read_reg(dev, 0x2000002C, (uint8_t *)&reg->reg[0], CHSC5XXX_READ_REG_SIZE);
+    return chsc5xxx_read_reg(dev, 0x2000002C, (uint8_t*)&reg->reg[0], CHSC5XXX_READ_REG_SIZE);
 }
 
-static int parse_register(struct drv_touch_dev *dev, struct touch_register *reg, struct touch_point *result) {
-    const rt_uint8_t event[4] = {RT_TOUCH_EVENT_DOWN, RT_TOUCH_EVENT_UP, RT_TOUCH_EVENT_MOVE, RT_TOUCH_EVENT_NONE};
-    
-    rt_uint8_t finger_num = 0;
-    rt_uint8_t xh, xl, yh, yl, flg, id;
+static int parse_register(struct drv_touch_dev* dev, struct touch_register* reg, struct touch_point* result)
+{
+    const rt_uint8_t event[4] = { RT_TOUCH_EVENT_DOWN, RT_TOUCH_EVENT_UP, RT_TOUCH_EVENT_MOVE, RT_TOUCH_EVENT_NONE };
+
+    rt_uint8_t  finger_num = 0;
+    rt_uint8_t  xh, xl, yh, yl, flg, id;
     rt_uint16_t point_x, point_y;
-    rt_uint8_t result_index = 0, point_index = 0;
+    rt_uint8_t  result_index = 0, point_index = 0;
 
     rt_tick_t time = reg->time;
 
-    struct rt_touch_data *point = NULL;
-    struct chsc5xxx_reg *chsc5xxx_reg = (struct chsc5xxx_reg *)reg->reg;
+    struct rt_touch_data* point        = NULL;
+    struct chsc5xxx_reg*  chsc5xxx_reg = (struct chsc5xxx_reg*)reg->reg;
 
     if (0xFF != chsc5xxx_reg->act) {
         result->point_num = 0;
@@ -104,7 +108,7 @@ static int parse_register(struct drv_touch_dev *dev, struct touch_register *reg,
         }
     }
 
-    if(finger_num > TOUCH_MAX_POINT_NUMBER) {
+    if (finger_num > TOUCH_MAX_POINT_NUMBER) {
         LOG_W("CHSC5xxx touch point %d > max %d", finger_num, TOUCH_MAX_POINT_NUMBER);
 
         finger_num = TOUCH_MAX_POINT_NUMBER;
@@ -112,44 +116,45 @@ static int parse_register(struct drv_touch_dev *dev, struct touch_register *reg,
     result->point_num = finger_num;
 
     if (finger_num) {
-        for(result_index = 0, point_index = 0; result_index < finger_num; result_index++, point_index++) {
+        for (result_index = 0, point_index = 0; result_index < finger_num; result_index++, point_index++) {
             point = &result->point[point_index];
 
             xh = chsc5xxx_reg->pos[result_index].xh & 0x0F;
             xl = chsc5xxx_reg->pos[result_index].xl;
 
             point_x = (xh << 8) | xl;
-            if(point_x > dev->touch.range_x) {
+            if (point_x > dev->touch.range_x) {
                 point_index--;
                 continue;
             }
 
             yh = chsc5xxx_reg->pos[result_index].yh & 0x0F;
             yl = chsc5xxx_reg->pos[result_index].yl;
-            
+
             point_y = (yh << 8) | yl;
-            if(point_y > dev->touch.range_y) {
+            if (point_y > dev->touch.range_y) {
                 point_index--;
                 continue;
             }
 
             flg = (chsc5xxx_reg->pos[result_index].event & 0x0F) >> 2;
-            id = chsc5xxx_reg->pos[result_index].id & 0x0F;
+            id  = chsc5xxx_reg->pos[result_index].id & 0x0F;
 
-            point->event = event[flg];
-            point->track_id = id;
-            point->width = 0;
+            point->event        = event[flg];
+            point->track_id     = id;
+            point->width        = 0;
             point->x_coordinate = point_x;
             point->y_coordinate = point_y;
-            point->timestamp = time;
+            point->timestamp    = time;
         }
     }
 
     return 0;
 }
 
-static int reset(struct drv_touch_dev *dev) {
-    if((0 <= dev->pin.rst) && (63 >= dev->pin.rst)) {
+static int reset(struct drv_touch_dev* dev)
+{
+    if ((0 <= dev->pin.rst) && (63 >= dev->pin.rst)) {
         kd_pin_write(dev->pin.rst, 1 - dev->pin.rst_valid);
         rt_thread_mdelay(5);
         kd_pin_write(dev->pin.rst, dev->pin.rst_valid);
@@ -161,14 +166,13 @@ static int reset(struct drv_touch_dev *dev) {
     return 0;
 }
 
-static int get_default_rotate(struct drv_touch_dev *dev) {
-    return RT_TOUCH_ROTATE_DEGREE_270;
-}
+static int get_default_rotate(struct drv_touch_dev* dev) { return RT_TOUCH_ROTATE_DEGREE_270; }
 
-int drv_touch_probe_chsc5xxx(struct drv_touch_dev *dev) {
+int drv_touch_probe_chsc5xxx(struct drv_touch_dev* dev)
+{
     rt_uint8_t data[8];
 
-    const char *chip_type[] = {
+    const char* chip_type[] = {
         /*00H*/ "CHSC5472",
         /*01H*/ "CHSC5448",
         /*02H*/ "CHSC5448A",
@@ -187,27 +191,29 @@ int drv_touch_probe_chsc5xxx(struct drv_touch_dev *dev) {
         return -1;
     }
 
-    switch(data[0]) {
-        case 0 ... 5:
-            rt_strncpy(dev->dev.drv_name, chip_type[data[0]], sizeof(dev->dev.drv_name));
+    switch (data[0]) {
+    case 0 ... 5:
+        rt_strncpy(dev->dev.drv_name, chip_type[data[0]], sizeof(dev->dev.drv_name));
         break;
-        case 0x10:
-            rt_strncpy(dev->dev.drv_name, chip_type[6], sizeof(dev->dev.drv_name));
+    case 0x10:
+        rt_strncpy(dev->dev.drv_name, chip_type[6], sizeof(dev->dev.drv_name));
         break;
-        case 0x11:
-            rt_strncpy(dev->dev.drv_name, chip_type[7], sizeof(dev->dev.drv_name));
+    case 0x11:
+        rt_strncpy(dev->dev.drv_name, chip_type[7], sizeof(dev->dev.drv_name));
         break;
-        default:
-            rt_strncpy(dev->dev.drv_name, "CHSC5xxx", sizeof(dev->dev.drv_name));
+    default:
+        rt_strncpy(dev->dev.drv_name, "CHSC5xxx", sizeof(dev->dev.drv_name));
         break;
     }
 
-    dev->dev.read_register = read_register;
-    dev->dev.parse_register = parse_register;
-    dev->dev.reset = reset;
+    dev->dev.read_register      = read_register;
+    dev->dev.parse_register     = parse_register;
+    dev->dev.reset              = reset;
     dev->dev.get_default_rotate = get_default_rotate;
 
-    dev->touch.point_num = 5;
+    dev->touch.range_x   = TOUCH_CHCS5XXX_DFT_RANGE_X;
+    dev->touch.range_y   = TOUCH_CHCS5XXX_DFT_RANGE_Y;
+    dev->touch.point_num = TOUCH_CHSC5XXX_MAX_POINTS;
 
     return 0;
 }
