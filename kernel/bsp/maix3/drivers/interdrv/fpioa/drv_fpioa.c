@@ -244,14 +244,14 @@ static const uint8_t g_pin_func_array[][FPIOA_PIN_MAX_FUNCS] = {
     { GPIO62, M_CLK2, UART3_DE, TEST_PIN14, FUNC_MAX },
     { GPIO63, M_CLK3, UART3_RE, TEST_PIN15, FUNC_MAX },
     // PMU
-    { GPIO64, PMU_INT0, FUNC_MAX, FUNC_MAX, FUNC_MAX },
-    { GPIO65, PMU_INT1, FUNC_MAX, FUNC_MAX, FUNC_MAX },
-    { GPIO66, PMU_INT2, FUNC_MAX, FUNC_MAX, FUNC_MAX },
-    { GPIO67, PMU_INT3, FUNC_MAX, FUNC_MAX, FUNC_MAX },
-    { GPIO68, PMU_INT4, FUNC_MAX, FUNC_MAX, FUNC_MAX },
-    { GPIO69, PMU_INT5, FUNC_MAX, FUNC_MAX, FUNC_MAX },
-    { GPIO70, PMU_OUT0, FUNC_MAX, FUNC_MAX, FUNC_MAX },
-    { GPIO71, PMU_OUT1, FUNC_MAX, FUNC_MAX, FUNC_MAX },
+    { FUNC_MAX, GPIO64, PMU_INT0, FUNC_MAX, FUNC_MAX },
+    { FUNC_MAX, GPIO65, PMU_INT1, FUNC_MAX, FUNC_MAX },
+    { FUNC_MAX, GPIO66, PMU_INT2, FUNC_MAX, FUNC_MAX },
+    { FUNC_MAX, GPIO67, PMU_INT3, FUNC_MAX, FUNC_MAX },
+    { FUNC_MAX, GPIO68, PMU_INT4, FUNC_MAX, FUNC_MAX },
+    { FUNC_MAX, GPIO69, PMU_INT5, FUNC_MAX, FUNC_MAX },
+    { FUNC_MAX, GPIO70, PMU_OUT0, FUNC_MAX, FUNC_MAX },
+    { FUNC_MAX, GPIO71, PMU_OUT1, FUNC_MAX, FUNC_MAX },
 };
 
 #pragma pack()
@@ -292,7 +292,6 @@ static uint32_t convert_iomux_to_pmu(uint32_t data)
     dst.u.bit.ds = src.u.bit.ds & 0x7;
 
     dst.u.bit.io_sel = src.u.bit.io_sel & 0x3;
-    dst.u.bit.io_sel += 1;
 
     return dst.u.value;
 }
@@ -314,7 +313,6 @@ static uint32_t convert_pmu_to_iomux(uint32_t data)
     dst.u.bit.ds = src.u.bit.ds;
 
     dst.u.bit.io_sel = src.u.bit.io_sel;
-    dst.u.bit.io_sel -= 1;
 
     return dst.u.value;
 }
@@ -438,10 +436,15 @@ int drv_fpioa_set_pin_cfg(int pin, uint32_t value)
 
 const fpioa_func_cfg_t* drv_fpioa_get_func_cfg(fpioa_func_t func)
 {
-    static fpioa_func_cfg_t gpio_dft_cfg = { .func = GPIO0, .cfg = 0x18f, .name = "GPIO0" };
+    static fpioa_func_cfg_t gpio_dft_cfg     = { .func = GPIO0, .cfg = 0x18f, .name = "GPIO0" };
+    static fpioa_func_cfg_t pmu_gpio_dft_cfg = { .func = GPIO64, .cfg = 0x98f, .name = "GPIO64" };
+
+    if (GPIO63 >= func) {
+        return &gpio_dft_cfg;
+    }
 
     if (GPIO71 >= func) {
-        return &gpio_dft_cfg;
+        return &pmu_gpio_dft_cfg;
     }
 
     for (size_t i = 0; i < sizeof(g_func_describ_array) / sizeof(g_func_describ_array[0]); i++) {
@@ -514,6 +517,10 @@ int drv_fpioa_set_pin_func(int pin, fpioa_func_t func)
     if ((GPIO71 >= func) && (GPIO0 <= func)) {
         found    = 1;
         func_sel = 0;
+
+        if (GPIO63 <= func) {
+            func_sel = 1;
+        }
     }
 
     if (0x00 == found) {

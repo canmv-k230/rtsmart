@@ -287,8 +287,12 @@ rt_err_t kd_pin_mode(rt_base_t pin, rt_base_t mode)
     }
 
     /* or remove this ? */
-    new_cfg.u.bit.io_sel = 0; // Set to GPIO function
-    new_cfg.u.bit.st     = 1;
+    if (64 <= pin) {
+        new_cfg.u.bit.io_sel = 1; // Set to GPIO function
+    } else {
+        new_cfg.u.bit.io_sel = 0; // Set to GPIO function
+    }
+    new_cfg.u.bit.st = 1;
     if (new_cfg.u.value != curr_cfg.u.value) {
         if (0x00 != drv_fpioa_set_pin_cfg(pin, new_cfg.u.value)) {
             LOG_E("Failed to set pin configuration for pin %d", pin);
