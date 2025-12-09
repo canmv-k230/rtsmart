@@ -22,4 +22,16 @@ menuconfig RT_USING_REALTEK
             default -1
             depends on REALTEK_SDIO_DEV1
 
+        choice
+            prompt "realtek module"
+            default REALTEK_SDIO_RTL8189
+
+            config REALTEK_SDIO_RTL8189
+                bool "rtl8189"
+
+            config REALTEK_SDIO_RTL8733BS
+                bool "rtl8733BS"
+
+        endchoice
+
     endif
