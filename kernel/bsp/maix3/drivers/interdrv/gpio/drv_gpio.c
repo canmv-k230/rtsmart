@@ -189,7 +189,7 @@ uint32_t kd_pin_get_ddr(rt_base_t pin)
 
     /* Read pin state */
     uint32_t input_val = read32(ddr);
-    return (input_val & BIT(port_pin));
+    return (input_val & BIT(port_pin)) ? 1 : 0;
 }
 
 uint32_t kd_pin_get_dr(rt_base_t pin)
@@ -772,7 +772,7 @@ static rt_err_t kd_pin_control_wrap(rt_device_t dev, int cmd, void* args)
             rt_memcpy(&cfg, args, sizeof(cfg));
         }
         int pin = cfg.pin;
-        if (pin < 0 || pin >= GPIO_IRQ_MAX_NUM) {
+        if (pin < 0 || pin >= GPIO_MAX_NUM) {
             LOG_E("Invalid GPIO pin %d", pin);
             return -RT_EINVAL;
         }
@@ -791,7 +791,7 @@ static rt_err_t kd_pin_control_wrap(rt_device_t dev, int cmd, void* args)
             rt_memcpy(&cfg, args, sizeof(cfg));
         }
         int pin = cfg.pin;
-        if (pin < 0 || pin >= GPIO_IRQ_MAX_NUM) {
+        if (pin < 0 || pin >= GPIO_MAX_NUM) {
             LOG_E("Invalid GPIO pin %d", pin);
             return -RT_EINVAL;
         }
