@@ -445,7 +445,7 @@ void lwp_free(struct rt_lwp* lwp)
         struct termios *old_stdin_termios = get_old_termios();
         struct rt_lwp *old_lwp = NULL;
 
-        if (lwp->session == -1)
+        if (lwp->session == -1 && lwp->tty != RT_NULL)
         {
             tcsetattr(1, 0, old_stdin_termios);
         }
