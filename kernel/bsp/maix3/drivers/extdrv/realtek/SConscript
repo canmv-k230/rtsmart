@@ -2,13 +2,36 @@
 
 from building import *
 
-objs = []
-cwd     = GetCurrentDir()
+cwd = GetCurrentDir()
 
-list = os.listdir(cwd)
+path = [cwd]
+path += [cwd + '/api']
+path += [cwd + '/include']
+path += [cwd + '/os/customer_rtos']
+path += [cwd + '/os/os_dep/include']
+path += [cwd + '/platform/include']
+path += [cwd + '/platform/rtwlan_bsp']
+path += [cwd + '/platform/sdio']
+path += [cwd + '/platform/sdio/include']
 
-for item in list:
-    if os.path.isfile(os.path.join(cwd, item, 'SConscript')):
-        objs = objs + SConscript(os.path.join(item, 'SConscript'))
+src = Glob('*.c')
+src += Glob('api/*.c')
+src += Glob('api/wifi/*.c')
+src += Glob('os/customer_rtos/customer_rtt_service.c')
+src += Glob('os/os_dep/*.c')
+src += Glob('platform/rtwlan_bsp/*.c')
+src += Glob('platform/sdio/*.c')
 
-Return('objs')
+wifi_name = ''
+if GetDepend('REALTEK_SDIO_RTL8733BS'):
+    wifi_name = 'rtl8733BS'
+if GetDepend('REALTEK_SDIO_RTL8189FTV'):
+    wifi_name = 'rtl8189FTV'
+
+lib_name = 'wlan_' + wifi_name + '_v1_1'
+libs = [lib_name]
+libpath = [cwd + '/wlan_lib']
+
+group = DefineGroup('realtek', src, depend = ['RT_USING_REALTEK'], CPPPATH = path, LIBS = libs, LIBPATH = libpath)
+
+Return('group')

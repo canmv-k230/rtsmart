@@ -24,9 +24,9 @@ menuconfig RT_USING_REALTEK
 
         choice
             prompt "realtek module"
-            default REALTEK_SDIO_RTL8189
+            default REALTEK_SDIO_RTL8189FTV
 
-            config REALTEK_SDIO_RTL8189
+            config REALTEK_SDIO_RTL8189FTV
                 bool "rtl8189"
 
             config REALTEK_SDIO_RTL8733BS
