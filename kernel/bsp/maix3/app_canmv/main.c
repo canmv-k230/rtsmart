@@ -29,6 +29,10 @@
 #include "drv_gpio.h"
 #endif // CONFIG_BOARD_K230_CANMV_LCKFB
 
+#ifdef CONFIG_BOARD_K230_CANMV_YAHBOOM
+#include "drv_gpio.h"
+#endif // CONFIG_BOARD_K230_CANMV_YAHBOOM
+
 #include "sysctl_pwr.h"
 #include "sysctl_boot.h"
 
@@ -187,6 +191,11 @@ int main(void) {
   sysctl_pwr_off(SYSCTL_PD_CPU0);
   sysctl_pwr_off(SYSCTL_PD_DPU);
 
+#ifdef CONFIG_BOARD_K230_CANMV_YAHBOOM
+  kd_pin_mode(48, GPIO_DM_OUTPUT);
+  kd_pin_write(48, GPIO_PV_LOW);
+#endif
+
   check_bank_voltage();
 
   rt_kprintf("\n#############SDK VERSION######################################\n");
@@ -206,6 +215,18 @@ int main(void) {
     }
   }
 #endif //RT_USING_SDIO
+
+#ifdef CONFIG_RT_USING_DFS_ROMFS
+    extern const struct romfs_dirent romfs_root;
+    if (dfs_mount(RT_NULL, "/rom", "rom", 0, &romfs_root) != 0)
+    {
+        mkdir("/rom", 0x777);
+        if (dfs_mount(RT_NULL, "/rom", "rom", 0, &romfs_root) != 0)
+        {
+            rt_kprintf("romfs mount failed!\n");
+        }
+    }
+#endif
 
   mnt_mount_table();
   excute_sdcard_config();

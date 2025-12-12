@@ -26,6 +26,13 @@
 #include "rtthread.h"
 #include <stdint.h>
 
+#ifndef TOUCH_CST128_DFT_RANGE_X
+#define TOUCH_CST128_DFT_RANGE_X 480
+#endif
+#ifndef TOUCH_CST128_DFT_RANGE_Y
+#define TOUCH_CST128_DFT_RANGE_Y 640
+#endif
+
 #define DBG_TAG "cst128"
 #define DBG_LVL DBG_WARNING
 #define DBG_COLOR
