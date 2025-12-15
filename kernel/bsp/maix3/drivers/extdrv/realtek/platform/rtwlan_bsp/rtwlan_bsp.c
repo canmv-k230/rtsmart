@@ -168,6 +168,7 @@ static rt_err_t wlan_join(struct rt_wlan_device* wlan, struct rt_sta_info* sta_i
     if (wifi_is_up(RTW_AP_INTERFACE)) {
         wifi_off();
         rt_thread_mdelay(20);
+        rt_wlan_dev_indicate_event_handle(&wlan_ap, RT_WLAN_DEV_EVT_AP_STOP, NULL);
         if (wifi_on(RTW_MODE_STA) < 0) {
             rt_kprintf("%s: STA start failed\n", __func__);
             ret = -RT_EIO;

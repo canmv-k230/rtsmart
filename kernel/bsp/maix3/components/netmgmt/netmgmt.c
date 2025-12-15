@@ -69,6 +69,7 @@ struct rt_net_mgmt_device {
     // struct rt_mutex lock;
 };
 static struct rt_net_mgmt_device net_mgmt_device;
+static volatile int g_auto_reconnect = 1;
 
 enum rt_netif_t {
     RT_NET_DEV_WLAN_STA    = 0,
@@ -104,6 +105,7 @@ static rt_err_t _wlan_mgmt_cmd_basic_set_auto_reconnect(void* mgmt_dev, void* ar
     lwp_get_from_user(&auto_reconnect, args, sizeof(int));
 
     rt_wlan_config_autoreconnect((rt_bool_t)(auto_reconnect & 0x01));
+    g_auto_reconnect = auto_reconnect;
 
     return RT_EOK;
 }
@@ -114,6 +116,10 @@ static rt_err_t _wlan_mgmt_cmd_sta_connect(void* mgmt_dev, void* args)
     struct rt_wlan_connect_config config;
 
     lwp_get_from_user(&config, args, sizeof(struct rt_wlan_connect_config));
+
+    if (g_auto_reconnect) {
+        rt_wlan_config_autoreconnect((rt_bool_t)(g_auto_reconnect & 0x01));
+    }
 
     if (config.use_info) {
         err = rt_wlan_connect_adv(&config.info, (char*)config.key.val);
@@ -232,6 +238,10 @@ static rt_err_t _wlan_mgmt_cmd_ap_start(void* mgmt_dev, void* args)
     struct rt_wlan_connect_config config;
 
     lwp_get_from_user(&config, args, sizeof(struct rt_wlan_connect_config));
+
+    if (g_auto_reconnect) {
+        rt_wlan_config_autoreconnect((rt_bool_t)(RT_FALSE);
+    }
 
     if (config.use_info) {
         err = rt_wlan_start_ap_adv(&config.info, (char*)config.key.val);
