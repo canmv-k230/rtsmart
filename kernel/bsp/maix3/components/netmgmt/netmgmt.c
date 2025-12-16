@@ -240,7 +240,7 @@ static rt_err_t _wlan_mgmt_cmd_ap_start(void* mgmt_dev, void* args)
     lwp_get_from_user(&config, args, sizeof(struct rt_wlan_connect_config));
 
     if (g_auto_reconnect) {
-        rt_wlan_config_autoreconnect((rt_bool_t)(RT_FALSE);
+        rt_wlan_config_autoreconnect(RT_FALSE);
     }
 
     if (config.use_info) {
