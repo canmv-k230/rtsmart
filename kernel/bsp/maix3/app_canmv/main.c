@@ -29,7 +29,6 @@
 #include "drv_gpio.h"
 #endif // CONFIG_BOARD_K230_CANMV_LCKFB
 
-
 #include "sysctl_pwr.h"
 #include "sysctl_boot.h"
 

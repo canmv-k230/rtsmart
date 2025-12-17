@@ -26,7 +26,6 @@
 #include "rtthread.h"
 #include <stdint.h>
 
-
 #define DBG_TAG "cst128"
 #define DBG_LVL DBG_WARNING
 #define DBG_COLOR
