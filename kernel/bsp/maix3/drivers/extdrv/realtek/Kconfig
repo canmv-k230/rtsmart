@@ -34,4 +34,13 @@ menuconfig RT_USING_REALTEK
 
         endchoice
 
+        config REALTEK_INTERACTIVE_CMD
+            bool "RealTek Interactive CMDs"
+            default n
+            select REALTEK_ENABLE_DEBUG
+
+        config REALTEK_ENABLE_DEBUG
+            bool "RealTek Enable Debug"
+            default n
+
     endif

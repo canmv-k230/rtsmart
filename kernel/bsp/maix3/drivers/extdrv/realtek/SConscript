@@ -22,15 +22,19 @@ src += Glob('os/os_dep/*.c')
 src += Glob('platform/rtwlan_bsp/*.c')
 src += Glob('platform/sdio/*.c')
 
-wifi_name = ''
-if GetDepend('REALTEK_SDIO_RTL8733BS'):
-    wifi_name = 'rtl8733BS'
-if GetDepend('REALTEK_SDIO_RTL8189FTV'):
-    wifi_name = 'rtl8189FTV'
+libs=[]
+libpath=[]
+lib_base_path=[]
 
-lib_name = 'wlan_' + wifi_name + '_v1_1'
-libs = [lib_name]
-libpath = [cwd + '/wlan_lib']
+if GetDepend('REALTEK_SDIO_RTL8733BS'):
+    libs += ['wlan_rtl8733BS_v1_2']
+    lib_base_path = cwd + '/wlan_lib/8733/'
+elif GetDepend('REALTEK_SDIO_RTL8189FTV'):
+    libs += ['wlan_rtl8189FTV_v1_1']
+    lib_base_path = cwd + '/wlan_lib/8189/'
+
+path += [lib_base_path]
+libpath += [lib_base_path]
 
 group = DefineGroup('realtek', src, depend = ['RT_USING_REALTEK'], CPPPATH = path, LIBS = libs, LIBPATH = libpath)
 

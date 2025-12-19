@@ -1,4 +1,7 @@
+#include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
+
 #include "rtthread.h"
 #include "rtdevice.h"
 #include "drivers/sdio.h"
@@ -101,18 +104,24 @@ void wlan_event_indication(rtw_event_indicate_t event, char* buf, int buf_len)
 void ethernetif_recv(int idx, int total_len)
 {
     struct eth_drv_sg sg_list;
+    void *buffer = NULL;
 
     if (!rltk_wlan_running(idx))
         return;
 
-    sg_list.buf = rt_malloc(total_len);
-    if (sg_list.buf == NULL)
+    buffer = rt_malloc(total_len);
+    if(!buffer) {
+        rt_kprintf("%s->%d no mem\n", __func__, __LINE__);
         return;
+    }
+
+    sg_list.buf = (unsigned int)(uintptr_t)buffer;
     sg_list.len = total_len;
 
     rltk_wlan_recv(idx, &sg_list, 1);
-    rt_wlan_dev_report_data(idx == 0 ? &wlan_sta : &wlan_ap, sg_list.buf, total_len);
-    rt_free(sg_list.buf);
+    rt_wlan_dev_report_data(idx == 0 ? &wlan_sta : &wlan_ap, (void*)(uint64_t)sg_list.buf, total_len);
+
+    rt_free(buffer);
 }
 
 static rt_err_t wlan_init(struct rt_wlan_device* wlan)
@@ -330,7 +339,7 @@ static int wlan_send(struct rt_wlan_device* wlan, void* buff, int len)
     if (!rltk_wlan_running(idx))
         return -1;
 
-    sg_list.buf = buff;
+    sg_list.buf = (unsigned int)(uintptr_t)buff;
     sg_list.len = len;
 
     rltk_wlan_send(idx, &sg_list, 1, len);

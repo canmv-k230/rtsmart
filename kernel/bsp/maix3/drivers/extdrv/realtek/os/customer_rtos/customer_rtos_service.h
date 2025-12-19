@@ -5,6 +5,8 @@
 // Include Files
 //----- ------------------------------------------------------------------
 
+#include "autoconf.h"
+
 #include "dlist.h"
 
 /* For SPI interface transfer and us delay implementation */
@@ -157,7 +159,11 @@ void cli(void);
 #define netif_wake_queue(dev)		do { } while (0)
 
 int rtw_printf(const char *format, ...);
+#if CONFIG_DEBUG
 #define printk				rtw_printf
+#else
+#define printk
+#endif
 
 #ifndef __CC_ARM
 #define DBG_INFO(fmt, args...) 		printk("\n\rRTL871X: " fmt, ## args)

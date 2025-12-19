@@ -447,7 +447,7 @@ static void cmd_wifi_ap(int argc, char **argv)
 static void cmd_wifi_connect(int argc, char **argv)
 {
 	int ret = RTW_ERROR;
-	unsigned long tick1 = xTaskGetTickCount();
+	unsigned long tick1 = rtw_get_current_time();
 	unsigned long tick2, tick3;
 	int mode;
 	char 				*ssid;
@@ -475,7 +475,7 @@ static void cmd_wifi_connect(int argc, char **argv)
 #endif
 #endif
 		wifi_off();
-		vTaskDelay(20);
+		rtw_msleep_os(20);
 		if (wifi_on(RTW_MODE_STA) < 0){
 			DBG_INFO("ERROR: Wifi on failed!");
 			return;
@@ -526,7 +526,7 @@ static void cmd_wifi_connect(int argc, char **argv)
 		DBG_INFO("ERROR: Operation failed!");
 		return;
 	} else {
-		tick2 = xTaskGetTickCount();
+		tick2 = rtw_get_current_time();
 		DBG_INFO("Connected after %dms.\n", (tick2-tick1));
 	
 #if CONFIG_LWIP_LAYER
@@ -538,14 +538,14 @@ static void cmd_wifi_connect(int argc, char **argv)
 #endif
 #endif
 	}
-	tick3 = xTaskGetTickCount();
+	tick3 = rtw_get_current_time();
 	DBG_INFO("Got IP after %dms.\n", (tick3-tick1));
 }
 
 static void cmd_wifi_connect_bssid(int argc, char **argv)
 {
 	int ret = RTW_ERROR;
-	unsigned long tick1 = xTaskGetTickCount();
+	unsigned long tick1 = rtw_get_current_time();
 	unsigned long tick2, tick3;
 	int mode;
 	unsigned char 	bssid[ETH_ALEN];
@@ -579,7 +579,7 @@ static void cmd_wifi_connect_bssid(int argc, char **argv)
 #endif
 #endif
 		wifi_off();
-		vTaskDelay(20);
+		rtw_msleep_os(20);
 		if (wifi_on(RTW_MODE_STA) < 0){
 			DBG_INFO("ERROR: Wifi on failed!");
 			return;
@@ -644,7 +644,7 @@ static void cmd_wifi_connect_bssid(int argc, char **argv)
 		DBG_INFO("ERROR: Operation failed!");
 		return;
 	} else {
-		tick2 = xTaskGetTickCount();
+		tick2 = rtw_get_current_time();
 		DBG_INFO("Connected after %dms.\n", (tick2-tick1));
 		
 #if CONFIG_LWIP_LAYER
@@ -657,7 +657,7 @@ static void cmd_wifi_connect_bssid(int argc, char **argv)
 #endif
 #endif
 	}
-	tick3 = xTaskGetTickCount();
+	tick3 = rtw_get_current_time();
 	DBG_INFO("Got IP after %dms.\n", (tick3-tick1));
 }
 
@@ -809,7 +809,7 @@ static void cmd_wifi_info(int argc, char **argv)
 	DBG_INFO("Memory Usage");
 	DBG_INFO("==============================");
 	DBG_INFO("Min Free Heap Size:  %d", min_free_heap_size);
-	DBG_INFO("Cur Free Heap Size:  %d\n", xPortGetFreeHeapSize());
+	DBG_INFO("Cur Free Heap Size:  %d\n", rtw_getFreeHeapSize());
 #endif
 }
 
@@ -893,6 +893,9 @@ static void cmd_wifi_scan_with_multiple_ssid(int argc,char **argv)
 	}
 	scan_buflen = 200;
 	num_ssid = argc -1;
+
+	extern int wifi_scan_networks_with_multissid(int (results_handler)(char*buf, int buflen, char *ssid, void *user_data), 
+	OUT void* user_data, IN int scan_buflen, IN scan_ssid* Ssid ,IN int num_ssid);
 	if(wifi_scan_networks_with_multissid(NULL,NULL, scan_buflen, Ssid ,num_ssid) != RTW_SUCCESS){
 		DBG_INFO("ERROR: wifi scan failed");
 	}
@@ -930,12 +933,12 @@ static void cmd_wifi_scan_with_ssid(int argc, char **argv)
 			DBG_INFO("Wrong ssid. Length must be less than 32.");
 			goto exit;
 		}		
-		channel_list = (u8*)pvPortMalloc(num_channel);
+		channel_list = (u8*)rtw_malloc(num_channel);
 		if(!channel_list){
 			DBG_INFO("ERROR: Can't malloc memory for channel list");
 			goto exit;
 		}
-		pscan_config = (u8*)pvPortMalloc(num_channel);
+		pscan_config = (u8*)rtw_malloc(num_channel);
 		if(!pscan_config){
 			DBG_INFO("ERROR: Can't malloc memory for pscan_config");
 			goto exit;
@@ -962,9 +965,9 @@ static void cmd_wifi_scan_with_ssid(int argc, char **argv)
 
 exit:
 	if(argc > 2 && channel_list)
-		vPortFree(channel_list);
+		rtw_free(channel_list);
 	if(argc > 2 && pscan_config)
-		vPortFree(pscan_config);
+		rtw_free(pscan_config);
 	
 }
 #endif
@@ -978,12 +981,12 @@ static void cmd_wifi_scan(int argc, char **argv)
 		int i = 0;
 		int num_channel = atoi(argv[1]);
 
-		channel_list = (u8*)pvPortMalloc(num_channel);
+		channel_list = (u8*)rtw_malloc(num_channel);
 		if(!channel_list){
 			DBG_INFO("ERROR: Can't malloc memory for channel list");
 			goto exit;
 		}
-		pscan_config = (u8*)pvPortMalloc(num_channel);
+		pscan_config = (u8*)rtw_malloc(num_channel);
 		if(!pscan_config){
 			DBG_INFO("ERROR: Can't malloc memory for pscan_config");
 			goto exit;
@@ -1007,9 +1010,9 @@ static void cmd_wifi_scan(int argc, char **argv)
 	}
 exit:
 	if(argc > 2 && channel_list)
-		vPortFree(channel_list);
+		rtw_free(channel_list);
 	if(argc > 2 && pscan_config)
-		vPortFree(pscan_config);
+		rtw_free(pscan_config);
 
 }
 
@@ -1020,13 +1023,15 @@ static void cmd_wifi_reorder_scan(int argc, char **argv)
 	int i = 0;
 	int num_channel = 13;
 	char channel_reorder[]= {1,3,5,7,9,2,4,6,8,10,11,12,13};//set channel order
-	channel_list = (u8*)pvPortMalloc(num_channel);
+	channel_list = (u8*)rtw_malloc(num_channel);
 	if(!channel_list){
 		DBG_INFO("ERROR: Can't malloc memory for channel_list");
 		goto exit;
 	}
 	for(i=0;i<num_channel;i++)
 		*(channel_list+i) = channel_reorder[i];
+
+	extern int wifi_set_scan_reorderchan(__u8 * channel_list, __u8 length);
 	if(wifi_set_scan_reorderchan(channel_list, num_channel) < 0){
 		DBG_INFO("ERROR: wifi set reoder scan channel fail");
 		goto exit;
@@ -1037,7 +1042,7 @@ static void cmd_wifi_reorder_scan(int argc, char **argv)
 	}
 exit:
 	if(channel_list)
-		vPortFree(channel_list);
+		rtw_free(channel_list);
 }
 #if CONFIG_WEBSERVER
 static void cmd_wifi_start_webserver(int argc, char **argv)
@@ -1097,7 +1102,7 @@ static void cmd_edit_reg(int argc, char **argv)
 static void cmd_exit(int argc, char **argv)
 {
 	DBG_INFO("Leave INTERACTIVE MODE");
-	vTaskDelete(NULL);
+	rtw_delete_task(NULL);
 }
 
 static void cmd_debug(int argc, char **argv)
@@ -1113,9 +1118,12 @@ static void cmd_debug(int argc, char **argv)
 		wifi_get_mac_address((char*)mac);
 		DBG_INFO("%s", mac);
 	} else if(strcmp(argv[1], "set_bt_mac") == 0){
+
+		extern int bt_set_mac_address(char *mac);
 		DBG_INFO("%d", bt_set_mac_address(argv[2]));
 	}else if(strcmp(argv[1], "get_bt_mac") == 0){
 		u8 mac[18] = {0};
+		extern int bt_get_mac_address(char *mac);
 		bt_get_mac_address((char*)mac);
 		DBG_INFO("%s", mac);
 	}else if(strcmp(argv[1], "ps_on") == 0) {
@@ -1648,7 +1656,7 @@ void interactive_mode(void *param)
 #endif
 			if(!found)
 				DBG_INFO("unknown command '%s'", argv[0]);
-			DBG_INFO("[MEM] After do cmd, available heap %d\n\r", xPortGetFreeHeapSize());
+			DBG_INFO("[MEM] After do cmd, available heap %d\n\r", rtw_getFreeHeapSize());
 		}
 
 		printk("\r\n\n# ");
@@ -1670,3 +1678,85 @@ void start_interactive_mode(void)
 	DBG_INFO("ERROR: No SERIAL_DEBUG_RX to support interactive mode!");
 #endif
 }
+
+#if defined (REALTEK_INTERACTIVE_CMD) && defined(RT_USING_MSH)
+#include <finsh.h> // For MSH_CMD_EXPORT
+
+static void rtl_wrap(int argc, char **argv)
+{
+    const cmd_entry *entry;
+
+    // Check argument count
+    if (argc < 2) {
+        rt_kprintf("Usage: rtl <command> [args...]\n");
+        rt_kprintf("Available commands:\n");
+        for(size_t i = 0; i < sizeof(cmd_table) / sizeof(cmd_table[0]); i++) {
+            rt_kprintf("  %s\n", cmd_table[i].command);
+        }
+        return;
+    }
+
+    // argv[0] = "rtl" (MSH command name)
+    // argv[1] = Realtek command (e.g., "iwpriv")
+
+    // Find command in cmd_table
+    for(size_t i = 0; i < sizeof(cmd_table) / sizeof(cmd_table[0]); i++) {
+        entry = &cmd_table[i];
+
+        if (strcmp(argv[1], entry->command) == 0) {
+            // Special handling for iwpriv
+            if (strcmp(argv[1], "iwpriv") == 0) {
+                // iwpriv expects: function(argc, argv)
+                // where argc = 2 (always!)
+                // argv[0] = "iwpriv"
+                // argv[1] = "all remaining arguments as single string"
+
+                if (argc < 3) {
+                    rt_kprintf("Usage: rtl iwpriv <interface> <cmd> [params]\n");
+                    return;
+                }
+
+                // Combine all remaining arguments into one string
+                // Calculate needed buffer size
+                int total_len = 0;
+                for (int j = 2; j < argc; j++) {
+                    total_len += strlen(argv[j]) + 1;  // +1 for space
+                }
+
+                // Create combined string
+                char *combined = (char *)rt_malloc(total_len);
+                if (!combined) {
+                    rt_kprintf("Memory allocation failed\n");
+                    return;
+                }
+
+                combined[0] = '\0';
+                for (int j = 2; j < argc; j++) {
+                    strcat(combined, argv[j]);
+                    if (j < argc - 1) {
+                        strcat(combined, " ");
+                    }
+                }
+
+                // Prepare arguments as iwpriv expects
+                char *iwpriv_argv[2];
+                iwpriv_argv[0] = "iwpriv";
+                iwpriv_argv[1] = combined;
+
+                // Call iwpriv with 2 arguments
+                entry->function(2, iwpriv_argv);
+
+                rt_free(combined);
+            } else {
+                // Normal commands: just pass the arguments
+                entry->function(argc - 1, &argv[1]);
+            }
+            return;
+        }
+    }
+
+    // Command not found
+    rt_kprintf("Unsupported Realtek command: %s\n", argv[1]);
+}
+MSH_CMD_EXPORT_ALIAS(rtl_wrap, rtl, "Realtek Command Wrapper");
+#endif

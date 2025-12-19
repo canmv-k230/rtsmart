@@ -158,7 +158,7 @@ void wifi_indication( rtw_event_indicate_t event, char *buf, int buf_len, int fl
 			break;
 #endif
 		case WIFI_EVENT_BEACON_AFTER_DHCP:
-			DBG_INFO("%s(): WIFI_EVENT_BEACON_AFTER_DHCP\n", __func__);
+			// DBG_INFO("%s(): WIFI_EVENT_BEACON_AFTER_DHCP\n", __func__);
 			break;
 		case WIFI_EVENT_IP_CHANGED:
 			DBG_INFO("%s(): WIFI_EVENT_IP_CHANNGED\n", __func__);
@@ -226,7 +226,7 @@ void wifi_indication( rtw_event_indicate_t event, char *buf, int buf_len, int fl
 #else
 	rtw_indicate_event_handle(event, buf, buf_len, flags);
 #endif
-	extern wlan_event_indication(rtw_event_indicate_t event, char *buf, int buf_len);
+	extern void wlan_event_indication(rtw_event_indicate_t event, char *buf, int buf_len);
 	wlan_event_indication(event, buf, buf_len);
 }
 
