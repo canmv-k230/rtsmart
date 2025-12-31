@@ -1,3 +1,22 @@
+/*
+ ******************************************************************************
+ * @file    lsm6dsm_reg.h
+ * @author  Sensors Software Solution Team
+ * @brief   This file contains all the functions prototypes for the
+ *          lsm6dsm_reg.c driver.
+ ******************************************************************************
+ * @attention
+ *
+ * <h2><center>&copy; Copyright (c) 2020 STMicroelectronics.
+ * All rights reserved.</center></h2>
+ *
+ * This software component is licensed by ST under BSD 3-Clause license,
+ * the "License"; You may not use this file except in compliance with the
+ * License. You may obtain a copy of the License at:
+ *                        opensource.org/licenses/BSD-3-Clause
+ *
+ ******************************************************************************
+ */
 /* Define to prevent recursive inclusion -------------------------------------*/
 #ifndef LSM6DSM_REGS_H
 #define LSM6DSM_REGS_H
