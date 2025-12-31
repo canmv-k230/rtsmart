@@ -43,8 +43,8 @@ struct chsc5xxx_point {
 };
 
 struct chsc5xxx_reg {
-    rt_uint8_t act;
-    rt_uint8_t finger_num;
+    rt_uint8_t            act;
+    rt_uint8_t            finger_num;
     struct chsc5xxx_point pos[10];
 };
 
@@ -62,6 +62,7 @@ struct chsc5xxx_info {
     uint8_t lcd_res_y[2]; // 0x20000088
     uint8_t resv_8A_8D[4];
     uint8_t lcd_finger; // 0x2000008e
+    uint8_t resv_8f; // for align to 4B
 };
 
 static int chsc5xxx_read_reg(struct drv_touch_dev* dev, rt_uint32_t addr, rt_uint8_t* buffer, rt_size_t length)
@@ -92,9 +93,15 @@ static int chsc5xxx_read_reg(struct drv_touch_dev* dev, rt_uint32_t addr, rt_uin
 
 static int read_register(struct drv_touch_dev* dev, struct touch_register* reg)
 {
-    size_t length = sizeof(struct chsc5xxx_reg ) + sizeof(struct chsc5xxx_point) * dev->touch.point_num;
+    size_t length = 2 + sizeof(struct chsc5xxx_point) * dev->touch.point_num;
 
     reg->time = rt_tick_get();
+
+    // align to 4B
+    length = (length + 3) & ~3;
+    if (length > CHSC5XXX_READ_REG_SIZE) {
+        length = CHSC5XXX_READ_REG_SIZE;
+    }
 
     return chsc5xxx_read_reg(dev, 0x2000002C, (uint8_t*)&reg->reg[0], length);
 }
@@ -121,9 +128,10 @@ static int parse_register(struct drv_touch_dev* dev, struct touch_register* reg,
     finger_num = chsc5xxx_reg->finger_num;
 
     if (finger_num > TOUCH_MAX_POINT_NUMBER) {
-        LOG_W("CHSC5xxx touch point %d > max %d", finger_num, TOUCH_MAX_POINT_NUMBER);
+        LOG_D("CHSC5xxx touch point %d > max %d", finger_num, TOUCH_MAX_POINT_NUMBER);
 
-        finger_num = TOUCH_MAX_POINT_NUMBER;
+        result->point_num = 0;
+        return 0;
     }
     result->point_num = finger_num;
 
@@ -195,9 +203,9 @@ int drv_touch_probe_chsc5xxx(struct drv_touch_dev* dev)
         /*11H*/ "CHSC1716",
     };
 
-    dev->i2c.addr = 0x2e;
+    reset(dev);
 
-    rt_thread_mdelay(100);
+    dev->i2c.addr = 0x2e;
 
     if (0 != chsc5xxx_read_reg(dev, 0x20000080, (uint8_t*)&info, sizeof(info))) {
         return -1;
