@@ -1,0 +1,14 @@
+# RT-Thread building script for component
+
+from building import *
+
+cwd	= GetCurrentDir()
+src	= Glob('*.c')
+CPPPATH = [cwd]
+
+# add src and include to group.
+group = DefineGroup('lsm6dsm', src, depend = ['RT_USING_LSM6DSM', 'RT_USING_SENSOR'], CPPPATH = CPPPATH)
+
+objs = [group]
+
+Return('objs')
