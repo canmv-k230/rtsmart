@@ -518,7 +518,7 @@ int drv_fpioa_set_pin_func(int pin, fpioa_func_t func)
         found    = 1;
         func_sel = 0;
 
-        if (GPIO63 <= func) {
+        if (GPIO63 < func) {
             func_sel = 1;
         }
     }
