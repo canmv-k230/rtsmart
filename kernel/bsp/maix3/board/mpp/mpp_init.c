@@ -23,24 +23,6 @@ extern int log_init(void);
 /***************************************************/
 
 /********************MMZ*****************************/
-/* defined in k_autoconf_comm.h */
-#ifdef CONFIG_MEM_MMZ_BASE
-#undef MEM_MMZ_BASE
-#define MEM_MMZ_BASE CONFIG_MEM_MMZ_BASE
-#endif
-
-#ifdef CONFIG_MEM_MMZ_SIZE
-#undef MEM_MMZ_SIZE
-#define MEM_MMZ_SIZE (CONFIG_MEM_MMZ_SIZE - 4096)
-#endif
-
-#ifndef MEM_MMZ_BASE
-#define MEM_MMZ_BASE 0x10000000UL
-#endif
-
-#ifndef MEM_MMZ_SIZE
-#define MEM_MMZ_SIZE 0xffff000UL
-#endif
 int __attribute__((weak)) mmz_init(unsigned long  mmz_start, unsigned long mmz_size)
 {
     rt_kprintf("no mmz library!\n");

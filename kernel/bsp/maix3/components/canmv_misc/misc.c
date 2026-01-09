@@ -153,6 +153,7 @@ static int misc_close(struct dfs_fd *file) { return 0; }
 #define MISC_DEV_CMD_DELETE_ROTARY_ENC_DEV    _IOWR('M', 0x0f, void *)
 #define MISC_DEV_CMD_REGISTER_TOUCH_DEVICE    _IOWR('M', 0x10, void *)
 #define MISC_DEV_CMD_UNREGISTER_TOUCH_DEVICE  _IOWR('M', 0x11, void *)
+#define MISC_DEV_CMD_GET_MMZ_ZONE_INFO        _IOWR('M', 0x12, void *)
 
 struct meminfo_t {
   size_t total_size;
@@ -591,6 +592,23 @@ static int misc_unregister_touch_device(void* args)
 }
 #endif
 
+static int misc_get_mmz_zone_info(void* args)
+{
+  struct mmz_zone_info_t {
+    size_t mmz_start;
+    size_t mmz_end;
+  } info;
+
+  info.mmz_start = MEM_MMZ_BASE;
+  info.mmz_end = MEM_MMZ_BASE + MEM_MMZ_SIZE;
+
+  if(0x00 != lwp_put_to_user_ex(args, &info, sizeof(info))) {
+        rt_kprintf("%s put_to_user failed\n", __func__);
+        return -1;
+  }
+  return 0;
+}
+
 static const struct misc_dev_handle misc_handles[] = {
   {
     .cmd = MISC_DEV_CMD_READ_HEAP,
@@ -665,6 +683,10 @@ static const struct misc_dev_handle misc_handles[] = {
     .func = misc_unregister_touch_device,
   },
 #endif
+  {
+    .cmd = MISC_DEV_CMD_GET_MMZ_ZONE_INFO,
+    .func = misc_get_mmz_zone_info,
+  },
 
 };
 
