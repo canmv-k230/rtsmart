@@ -228,7 +228,7 @@ static void dw_i2c_isr(int irq, void* param)
     }
     if (stat & (IC_RX_FULL | IC_STOP_DET)) {
         uint32_t valid = readl(&i2c_base->ic_rxflr);
-        for (; bus->msg_rd_idx < bus->msg_wr_idx;) {
+        for (; bus->msg_rd_idx <= bus->msg_wr_idx && bus->msg_rd_idx < bus->msgs_num;) {
             int i = bus->msg_rd_idx;
             if ((bus->msgs[i].flags & RT_I2C_RD) == 0) {
                 bus->msg_rd_idx++;
@@ -506,8 +506,8 @@ static int eeprom_ioctl(struct dfs_fd* file, int cmd, void* args)
             return -RT_EINVAL;
         }
         size_t size = *((uint32_t*)args);
-        if (size > 256) {
-            LOG_E("slave set buffer size is too big\n");
+        if ((size > 4096) || (0 == size)) {
+            LOG_E("slave set buffer size is illegal, size = %d\n", size);
             return -RT_EINVAL;
         }
         eeprom->buffer = rt_realloc(eeprom->buffer, size);
@@ -515,6 +515,8 @@ static int eeprom_ioctl(struct dfs_fd* file, int cmd, void* args)
             LOG_E("slave buffer malloc fail\n");
             return -RT_ENOMEM;
         }
+        eeprom->buffer_size = size;
+        file->fnode->size = size;
         break;
     case I2C_SLAVE_IOCTL_SET_ADDR:
         if (args == NULL) {
