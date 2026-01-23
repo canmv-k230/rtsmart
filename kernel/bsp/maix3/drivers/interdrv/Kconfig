@@ -96,60 +96,95 @@ menu "InterDriver"
                 bool "Enable Soft I2C"
                 default n
 
-            config RT_USING_I2C_SLAVE_EEPROM
-                bool "Enable I2C Slave Server as eeprom"
-                default n
-
             config RT_USING_I2C0
                 bool "Enable I2C0"
                 default n
+            if RT_USING_I2C0
+                choice I2C0_MODE_CHOICE
+                    bool "I2C0 mode"
+                    default I2C0_MODE_MASTER
+                    config I2C0_MODE_MASTER
+                        bool "Master"
+                    config I2C0_MODE_SLAVE
+                        bool "Slave"
+                endchoice
+                config I2C0_MODE
+                    int
+                    default 0 if I2C0_MODE_MASTER
+                    default 1 if I2C0_MODE_SLAVE
+            endif
 
-                if RT_USING_I2C0
-                    config RT_USING_I2C0_SLAVE
-                    bool "Enable I2C0 SLAVE mode"
-                    select RT_USING_I2C_SLAVE_EEPROM
-                    default n
-                endif
             config RT_USING_I2C1
                 bool "Enable I2C1"
                 default n
+            if RT_USING_I2C1
+                choice I2C1_MODE_CHOICE
+                    bool "I2C1 mode"
+                    default I2C1_MODE_MASTER
+                    config I2C1_MODE_MASTER
+                        bool "Master"
+                    config I2C1_MODE_SLAVE
+                        bool "Slave"
+                endchoice
+                config I2C1_MODE
+                    int
+                    default 0 if I2C1_MODE_MASTER
+                    default 1 if I2C1_MODE_SLAVE
+            endif
 
-                if RT_USING_I2C1
-                    config RT_USING_I2C1_SLAVE
-                    bool "Enable I2C1 SLAVE mode"
-                    select RT_USING_I2C_SLAVE_EEPROM
-                    default n
-                endif
             config RT_USING_I2C2
                 bool "Enable I2C2"
                 default n
+            if RT_USING_I2C2
+                choice I2C2_MODE_CHOICE
+                    bool "I2C2 mode"
+                    default I2C2_MODE_MASTER
+                    config I2C2_MODE_MASTER
+                        bool "Master"
+                    config I2C2_MODE_SLAVE
+                        bool "Slave"
+                endchoice
+                config I2C2_MODE
+                    int
+                    default 0 if I2C2_MODE_MASTER
+                    default 1 if I2C2_MODE_SLAVE
+            endif
 
-                if RT_USING_I2C2
-                    config RT_USING_I2C2_SLAVE
-                    bool "Enable I2C2 SLAVE mode"
-                    select RT_USING_I2C_SLAVE_EEPROM
-                    default n
-                endif
             config RT_USING_I2C3
                 bool "Enable I2C3"
                 default n
+            if RT_USING_I2C3
+                choice I2C3_MODE_CHOICE
+                    bool "I2C3 mode"
+                    default I2C3_MODE_MASTER
+                    config I2C3_MODE_MASTER
+                        bool "Master"
+                    config I2C3_MODE_SLAVE
+                        bool "Slave"
+                endchoice
+                config I2C3_MODE
+                    int
+                    default 0 if I2C3_MODE_MASTER
+                    default 1 if I2C3_MODE_SLAVE
+            endif
 
-                if RT_USING_I2C3
-                    config RT_USING_I2C3_SLAVE
-                    bool "Enable I2C3 SLAVE mode"
-                    select RT_USING_I2C_SLAVE_EEPROM
-                    default n
-                endif
             config RT_USING_I2C4
                 bool "Enable I2C4"
                 default n
-
-                if RT_USING_I2C4
-                    config RT_USING_I2C4_SLAVE
-                    bool "Enable I2C4 SLAVE mode"
-                    select RT_USING_I2C_SLAVE_EEPROM
-                    default n
-                endif
+            if RT_USING_I2C4
+                choice I2C4_MODE_CHOICE
+                    bool "I2C4 mode"
+                    default I2C4_MODE_MASTER
+                    config I2C4_MODE_MASTER
+                        bool "Master"
+                    config I2C4_MODE_SLAVE
+                        bool "Slave"
+                endchoice
+                config I2C4_MODE
+                    int
+                    default 0 if I2C4_MODE_MASTER
+                    default 1 if I2C4_MODE_SLAVE
+            endif
         endif
 
     config RT_USING_PDMA
