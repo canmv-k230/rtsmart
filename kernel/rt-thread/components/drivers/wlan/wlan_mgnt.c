@@ -366,7 +366,10 @@ static rt_err_t rt_wlan_scan_result_cache(struct rt_wlan_info *info, int timeout
         insert = scan_result.num;
 
     if (scan_result.num >= RT_WLAN_SCAN_CACHE_NUM)
+    {
+        rt_mutex_release(&scan_result_mutex);
         return RT_EOK;
+    }
 
     /* malloc memory */
     ptable = rt_malloc(sizeof(struct rt_wlan_info) * (scan_result.num + 1));
@@ -504,11 +507,13 @@ static void rt_wlan_auto_connect_run(struct rt_work *work, void *parameter)
     struct rt_wlan_cfg_info cfg_info;
     char *password = RT_NULL;
     rt_base_t level;
+    rt_bool_t mgnt_locked = RT_FALSE;
 
     RT_WLAN_LOG_D("F:%s is run", __FUNCTION__);
 
     if (rt_mutex_take(&mgnt_mutex, 0) != RT_EOK)
         goto exit;
+    mgnt_locked = RT_TRUE;
 
     /* auto connect status is disable or wifi is connect or connecting, exit */
     if (_is_do_connect() == RT_FALSE)
@@ -536,7 +541,10 @@ static void rt_wlan_auto_connect_run(struct rt_work *work, void *parameter)
     }
     rt_wlan_connect((char *)cfg_info.info.ssid.val, password);
 exit:
-    rt_mutex_release(&mgnt_mutex);
+    if (mgnt_locked)
+    {
+        rt_mutex_release(&mgnt_mutex);
+    }
     level = rt_hw_interrupt_disable();
     rt_memset(work, 0, sizeof(struct rt_work));
     rt_hw_interrupt_enable(level);
@@ -752,7 +760,6 @@ static struct rt_wlan_complete_des *rt_wlan_complete_create(const char *name)
     if (complete == RT_NULL)
     {
         RT_WLAN_LOG_E("complete event create failed");
-        MGNT_UNLOCK();
         return complete;
     }
     rt_event_init(&complete->complete, name, RT_IPC_FLAG_FIFO);
