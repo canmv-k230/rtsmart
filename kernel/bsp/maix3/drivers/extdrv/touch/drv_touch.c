@@ -526,6 +526,10 @@ static const drv_touch_probe touch_probes[] = {
     drv_touch_probe_st7102,
 #endif // TOUCH_TYPE_ST7102
 
+#if defined TOUCH_TYPE_CST78XX
+    drv_touch_probe_cst_78xx,
+#endif // TOUCH_TYPE_ST7102
+
     NULL
 };
 
