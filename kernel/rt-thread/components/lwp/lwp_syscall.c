@@ -4746,6 +4746,15 @@ const void *lwp_get_sys_api(rt_uint32_t number)
         }
     }
 
+    if (func == (const void *)sys_notimpl) {
+        /* workaround for __unmapself */
+        if (215 == (number + 1)) {
+            func = (void *)sys_munmap;
+        } else if (93 == (number + 1)) {
+            func = (void *)sys_exit;
+        }
+    }
+
     return func;
 }
 
