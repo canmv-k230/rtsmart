@@ -536,6 +536,7 @@ static rt_err_t _net_mgmt_dev_cmd_net_ifconfig(void* mgmt_dev, void* args)
 
     lwp_get_from_user(&ifconfig, args, sizeof(struct ifconfig));
 
+#ifdef CONFIG_ENABLE_NETWORK_RT_WLAN
     if (RT_NET_DEV_WLAN_STA == ifconfig.net_if) { /* wlan station */
         wlan_dev = (struct rt_wlan_device*)rt_device_find(RT_WLAN_DEVICE_STA_NAME);
         if (NULL == wlan_dev) {
@@ -550,9 +551,11 @@ static rt_err_t _net_mgmt_dev_cmd_net_ifconfig(void* mgmt_dev, void* args)
             return -RT_ERROR;
         }
         netdev = wlan_dev->netdev;
-    }
+    } else
+#endif
+
 #if defined(CONFIG_ENABLE_NETWORK_RT_LAN_OVER_USB)
-    else if (RT_NET_DEV_USB_RTL8152 == ifconfig.net_if) { /* eth usb */
+    if (RT_NET_DEV_USB_RTL8152 == ifconfig.net_if) { /* eth usb */
         /* eth rtl8152 device and netdev name is same */
         netdev = netdev_get_by_name(CANMV_USB_HOST_NET_RTL8152_DEV_NAME);
         if (NULL == netdev) {
@@ -566,9 +569,9 @@ static rt_err_t _net_mgmt_dev_cmd_net_ifconfig(void* mgmt_dev, void* args)
             LOG_E("Can't find netif %s\n", CANMV_USB_HOST_NET_LTE_DEV_NAME);
             return -RT_ERROR;
         }
-    }
+    } else
 #endif
-    else {
+    if (1) {
         LOG_E("Unsupport netif %d\n", ifconfig.net_if);
         return -RT_ERROR;
     }
@@ -750,18 +753,24 @@ static rt_err_t _net_mgmt_cmd_get_isactive(void* mgmt_dev, void* args)
 
     lwp_get_from_user(&itf, args, sizeof(itf));
 
+#ifdef CONFIG_ENABLE_NETWORK_RT_WLAN
     if (RT_NET_DEV_WLAN_STA == itf) { /* wlan station */
         net_dev = rt_device_find(RT_WLAN_DEVICE_STA_NAME);
     } else if (RT_NET_DEV_WLAN_AP == itf) { /* wlan ap */
         net_dev = rt_device_find(RT_WLAN_DEVICE_AP_NAME);
-    }
+    } else
+#endif
 #ifdef CONFIG_ENABLE_NETWORK_RT_LAN_OVER_USB
-    else if (RT_NET_DEV_USB_RTL8152 == itf) { /* eth usb */
+    if (RT_NET_DEV_USB_RTL8152 == itf) { /* eth usb */
         net_dev = rt_device_find(CANMV_USB_HOST_NET_RTL8152_DEV_NAME);
     } else if (RT_NET_DEV_USB_ECM == itf) { /* eth usb */
         net_dev = rt_device_find(CANMV_USB_HOST_NET_LTE_DEV_NAME);
-    }
+    } else
 #endif
+    if (1) {
+        LOG_E("Unsupport netif %d\n", itf);
+        return -RT_ERROR;
+    }
 
     isactive = (NULL == net_dev) ? 0 : 1;
     lwp_put_to_user(args, &isactive, sizeof(isactive));
