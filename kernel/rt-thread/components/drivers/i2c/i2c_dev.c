@@ -12,6 +12,10 @@
 
 #include <rtdevice.h>
 
+#ifdef RT_USING_USERSPACE
+#include <lwp_user_mm.h>
+#endif
+
 #define DBG_TAG               "I2C"
 #ifdef RT_I2C_DEBUG
 #define DBG_LVL               DBG_LOG
@@ -82,18 +86,173 @@ static rt_err_t i2c_bus_device_control(rt_device_t dev,
         bus->flags |= RT_I2C_ADDR_10BIT;
         break;
     case RT_I2C_DEV_CTRL_TIMEOUT:
+#ifdef RT_USING_USERSPACE
+        if (args == RT_NULL)
+        {
+            return -RT_EINVAL;
+        }
+        if (LWP_GET_FROM_USER(&bus->timeout, args, rt_uint32_t) != 0)
+        {
+            return -RT_EINVAL;
+        }
+#else
         bus->timeout = *(rt_uint32_t *)args;
+#endif
         break;
     case RT_I2C_DEV_CTRL_RW:
+    {
+#ifdef RT_USING_USERSPACE
+        struct rt_i2c_priv_data user_priv;
+        struct rt_i2c_msg *kmsgs = RT_NULL;
+        rt_uint8_t **user_bufs = RT_NULL;
+        rt_size_t i;
+
+        if (args == RT_NULL)
+        {
+            return -RT_EINVAL;
+        }
+
+        /* copy rt_i2c_priv_data from user/kernel space */
+        if (LWP_GET_FROM_USER(&user_priv, args, struct rt_i2c_priv_data) != 0)
+        {
+            return -RT_EINVAL;
+        }
+
+        if (user_priv.msgs == RT_NULL || user_priv.number == 0)
+        {
+            return -RT_EINVAL;
+        }
+
+        /* allocate kernel-side message array */
+        kmsgs = (struct rt_i2c_msg *)rt_calloc(user_priv.number, sizeof(struct rt_i2c_msg));
+        if (kmsgs == RT_NULL)
+        {
+            return -RT_ENOMEM;
+        }
+
+        /* keep original user buffers so we can copy data back */
+        user_bufs = (rt_uint8_t **)rt_calloc(user_priv.number, sizeof(rt_uint8_t *));
+        if (user_bufs == RT_NULL)
+        {
+            rt_free(kmsgs);
+            return -RT_ENOMEM;
+        }
+
+        /* copy each rt_i2c_msg from user to kernel */
+        for (i = 0; i < user_priv.number; i++)
+        {
+            if (LWP_GET_FROM_USER(&kmsgs[i],
+                                  &user_priv.msgs[i],
+                                  struct rt_i2c_msg) != 0)
+            {
+                ret = -RT_EINVAL;
+                goto __i2c_rw_cleanup;
+            }
+
+            user_bufs[i] = kmsgs[i].buf;
+            if (kmsgs[i].len == 0)
+            {
+                kmsgs[i].buf = RT_NULL;
+                continue;
+            }
+
+            if (kmsgs[i].buf == RT_NULL)
+            {
+                ret = -RT_EINVAL;
+                goto __i2c_rw_cleanup;
+            }
+
+            kmsgs[i].buf = (rt_uint8_t *)rt_malloc(kmsgs[i].len);
+            if (kmsgs[i].buf == RT_NULL)
+            {
+                ret = -RT_ENOMEM;
+                goto __i2c_rw_cleanup;
+            }
+
+            /* for write messages, copy data from user buffer */
+            if (!(kmsgs[i].flags & RT_I2C_RD))
+            {
+                if (lwp_get_from_user(kmsgs[i].buf,
+                                      user_bufs[i],
+                                      kmsgs[i].len) != kmsgs[i].len)
+                {
+                    ret = -RT_EINVAL;
+                    goto __i2c_rw_cleanup;
+                }
+            }
+        }
+
+        /* perform transfer using kernel buffers */
+        ret = rt_i2c_transfer(bus, kmsgs, user_priv.number);
+        if (ret < 0)
+        {
+            ret = -RT_EIO;
+            goto __i2c_rw_cleanup;
+        }
+
+        /* copy read data back to user buffers */
+        for (i = 0; i < user_priv.number; i++)
+        {
+            if ((kmsgs[i].flags & RT_I2C_RD) &&
+                (kmsgs[i].len > 0) &&
+                (user_bufs[i] != RT_NULL))
+            {
+                if (lwp_put_to_user(user_bufs[i],
+                                    kmsgs[i].buf,
+                                    kmsgs[i].len) != kmsgs[i].len)
+                {
+                    ret = -RT_EINVAL;
+                    goto __i2c_rw_cleanup;
+                }
+            }
+        }
+
+        ret = RT_EOK;
+
+__i2c_rw_cleanup:
+        if (kmsgs != RT_NULL)
+        {
+            for (i = 0; i < user_priv.number; i++)
+            {
+                if (kmsgs[i].buf != RT_NULL && kmsgs[i].len > 0)
+                {
+                    rt_free(kmsgs[i].buf);
+                }
+            }
+            rt_free(kmsgs);
+        }
+        if (user_bufs != RT_NULL)
+        {
+            rt_free(user_bufs);
+        }
+
+        if (ret < 0)
+        {
+            return ret;
+        }
+#else
         priv_data = (struct rt_i2c_priv_data *)args;
         ret = rt_i2c_transfer(bus, priv_data->msgs, priv_data->number);
         if (ret < 0)
         {
             return -RT_EIO;
         }
+#endif
         break;
+    }
     case RT_I2C_DEV_CTRL_CLK:
+        if (args == RT_NULL)
+        {
+            return -RT_EINVAL;
+        }
+#ifdef RT_USING_USERSPACE
+        if (LWP_GET_FROM_USER(&bus_clock, args, rt_uint32_t) != 0)
+        {
+            return -RT_EINVAL;
+        }
+#else
         bus_clock = *(rt_uint32_t *)args;
+#endif
         ret = rt_i2c_control(bus, cmd, bus_clock);
         if (ret < 0)
         {

@@ -72,6 +72,17 @@ menuconfig RT_USING_TOUCH
             bool "Enable Touch ST7102 (LCD + Touch)"
             default n
 
+        menuconfig TOUCH_TYPE_CST78XX
+            bool "Enable Touch CST_7_8XX"
+            default n
+
+            if TOUCH_TYPE_CST78XX
+                config TOUCH_CST78XX_DFT_RANGE_X
+                    int "CST_7_8XX Default Range X"
+                config TOUCH_CST78XX_DFT_RANGE_Y
+                    int "CST_7_8XX Default Range Y"
+            endif
+
         comment "Touch Default Device"
 
         menuconfig TOUCH_DEFAULT_DEVICE

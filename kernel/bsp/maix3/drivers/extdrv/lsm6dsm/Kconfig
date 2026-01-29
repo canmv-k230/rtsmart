@@ -1,0 +1,47 @@
+menuconfig RT_USING_LSM6DSM
+    bool "Enable LSM6DSM"
+    default n
+    
+    if RT_USING_LSM6DSM
+    choice
+        bool "LSM6DSM Device I2C Bus"
+        default LSM6DSM_DEV_I2C_BUS_1
+
+        config LSM6DSM_DEV_I2C_BUS_0
+            bool "I2C 0"
+        config LSM6DSM_DEV_I2C_BUS_1
+            bool "I2C 1"
+        config LSM6DSM_DEV_I2C_BUS_2
+            bool "I2C 2"
+        config LSM6DSM_DEV_I2C_BUS_3
+            bool "I2C 3"
+        config LSM6DSM_DEV_I2C_BUS_4
+            bool "I2C 4"
+    endchoice
+    config LSM6DSM_DEV_I2C_BUS
+        int
+        default 0 if LSM6DSM_DEV_I2C_BUS_0
+        default 1 if LSM6DSM_DEV_I2C_BUS_1
+        default 2 if LSM6DSM_DEV_I2C_BUS_2
+        default 3 if LSM6DSM_DEV_I2C_BUS_3
+        default 4 if LSM6DSM_DEV_I2C_BUS_4
+    config CONFIG_PKG_LSM6DSM_I2C_ADDR
+        hex "LSM6DSM I2C Address"
+        default 0x6a
+        range 0x00 0x7f
+        help
+            Input the I2C slave address of LSM6DSM. 
+            Common values: 0x6a or 0x6b.
+    config PKG_LSM6DSM_USING_ACCE
+            bool "Enable USING ACCE"
+            default y
+    config PKG_LSM6DSM_USING_GYRO
+            bool "Enable USING GYRO"
+            default y
+    config PKG_LSM6DSM_USING_STEP
+            bool "Enable USING STEP"
+            default n
+    config PKG_LSM6DSM_USING_TEMP
+        bool "Enable USING TEMP"
+        default n
+endif

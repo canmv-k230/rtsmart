@@ -8,4 +8,5 @@ menu "Ext Driver"
     source "drivers/extdrv/ws2812/Kconfig"
     source "drivers/extdrv/onewire/Kconfig"
     source "drivers/extdrv/rw007/Kconfig"
+    source "drivers/extdrv/lsm6dsm/Kconfig"
 endmenu

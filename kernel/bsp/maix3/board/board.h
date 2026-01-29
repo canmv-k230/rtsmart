@@ -30,6 +30,24 @@ extern rt_size_t get_mem_mmz_size(void);
     #define CONFIG_MEM_MMZ_SIZE             get_mem_mmz_size()
 #endif
 
+#ifdef CONFIG_MEM_MMZ_BASE
+#undef MEM_MMZ_BASE
+#define MEM_MMZ_BASE CONFIG_MEM_MMZ_BASE
+#endif
+
+#ifdef CONFIG_MEM_MMZ_SIZE
+#undef MEM_MMZ_SIZE
+#define MEM_MMZ_SIZE (CONFIG_MEM_MMZ_SIZE - 4096)
+#endif
+
+#ifndef MEM_MMZ_BASE
+#define MEM_MMZ_BASE 0x10000000UL
+#endif
+
+#ifndef MEM_MMZ_SIZE
+#define MEM_MMZ_SIZE 0xffff000UL
+#endif
+
 void rt_hw_board_init(void);
 void rt_init_user_mem(struct rt_thread *thread, const char *name, unsigned long *entry);
 
