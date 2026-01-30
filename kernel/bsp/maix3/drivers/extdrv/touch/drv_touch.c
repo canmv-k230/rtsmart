@@ -475,14 +475,23 @@ static rt_err_t drv_touch_control(struct rt_touch_device* touch, int cmd, void* 
 
         return RT_EOK;
     } break;
+    case RT_TOUCH_CTRL_ENABLE_INT: {
+        if (!dev) {
+            return RT_EINVAL;
+        }
+
+        if (0x00 == dev->pin.fake_intr) {
+            kd_pin_irq_enable(dev->pin.intr, KD_GPIO_IRQ_ENABLE);
+        }
+
+        return RT_EOK;
+    } break;
     case RT_TOUCH_CTRL_DISABLE_INT: {
         if (!dev) {
             return RT_EINVAL;
         }
 
         if (0x00 == dev->pin.fake_intr) {
-            dev->pin.fake_intr = 1;
-
             kd_pin_detach_irq(dev->pin.intr);
         }
 
