@@ -25,11 +25,13 @@
 
 #include "drv_touch.h"
 #include "drv_gpio.h"
+
 #include "rtconfig.h"
 #include "rtdef.h"
 #include "rthw.h"
 #include "rtservice.h"
 #include "rtthread.h"
+#include "tick.h"
 
 #include <ioremap.h>
 #include <lwp_user_mm.h>
@@ -343,12 +345,11 @@ static void touch_read_thread(void* args)
 static rt_size_t drv_touch_read(struct rt_touch_device* touch, void* buf, rt_size_t len)
 {
     static rt_size_t last_finger_num = 0;
-    const rt_tick_t  one_sec_tick    = rt_tick_from_millisecond(1000);
 
+    struct touch_register reg = {};
     struct drv_touch_dev* dev = touch->config.user_data;
 
-    rt_tick_t             time;
-    struct touch_register reg;
+    rt_bool_t have_new_data = RT_FALSE;
 
     // make a fake interrupt
     if (dev->pin.fake_intr) {
@@ -357,18 +358,14 @@ static rt_size_t drv_touch_read(struct rt_touch_device* touch, void* buf, rt_siz
         rt_thread_mdelay(1);
     }
 
-    while (1) {
-        if (RT_EOK != rt_mq_recv(&dev->thr.read_mq, &reg, sizeof(reg), rt_tick_from_millisecond(3))) {
-            // No touch data, but we might need to generate an UP event
-            if (last_finger_num > 0) {
-                break;
-            }
+    if (RT_EOK == rt_mq_recv(&dev->thr.read_mq, &reg, sizeof(reg), rt_tick_from_millisecond(33))) {
+        have_new_data = RT_TRUE;
+    } else {
+        if (last_finger_num <= 0) {
             return 0;
         }
-        time = rt_tick_get() - reg.time;
-        if (one_sec_tick > time) {
-            break;
-        }
+
+        last_finger_num = 0;
     }
 
     rt_size_t             result, req_finger_num = len / sizeof(struct rt_touch_data);
@@ -376,7 +373,9 @@ static rt_size_t drv_touch_read(struct rt_touch_device* touch, void* buf, rt_siz
 
     result = drv_touch_parse(dev, &reg, req_point, &req_finger_num);
 
-    last_finger_num = result / sizeof(struct rt_touch_data);
+    if (have_new_data) {
+        last_finger_num = result / sizeof(struct rt_touch_data);
+    }
 
     return result;
 }

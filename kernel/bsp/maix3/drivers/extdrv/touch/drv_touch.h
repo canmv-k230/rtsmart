@@ -37,7 +37,7 @@
 
 #define TOUCH_MAX_POINT_NUMBER  10
 #define TOUCH_READ_REG_MAX_SIZE 128
-#define TOUCH_READ_MQ_MSG_COUNT 3
+#define TOUCH_READ_MQ_MSG_COUNT 16
 
 struct touch_register {
     rt_tick_t time;
