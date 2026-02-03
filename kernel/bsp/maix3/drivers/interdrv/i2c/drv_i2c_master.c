@@ -767,7 +767,7 @@ static rt_err_t k230_i2c_do_xfer(struct dw_i2c_master *master)
     if (ret != RT_EOK) {
         k230_i2c_ctrl_enable(master, RT_FALSE);
         if (ret == -RT_ETIMEOUT) {
-            LOG_E("i2c: xfer timeout, tar=0x%02X", val);
+            LOG_E("i2c: xfer timeout, tar=0x%02X, bus %s, maybe dts is incorrect.", val, master->name);
             (void)k230_i2c_recover_bus(master);
         } else {
             LOG_E("i2c: xfer error %d", ret);
