@@ -1046,7 +1046,11 @@ int wifi_disable_multicast_address_filter(void)
 _WEAK void wifi_set_mib(void)
 {
 	// adaptivity
+#ifdef REALTEK_ENABLE_ADAPTIVITY
+    wext_set_adaptivity(RTW_ADAPTIVITY_NORMAL);
+#else
 	wext_set_adaptivity(RTW_ADAPTIVITY_DISABLE);
+#endif
 }
 
 //----------------------------------------------------------------------------//

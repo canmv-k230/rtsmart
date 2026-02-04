@@ -43,4 +43,7 @@ menuconfig RT_USING_REALTEK
             bool "RealTek Enable Debug"
             default n
 
+        config REALTEK_ENABLE_ADAPTIVITY
+            bool "RealTek Enable Adaptivity"
+            default n
     endif
