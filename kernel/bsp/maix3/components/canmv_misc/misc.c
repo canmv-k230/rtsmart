@@ -14,6 +14,8 @@
 #include "tick.h"
 #include "ioremap.h"
 
+#include "sdk_version.h"
+
 #ifdef RT_USING_LWP
 #include <lwp.h>
 #include <mmu.h>
@@ -154,6 +156,7 @@ static int misc_close(struct dfs_fd *file) { return 0; }
 #define MISC_DEV_CMD_REGISTER_TOUCH_DEVICE    _IOWR('M', 0x10, void *)
 #define MISC_DEV_CMD_UNREGISTER_TOUCH_DEVICE  _IOWR('M', 0x11, void *)
 #define MISC_DEV_CMD_GET_MMZ_ZONE_INFO        _IOWR('M', 0x12, void *)
+#define MISC_DEV_CMD_GET_KERNEL_BUILD_INFO    _IOWR('M', 0x13, void *)
 
 struct meminfo_t {
   size_t total_size;
@@ -609,6 +612,41 @@ static int misc_get_mmz_zone_info(void* args)
   return 0;
 }
 
+static int misc_get_kernel_build_info(void* args)
+{
+#define INFO_MAX_LEN (256)
+
+    struct kernel_build_info_t {
+        int  len;
+        char info[0];
+    };
+
+    struct kernel_build_info_t* info = rt_malloc(sizeof(struct kernel_build_info_t) + INFO_MAX_LEN);
+    if (!info) {
+        return -1;
+    }
+
+    info->len = sizeof(SDK_VERSION_);
+    if (INFO_MAX_LEN < info->len) {
+        info->len = INFO_MAX_LEN;
+    }
+
+    rt_memcpy(info->info, SDK_VERSION_, info->len);
+
+    if (0x00 != lwp_put_to_user_ex(args, info, info->len + sizeof(struct kernel_build_info_t))) {
+        rt_free(info);
+
+        rt_kprintf("%s put_to_user failed\n", __func__);
+
+        return -1;
+    }
+
+    rt_free(info);
+    return 0;
+
+#undef INFO_MAX_LEN
+}
+
 static const struct misc_dev_handle misc_handles[] = {
   {
     .cmd = MISC_DEV_CMD_READ_HEAP,
@@ -686,6 +724,10 @@ static const struct misc_dev_handle misc_handles[] = {
   {
     .cmd = MISC_DEV_CMD_GET_MMZ_ZONE_INFO,
     .func = misc_get_mmz_zone_info,
+  },
+  {
+    .cmd = MISC_DEV_CMD_GET_KERNEL_BUILD_INFO,
+    .func = misc_get_kernel_build_info,
   },
 
 };

@@ -3902,17 +3902,22 @@ lwip_fcntl(int s, int cmd, int val)
       ret |= (op_mode == (O_RDONLY | O_WRONLY)) ? O_RDWR : op_mode;
 
       break;
-    case F_SETFL:
-      /* Bits corresponding to the file access mode and the file creation flags [..] that are set in arg shall be ignored */
-      val &= ~(O_RDONLY | O_WRONLY | O_RDWR);
-      if ((val & O_NONBLOCK) == O_NONBLOCK) {
-        /* only O_NONBLOCK, all other bits are zero */
+    case F_SETFL: {
+        int flags = 0;
+
+        flags = val;
+        /* Bits corresponding to the file access mode and the file creation flags [..] that are set in arg shall be ignored */
+        flags &= ~(O_RDONLY | O_WRONLY | O_RDWR);
         netconn_set_nonblocking(sock->conn, val & O_NONBLOCK);
+        flags &= ~O_NONBLOCK;
+
+        if (flags != 0) {
+            rt_kprintf("lwip_fcntl(%d, F_SETFL, 0x%x): unsupported flags 0x%x\n", s, val, flags);
+        }
+
         ret = 0;
         sock_set_errno(sock, 0);
-      } else {
-        sock_set_errno(sock, ENOSYS); /* not yet implemented */
-      }
+    }
       break;
     default:
       LWIP_DEBUGF(SOCKETS_DEBUG, ("lwip_fcntl(%d, UNIMPL: %d, %d)\n", s, cmd, val));
