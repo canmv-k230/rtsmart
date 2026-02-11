@@ -99,6 +99,9 @@ if GetDepend(['ENABLE_CHERRY_USB_HOST']):
     if GetDepend(['CHERRY_USB_HOST_ENABLE_CLASS_CDC_ECM']):
         src += Glob('class/cdc/usbh_cdc_ecm.c')
 
+    if GetDepend(['CHERRY_USB_HOST_ENABLE_CLASS_CDC_NCM']):
+        src += Glob('class/cdc/usbh_cdc_ncm.c')
+
 if GetDepend(['CHERRYUSB_HOST_DWC2_K230']) or GetDepend(['CHERRYUSB_DEVICE_DWC2_K230']):
     src += Glob('port/dwc2/usb_glue_kendryte.c')
 

@@ -399,6 +399,7 @@ int usbh_enumerate(struct usbh_hubport *hport)
     uint8_t config_value;
     uint8_t config_index;
     int ret;
+    uint16_t idVendor, idProduct;
 
     hport->setup = &g_setup_buffer[hport->bus->busid][hport->parent->index - 1][hport->port - 1];
     setup = hport->setup;
@@ -509,15 +510,22 @@ int usbh_enumerate(struct usbh_hubport *hport)
     }
 
     parse_device_descriptor(hport, (struct usb_device_descriptor *)ep0_request_buffer[hport->bus->busid], USB_SIZEOF_DEVICE_DESC);
-    USB_LOG_INFO("New device found,idVendor:%04x,idProduct:%04x,bcdDevice:%04x, dev_addr = %d\r\n",
-                 ((struct usb_device_descriptor *)ep0_request_buffer[hport->bus->busid])->idVendor,
-                 ((struct usb_device_descriptor *)ep0_request_buffer[hport->bus->busid])->idProduct,
+
+    idVendor = ((struct usb_device_descriptor *)ep0_request_buffer[hport->bus->busid])->idVendor;
+    idProduct = ((struct usb_device_descriptor *)ep0_request_buffer[hport->bus->busid])->idProduct;
+
+    USB_LOG_INFO("New device found,idVendor:%04x,idProduct:%04x,bcdDevice:%04x, dev_addr = %d\r\n", idVendor, idProduct,
                  ((struct usb_device_descriptor *)ep0_request_buffer[hport->bus->busid])->bcdDevice,
                  dev_addr);
 
     USB_LOG_INFO("The device has %d bNumConfigurations\r\n", ((struct usb_device_descriptor *)ep0_request_buffer[hport->bus->busid])->bNumConfigurations);
 
     config_index = 0;
+    if((0x1A86 == idVendor) && (0x5397 == idProduct)) {
+        // for ch397
+        config_index = 3;
+    }
+
     USB_LOG_INFO("The device selects config %d\r\n", config_index);
 
     /* Read the first 9 bytes of the config descriptor */
