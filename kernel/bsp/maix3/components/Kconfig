@@ -172,15 +172,17 @@ menu "Components Configuration"
                                     default n
                             endif
 
-                            menuconfig CHERRY_USB_HOST_ENABLE_CLASS_NET_RTL8152
-                                bool "Enable net RTL8152"
+                            config CHERRY_USB_HOST_ENABLE_CLASS_CDC_ACM
+                                bool "Enable cdc ACM"
                                 default n
 
-                                if CHERRY_USB_HOST_ENABLE_CLASS_NET_RTL8152
-                                    config CHERRY_USB_RTL8152_LINKCHECK
-                                        bool "Enable Link Down Check"
-                                        default n
-                                endif
+                            config CHERRY_USB_HOST_ENABLE_CLASS_CDC_ECM
+                                bool "Enable cdc ECM"
+                                default n
+
+                            config CHERRY_USB_HOST_ENABLE_CLASS_CDC_NCM
+                                bool "Enable cdc NCM"
+                                default n
 
                             menuconfig CHERRY_USB_HOST_ENABLE_CLASS_SERIAL
                                 bool "Enable SERIAL"
@@ -194,17 +196,33 @@ menu "Components Configuration"
 
                                 endif
 
-                            config CHERRY_USB_HOST_ENABLE_CLASS_CDC_ACM
-                                bool "Enable cdc ACM"
+                            menuconfig CHERRY_USB_HOST_ENABLE_CLASS_NET_RTL8152
+                                bool "Enable net RTL8152"
                                 default n
 
-                            config CHERRY_USB_HOST_ENABLE_CLASS_CDC_ECM
-                                bool "Enable cdc ECM"
-                                default n
+                                if CHERRY_USB_HOST_ENABLE_CLASS_NET_RTL8152
+                                    config CHERRY_USB_RTL8152_LINKCHECK
+                                        bool "Enable Link Down Check"
+                                        default n
+                                endif
 
-                            config CHERRY_USB_HOST_ENABLE_CLASS_CDC_NCM
-                                bool "Enable cdc NCM"
-                                default n
+                            choice
+                                bool "CH397 Mode"
+                                depends on CHERRY_USB_HOST_ENABLE_CLASS_CDC_ECM || CHERRY_USB_HOST_ENABLE_CLASS_CDC_NCM
+
+                                config CHERRY_USB_HOST_CH397_MODE_ECM
+                                    depends on CHERRY_USB_HOST_ENABLE_CLASS_CDC_ECM
+                                    bool "ECM"
+
+                                config CHERRY_USB_HOST_CH397_MODE_NCM
+                                    depends on CHERRY_USB_HOST_ENABLE_CLASS_CDC_NCM
+                                    bool "NCM"
+                            endchoice
+
+                            config CHERRY_USB_HOST_CH397_MODE
+                                int
+                                default 1 if CHERRY_USB_HOST_CH397_MODE_ECM
+                                default 2 if CHERRY_USB_HOST_CH397_MODE_NCM
 
                         endif
 

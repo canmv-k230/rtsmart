@@ -522,8 +522,8 @@ int usbh_enumerate(struct usbh_hubport *hport)
 
     config_index = 0;
     if((0x1A86 == idVendor) && (0x5397 == idProduct)) {
-        // for ch397
-        config_index = 3;
+        // for ch397, 0: vendor; 1: ecm; 2: ncm
+        config_index = CHERRY_USB_HOST_CH397_MODE;
     }
 
     USB_LOG_INFO("The device selects config %d\r\n", config_index);
