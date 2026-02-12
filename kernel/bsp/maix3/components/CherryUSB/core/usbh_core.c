@@ -27,6 +27,10 @@ struct usbh_bus g_usbhost_bus[CONFIG_USBHOST_MAX_BUS];
 #define USB_DEV_ADDR_MARK_OFFSET 5
 #define USB_DEV_ADDR_MARK_MASK   0x1f
 
+#ifndef CHERRY_USB_HOST_CH397_MODE
+#define CHERRY_USB_HOST_CH397_MODE 1
+#endif
+
 static int usbh_allocate_devaddr(struct usbh_devaddr_map *devgen)
 {
     uint8_t startaddr = devgen->next;
