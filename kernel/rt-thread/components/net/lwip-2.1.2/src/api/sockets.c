@@ -3911,9 +3911,9 @@ lwip_fcntl(int s, int cmd, int val)
         netconn_set_nonblocking(sock->conn, val & O_NONBLOCK);
         flags &= ~O_NONBLOCK;
 
-        if (flags != 0) {
-            rt_kprintf("lwip_fcntl(%d, F_SETFL, 0x%x): unsupported flags 0x%x\n", s, val, flags);
-        }
+        // if (flags != 0) {
+        //     rt_kprintf("lwip_fcntl(%d, F_SETFL, 0x%x): unsupported flags 0x%x\n", s, val, flags);
+        // }
 
         ret = 0;
         sock_set_errno(sock, 0);
