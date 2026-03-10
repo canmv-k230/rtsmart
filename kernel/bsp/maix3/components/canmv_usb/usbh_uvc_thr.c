@@ -34,8 +34,10 @@ struct uvc_buffer {
     bool driver_use;
     /* for vb version */
     uint32_t handle;
+    uint64_t blk_phys_addr;
     uint64_t phys_addr;
     uint32_t pool_id;
+    void *blk_virt_addr;
     void *virt_addr;
 };
 
@@ -52,6 +54,8 @@ struct uvc_queue {
     char *urb_buffer[UVC_URBS];
     uint64_t urb_dma[UVC_URBS];
     rt_bool_t disconnect;
+    rt_bool_t streaming;
+    rt_bool_t opened;
 };
 
 /* Values for bmHeaderInfo (Video and Still Image Payload Headers, 2.4.3.3) */
@@ -97,8 +101,120 @@ static int usb_control_msg(struct usbh_hubport *hport, uint8_t request, uint8_t 
 #define min_t(type, a, b) min(((type) a), ((type) b))
 #define max_t(type, a, b) max(((type) a), ((type) b))
 
+static uint32_t uvc_get_current_frame_size(const struct usbh_video *video)
+{
+    switch (video->current_fourcc) {
+    case USBH_VIDEO_FOURCC_YUY2:
+    case USBH_VIDEO_FOURCC_UYVY:
+        return video->current_frame.wHeight * video->current_frame.wWidth * 2;
+    case USBH_VIDEO_FOURCC_NV12:
+    case USBH_VIDEO_FOURCC_I420:
+        return (video->current_frame.wHeight * video->current_frame.wWidth * 3) / 2;
+    default:
+        return video->current_frame.dwMaxVideoFrameBufferSize;
+    }
+}
+
+static const char *uvc_fourcc_to_name(uint32_t fourcc)
+{
+    switch (fourcc) {
+    case USBH_VIDEO_FOURCC_YUY2:
+        return "YUV 4:2:2 (YUY2)";
+    case USBH_VIDEO_FOURCC_UYVY:
+        return "YUV 4:2:2 (UYVY)";
+    case USBH_VIDEO_FOURCC_NV12:
+        return "YUV 4:2:0 (NV12)";
+    case USBH_VIDEO_FOURCC_I420:
+        return "YUV 4:2:0 (I420)";
+    case USBH_VIDEO_FOURCC_MJPEG:
+        return "MJPEG";
+    default:
+        return "UNKNOWN";
+    }
+}
+
+static void uvc_release_buffers(void)
+{
+#if VB_VERSION
+    for (int i = 0; i < MAX_UVC_BUFFER + 1; i++) {
+        if (uvc_queue.buffer[i].handle != VB_INVALID_HANDLE) {
+            int ret = vb_user_sub(uvc_queue.buffer[i].pool_id,
+                                  uvc_queue.buffer[i].blk_phys_addr,
+                                  VB_UID_V_VI);
+            if (ret != K_SUCCESS) {
+                USB_LOG_ERR("put blk[%d] fail\n", i);
+            }
+            uvc_queue.buffer[i].handle = VB_INVALID_HANDLE;
+        }
+    }
+
+    if (uvc_queue.buffer[0].pool_id != VB_INVALID_POOLID) {
+        if (vb_destroy_pool(uvc_queue.buffer[0].pool_id) != 0) {
+            USB_LOG_ERR("fail to destroyed pool %d: %s %d\n",
+                        uvc_queue.buffer[0].pool_id, __func__, __LINE__);
+        }
+    }
+#else
+    if (uvc_queue.mem != RT_NULL) {
+        rt_free_align(uvc_queue.mem);
+    }
+#endif
+
+    for (int i = 0; i < MAX_UVC_BUFFER + 1; i++) {
+        uvc_queue.buffer[i].pool_id = VB_INVALID_POOLID;
+        uvc_queue.buffer[i].buf.userptr = RT_NULL;
+        uvc_queue.buffer[i].buf.bytesused = 0;
+        uvc_queue.buffer[i].buf.length = 0;
+        uvc_queue.buffer[i].buf.offset = 0;
+        uvc_queue.buffer[i].driver_use = false;
+        uvc_queue.buffer[i].phys_addr = 0;
+        uvc_queue.buffer[i].virt_addr = RT_NULL;
+        uvc_queue.buffer[i].blk_phys_addr = 0;
+        uvc_queue.buffer[i].blk_virt_addr = RT_NULL;
+        uvc_queue.buffer[i].state = VIDEOBUF_IDLE;
+    }
+
+    uvc_queue.mem = RT_NULL;
+    uvc_queue.count = 0;
+    uvc_queue.buffer_size = 0;
+    rt_list_init(&uvc_queue.app_queue);
+    rt_list_init(&uvc_queue.irq_queue);
+}
+
+static struct usbh_video_format *uvc_find_format(struct usbh_video *video,
+                                                 uint32_t fourcc)
+{
+    for (int i = 0; i < video->num_of_formats; i++) {
+        if ((fourcc == 0) || (video->format[i].fourcc == fourcc)) {
+            return &video->format[i];
+        }
+    }
+
+    return RT_NULL;
+}
+
+static k_pixel_format uvc_fourcc_to_kpixel(uint32_t fourcc)
+{
+    switch (fourcc) {
+    case USBH_VIDEO_FOURCC_YUY2:
+        return PIXEL_FORMAT_YUYV_PACKAGE_422;
+    case USBH_VIDEO_FOURCC_UYVY:
+        return PIXEL_FORMAT_UYVY_PACKAGE_422;
+    case USBH_VIDEO_FOURCC_NV12:
+        return PIXEL_FORMAT_YUV_SEMIPLANAR_420;
+    case USBH_VIDEO_FOURCC_I420:
+        return PIXEL_FORMAT_YVU_PLANAR_420;
+    default:
+        return PIXEL_FORMAT_BUTT;
+    }
+}
+
 static struct uvc_buffer *get_uvc_buf()
 {
+    if (uvc_queue.count <= 0) {
+        return RT_NULL;
+    }
+
     struct uvc_buffer *_uvc_buf = &uvc_queue.buffer[uvc_queue.count];
     struct uvc_buffer *uvc_buf = _uvc_buf;
 
@@ -111,9 +227,11 @@ static struct uvc_buffer *get_uvc_buf()
 
     if (!rt_list_isempty(&uvc_queue.irq_queue)) {
         uvc_buf = rt_list_first_entry(&uvc_queue.irq_queue, struct uvc_buffer, irq);
+#if VB_VERSION
         if (vb_inquire_user_cnt(uvc_buf->handle) != 1) {
             uvc_buf = _uvc_buf;
         }
+#endif
     }
 #if 0
     else {
@@ -136,6 +254,8 @@ out:
 
 static void uvc_decode_iso(struct usbh_urb *urb, struct uvc_buffer *uvc_buf, struct usbh_video *video)
 {
+    static uint32_t drop_err_cnt = 0;
+    static uint32_t drop_last_ms = 0;
     uint8_t *src;
     uint8_t *dst;
     int i;
@@ -163,7 +283,14 @@ static void uvc_decode_iso(struct usbh_urb *urb, struct uvc_buffer *uvc_buf, str
         }
 
         if (src[1] & UVC_STREAM_ERR) {
-            rt_kprintf("Dropping payload (error bit set) (%d, %d, %p).\n", i, urb->num_of_iso_packets, urb);
+            uint32_t now_ms = rt_tick_get_millisecond();
+
+            drop_err_cnt++;
+            if ((now_ms - drop_last_ms) >= 1000) {
+                USB_LOG_ERR("Dropping payload (error bit set): %u in last second\n", drop_err_cnt);
+                drop_last_ms = now_ms;
+                drop_err_cnt = 0;
+            }
             continue;
         }
 
@@ -188,7 +315,7 @@ static void uvc_decode_iso(struct usbh_urb *urb, struct uvc_buffer *uvc_buf, str
         if (uvc_buf->state == VIDEOBUF_DONE || uvc_buf->state == VIDEOBUF_ERROR) {
             if (!uvc_buf->driver_use) {
 
-                if ((video->current_format == USBH_VIDEO_FORMAT_MJPEG) ||
+                if ((video->current_format_type == USBH_VIDEO_FORMAT_MJPEG) ||
                     (uvc_buf->buf.bytesused == uvc_buf->buf.length)) {
                     rt_base_t level;
 #if 0
@@ -224,6 +351,8 @@ static void uvc_decode_iso(struct usbh_urb *urb, struct uvc_buffer *uvc_buf, str
 
 static void uvc_decode_bulk(struct usbh_urb *urb, struct uvc_buffer *uvc_buf, struct usbh_video *video)
 {
+    static uint32_t drop_err_cnt = 0;
+    static uint32_t drop_last_ms = 0;
     int len, ret = 0;
     uint8_t *mem;
     uint8_t *dst;
@@ -246,7 +375,14 @@ static void uvc_decode_bulk(struct usbh_urb *urb, struct uvc_buffer *uvc_buf, st
         }
 
         if (mem[1] & UVC_STREAM_ERR) {
-            USB_LOG_ERR("Dropping payload (error bit set).\n");
+            uint32_t now_ms = rt_tick_get_millisecond();
+
+            drop_err_cnt++;
+            if ((now_ms - drop_last_ms) >= 1000) {
+                USB_LOG_ERR("Dropping bulk payload (error bit set): %u in last second\n", drop_err_cnt);
+                drop_last_ms = now_ms;
+                drop_err_cnt = 0;
+            }
             ret = -RT_EIO;
             goto check;
         }
@@ -326,17 +462,27 @@ static void uvc_video_complete(void *arg, int nb)
     struct usbh_urb *urb = (struct usbh_urb *)arg;
     struct usbh_video *video_class = (struct usbh_video *)urb->context;
 
-    switch (urb->errorcode) {
-    case 0:
-        break;
-
-    default:
-        USB_LOG_DBG("Non-zero status (%d) in video "
-                    "completion handler.\n", urb->errorcode);
+    if (!video_class->is_opened) {
         return;
     }
 
+    if (urb->errorcode != 0) {
+        if (urb->errorcode == -USB_ERR_SHUTDOWN) {
+            return;
+        }
+        USB_LOG_DBG("Non-zero status (%d) in video completion handler, try resubmit.\n",
+                    urb->errorcode);
+        goto requeue;
+    }
+
+    if (uvc_queue.count <= 0 || uvc_queue.buffer_size <= 0) {
+        goto requeue;
+    }
+
     uvc_buf = get_uvc_buf();
+    if (!uvc_buf) {
+        goto requeue;
+    }
 
     if (video_class->num_of_intf_altsettings > 1) {
         uvc_decode_iso(urb, uvc_buf, video_class);
@@ -344,6 +490,7 @@ static void uvc_video_complete(void *arg, int nb)
         uvc_decode_bulk(urb, uvc_buf, video_class);
     }
 
+requeue:
     if ((ret = usbh_submit_urb(urb)) < 0) {
         USB_LOG_ERR("Failed to resubmit video URB (%d).\n", ret);
     }
@@ -438,7 +585,7 @@ out:
     return ret;
 }
 
-static void uvc_uninit_urbs(struct usbh_video *video_class)
+static void uvc_uninit_urbs(void)
 {
     int i;
 
@@ -455,11 +602,13 @@ static void uvc_uninit_urbs(struct usbh_video *video_class)
     }
 }
 
+static void usbh_video_off(struct usbh_video *video_class);
+
 static int usbh_video_on(struct usbh_video *video_class)
 {
     int ret;
 
-    ret = usbh_video_open(video_class, video_class->current_format,
+    ret = usbh_video_open(video_class, video_class->current_fourcc,
                           video_class->current_frame.wWidth,
                           video_class->current_frame.wHeight, -1);
     if (ret < 0) {
@@ -502,16 +651,19 @@ static int usbh_video_on(struct usbh_video *video_class)
     ret = uvc_init_urbs(video_class);
     if (ret) {
         USB_LOG_ERR("%s err: ret = %d\n", __func__, ret);
+        usbh_video_off(video_class);
         goto out;
     }
 
     for (int i = 0; i < UVC_URBS; ++i) {
         if ((ret = usbh_submit_urb(uvc_queue.urb[i])) < 0) {
             USB_LOG_ERR("%s: Failed to submit URB %u (%d).\n", __func__, i, ret);
-            uvc_uninit_urbs(video_class);
+            usbh_video_off(video_class);
             return ret;
         }
     }
+
+    uvc_queue.streaming = RT_TRUE;
 
 out:
     return ret;
@@ -519,22 +671,20 @@ out:
 
 static void usbh_video_off(struct usbh_video *video_class)
 {
-    if (video_class->is_opened) {
-        for (int i = 0; i < UVC_URBS; i++) {
-            if (uvc_queue.urb[i] != RT_NULL) {
-                usbh_kill_urb(uvc_queue.urb[i]);
+    rt_bool_t need_close = video_class->is_opened;
 
-                rt_free(uvc_queue.urb[i]);
-                uvc_queue.urb[i] = RT_NULL;
+    /* Mark stream as stopping first to block decode/resubmit in URB completion. */
+    video_class->is_opened = false;
+    uvc_queue.streaming = RT_FALSE;
 
-                if (uvc_queue.urb_buffer[i] != RT_NULL) {
-                    rt_free_align(uvc_queue.urb_buffer[i]);
-                    uvc_queue.urb_buffer[i] = RT_NULL;
-                }
-                //USB_LOG_ERR("kill urb_[%d]\n", i);
-            }
+    for (int i = 0; i < UVC_URBS; i++) {
+        if (uvc_queue.urb[i] != RT_NULL) {
+            usbh_kill_urb(uvc_queue.urb[i]);
         }
+    }
+    uvc_uninit_urbs();
 
+    if (need_close) {
         /* todo: check return val */
         usbh_video_close(video_class);
     }
@@ -544,10 +694,10 @@ static struct rt_mutex io_mutex;
 
 int uvc_iomutex_init(void)
 {
-    rt_mutex_init(&io_mutex, "io_mutex", RT_IPC_FLAG_PRIO);
+    return rt_mutex_init(&io_mutex, "io_mutex", RT_IPC_FLAG_PRIO);
 }
 
-static inline void io_lock()
+static inline rt_err_t io_lock(void)
 {
     rt_err_t ret;
 
@@ -559,9 +709,11 @@ static inline void io_lock()
             RT_ASSERT(0);
         }
     }
+
+    return ret;
 }
 
-static inline void io_unlock()
+static inline void io_unlock(void)
 {
     rt_mutex_release(&io_mutex);
 }
@@ -570,17 +722,52 @@ INIT_COMPONENT_EXPORT(uvc_iomutex_init);
 
 static int uvc_fops_open(struct dfs_fd *fd)
 {
+    if (io_lock() != RT_EOK) {
+        return -RT_ERROR;
+    }
+
+    if (uvc_queue.opened) {
+        io_unlock();
+        return -RT_EBUSY;
+    }
+
+    uvc_queue.opened = RT_TRUE;
+    uvc_queue.disconnect = RT_FALSE;
+    uvc_queue.streaming = RT_FALSE;
+    uvc_queue.count = 0;
+    uvc_queue.buffer_size = 0;
+    rt_list_init(&uvc_queue.app_queue);
+    rt_list_init(&uvc_queue.irq_queue);
+
     for (int i = 0; i < MAX_UVC_BUFFER + 1; i++) {
         uvc_queue.buffer[i].handle = VB_INVALID_HANDLE;
         uvc_queue.buffer[i].pool_id = VB_INVALID_POOLID;
+        uvc_queue.buffer[i].blk_phys_addr = 0;
+        uvc_queue.buffer[i].blk_virt_addr = RT_NULL;
+        uvc_queue.buffer[i].phys_addr = 0;
+        uvc_queue.buffer[i].virt_addr = RT_NULL;
         uvc_queue.buffer[i].buf.userptr = RT_NULL;
+        uvc_queue.buffer[i].buf.bytesused = 0;
+        uvc_queue.buffer[i].state = VIDEOBUF_IDLE;
+        uvc_queue.buffer[i].driver_use = false;
     }
 
+    io_unlock();
     return 0;
 }
 
 static int uvc_fops_close(struct dfs_fd *fd)
 {
+    if (io_lock() != RT_EOK) {
+        return -RT_ERROR;
+    }
+
+    rt_device_t device = (rt_device_t)fd->fnode->data;
+    struct usbh_video *video = (struct usbh_video *)device;
+    if (video) {
+        usbh_video_off(video);
+    }
+
     if (lwp_self() != NULL) {
         for (int i = 0; i < uvc_queue.count; i ++) {
             void *va = (void *)uvc_queue.buffer[i].buf.userptr;
@@ -592,35 +779,11 @@ static int uvc_fops_close(struct dfs_fd *fd)
         }
     }
 
-#if VB_VERSION
-    for (int i = 0; i < uvc_queue.count + 1; i ++) {
-        if (uvc_queue.buffer[i].handle != VB_INVALID_HANDLE) {
-            int ret;
-            ret = vb_user_sub(uvc_queue.buffer[i].pool_id,
-                              uvc_queue.buffer[i].phys_addr, VB_UID_V_VI);
-            if (ret != K_SUCCESS) {
-                USB_LOG_ERR("put blk[%d] fail\n", i);
-            } else {
-                uvc_queue.buffer[i].handle = VB_INVALID_HANDLE;
-            }
-        }
-    }
+    uvc_release_buffers();
+    uvc_queue.opened = RT_FALSE;
+    uvc_queue.disconnect = RT_FALSE;
+    io_unlock();
 
-    if (uvc_queue.buffer[0].pool_id != VB_INVALID_POOLID) {
-        if (vb_destroy_pool(uvc_queue.buffer[0].pool_id) != 0) {
-            USB_LOG_ERR("fail to destroyed pool %d: %s %d\n",
-                        uvc_queue.buffer[0].pool_id, __func__, __LINE__);
-        }
-        uvc_queue.buffer[0].pool_id = VB_INVALID_POOLID;
-    }
-
-#else
-
-    if (uvc_queue.mem != RT_NULL) {
-        rt_free_align(uvc_queue.mem);
-        uvc_queue.mem = RT_NULL;
-    }
-#endif
     return 0;
 }
 
@@ -629,12 +792,13 @@ static int uvc_fops_ioctl(struct dfs_fd *fd, int cmd, void *args)
     int ret;
     rt_device_t device;
 
-    io_lock();
+    if (io_lock() != RT_EOK) {
+        return -RT_ERROR;
+    }
     if (uvc_queue.disconnect) {
         ret = -ENODEV;
         goto out;
     }
-
     device = (rt_device_t)fd->fnode->data;
     ret = rt_device_control(device, cmd, args);
 
@@ -660,15 +824,14 @@ static int uvc_fops_poll(struct dfs_fd *fd, struct rt_pollreq *req)
     int flags = 0;
     rt_base_t level;
     rt_device_t device;
-    struct usbh_video *video;
     struct uvc_buffer *uvc_buf;
 
     device = (rt_device_t)fd->fnode->data;
     RT_ASSERT(device != RT_NULL);
 
-    video = (struct usbh_video *)device;
-
-    io_lock();
+    if (io_lock() != RT_EOK) {
+        return POLLERR;
+    }
     if (uvc_queue.disconnect) {
         mask |= POLLERR;
         goto done;
@@ -692,8 +855,11 @@ static int uvc_fops_poll(struct dfs_fd *fd, struct rt_pollreq *req)
         rt_poll_add(&(uvc_buf->wait_queue), req);
 
         level = rt_hw_interrupt_disable();
-        if (uvc_buf->state == VIDEOBUF_DONE || uvc_buf->state == VIDEOBUF_ERROR)
-            mask |= POLLIN | POLLRDNORM;
+        if (uvc_buf->state == VIDEOBUF_DONE) {
+            mask |= POLLIN;
+        } else if (uvc_buf->state == VIDEOBUF_ERROR) {
+            mask |= POLLERR;
+        }
         rt_hw_interrupt_enable(level);
     }
 
@@ -738,27 +904,31 @@ static rt_size_t uvc_write(rt_device_t dev, rt_off_t pos, const void *buffer, rt
 }
 
 struct uvc_format_desc {
-    char *name;
-    uint8_t guid[16];
+    uint32_t fourcc;
+    const char *name;
 };
 
 static struct uvc_format_desc uvc_fmts[] = {
-	{
-		.name		= "YUV 4:2:2 (YUYV)",
-		.guid		= VIDEO_GUID_YUY2,
-	},
-	{
-		.name		= "YUV 4:2:0 (NV12)",
-		.guid		= VIDEO_GUID_NV12,
-	},
-	{
-		.name		= "YUV 4:2:0 (I420)",
-		.guid		= VIDEO_GUID_I420,
-	},
-	{
-		.name		= "YUV 4:2:2 (UYVY)",
-		.guid		= VIDEO_GUID_UYVY,
-	},
+    {
+        .fourcc = USBH_VIDEO_FOURCC_YUY2,
+        .name = "YUV 4:2:2 (YUY2)",
+    },
+    {
+        .fourcc = USBH_VIDEO_FOURCC_UYVY,
+        .name = "YUV 4:2:2 (UYVY)",
+    },
+    {
+        .fourcc = USBH_VIDEO_FOURCC_NV12,
+        .name = "YUV 4:2:0 (NV12)",
+    },
+    {
+        .fourcc = USBH_VIDEO_FOURCC_I420,
+        .name = "YUV 4:2:0 (I420)",
+    },
+    {
+        .fourcc = USBH_VIDEO_FOURCC_MJPEG,
+        .name = "MJPEG",
+    },
 };
 
 #include "cache.h"
@@ -837,46 +1007,22 @@ static rt_err_t uvc_control(rt_device_t dev, int cmd, void *args)
             goto out;
         }
 
-        fmt->format_type = video->format[idx].format_type;
+        fmt->fourcc = video->format[idx].fourcc;
 
-        switch (fmt->format_type) {
-        case USBH_VIDEO_FORMAT_UNCOMPRESSED: {
-
-            for (i = 0; i < sizeof(uvc_fmts)/sizeof(uvc_fmts[0]); i ++) {
-                if (memcmp(video->format[idx].guidFormat, uvc_fmts[i].guid, 16) == 0) {
-                    break;
-                }
+        for (i = 0; i < sizeof(uvc_fmts) / sizeof(uvc_fmts[0]); i++) {
+            if (uvc_fmts[i].fourcc == fmt->fourcc) {
+                break;
             }
-
-
-            if (i >= sizeof(uvc_fmts)/sizeof(uvc_fmts[0])) {
-                USB_LOG_ERR("Unsupport video format: %s %d\n", __func__, __LINE__);
-                USB_LOG_ERR("GUID[%d]: ", idx);
-                for (int j = 0; j < 16; j++) {
-                    rt_kprintf("%02x ", video->format[idx].guidFormat[j]);
-                }
-                rt_kprintf("\n");
-                memset(fmt->description, 0, sizeof(fmt->description));
-                ret = -RT_EINVAL;
-                goto out;
-            } else {
-                memcpy(fmt->description, uvc_fmts[i].name, sizeof(fmt->description));
-                fmt->description[sizeof(fmt->description) - 1] = '\0';
-            }
-
-            break;
-        }
-        case USBH_VIDEO_FORMAT_MJPEG: {
-            memcpy(fmt->description, "MJPEG", sizeof(fmt->description));
-            fmt->description[sizeof(fmt->description) - 1] = '\0';
-            break;
         }
 
-        default:
-            USB_LOG_ERR("Unsupport video format type: %s %d\n", __func__, __LINE__);
-            ret = -RT_EINVAL;
-            goto out;
+        memset(fmt->description, 0, sizeof(fmt->description));
+        if (i < sizeof(uvc_fmts) / sizeof(uvc_fmts[0])) {
+            strncpy((char *)fmt->description, uvc_fmts[i].name, sizeof(fmt->description) - 1);
+        } else {
+            strncpy((char *)fmt->description, uvc_fourcc_to_name(fmt->fourcc),
+                    sizeof(fmt->description) - 1);
         }
+        fmt->description[sizeof(fmt->description) - 1] = '\0';
 
         if (lwp_self() != NULL) {
             lwp_put_to_user(args, fmt, sizeof(*fmt));
@@ -884,7 +1030,6 @@ static rt_err_t uvc_control(rt_device_t dev, int cmd, void *args)
         break;
     }
     case VIDIOC_ENUM_FRAME: {
-        int i;
         struct uvc_framedesc local_frame;
         struct uvc_framedesc *frame_desc;
         struct usbh_video_format *format = NULL;
@@ -896,15 +1041,10 @@ static rt_err_t uvc_control(rt_device_t dev, int cmd, void *args)
             lwp_get_from_user(frame_desc, args, sizeof(*frame_desc));
         }
 
-        for (i = 0; i < video->num_of_formats; i++) {
-            if (frame_desc->format_type == video->format[i].format_type) {
-                format = &video->format[i];
-                break;
-            }
-        }
+        format = uvc_find_format(video, frame_desc->fourcc);
 
         if (format == NULL) {
-            USB_LOG_ERR("unmatch video format type: %s %d\n", __func__, __LINE__);
+            USB_LOG_ERR("unmatch video format fourcc: %s %d\n", __func__, __LINE__);
             ret = -RT_EINVAL;
             goto out;
         }
@@ -917,6 +1057,7 @@ static rt_err_t uvc_control(rt_device_t dev, int cmd, void *args)
         frame_desc->width = format->frame[frame_desc->index].wWidth;
         frame_desc->height = format->frame[frame_desc->index].wHeight;
         frame_desc->defaultframeinterval = format->frame[frame_desc->index].dwDefaultFrameInterval;
+        frame_desc->fourcc = format->fourcc;
 
         if (lwp_self() != NULL) {
             lwp_put_to_user(args, frame_desc, sizeof(*frame_desc));
@@ -938,15 +1079,10 @@ static rt_err_t uvc_control(rt_device_t dev, int cmd, void *args)
             lwp_get_from_user(fps_desc, args, sizeof(*fps_desc));
         }
 
-        for (i = 0; i < video->num_of_formats; i++) {
-            if (fps_desc->format_type == video->format[i].format_type) {
-                format = &video->format[i];
-                break;
-            }
-        }
+        format = uvc_find_format(video, fps_desc->fourcc);
 
         if (format == NULL) {
-            USB_LOG_ERR("unmatch video format type: %s %d\n", __func__, __LINE__);
+            USB_LOG_ERR("unmatch video format fourcc: %s %d\n", __func__, __LINE__);
             ret = -RT_EINVAL;
             goto out;
         }
@@ -957,6 +1093,13 @@ static rt_err_t uvc_control(rt_device_t dev, int cmd, void *args)
                 frame = &format->frame[i];
         }
 
+        if (frame == NULL) {
+            USB_LOG_ERR("unmatch frame size: %ux%u\n",
+                        fps_desc->width, fps_desc->height);
+            ret = -RT_EINVAL;
+            goto out;
+        }
+
         if (frame->bFrameIntervalType) {
             if (fps_desc->index >= frame->bFrameIntervalType) {
                 ret = -RT_EINVAL;
@@ -964,6 +1107,7 @@ static rt_err_t uvc_control(rt_device_t dev, int cmd, void *args)
             }
 
             fps_desc->frameinterval = frame->dwFrameInterval[fps_desc->index];
+            fps_desc->fourcc = format->fourcc;
 
         } else {
             USB_LOG_ERR("have no interval field ?: %s %d\n", __func__, __LINE__);
@@ -979,7 +1123,7 @@ static rt_err_t uvc_control(rt_device_t dev, int cmd, void *args)
         struct uvc_format *fmt;
         uint16_t rw, rh;
         unsigned int d, maxd;
-        int i, nframes;
+        int i;
         struct usbh_video_format *uvc_format = RT_NULL;
         struct usbh_video_frame *frame = RT_NULL;
 
@@ -990,14 +1134,9 @@ static rt_err_t uvc_control(rt_device_t dev, int cmd, void *args)
             lwp_get_from_user(fmt, args, sizeof(*fmt));
         }
 
-        for (i = 0; i < video->num_of_formats; i ++) {
-            if (video->format[i].format_type == fmt->format_type) {
-                uvc_format = &video->format[i];
-                break;
-            }
-        }
+        uvc_format = uvc_find_format(video, fmt->fourcc);
         if (uvc_format == RT_NULL) {
-            USB_LOG_ERR("Unsupport video format type: %s %d\n", __func__, __LINE__);
+            USB_LOG_ERR("Unsupport video format fourcc: %s %d\n", __func__, __LINE__);
             ret = -RT_EINVAL;
             goto out;
         }
@@ -1044,8 +1183,10 @@ static rt_err_t uvc_control(rt_device_t dev, int cmd, void *args)
 
         fmt->width = frame->wWidth;
         fmt->height = frame->wHeight;
+        fmt->fourcc = uvc_format->fourcc;
 
-        video->current_format = fmt->format_type;
+        video->current_format_type = uvc_format->format_type;
+        video->current_fourcc = fmt->fourcc;
         video->current_frame.wWidth = frame->wWidth;
         video->current_frame.wHeight = frame->wHeight;
         video->current_frame.dwRequestFrameInterval = fmt->frameinterval;
@@ -1070,11 +1211,13 @@ static rt_err_t uvc_control(rt_device_t dev, int cmd, void *args)
             lwp_get_from_user(request, args, sizeof(*request));
         }
 
-        memset(&uvc_queue, 0 , sizeof(uvc_queue));
-
-        if (video->current_format == USBH_VIDEO_FORMAT_UNCOMPRESSED) {
-            buffer_size = video->current_frame.wHeight * video->current_frame.wWidth * 2;
+        if (uvc_queue.streaming || video->is_opened) {
+            USB_LOG_ERR("reqbufs while stream is running\n");
+            ret = -RT_EBUSY;
+            goto out;
         }
+
+        buffer_size = uvc_get_current_frame_size(video);
         buffer_size = USB_ALIGN_UP(buffer_size, CONFIG_USB_ALIGN_SIZE);
 
         USB_LOG_DBG("buffer_size = %d, dwMaxVideoFrameBufferSize = %d, count = %d\n",
@@ -1084,6 +1227,17 @@ static rt_err_t uvc_control(rt_device_t dev, int cmd, void *args)
             ret = -RT_EINVAL;
             goto out;
         }
+
+        if (request->count == 0) {
+            uvc_release_buffers();
+            if (lwp_self() != NULL) {
+                lwp_put_to_user(args, request, sizeof(*request));
+            }
+            break;
+        }
+
+        uvc_release_buffers();
+
 #if VB_VERSION
         k_u32 pool_id;
         int alloc_size = buffer_size + VDEC_ALIGN_SIZE;
@@ -1092,8 +1246,10 @@ static rt_err_t uvc_control(rt_device_t dev, int cmd, void *args)
         if (vb_create_pool(&pool_id, request->count + 1, alloc_size,
                            RT_NULL, "uvc", VB_REMAP_MODE_CACHED) != 0) {
             USB_LOG_ERR("Can't create pool: %s %d\n", __func__, __LINE__);
+            ret = -RT_ENOMEM;
             goto release;
         }
+        uvc_queue.buffer[0].pool_id = pool_id;
 #else
         uvc_queue.mem = rt_malloc_align(buffer_size * (request->count + 1), CONFIG_USB_ALIGN_SIZE);
         if (uvc_queue.mem == RT_NULL) {
@@ -1120,12 +1276,17 @@ static rt_err_t uvc_control(rt_device_t dev, int cmd, void *args)
                 vb_get_blk_by_size_and_pool_id(pool_id, alloc_size, VB_UID_V_VI);
             if (uvc_queue.buffer[i].handle == VB_INVALID_HANDLE) {
                 USB_LOG_ERR("Can't get buffer from pool: %s %d\n", __func__, __LINE__);
+                ret = -RT_ENOMEM;
                 goto release;
             }
+            uvc_queue.buffer[i].blk_phys_addr =
+                vb_blk_handle_to_phys(uvc_queue.buffer[i].handle);
+            uvc_queue.buffer[i].blk_virt_addr =
+                vb_blk_handle_to_kern(uvc_queue.buffer[i].handle);
             uvc_queue.buffer[i].phys_addr =
-                ALIGN_UP(vb_blk_handle_to_phys(uvc_queue.buffer[i].handle), VDEC_ALIGN_SIZE);
+                ALIGN_UP(uvc_queue.buffer[i].blk_phys_addr, VDEC_ALIGN_SIZE);
             uvc_queue.buffer[i].virt_addr =
-                (void *)ALIGN_UP((k_u64)vb_blk_handle_to_kern(uvc_queue.buffer[i].handle), VDEC_ALIGN_SIZE);
+                (void *)ALIGN_UP((k_u64)uvc_queue.buffer[i].blk_virt_addr, VDEC_ALIGN_SIZE);
             uvc_queue.buffer[i].pool_id =
                 vb_blk_handle_to_pool_id(uvc_queue.buffer[i].handle);
             USB_LOG_DBG("phys[%d] = 0x%lx, virt[%d] = 0x%p, pool_id = %d\n",
@@ -1145,19 +1306,7 @@ static rt_err_t uvc_control(rt_device_t dev, int cmd, void *args)
 
 #if VB_VERSION
 release:
-        for (i = 0; i < request->count + 1; i ++) {
-            if (uvc_queue.buffer[i].handle != RT_NULL) {
-                vb_user_sub(uvc_queue.buffer[i].pool_id, uvc_queue.buffer[i].phys_addr, VB_UID_V_VI);
-            }
-        }
-
-        if (uvc_queue.buffer[0].pool_id != VB_INVALID_POOLID) {
-            if (vb_destroy_pool(uvc_queue.buffer[0].pool_id) != 0) {
-                USB_LOG_ERR("fail to destroyed pool %d: %s %d\n",
-                            uvc_queue.buffer[0].pool_id, __func__, __LINE__);
-            }
-            uvc_queue.buffer[0].pool_id = VB_INVALID_POOLID;
-        }
+        uvc_release_buffers();
         break;
 #endif
     }
@@ -1331,19 +1480,43 @@ release:
         memcpy(dq_buf, &uvc_buf->buf, sizeof(struct uvc_frame));
 
 #if VB_VERSION
-        if (video->current_format == USBH_VIDEO_FORMAT_UNCOMPRESSED) {
-            dq_buf->v_info.v_frame.width = video->current_frame.wWidth;
-            dq_buf->v_info.v_frame.height = video->current_frame.wHeight;
+        if (video->current_format_type == USBH_VIDEO_FORMAT_UNCOMPRESSED) {
+            k_pixel_format pixel_fmt = uvc_fourcc_to_kpixel(video->current_fourcc);
+            uint32_t width = video->current_frame.wWidth;
+            uint32_t height = video->current_frame.wHeight;
+            if (pixel_fmt == PIXEL_FORMAT_BUTT) {
+                USB_LOG_ERR("unsupport uncompressed fourcc: 0x%08x\n", video->current_fourcc);
+                pixel_fmt = PIXEL_FORMAT_YUYV_PACKAGE_422;
+            }
+            dq_buf->v_info.v_frame.width = width;
+            dq_buf->v_info.v_frame.height = height;
 
-            /* todo */
-            dq_buf->v_info.v_frame.stride[0] = video->current_frame.wWidth;
-            dq_buf->v_info.v_frame.pixel_format = PIXEL_FORMAT_YUYV_PACKAGE_422;
+            if (pixel_fmt == PIXEL_FORMAT_YUYV_PACKAGE_422 ||
+                pixel_fmt == PIXEL_FORMAT_UYVY_PACKAGE_422) {
+                dq_buf->v_info.v_frame.stride[0] = width * 2;
+            } else if (pixel_fmt == PIXEL_FORMAT_YUV_SEMIPLANAR_420) {
+                dq_buf->v_info.v_frame.stride[0] = width;
+                dq_buf->v_info.v_frame.stride[1] = width;
+                dq_buf->v_info.v_frame.phys_addr[1] = uvc_buf->phys_addr + (width * height);
+                dq_buf->v_info.v_frame.virt_addr[1] = (uint64_t)uvc_buf->virt_addr + (width * height);
+            } else if (pixel_fmt == PIXEL_FORMAT_YVU_PLANAR_420) {
+                dq_buf->v_info.v_frame.stride[0] = width;
+                dq_buf->v_info.v_frame.stride[1] = width / 2;
+                dq_buf->v_info.v_frame.stride[2] = width / 2;
+                dq_buf->v_info.v_frame.phys_addr[1] = uvc_buf->phys_addr + (width * height);
+                dq_buf->v_info.v_frame.phys_addr[2] = dq_buf->v_info.v_frame.phys_addr[1] + (width * height / 4);
+                dq_buf->v_info.v_frame.virt_addr[1] = (uint64_t)uvc_buf->virt_addr + (width * height);
+                dq_buf->v_info.v_frame.virt_addr[2] = dq_buf->v_info.v_frame.virt_addr[1] + (width * height / 4);
+            } else {
+                dq_buf->v_info.v_frame.stride[0] = width;
+            }
+            dq_buf->v_info.v_frame.pixel_format = pixel_fmt;
             dq_buf->v_info.v_frame.phys_addr[0] = uvc_buf->phys_addr;
             dq_buf->v_info.v_frame.virt_addr[0] = (uint64_t)uvc_buf->virt_addr;
 
             dq_buf->v_info.mod_id = K_ID_VO;
             dq_buf->v_info.pool_id = uvc_buf->pool_id;
-        } else if (video->current_format == USBH_VIDEO_FORMAT_MJPEG) {
+        } else if (video->current_format_type == USBH_VIDEO_FORMAT_MJPEG) {
             dq_buf->v_stream.len = uvc_buf->buf.bytesused;
             dq_buf->v_stream.phy_addr = uvc_buf->phys_addr;
             /* todo */
@@ -1358,10 +1531,10 @@ release:
         va = uvc_buf->virt_addr;
 #else
         va = uvc_queue.mem + uvc_buf->buf.offset;
-        dq_buf->v_stream.len = dq_buf->length;
+        dq_buf->v_stream.len = dq_buf->bytesused;
 #endif
 
-        rt_hw_cpu_dcache_clean((void *)va, dq_buf->length);
+        rt_hw_cpu_dcache_clean((void *)va, dq_buf->bytesused ? dq_buf->bytesused : dq_buf->length);
 
         level = rt_hw_interrupt_disable();
         rt_list_remove(&uvc_buf->stream);
@@ -1381,6 +1554,16 @@ release:
         break;
     }
     case VIDIOC_STREAMON: {
+        if (uvc_queue.streaming) {
+            ret = -RT_EBUSY;
+            break;
+        }
+        if ((uvc_queue.count <= 0) || (uvc_queue.buffer_size <= 0) ||
+            rt_list_isempty(&uvc_queue.irq_queue)) {
+            USB_LOG_ERR("stream on without prepared/qbuf buffers\n");
+            ret = -RT_EINVAL;
+            break;
+        }
         ret = usbh_video_on(video);
         break;
     }
@@ -1412,7 +1595,10 @@ void usbh_video_run(struct usbh_video *video_class)
     struct rt_device *device;
     const char *dev_name = video_class->hport->config.intf[video_class->ctrl_intf].devname;
 
-    io_lock();
+    if (io_lock() != RT_EOK) {
+        USB_LOG_ERR("set disconnect flag fail in %s\n", __func__);
+        return;
+    }
     uvc_queue.disconnect = RT_FALSE;
     io_unlock();
     device = &(video_class->device);
@@ -1434,9 +1620,12 @@ void usbh_video_run(struct usbh_video *video_class)
 
 void usbh_video_stop(struct usbh_video *video_class)
 {
-    io_lock();
-    uvc_queue.disconnect = RT_TRUE;
-    io_unlock();
+    if (io_lock() == RT_EOK) {
+        uvc_queue.disconnect = RT_TRUE;
+        io_unlock();
+    } else {
+        USB_LOG_ERR("set disconnect flag fail in %s\n", __func__);
+    }
 
     usbh_video_off(video_class);
 

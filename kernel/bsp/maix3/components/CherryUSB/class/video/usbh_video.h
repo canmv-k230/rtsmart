@@ -11,7 +11,17 @@
 #define USBH_VIDEO_FORMAT_UNCOMPRESSED 0
 #define USBH_VIDEO_FORMAT_MJPEG        1
 
-#define MAX_FORMAT_NUM (3)
+#define USBH_VIDEO_FOURCC(a, b, c, d)                                           \
+    ((uint32_t)(uint8_t)(a) | ((uint32_t)(uint8_t)(b) << 8) |                   \
+     ((uint32_t)(uint8_t)(c) << 16) | ((uint32_t)(uint8_t)(d) << 24))
+
+#define USBH_VIDEO_FOURCC_YUY2  USBH_VIDEO_FOURCC('Y', 'U', 'Y', '2')
+#define USBH_VIDEO_FOURCC_UYVY  USBH_VIDEO_FOURCC('U', 'Y', 'V', 'Y')
+#define USBH_VIDEO_FOURCC_NV12  USBH_VIDEO_FOURCC('N', 'V', '1', '2')
+#define USBH_VIDEO_FOURCC_I420  USBH_VIDEO_FOURCC('I', '4', '2', '0')
+#define USBH_VIDEO_FOURCC_MJPEG USBH_VIDEO_FOURCC('M', 'J', 'P', 'G')
+
+#define MAX_FORMAT_NUM (8)
 #define MAX_FRAME_NUM (30)
 #define MAX_INTERVAL_NUM (10)
 
@@ -29,6 +39,7 @@ struct usbh_video_format {
     uint8_t format_type;
     uint8_t num_of_frames;
     uint8_t guidFormat[16];
+    uint32_t fourcc;
 };
 
 struct usbh_videoframe {
@@ -77,7 +88,8 @@ struct usbh_video {
     uint16_t isoin_mps;
     uint16_t isoout_mps;
     bool is_opened;
-    uint8_t current_format;
+    uint8_t current_format_type;
+    uint32_t current_fourcc;
     struct request_frame current_frame;
     uint16_t bcdVDC;
     uint8_t num_of_intf_altsettings;
@@ -98,14 +110,14 @@ struct usbh_video {
 
 struct uvc_fmtdesc {
     uint32_t index;
-    uint8_t format_type;
+    uint32_t fourcc;
     uint8_t description[32];
 };
 
 struct uvc_format {
     uint32_t width;
     uint32_t height;
-    uint8_t format_type;
+    uint32_t fourcc;
     uint32_t frameinterval;
 };
 
@@ -127,7 +139,7 @@ struct uvc_frame {
 
 struct uvc_framedesc {
     uint32_t index;
-    uint8_t format_type;
+    uint32_t fourcc;
     uint32_t width;
     uint32_t height;
     uint32_t defaultframeinterval;
@@ -135,7 +147,7 @@ struct uvc_framedesc {
 
 struct uvc_fpsdesc {
     uint32_t index;
-    uint8_t format_type;
+    uint32_t fourcc;
     uint32_t width;
     uint32_t height;
     uint32_t frameinterval;
@@ -183,7 +195,7 @@ int usbh_video_get(struct usbh_video *video_class, uint8_t request, uint8_t intf
 int usbh_video_set(struct usbh_video *video_class, uint8_t request, uint8_t intf, uint8_t entity_id, uint8_t cs, uint8_t *buf, uint16_t len);
 
 int usbh_video_open(struct usbh_video *video_class,
-                    uint8_t format_type,
+                    uint32_t fourcc,
                     uint16_t wWidth,
                     uint16_t wHeight,
                     uint8_t altsetting);
