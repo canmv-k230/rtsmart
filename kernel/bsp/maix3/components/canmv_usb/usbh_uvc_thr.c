@@ -6,6 +6,10 @@
 #include <lwp.h>
 #include <lwp_user_mm.h>
 #include "tick.h"
+#include "rvv_ops.h"
+
+#define UVC_USE_RVV_COPY 1
+#define UVC_PROFILE_WINDOW_MS 1000
 
 #define UVC_URBS (5)
 #define UVC_MAX_PACKETS (32)
@@ -32,6 +36,9 @@ struct uvc_buffer {
     struct rt_list_node stream;
     struct rt_list_node irq;
     bool driver_use;
+    uint64_t frame_copy_ns;
+    uint64_t frame_copy_bytes;
+    uint32_t frame_copy_count;
     /* for vb version */
     uint32_t handle;
     uint64_t blk_phys_addr;
@@ -69,6 +76,362 @@ struct uvc_queue {
 #define UVC_STREAM_FID	(1 << 0)
 
 static struct uvc_queue uvc_queue;
+struct uvc_copy_window {
+    uint64_t total_ns;
+    uint64_t max_ns;
+    uint64_t total_bytes;
+    uint32_t count;
+    uint64_t start_ms;
+    uint64_t sample_ms;
+    rt_bool_t valid;
+};
+
+struct uvc_copy_profiler {
+    struct uvc_copy_window active;
+    struct uvc_copy_window last;
+};
+
+struct uvc_frame_window {
+    uint64_t total_ns;
+    uint64_t max_ns;
+    uint64_t total_bytes;
+    uint64_t total_copies;
+    uint32_t frame_count;
+    uint64_t start_ms;
+    uint64_t sample_ms;
+    rt_bool_t valid;
+};
+
+struct uvc_frame_profiler {
+    struct uvc_frame_window active;
+    struct uvc_frame_window last;
+};
+
+struct uvc_copy_summary {
+    uint64_t avg_ns;
+    uint64_t max_ns;
+    uint64_t avg_bytes;
+    uint64_t throughput;
+    uint64_t total_bytes;
+    uint32_t count;
+    uint64_t sample_ms;
+    rt_bool_t valid;
+};
+
+struct uvc_frame_summary {
+    uint64_t avg_ns;
+    uint64_t max_ns;
+    uint64_t avg_frame_bytes;
+    uint64_t avg_copies;
+    uint32_t frames;
+    uint64_t sample_ms;
+    rt_bool_t valid;
+};
+
+static struct uvc_copy_profiler uvc_copy_profiler;
+static struct uvc_frame_profiler uvc_frame_profiler;
+static volatile rt_bool_t uvc_profile_enabled = RT_FALSE;
+
+static inline const char *uvc_copy_method_name(void)
+{
+#if UVC_USE_RVV_COPY
+    return "rvv";
+#else
+    return "memcpy";
+#endif
+}
+
+static void uvc_memcpy_bytes(void *dst, const void *src, uint32_t nbytes)
+{
+#if UVC_USE_RVV_COPY
+    rvv_memcpy(dst, src, nbytes);
+#else
+    memcpy(dst, src, nbytes);
+#endif
+}
+
+static void uvc_roll_copy_window(struct uvc_copy_profiler *profiler, uint64_t now_ms)
+{
+    rt_base_t level = rt_hw_interrupt_disable();
+
+    profiler->last = profiler->active;
+    profiler->last.sample_ms = now_ms - profiler->active.start_ms;
+    profiler->last.valid = RT_TRUE;
+    rt_memset(&profiler->active, 0, sizeof(profiler->active));
+    profiler->active.start_ms = now_ms;
+
+    rt_hw_interrupt_enable(level);
+}
+
+static void uvc_roll_frame_window(struct uvc_frame_profiler *profiler, uint64_t now_ms)
+{
+    rt_base_t level = rt_hw_interrupt_disable();
+
+    profiler->last = profiler->active;
+    profiler->last.sample_ms = now_ms - profiler->active.start_ms;
+    profiler->last.valid = RT_TRUE;
+    rt_memset(&profiler->active, 0, sizeof(profiler->active));
+    profiler->active.start_ms = now_ms;
+
+    rt_hw_interrupt_enable(level);
+}
+
+static void uvc_copy_stat_update(uint64_t delta_ns, uint32_t bytes)
+{
+    struct uvc_copy_window *active = &uvc_copy_profiler.active;
+    uint64_t now_ms = cpu_ticks_ms();
+
+    if (active->start_ms == 0) {
+        active->start_ms = now_ms;
+    }
+
+    active->total_ns += delta_ns;
+    active->total_bytes += bytes;
+    active->count++;
+    if (delta_ns > active->max_ns) {
+        active->max_ns = delta_ns;
+    }
+
+    if ((now_ms - active->start_ms) >= UVC_PROFILE_WINDOW_MS && active->count) {
+        uvc_roll_copy_window(&uvc_copy_profiler, now_ms);
+    }
+}
+
+static void uvc_buffer_copy_stat_reset(struct uvc_buffer *uvc_buf)
+{
+    uvc_buf->frame_copy_ns = 0;
+    uvc_buf->frame_copy_bytes = 0;
+    uvc_buf->frame_copy_count = 0;
+}
+
+static void uvc_buffer_copy_stat_update(struct uvc_buffer *uvc_buf, uint64_t delta_ns, uint32_t bytes)
+{
+    uvc_buf->frame_copy_ns += delta_ns;
+    uvc_buf->frame_copy_bytes += bytes;
+    uvc_buf->frame_copy_count++;
+}
+
+static void uvc_frame_copy_stat_finish(struct uvc_buffer *uvc_buf)
+{
+    uint64_t now_ms = cpu_ticks_ms();
+    struct uvc_frame_window *active = &uvc_frame_profiler.active;
+
+    if (uvc_buf->frame_copy_count == 0) {
+        uvc_buffer_copy_stat_reset(uvc_buf);
+        return;
+    }
+
+    if (active->start_ms == 0) {
+        active->start_ms = now_ms;
+    }
+
+    active->total_ns += uvc_buf->frame_copy_ns;
+    active->total_bytes += uvc_buf->frame_copy_bytes;
+    active->total_copies += uvc_buf->frame_copy_count;
+    active->frame_count++;
+    if (uvc_buf->frame_copy_ns > active->max_ns) {
+        active->max_ns = uvc_buf->frame_copy_ns;
+    }
+
+    if ((now_ms - active->start_ms) >= UVC_PROFILE_WINDOW_MS && active->frame_count) {
+        uvc_roll_frame_window(&uvc_frame_profiler, now_ms);
+    }
+
+    uvc_buffer_copy_stat_reset(uvc_buf);
+}
+
+static void uvc_copy_window_snapshot(struct uvc_copy_window *window)
+{
+    rt_base_t level = rt_hw_interrupt_disable();
+    *window = uvc_copy_profiler.last;
+    rt_hw_interrupt_enable(level);
+}
+
+static void uvc_frame_window_snapshot(struct uvc_frame_window *window)
+{
+    rt_base_t level = rt_hw_interrupt_disable();
+    *window = uvc_frame_profiler.last;
+    rt_hw_interrupt_enable(level);
+}
+
+static void uvc_copy_window_summarize(const struct uvc_copy_window *window, struct uvc_copy_summary *summary)
+{
+    rt_memset(summary, 0, sizeof(*summary));
+    if (!window->valid || !window->count || !window->sample_ms) {
+        return;
+    }
+
+    summary->avg_ns = window->total_ns / window->count;
+    summary->max_ns = window->max_ns;
+    summary->avg_bytes = window->total_bytes / window->count;
+    summary->throughput = (window->total_bytes * 1000ULL) / window->sample_ms;
+    summary->total_bytes = window->total_bytes;
+    summary->count = window->count;
+    summary->sample_ms = window->sample_ms;
+    summary->valid = RT_TRUE;
+}
+
+static void uvc_frame_window_summarize(const struct uvc_frame_window *window, struct uvc_frame_summary *summary)
+{
+    rt_memset(summary, 0, sizeof(*summary));
+    if (!window->valid || !window->frame_count || !window->sample_ms) {
+        return;
+    }
+
+    summary->avg_ns = window->total_ns / window->frame_count;
+    summary->max_ns = window->max_ns;
+    summary->avg_frame_bytes = window->total_bytes / window->frame_count;
+    summary->avg_copies = window->total_copies / window->frame_count;
+    summary->frames = window->frame_count;
+    summary->sample_ms = window->sample_ms;
+    summary->valid = RT_TRUE;
+}
+
+static void uvc_profile_reset(void)
+{
+    rt_base_t level = rt_hw_interrupt_disable();
+    rt_memset(&uvc_copy_profiler, 0, sizeof(uvc_copy_profiler));
+    rt_memset(&uvc_frame_profiler, 0, sizeof(uvc_frame_profiler));
+    for (int i = 0; i < MAX_UVC_BUFFER + 1; i++) {
+        uvc_buffer_copy_stat_reset(&uvc_queue.buffer[i]);
+    }
+    rt_hw_interrupt_enable(level);
+}
+
+static void uvc_profile_set_enabled(rt_bool_t enable)
+{
+    if (enable) {
+        uvc_profile_reset();
+        uvc_profile_enabled = RT_TRUE;
+    } else {
+        uvc_profile_enabled = RT_FALSE;
+        uvc_profile_reset();
+    }
+}
+
+static int uvc_profile_cmd(int argc, char **argv)
+{
+    if (argc == 1) {
+        rt_kprintf("uvc host profile: %d\n", uvc_profile_enabled ? 1 : 0);
+        return 0;
+    }
+
+    if (argc == 2) {
+        if (argv[1][0] == '0' && argv[1][1] == '\0') {
+            uvc_profile_set_enabled(RT_FALSE);
+            rt_kprintf("uvc host profile: 0\n");
+            return 0;
+        }
+
+        if (argv[1][0] == '1' && argv[1][1] == '\0') {
+            uvc_profile_set_enabled(RT_TRUE);
+            rt_kprintf("uvc host profile: 1\n");
+            return 0;
+        }
+    }
+
+    rt_kprintf("Usage: uvc_host_profile [0|1]\n");
+    return -RT_ERROR;
+}
+
+static int uvc_profile_dump_cmd(int argc, char **argv)
+{
+    struct uvc_copy_window copy_window;
+    struct uvc_frame_window frame_window;
+    struct uvc_copy_summary copy_summary;
+    struct uvc_frame_summary frame_summary;
+
+    (void)argc;
+    (void)argv;
+
+    if (!uvc_profile_enabled) {
+        rt_kprintf("uvc host profile: disabled\n");
+        return 0;
+    }
+
+    uvc_copy_window_snapshot(&copy_window);
+    uvc_copy_window_summarize(&copy_window, &copy_summary);
+    if (!copy_summary.valid) {
+        rt_kprintf("uvc %s copy: no completed %dms sample yet\n",
+                   uvc_copy_method_name(), UVC_PROFILE_WINDOW_MS);
+    } else {
+        rt_kprintf("uvc %s copy: sample=%lums count=%u avg=%lu.%03luus max=%lu.%03luus "
+                   "avg_bytes=%lu throughput=%luB/s bytes=%lu\n",
+                   uvc_copy_method_name(),
+                   (unsigned long)copy_summary.sample_ms,
+                   copy_summary.count,
+                   (unsigned long)(copy_summary.avg_ns / 1000),
+                   (unsigned long)(copy_summary.avg_ns % 1000),
+                   (unsigned long)(copy_summary.max_ns / 1000),
+                   (unsigned long)(copy_summary.max_ns % 1000),
+                   (unsigned long)copy_summary.avg_bytes,
+                   (unsigned long)copy_summary.throughput,
+                   (unsigned long)copy_summary.total_bytes);
+    }
+
+    uvc_frame_window_snapshot(&frame_window);
+    uvc_frame_window_summarize(&frame_window, &frame_summary);
+    if (!frame_summary.valid) {
+        rt_kprintf("uvc frame copy: no completed %dms sample yet\n", UVC_PROFILE_WINDOW_MS);
+    } else {
+        rt_kprintf("uvc frame copy: sample=%lums frames=%u avg=%lu.%03luus max=%lu.%03luus "
+                   "avg_copies=%lu avg_frame_bytes=%lu\n",
+                   (unsigned long)frame_summary.sample_ms,
+                   frame_summary.frames,
+                   (unsigned long)(frame_summary.avg_ns / 1000),
+                   (unsigned long)(frame_summary.avg_ns % 1000),
+                   (unsigned long)(frame_summary.max_ns / 1000),
+                   (unsigned long)(frame_summary.max_ns % 1000),
+                   (unsigned long)frame_summary.avg_copies,
+                   (unsigned long)frame_summary.avg_frame_bytes);
+    }
+
+    return 0;
+}
+
+static int uvc_profile_reset_cmd(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    uvc_profile_reset();
+    rt_kprintf("uvc host profile reset\n");
+    return 0;
+}
+
+MSH_CMD_EXPORT_ALIAS(uvc_profile_dump_cmd, uvc_host_profile_dump, dump last completed uvc host copy profile window);
+MSH_CMD_EXPORT_ALIAS(uvc_profile_reset_cmd, uvc_host_profile_reset, reset uvc host copy profile windows);
+MSH_CMD_EXPORT_ALIAS(uvc_profile_cmd, uvc_host_profile, get or set uvc host copy profile state);
+
+static inline void uvc_copy_payload(struct uvc_buffer *uvc_buf, void *dst, const void *src, uint32_t nbytes)
+{
+    if (nbytes == 0) {
+        return;
+    }
+
+    if (!uvc_profile_enabled) {
+        uvc_memcpy_bytes(dst, src, nbytes);
+    } else {
+        uint64_t start_ns = cpu_ticks_ns();
+        uint64_t delta_ns;
+
+        uvc_memcpy_bytes(dst, src, nbytes);
+        delta_ns = cpu_ticks_ns() - start_ns;
+        uvc_copy_stat_update(delta_ns, nbytes);
+        uvc_buffer_copy_stat_update(uvc_buf, delta_ns, nbytes);
+    }
+}
+
+static inline void uvc_buffer_profile_finish(struct uvc_buffer *uvc_buf)
+{
+    if (uvc_profile_enabled) {
+        uvc_frame_copy_stat_finish(uvc_buf);
+    }
+}
+
+static inline void uvc_buffer_profile_reset(struct uvc_buffer *uvc_buf)
+{
+    uvc_buffer_copy_stat_reset(uvc_buf);
+}
 
 static int usb_control_msg(struct usbh_hubport *hport, uint8_t request, uint8_t requesttype,
                            uint16_t value, uint16_t index, void *data, uint16_t size)
@@ -255,7 +618,7 @@ out:
 static void uvc_decode_iso(struct usbh_urb *urb, struct uvc_buffer *uvc_buf, struct usbh_video *video)
 {
     static uint32_t drop_err_cnt = 0;
-    static uint32_t drop_last_ms = 0;
+    static uint64_t drop_last_ms = 0;
     uint8_t *src;
     uint8_t *dst;
     int i;
@@ -283,7 +646,7 @@ static void uvc_decode_iso(struct usbh_urb *urb, struct uvc_buffer *uvc_buf, str
         }
 
         if (src[1] & UVC_STREAM_ERR) {
-            uint32_t now_ms = rt_tick_get_millisecond();
+            uint64_t now_ms = cpu_ticks_ms();
 
             drop_err_cnt++;
             if ((now_ms - drop_last_ms) >= 1000) {
@@ -299,7 +662,7 @@ static void uvc_decode_iso(struct usbh_urb *urb, struct uvc_buffer *uvc_buf, str
         maxlen = uvc_buf->buf.length - uvc_buf->buf.bytesused;
         nbytes = min(len, maxlen);
 
-        memcpy(dst, src + src[0], nbytes);
+        uvc_copy_payload(uvc_buf, dst, src + src[0], nbytes);
 
         uvc_buf->buf.bytesused += nbytes;
 
@@ -319,10 +682,11 @@ static void uvc_decode_iso(struct usbh_urb *urb, struct uvc_buffer *uvc_buf, str
                     (uvc_buf->buf.bytesused == uvc_buf->buf.length)) {
                     rt_base_t level;
 #if 0
-                    static uint32_t prev;
-                    int diff = rt_tick_get_millisecond() - prev;
-                    prev = rt_tick_get_millisecond();
-                    USB_LOG_ERR("F = %02d ms, L = %d\n", diff, uvc_buf->buf.bytesused);
+                    static uint64_t prev;
+                    uint64_t diff = cpu_ticks_ms() - prev;
+                    prev = cpu_ticks_ms();
+                    USB_LOG_ERR("F = %02llu ms, L = %d\n",
+                                (unsigned long long)diff, uvc_buf->buf.bytesused);
 #endif
 
                     level = rt_hw_interrupt_disable();
@@ -330,16 +694,18 @@ static void uvc_decode_iso(struct usbh_urb *urb, struct uvc_buffer *uvc_buf, str
                     rt_list_remove(&uvc_buf->irq);
 
                     rt_hw_interrupt_enable(level);
-
+                    uvc_buffer_profile_finish(uvc_buf);
                     rt_wqueue_wakeup(&uvc_buf->wait_queue, 0);
                 } else {
                     uvc_buf->state = VIDEOBUF_QUEUED;
                     uvc_buf->buf.bytesused = 0;
+                    uvc_buffer_profile_reset(uvc_buf);
                 }
             } else {
 #if 0
                 USB_LOG_ERR("LLEN = %d\n", uvc_buf->buf.bytesused);
 #endif
+                uvc_buffer_profile_finish(uvc_buf);
                 uvc_buf->state = VIDEOBUF_QUEUED;
                 uvc_buf->buf.bytesused = 0;
             }
@@ -352,7 +718,7 @@ static void uvc_decode_iso(struct usbh_urb *urb, struct uvc_buffer *uvc_buf, str
 static void uvc_decode_bulk(struct usbh_urb *urb, struct uvc_buffer *uvc_buf, struct usbh_video *video)
 {
     static uint32_t drop_err_cnt = 0;
-    static uint32_t drop_last_ms = 0;
+    static uint64_t drop_last_ms = 0;
     int len, ret = 0;
     uint8_t *mem;
     uint8_t *dst;
@@ -375,7 +741,7 @@ static void uvc_decode_bulk(struct usbh_urb *urb, struct uvc_buffer *uvc_buf, st
         }
 
         if (mem[1] & UVC_STREAM_ERR) {
-            uint32_t now_ms = rt_tick_get_millisecond();
+            uint64_t now_ms = cpu_ticks_ms();
 
             drop_err_cnt++;
             if ((now_ms - drop_last_ms) >= 1000) {
@@ -408,7 +774,7 @@ check:
 #endif
         maxlen = uvc_buf->buf.length - uvc_buf->buf.bytesused;
         nbytes = min(len, maxlen);
-        memcpy(dst, mem, nbytes);
+        uvc_copy_payload(uvc_buf, dst, mem, nbytes);
         uvc_buf->buf.bytesused += nbytes;
         if (len > maxlen) {
             uvc_buf->state = VIDEOBUF_DONE;
@@ -427,21 +793,24 @@ check:
                 if (!uvc_buf->driver_use) {
                     rt_base_t level;
 #if 0
-                    static uint32_t prev;
-                    int diff = rt_tick_get_millisecond() - prev;
-                    prev = rt_tick_get_millisecond();
-                    USB_LOG_ERR("F = %02d ms, L = %d\n", diff, uvc_buf->buf.bytesused);
+                    static uint64_t prev;
+                    uint64_t diff = cpu_ticks_ms() - prev;
+                    prev = cpu_ticks_ms();
+                    USB_LOG_ERR("F = %02llu ms, L = %d\n",
+                                (unsigned long long)diff, uvc_buf->buf.bytesused);
 #endif
                     level = rt_hw_interrupt_disable();
 
                     rt_list_remove(&uvc_buf->irq);
 
                     rt_hw_interrupt_enable(level);
+                    uvc_buffer_profile_finish(uvc_buf);
                     rt_wqueue_wakeup(&uvc_buf->wait_queue, 0);
                 } else {
 #if 0
                     USB_LOG_ERR("LLEN = %d\n", uvc_buf->buf.bytesused);
 #endif
+                    uvc_buffer_profile_finish(uvc_buf);
                     uvc_buf->state = VIDEOBUF_QUEUED;
                     uvc_buf->buf.bytesused = 0;
                 }
@@ -736,6 +1105,7 @@ static int uvc_fops_open(struct dfs_fd *fd)
     uvc_queue.streaming = RT_FALSE;
     uvc_queue.count = 0;
     uvc_queue.buffer_size = 0;
+    uvc_profile_reset();
     rt_list_init(&uvc_queue.app_queue);
     rt_list_init(&uvc_queue.irq_queue);
 
@@ -750,6 +1120,7 @@ static int uvc_fops_open(struct dfs_fd *fd)
         uvc_queue.buffer[i].buf.bytesused = 0;
         uvc_queue.buffer[i].state = VIDEOBUF_IDLE;
         uvc_queue.buffer[i].driver_use = false;
+        uvc_buffer_profile_reset(&uvc_queue.buffer[i]);
     }
 
     io_unlock();
@@ -1269,6 +1640,7 @@ static rt_err_t uvc_control(rt_device_t dev, int cmd, void *args)
             uvc_queue.buffer[i].buf.bytesused = 0;
             uvc_queue.buffer[i].state = VIDEOBUF_IDLE;
             uvc_queue.buffer[i].driver_use = false;
+            uvc_buffer_profile_reset(&uvc_queue.buffer[i]);
             rt_wqueue_init(&uvc_queue.buffer[i].wait_queue);
 
 #if VB_VERSION
@@ -1522,8 +1894,7 @@ release:
             /* todo */
             dq_buf->v_stream.end_of_stream = 0;
 
-            uint64_t time_elapsed = cpu_ticks();
-            dq_buf->v_stream.pts = time_elapsed / 27;
+            dq_buf->v_stream.pts = cpu_ticks_us();
         } else {
             USB_LOG_ERR("Unsupport format %s %d\n", __func__, __LINE__);
         }
