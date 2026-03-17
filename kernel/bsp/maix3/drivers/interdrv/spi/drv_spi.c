@@ -37,6 +37,7 @@
 #include "sysctl_rst.h"
 #include "sysctl_clk.h"
 #include "cache.h"
+#include "rvv_ops.h"
 
 #define DBG_TAG "spi"
 #ifdef RT_SPI_DEBUG
@@ -348,7 +349,7 @@ static rt_uint32_t drv_spi_xfer(struct rt_spi_device* device, struct rt_spi_mess
         uint8_t cell_size = (cfg->parent.data_width + 7) >> 3;
         uint8_t* buf = NULL;
         if (length) {
-            buf = rt_malloc(length * cell_size);
+            buf = rt_malloc_align(length * cell_size, RT_CPU_CACHE_LINE_SZ);
             if (buf == NULL) {
                 LOG_E("alloc mem error");
                 return 0;
@@ -365,8 +366,10 @@ static rt_uint32_t drv_spi_xfer(struct rt_spi_device* device, struct rt_spi_mess
             spi->ctrlr1 = length - 1;
             spi->spidr = msg->instruction.content;
             spi->spiar = msg->address.content;
-            if (tmod == SPI_TMOD_TO)
-                rt_memcpy(buf, msg->parent.send_buf, length * cell_size);
+            if (tmod == SPI_TMOD_TO) {
+                // rt_memcpy(buf, msg->parent.send_buf, length * cell_size);
+                rvv_memcpy(buf, msg->parent.send_buf, length * cell_size);
+            }
             rt_hw_cpu_dcache_clean(buf, length * cell_size);
             spi->axiar0 = (uint32_t)((uint64_t)buf);
             spi->axiar1 = (uint32_t)((uint64_t)buf >> 32);
@@ -441,11 +444,12 @@ static rt_uint32_t drv_spi_xfer(struct rt_spi_device* device, struct rt_spi_mess
         }
         if (tmod == SPI_TMOD_RO) {
             rt_hw_cpu_dcache_invalidate(buf, length * cell_size);
-            rt_memcpy(msg->parent.recv_buf, buf, length * cell_size);
+            // rt_memcpy(msg->parent.recv_buf, buf, length * cell_size);
+            rvv_memcpy(msg->parent.recv_buf, buf, length * cell_size);
         }
     multi_exit:
         if (buf)
-            rt_free(buf);
+            rt_free_align(buf);
         return length;
     } else { // 单线模式
         if(msg->parent.cs_take && cfg->parent.soft_cs & 0x80) {
@@ -512,7 +516,7 @@ static rt_uint32_t drv_spi_xfer(struct rt_spi_device* device, struct rt_spi_mess
             } else {
                 send_single = add_length;
             }
-            send_buf = rt_malloc(send_single * cell_size);
+            send_buf = rt_malloc_align(send_single * cell_size, RT_CPU_CACHE_LINE_SZ);
             if (send_buf == NULL) {
                 LOG_E("alloc mem error");
                 return 0;
@@ -526,16 +530,18 @@ static rt_uint32_t drv_spi_xfer(struct rt_spi_device* device, struct rt_spi_mess
                 for (int i = msg->dummy_cycles / 8; i; i--)
                     *temp++ = 0xFF;
             }
-            if (tmod != SPI_TMOD_EPROMREAD && count)
-                rt_memcpy(send_buf + add_length, msg->parent.send_buf, count * cell_size);
+            if (tmod != SPI_TMOD_EPROMREAD && count) {
+                // rt_memcpy(send_buf + add_length, msg->parent.send_buf, count * cell_size);
+                rvv_memcpy(send_buf + add_length, msg->parent.send_buf, count * cell_size);
+            }
         }
         if (recv_buf) {
             recv_single = count;
-            recv_buf = rt_malloc(count * cell_size);
+            recv_buf = rt_malloc_align(count * cell_size, RT_CPU_CACHE_LINE_SZ);
             if (recv_buf == NULL) {
                 LOG_E("alloc mem error");
                 if (send_buf)
-                    rt_free(send_buf);
+                    rt_free_align(send_buf);
                 return 0;
             }
         }
@@ -585,7 +591,8 @@ static rt_uint32_t drv_spi_xfer(struct rt_spi_device* device, struct rt_spi_mess
             if (send_length < length && tmod <= SPI_TMOD_TO) {
                 count = length - send_length;
                 count = count > 0x10000 ? 0x10000 : count;
-                rt_memcpy(send_buf, msg->parent.send_buf + send_length * cell_size, count * cell_size);
+                // rt_memcpy(send_buf, msg->parent.send_buf + send_length * cell_size, count * cell_size);
+                rvv_memcpy(send_buf, msg->parent.send_buf + send_length * cell_size, count * cell_size);
                 spi_bus->send_buf = send_buf;
                 spi_bus->send_length = count;
                 send_single = count;
@@ -598,7 +605,8 @@ static rt_uint32_t drv_spi_xfer(struct rt_spi_device* device, struct rt_spi_mess
             }
         }
         if (event & BIT(SSI_RXF)) {
-            rt_memcpy(msg->parent.recv_buf + recv_length * cell_size, recv_buf, recv_single * cell_size);
+            // rt_memcpy(msg->parent.recv_buf + recv_length * cell_size, recv_buf, recv_single * cell_size);
+            rvv_memcpy(msg->parent.recv_buf + recv_length * cell_size, recv_buf, recv_single * cell_size);
             recv_length += recv_single;
             if (recv_length >= length)
                 goto single_error;
@@ -623,9 +631,9 @@ static rt_uint32_t drv_spi_xfer(struct rt_spi_device* device, struct rt_spi_mess
         spi->ser = 0;
         spi->ssienr = 0;
         if (send_buf)
-            rt_free(send_buf);
+            rt_free_align(send_buf);
         if (recv_buf)
-            rt_free(recv_buf);
+            rt_free_align(recv_buf);
     single_exit:
         if(msg->parent.cs_release &&cfg->parent.soft_cs & 0x80) {
             uint8_t cs_pin = cfg->parent.soft_cs & 0x7F;
