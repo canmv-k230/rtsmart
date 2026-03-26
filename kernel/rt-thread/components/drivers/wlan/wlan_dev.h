@@ -89,7 +89,7 @@ typedef enum
 #endif
 
 #ifndef RT_WLAN_PASSWORD_MAX_LENGTH
-#define RT_WLAN_PASSWORD_MAX_LENGTH   (32)   /* PASSWORD MAX LEN*/
+#define RT_WLAN_PASSWORD_MAX_LENGTH   (64)   /* PASSWORD MAX LEN*/
 #endif
 
 #ifndef RT_WLAN_DEV_EVENT_NUM
