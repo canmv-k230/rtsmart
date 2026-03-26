@@ -268,8 +268,8 @@ typedef struct _fpioa_pmu_iomux_cfg {
             uint32_t ie : 1; // bit 8    输入使能
             uint32_t resv_9 : 1; // bit 9
             uint32_t sl : 1; // bit 10 slewrate
-            uint32_t io_sel : 2; // bit 11-12 复用功能选择
-            uint32_t rsv_bit13_31 : 19; // bit 13-31
+            uint32_t io_sel : 3; // bit 11-13 复用功能选择
+            uint32_t rsv_bit14_31 : 18; // bit 14-31
         } bit;
         uint32_t value;
     } u;
@@ -291,7 +291,7 @@ static uint32_t convert_iomux_to_pmu(uint32_t data)
 
     dst.u.bit.ds = src.u.bit.ds & 0x7;
 
-    dst.u.bit.io_sel = src.u.bit.io_sel & 0x3;
+    dst.u.bit.io_sel = src.u.bit.io_sel & 0x7;
 
     return dst.u.value;
 }
