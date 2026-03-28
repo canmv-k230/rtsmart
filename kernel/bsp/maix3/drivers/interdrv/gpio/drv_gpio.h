@@ -29,7 +29,11 @@
 #include "rtdef.h"
 
 #define GPIO_IRQ_MAX_NUM (64)
+#ifdef CONFIG_BOARD_NOT_SUPPORT_HW_RTC
+#define GPIO_MAX_NUM     (64)
+#else
 #define GPIO_MAX_NUM     (64 + 8)
+#endif
 
 #define KD_GPIO_IRQ_DISABLE 0x00
 #define KD_GPIO_IRQ_ENABLE  0x01

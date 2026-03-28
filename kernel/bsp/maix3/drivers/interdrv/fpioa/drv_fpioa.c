@@ -408,8 +408,8 @@ static inline int drv_fpioa_set_pmu_iomux(int pin, uint32_t value)
 ///////////////////////////////////////////////////////////////////////////////
 int drv_fpioa_get_pin_cfg(int pin, uint32_t* value)
 {
-    if (pin < 0 || pin >= 72) {
-        rt_kprintf("[hal_fpioa]: Invalid pin %d (max=%d)\n", pin, 72 - 1);
+    if (pin < 0 || pin >= FPIOA_PIN_MAX_NUM) {
+        rt_kprintf("[hal_fpioa]: Invalid pin %d (max=%d)\n", pin, FPIOA_PIN_MAX_NUM - 1);
         return -1;
     }
 
@@ -422,8 +422,8 @@ int drv_fpioa_get_pin_cfg(int pin, uint32_t* value)
 
 int drv_fpioa_set_pin_cfg(int pin, uint32_t value)
 {
-    if (pin < 0 || pin >= 72) {
-        rt_kprintf("[hal_fpioa]: Invalid pin %d (max=%d)\n", pin, 72 - 1);
+    if (pin < 0 || pin >= FPIOA_PIN_MAX_NUM) {
+        rt_kprintf("[hal_fpioa]: Invalid pin %d (max=%d)\n", pin, FPIOA_PIN_MAX_NUM - 1);
         return -1;
     }
 
