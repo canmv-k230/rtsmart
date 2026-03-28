@@ -14,6 +14,8 @@
 
 #include <drivers/rtc.h>
 
+#include "tick.h"
+
 #ifdef RT_USING_SOFT_RTC
 
 /* 2018-01-30 14:44:50 = RTC_TIME_INIT(2018, 1, 30, 14, 44, 50)  */
@@ -25,7 +27,7 @@
 #endif
 
 static struct rt_device soft_rtc_dev;
-static rt_tick_t init_tick;
+static uint64_t init_tick;
 static time_t init_time;
 
 static rt_err_t soft_rtc_control(rt_device_t dev, int cmd, void *args)
@@ -40,13 +42,13 @@ static rt_err_t soft_rtc_control(rt_device_t dev, int cmd, void *args)
     {
     case RT_DEVICE_CTRL_RTC_GET_TIME:
         time = (time_t *) args;
-        *time = init_time + (rt_tick_get() - init_tick) / RT_TICK_PER_SECOND;
+        *time = init_time + (cpu_ticks_ms() - init_tick) / 1000;
         break;
 
     case RT_DEVICE_CTRL_RTC_SET_TIME:
     {
         time = (time_t *) args;
-        init_time = *time - (rt_tick_get() - init_tick) / RT_TICK_PER_SECOND;
+        init_time = *time - (cpu_ticks_ms() - init_tick) / 1000;
         break;
     }
     }
@@ -78,7 +80,7 @@ int rt_soft_rtc_init(void)
     /* make sure only one 'rtc' device */
     RT_ASSERT(!rt_device_find("rtc"));
 
-    init_tick = rt_tick_get();
+    init_tick = cpu_ticks_ms();
     init_time = mktime(&time_new);
 
     soft_rtc_dev.type    = RT_Device_Class_RTC;
@@ -105,5 +107,27 @@ int rt_soft_rtc_init(void)
     return 0;
 }
 INIT_DEVICE_EXPORT(rt_soft_rtc_init);
+
+#if 0 && defined (RT_USING_FINSH)
+static void rtc_dump(int argc, char **argv)
+{
+    int count = 60;
+    if (argc > 1)
+        count = atoi(argv[1]);
+
+    for (int i = 0; i < count; i++)
+    {
+        time_t now;
+        struct tm *tm;
+        soft_rtc_control(&soft_rtc_dev, RT_DEVICE_CTRL_RTC_GET_TIME, &now);
+        tm = localtime(&now);
+        rt_kprintf("[%3d] %04d-%02d-%02d %02d:%02d:%02d  ticks_ms=%ld\n",
+            i, tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,
+            tm->tm_hour, tm->tm_min, tm->tm_sec, cpu_ticks_ms());
+        rt_thread_mdelay(1000);
+    }
+}
+MSH_CMD_EXPORT(rtc_dump, dump RTC time every second. usage: rtc_dump [count]);
+#endif
 
 #endif /* RT_USING_SOFT_RTC */
