@@ -68,6 +68,10 @@ menuconfig RT_USING_TOUCH
             bool "Enable Touch GT911"
             default n
 
+        config TOUCH_TYPE_CF1124
+            bool "Enable Touch CF1124 (Sitronix)"
+            default n
+
         config TOUCH_TYPE_ST7102
             bool "Enable Touch ST7102 (LCD + Touch)"
             default n
