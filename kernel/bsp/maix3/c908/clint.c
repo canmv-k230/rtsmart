@@ -54,8 +54,8 @@ void clint_timer_init(void)
 
     clint_cmp_reg = (size_t)rt_ioremap_nocache((void*)(CLINT + CLINT_STIMECMPL0), 8);
 
-    write32(clint_cmp_reg, tick_l);
     write32(clint_cmp_reg + 4, tick_h);
+    write32(clint_cmp_reg, tick_l);
     rt_iounmap((void *)0x91108020);
     rt_iounmap((void *)0x91108030);
     set_csr(sie,  SIE_SSIE | SIE_STIE | SIE_SEIE); //set m-mode sip
@@ -72,6 +72,6 @@ void clint_timer_cmp_set_val(unsigned long val)
     rt_uint32_t tick_l = (cur_cnt & 0xffffffff);
     rt_uint32_t tick_h = (cur_cnt >> 32) & 0xffffffff;
 
-    write32(clint_cmp_reg, tick_l);
     write32(clint_cmp_reg + 4, tick_h);
+    write32(clint_cmp_reg, tick_l);
 }

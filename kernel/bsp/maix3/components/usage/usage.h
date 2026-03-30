@@ -15,8 +15,7 @@
 #include <rtthread.h>
 
 rt_uint8_t sys_cpu_usage(rt_uint8_t cpu_id);
-rt_uint8_t sys_thread_usage(rt_thread_t thread);
-rt_uint8_t sys_process_usage(int pid);
-rt_err_t sys_set_usage_period(int mill_sec);
+rt_uint8_t sys_thread_usage(int tid);
+rt_err_t usage_set_period(int mill_sec);
 
 #endif /* __DRV_UART_H__ */

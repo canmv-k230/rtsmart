@@ -24,6 +24,8 @@
 #include <lwp_arch.h>
 #include <lwp_mm.h>
 
+#include "rvv_ops.h"
+
 int lwp_user_space_init(struct rt_lwp *lwp)
 {
     return arch_user_space_init(lwp);
@@ -386,7 +388,7 @@ void* lwp_mmap2(void *addr, size_t length, int prot,
         {
             if ((flags & MAP_ANONYMOUS) != 0)
             {
-                rt_memset(ret, 0, length);
+                rvv_memset(ret, 0, length);
             }
         }
         else
@@ -469,7 +471,7 @@ int lwp_get_from_user_ex(void *dst, void *src, size_t size)
         }
     }
 
-    rt_memcpy(dst, src, size);
+    rvv_memcpy(dst, src, size);
 
     return 0;
 }
@@ -510,7 +512,7 @@ int lwp_put_to_user_ex(void *dst, void *src, size_t size)
         }
     }
 
-    rt_memcpy(dst, src, size);
+    rvv_memcpy(dst, src, size);
 
     return 0;
 }
@@ -600,7 +602,7 @@ size_t lwp_data_get(rt_mmu_info *mmu_info, void *dst, void *src, size_t size)
             break;
         }
         tmp_src = (void *)((char *)tmp_src - PV_OFFSET);
-        rt_memcpy(tmp_dst, tmp_src, len);
+        rvv_memcpy(tmp_dst, tmp_src, len);
         tmp_dst = (void *)((char *)tmp_dst + len);
         addr_start = (void *)((char *)addr_start + len);
         size -= len;
@@ -639,7 +641,7 @@ size_t lwp_data_put(rt_mmu_info *mmu_info, void *dst, void *src, size_t size)
             break;
         }
         tmp_dst = (void *)((char *)tmp_dst - PV_OFFSET);
-        rt_memcpy(tmp_dst, tmp_src, len);
+        rvv_memcpy(tmp_dst, tmp_src, len);
         tmp_src = (void *)((char *)tmp_src + len);
         addr_start = (void *)((char *)addr_start + len);
         size -= len;

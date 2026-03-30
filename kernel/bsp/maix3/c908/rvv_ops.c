@@ -1,5 +1,7 @@
 #include "rvv_ops.h"
 
+#include "rtthread.h"
+
 #include <stdint.h>
 #include <string.h>
 
@@ -8,6 +10,10 @@ void *rvv_memcpy(void *dst, const void *src, size_t n)
     const uint8_t *s = (const uint8_t *)src;
     uint8_t *d = (uint8_t *)dst;
     size_t remaining = n;
+
+    if ((64 >= n) || (0x00 < rt_interrupt_get_nest())) {
+        return rt_memcpy(dst, src, n);
+    }
 
     while (remaining > 0) {
         size_t vl;
@@ -36,6 +42,10 @@ void *rvv_memset(void *dst, int value, size_t n)
     uint8_t *d = (uint8_t *)dst;
     size_t remaining = n;
     uintptr_t fill = (uint8_t)value;
+
+    if ((64 >= n) || (0x00 < rt_interrupt_get_nest())) {
+        return rt_memset(dst, value, n);
+    }
 
     while (remaining > 0) {
         size_t vl;

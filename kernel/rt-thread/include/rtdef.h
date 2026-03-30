@@ -731,7 +731,7 @@ struct rt_thread
     rt_ubase_t  remaining_tick;                         /**< remaining tick */
 
     rt_ubase_t  tick_mark;
-    rt_ubase_t  run_tick;
+    rt_ubase_t  run_tick;                               /**<used by k230 usage */
 
     struct rt_timer thread_timer;                       /**< built-in thread timer */
 

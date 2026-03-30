@@ -4416,7 +4416,6 @@ int sys_sched_setscheduler(int tid, int policy, void *param)
         return -EFAULT;
     }
     return rt_thread_control(thread, RT_THREAD_CTRL_CHANGE_PRIORITY, (void *)&sched_param->sched_priority);
-    return 0;
 }
 
 int sys_sched_getscheduler(int tid, int *policy, void *param)
@@ -4433,6 +4432,11 @@ int sys_sched_getscheduler(int tid, int *policy, void *param)
     // sched_param->sched_priority = thread->current_priority;
     // *policy = 0;
     return thread->current_priority;
+}
+
+int sys_sched_yield(void)
+{
+    return (int)rt_thread_yield();
 }
 
 int sys_fsync(int fd)
@@ -4727,6 +4731,7 @@ const static void* func_table[] =
 
     SYSCALL_SIGN(sys_statfs),
 
+    SYSCALL_SIGN(sys_sched_yield), /* 165 */
 };
 
 const void *lwp_get_sys_api(rt_uint32_t number)

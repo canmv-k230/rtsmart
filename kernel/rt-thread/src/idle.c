@@ -17,6 +17,7 @@
  *                             combine the code of primary and secondary cpu
  */
 
+#include "rtdef.h"
 #include <rthw.h>
 #include <rtthread.h>
 
@@ -79,6 +80,10 @@ static void (*idle_hook_list[RT_IDLE_HOOK_LIST_SIZE])(void);
  */
 rt_err_t rt_thread_idle_sethook(void (*hook)(void))
 {
+#if 1
+    rt_kprintf("Currently we not support idle hook\n");
+    return -RT_EINVAL;
+#else
     rt_size_t i;
     rt_base_t level;
     rt_err_t ret = -RT_EFULL;
@@ -99,6 +104,7 @@ rt_err_t rt_thread_idle_sethook(void (*hook)(void))
     rt_hw_interrupt_enable(level);
 
     return ret;
+#endif
 }
 
 /**
@@ -276,6 +282,7 @@ static void rt_thread_idle_entry(void *parameter)
 
     while (1)
     {
+#if 0
 #ifdef RT_USING_IDLE_HOOK
         rt_size_t i;
 
@@ -293,6 +300,14 @@ static void rt_thread_idle_entry(void *parameter)
 
 #ifdef RT_USING_PM
         rt_system_power_manager();
+#endif
+#else
+
+#ifdef RT_USING_PM
+        rt_system_power_manager();
+#endif
+
+        asm volatile("wfi");
 #endif
     }
 }

@@ -40,6 +40,10 @@
 #include "ioremap.h"
 #include <riscv_io.h>
 
+#if defined(RT_USING_MSH)
+#include <finsh.h>
+#endif
+
 ///////////////////////////////////////////////////////////////////////////////
 ///////////////////////////////////////////////////////////////////////////////
 ///////////////////////////////////////////////////////////////////////////////
@@ -361,3 +365,31 @@ static int rt_hw_ts_init(void)
     return RT_EOK;
 }
 INIT_DEVICE_EXPORT(rt_hw_ts_init);
+
+#if defined(RT_USING_MSH)
+static void chip_temp(void)
+{
+    double     temp       = 0.0;
+    rt_int32_t temp_milli = 0;
+    rt_int32_t frac_milli = 0;
+
+    if (0x00 != tsensor_read_temp(&temp)) {
+        rt_kprintf("read chip temperature failed\n");
+        return;
+    }
+
+    if (temp >= 0.0) {
+        temp_milli = (rt_int32_t)(temp * 1000.0 + 0.5);
+    } else {
+        temp_milli = (rt_int32_t)(temp * 1000.0 - 0.5);
+    }
+
+    frac_milli = temp_milli % 1000;
+    if (frac_milli < 0) {
+        frac_milli = -frac_milli;
+    }
+
+    rt_kprintf("chip temperature: %d.%03d C\n", temp_milli / 1000, frac_milli);
+}
+MSH_CMD_EXPORT(chip_temp, dump chip temperature);
+#endif

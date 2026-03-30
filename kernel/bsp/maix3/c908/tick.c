@@ -35,8 +35,8 @@ int tick_isr(void)
     rt_tick_increase();
     sbi_set_timer(get_ticks() + tick_delta);
 #else
-    clint_timer_cmp_set_val(tick_delta);
     rt_tick_increase();
+    clint_timer_cmp_set_val(tick_delta);
 #endif
     return 0;
 }
