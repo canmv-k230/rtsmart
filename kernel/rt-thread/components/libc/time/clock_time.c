@@ -13,12 +13,12 @@
 #include <time.h>
 #include "clock_time.h"
 #include "lwp.h"
+#include "tick.h"
 
 static struct timeval _timevalue;
 int clock_time_system_init()
 {
     time_t time;
-    rt_tick_t tick;
     rt_device_t device;
 
     time = 0;
@@ -29,11 +29,18 @@ int clock_time_system_init()
         rt_device_control(device, RT_DEVICE_CTRL_RTC_GET_TIME, &time);
     }
 
-    /* get tick */
-    tick = rt_tick_get();
+    /* use hardware timer for microsecond precision */
+    uint64_t us = cpu_ticks_us();
 
-    _timevalue.tv_usec = (tick%RT_TICK_PER_SECOND) * MICROSECOND_PER_TICK;
-    _timevalue.tv_sec = time - tick/RT_TICK_PER_SECOND - 1;
+    _timevalue.tv_usec = us % MICROSECOND_PER_SECOND;
+    /*
+     * The -1 pre-compensates for the fractional second carry that occurs in
+     * clock_gettime(): there tv_nsec is computed as
+     *   (_timevalue.tv_usec + us % 1e6) * 1000
+     * which can exceed 1 second, triggering a +1 sec carry.  By subtracting
+     * 1 here the two cancel out and the result matches the RTC epoch time.
+     */
+    _timevalue.tv_sec = time - us / MICROSECOND_PER_SECOND - 1;
 
     return 0;
 }
@@ -89,7 +96,7 @@ int clock_getres(clockid_t clockid, struct timespec *res)
     {
     case CLOCK_REALTIME:
         res->tv_sec = 0;
-        res->tv_nsec = NANOSECOND_PER_SECOND/RT_TICK_PER_SECOND;
+        res->tv_nsec = 1000; /* microsecond resolution from hardware timer */
         break;
 
 #ifdef RT_USING_CPUTIME
@@ -124,17 +131,15 @@ int clock_gettime(clockid_t clockid, struct timespec *tp)
     {
     case CLOCK_REALTIME:
         {
-            /* get tick */
-            rt_base_t level = rt_hw_interrupt_disable();
-            rt_tick_t tick = rt_tick_get();
-            rt_hw_interrupt_enable(level);
+            /* use hardware timer for microsecond precision */
+            uint64_t us = cpu_ticks_us();
 
-            tp->tv_sec  = _timevalue.tv_sec + tick / RT_TICK_PER_SECOND;
-            tp->tv_nsec = (_timevalue.tv_usec + (tick % RT_TICK_PER_SECOND) * MICROSECOND_PER_TICK) * 1000;
-            if(tp->tv_nsec > 1000000000)
+            tp->tv_sec  = _timevalue.tv_sec + us / MICROSECOND_PER_SECOND;
+            tp->tv_nsec = (_timevalue.tv_usec + us % MICROSECOND_PER_SECOND) * 1000;
+            if (tp->tv_nsec >= NANOSECOND_PER_SECOND)
             {
-                tp->tv_nsec %= 1000000000;
-                tp->tv_sec += 1;
+                tp->tv_sec += tp->tv_nsec / NANOSECOND_PER_SECOND;
+                tp->tv_nsec %= NANOSECOND_PER_SECOND;
             }
         }
         break;
@@ -166,7 +171,6 @@ RTM_EXPORT(clock_gettime);
 int clock_settime(clockid_t clockid, const struct timespec *tp)
 {
     time_t second;
-    rt_tick_t tick;
     rt_device_t device;
 
     if ((clockid != CLOCK_REALTIME) || (tp == RT_NULL))
@@ -178,12 +182,12 @@ int clock_settime(clockid_t clockid, const struct timespec *tp)
 
     /* get second */
     second = tp->tv_sec;
-    /* get tick */
-    tick = rt_tick_get();
+    /* use hardware timer for microsecond precision */
+    uint64_t us = cpu_ticks_us();
 
     /* update timevalue */
-    _timevalue.tv_usec = MICROSECOND_PER_SECOND - (tick % RT_TICK_PER_SECOND) * MICROSECOND_PER_TICK;
-    _timevalue.tv_sec = second - tick/RT_TICK_PER_SECOND - 1;
+    _timevalue.tv_usec = MICROSECOND_PER_SECOND - (us % MICROSECOND_PER_SECOND);
+    _timevalue.tv_sec = second - us / MICROSECOND_PER_SECOND - 1;
 
     /* update for RTC device */
     device = rt_device_find("rtc");

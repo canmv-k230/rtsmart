@@ -17,6 +17,7 @@
 #include <board.h>
 
 #include <lwp.h>
+#include "tick.h"
 #ifdef RT_USING_USERSPACE
 #include <lwp_user_mm.h>
 #include <lwp_arch.h>
@@ -1029,8 +1030,9 @@ int sys_gettimeofday(struct timeval *tp, struct timezone *tzp)
         }
 
         if(0x00 != gettimeofday(&t_k, NULL)) {
-            t_k.tv_sec = rt_tick_get() / RT_TICK_PER_SECOND;
-            t_k.tv_usec = (rt_tick_get() % RT_TICK_PER_SECOND) * (1000000 / RT_TICK_PER_SECOND);
+            uint64_t us = cpu_ticks_us();
+            t_k.tv_sec = us / 1000000UL;
+            t_k.tv_usec = us % 1000000UL;
         }
 
         lwp_put_to_user(tp, (void *)&t_k, sizeof t_k);
@@ -1042,8 +1044,9 @@ int sys_gettimeofday(struct timeval *tp, struct timezone *tzp)
         {
             return -EFAULT;
         }
-        tp->tv_sec = rt_tick_get() / RT_TICK_PER_SECOND;
-        tp->tv_usec = (rt_tick_get() % RT_TICK_PER_SECOND) * (1000000 / RT_TICK_PER_SECOND);
+        uint64_t us = cpu_ticks_us();
+        tp->tv_sec = us / 1000000UL;
+        tp->tv_usec = us % 1000000UL;
     }
 #endif
 
