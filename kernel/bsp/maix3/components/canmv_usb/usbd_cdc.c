@@ -8,22 +8,13 @@
 
 #if defined(CHERRY_USB_DEVICE_FUNC_CDC) || defined (CHERRY_USB_DEVICE_FUNC_CDC_MTP) || defined (CHERRY_USB_DEVICE_FUNC_CDC_ADB)
 
-#define CDC_ACM_MAGIC_REBOOT_BAUDRATE (300)
-#define CDC_ACM_MAGIC_REBOOT_STOPBITS (2)
-#define CDC_ACM_MAGIC_REBOOT_PARITY   (3)
-#define CDC_ACM_MAGIC_REBOOT_DATABITS (5)
+#include "usbd_desc_cdc_common.h"
 
-static volatile bool pending_magic_reset = false;
-static volatile bool last_dtr_state = false;
-static volatile bool last_rts_state = false;
-static volatile bool send_break_flag = false;
-
-static struct cdc_line_coding s_line_coding = {
-    .dwDTERate = 2000000,
-    .bCharFormat = 0,
-    .bParityType = 0,
-    .bDataBits = 8,
-};
+#define CDC_ACM_MAGIC_REBOOT_BAUDRATE  (300)
+#define CDC_ACM_MAGIC_REBOOT_STOPBITS  (2)
+#define CDC_ACM_MAGIC_REBOOT_PARITY    (3)
+#define CDC_ACM_MAGIC_REBOOT_DATABITS  (5)
+#define CDC_ACM_MAGIC_REBOOT_PORT      (0)
 
 #ifdef RT_SERIAL_USING_DMA
 
@@ -33,10 +24,18 @@ static struct cdc_line_coding s_line_coding = {
 struct cdc_device {
     struct rt_serial_device serial;
     uint8_t                 busid;
+    uint8_t                 port_index;
     uint8_t                 in_ep;
     uint8_t                 out_ep;
+    uint8_t                 int_ep;
     struct usbd_interface   intf_ctrl;
     struct usbd_interface   intf_data;
+    struct cdc_line_coding  line_coding;
+    const char             *dev_name;
+    bool                    pending_magic_reset;
+    bool                    last_dtr_state;
+    bool                    last_rts_state;
+    bool                    send_break_flag;
     int                     cdc_dtr;
     bool                    is_open;
 };
@@ -44,25 +43,140 @@ struct cdc_device {
 #define CDC_MAX_MPS          USB_DEVICE_MAX_MPS
 #define CDC_READ_BUFFER_SIZE (4096)
 
-static struct cdc_device g_usbd_serial_cdc_acm;
+static struct cdc_device g_usbd_serial_cdc_acm[CANMV_USB_CDC_ACM_COUNT];
+static const char *g_usbd_serial_cdc_acm_name[CANMV_USB_CDC_ACM_COUNT] = {
+    "ttyGS0",
+#ifdef CONFIG_ENABLE_DUAL_CDC_PORT
+    "ttyGS1",
+#endif
+};
+static const uint8_t g_usbd_serial_cdc_acm_in_ep[CANMV_USB_CDC_ACM_COUNT] = {
+    CDC_IN_EP,
+#ifdef CONFIG_ENABLE_DUAL_CDC_PORT
+    CDC_IN_EP2,
+#endif
+};
+static const uint8_t g_usbd_serial_cdc_acm_out_ep[CANMV_USB_CDC_ACM_COUNT] = {
+    CDC_OUT_EP,
+#ifdef CONFIG_ENABLE_DUAL_CDC_PORT
+    CDC_OUT_EP2,
+#endif
+};
+static const uint8_t g_usbd_serial_cdc_acm_int_ep[CANMV_USB_CDC_ACM_COUNT] = {
+    CDC_INT_EP,
+#ifdef CONFIG_ENABLE_DUAL_CDC_PORT
+    CDC_INT_EP2,
+#endif
+};
 
 static USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t
-    g_usbd_serial_cdc_acm_rx_buf[USB_ALIGN_UP(CDC_READ_BUFFER_SIZE, CONFIG_USB_ALIGN_SIZE)];
+    g_usbd_serial_cdc_acm_rx_buf[CANMV_USB_CDC_ACM_COUNT][USB_ALIGN_UP(CDC_READ_BUFFER_SIZE, CONFIG_USB_ALIGN_SIZE)];
 
-static rt_err_t cdc_configure(struct rt_serial_device* serial, struct serial_configure* cfg) { return RT_EOK; }
+static uint32_t cdc_stop_bits_from_char_format(uint8_t char_format)
+{
+    return char_format == 2 ? STOP_BITS_2 : STOP_BITS_1;
+}
+
+static uint8_t cdc_char_format_from_stop_bits(uint32_t stop_bits)
+{
+    return stop_bits == STOP_BITS_2 ? 2 : 0;
+}
+
+static uint32_t cdc_parity_from_line_coding(uint8_t parity_type)
+{
+    switch (parity_type) {
+    case 1:
+        return PARITY_ODD;
+    case 2:
+        return PARITY_EVEN;
+    default:
+        return PARITY_NONE;
+    }
+}
+
+static uint8_t cdc_line_parity_from_serial(uint32_t parity)
+{
+    switch (parity) {
+    case PARITY_ODD:
+        return 1;
+    case PARITY_EVEN:
+        return 2;
+    default:
+        return 0;
+    }
+}
+
+static void cdc_sync_serial_config_from_line_coding(struct cdc_device *cdc, const struct cdc_line_coding *line_coding)
+{
+    if (!cdc || !line_coding) {
+        return;
+    }
+
+    cdc->serial.config.baud_rate = line_coding->dwDTERate;
+    cdc->serial.config.data_bits = line_coding->bDataBits;
+    cdc->serial.config.stop_bits = cdc_stop_bits_from_char_format(line_coding->bCharFormat);
+    cdc->serial.config.parity = cdc_parity_from_line_coding(line_coding->bParityType);
+}
+
+static void cdc_sync_line_coding_from_serial_config(struct cdc_device *cdc, const struct serial_configure *config)
+{
+    if (!cdc || !config) {
+        return;
+    }
+
+    cdc->line_coding.dwDTERate = config->baud_rate;
+    cdc->line_coding.bDataBits = config->data_bits;
+    cdc->line_coding.bCharFormat = cdc_char_format_from_stop_bits(config->stop_bits);
+    cdc->line_coding.bParityType = cdc_line_parity_from_serial(config->parity);
+}
+
+static struct cdc_device *cdc_find_by_intf(uint8_t intf_num)
+{
+    for (size_t i = 0; i < CANMV_USB_CDC_ACM_COUNT; i++) {
+        struct cdc_device *cdc = &g_usbd_serial_cdc_acm[i];
+
+        if (cdc->intf_ctrl.intf_num == intf_num || cdc->intf_data.intf_num == intf_num) {
+            return cdc;
+        }
+    }
+
+    return RT_NULL;
+}
+
+static void cdc_start_read(struct cdc_device *cdc)
+{
+    if (!cdc) {
+        USB_LOG_ERR("%s %d null cdc\n", __func__, __LINE__);
+        return;
+    }
+
+    usbd_ep_start_read(cdc->busid, cdc->out_ep, g_usbd_serial_cdc_acm_rx_buf[cdc->port_index], CDC_READ_BUFFER_SIZE);
+}
+
+static rt_err_t cdc_configure(struct rt_serial_device *serial, struct serial_configure *cfg)
+{
+    if (cfg) {
+        rt_memcpy(&serial->config, cfg, sizeof(serial->config));
+    }
+
+    return RT_EOK;
+}
 
 static rt_err_t cdc_control(struct rt_serial_device* serial, int cmd, void* arg)
 {
     int                ret = RT_EOK;
     struct cdc_device* cdc;
 
-    cdc = (struct cdc_device*)serial->parent.user_data;
+    cdc = (struct cdc_device *)serial->parent.user_data;
 
     switch (cmd) {
     case RT_DEVICE_CTRL_CONFIG: {
         if (arg == (void*)RT_DEVICE_FLAG_DMA_RX) {
             cdc->is_open = RT_TRUE;
             cdc->cdc_dtr = 0;
+            cdc->last_dtr_state = false;
+            cdc->last_rts_state = false;
+            cdc->send_break_flag = false;
         }
         break;
     }
@@ -75,7 +189,28 @@ static rt_err_t cdc_control(struct rt_serial_device* serial, int cmd, void* arg)
     } break;
     /* Added*/
     case UART_IOCTL_SET_CONFIG: {
+        struct serial_configure config;
 
+        if (!arg) {
+            USB_LOG_ERR("arg is NULL");
+            return -RT_EINVAL;
+        }
+
+        if (lwp_in_user_space(arg)) {
+            if (sizeof(config) != lwp_get_from_user(&config, arg, sizeof(config))) {
+                USB_LOG_ERR("lwp get error size");
+                return -RT_EINVAL;
+            }
+        } else {
+            rt_memcpy(&config, arg, sizeof(config));
+        }
+
+        if (config.bufsz == 0) {
+            config.bufsz = serial->config.bufsz;
+        }
+
+        rt_memcpy(&serial->config, &config, sizeof(serial->config));
+        cdc_sync_line_coding_from_serial_config(cdc, &serial->config);
     } break;
     case UART_IOCTL_GET_CONFIG: {
         if (!arg) {
@@ -123,7 +258,7 @@ static rt_size_t cdc_transmit(struct rt_serial_device* serial, rt_uint8_t* buf, 
 {
     struct cdc_device* cdc;
 
-    cdc = (struct cdc_device*)serial->parent.user_data;
+    cdc = (struct cdc_device *)serial->parent.user_data;
 
     if (dir == RT_SERIAL_DMA_TX) {
         usbd_ep_start_write(cdc->busid, cdc->in_ep, buf, size);
@@ -133,337 +268,229 @@ static rt_size_t cdc_transmit(struct rt_serial_device* serial, rt_uint8_t* buf, 
     return 0;
 }
 
-void usbd_cdc_acm_bulk_out(uint8_t busid, uint8_t ep, uint32_t nbytes)
+static void usbd_cdc_acm_bulk_out(uint8_t busid, uint8_t ep, uint32_t nbytes, void *arg)
 {
-    struct cdc_device* cdc;
+    struct cdc_device *cdc = (struct cdc_device *)arg;
 
-    cdc = &g_usbd_serial_cdc_acm;
-    if (cdc->is_open) {
-        rt_serial_put_rxfifo(&cdc->serial, g_usbd_serial_cdc_acm_rx_buf, nbytes);
+    (void)busid;
+    (void)ep;
+
+    if (cdc && cdc->is_open) {
+        rt_serial_put_rxfifo(&cdc->serial, g_usbd_serial_cdc_acm_rx_buf[cdc->port_index], nbytes);
         rt_hw_serial_isr(&cdc->serial, RT_SERIAL_EVENT_RX_DMADONE);
     }
-    usbd_ep_start_read(cdc->busid, cdc->out_ep, g_usbd_serial_cdc_acm_rx_buf, CDC_READ_BUFFER_SIZE);
+    cdc_start_read(cdc);
 }
 
-void usbd_cdc_acm_bulk_in(uint8_t busid, uint8_t ep, uint32_t nbytes)
+static void usbd_cdc_acm_bulk_in(uint8_t busid, uint8_t ep, uint32_t nbytes, void *arg)
 {
-    struct cdc_device* cdc;
+    struct cdc_device *cdc = (struct cdc_device *)arg;
 
     if ((nbytes % CDC_MAX_MPS) == 0 && nbytes) {
         /* send zlp */
         usbd_ep_start_write(busid, ep, NULL, 0);
-    } else {
-        cdc = &g_usbd_serial_cdc_acm;
+    } else if (cdc) {
         rt_hw_serial_isr(&cdc->serial, RT_SERIAL_EVENT_TX_DMADONE);
     }
 }
 
 void usbd_cdc_acm_set_dtr(uint8_t busid, uint8_t intf, bool dtr)
 {
-    struct cdc_device* cdc;
+    struct cdc_device *cdc;
 
-    cdc          = &g_usbd_serial_cdc_acm;
+    (void)busid;
+
+    cdc = cdc_find_by_intf(intf);
+    if (!cdc) {
+        return;
+    }
+
     cdc->cdc_dtr = (int)dtr;
     rt_hw_serial_isr(&cdc->serial, RT_SERIAL_EVENT_HOTPLUG);
 
-    last_dtr_state = dtr;
+    cdc->last_dtr_state = dtr;
 }
 
 void canmv_usb_device_cdc_on_connected(void)
 {
-    struct cdc_device* cdc;
+    for (size_t i = 0; i < CANMV_USB_CDC_ACM_COUNT; i++) {
+        struct cdc_device *cdc = &g_usbd_serial_cdc_acm[i];
 
-    cdc          = &g_usbd_serial_cdc_acm;
-    cdc->cdc_dtr = 0;
-    if (cdc->is_open) {
-        rt_hw_serial_isr(&cdc->serial, RT_SERIAL_EVENT_TX_DMADONE);
-        rt_hw_serial_isr(&cdc->serial, RT_SERIAL_EVENT_HOTPLUG);
+        cdc->cdc_dtr = 0;
+        cdc->last_dtr_state = false;
+        cdc->last_rts_state = false;
+        cdc->send_break_flag = false;
+        cdc->pending_magic_reset = false;
+
+        if (cdc->is_open) {
+            rt_hw_serial_isr(&cdc->serial, RT_SERIAL_EVENT_TX_DMADONE);
+            rt_hw_serial_isr(&cdc->serial, RT_SERIAL_EVENT_HOTPLUG);
+        }
+
+        cdc_start_read(cdc);
     }
-    usbd_ep_start_read(cdc->busid, cdc->out_ep, g_usbd_serial_cdc_acm_rx_buf, CDC_READ_BUFFER_SIZE);
 }
 
 static const struct rt_uart_ops cdc_ops = { .configure = cdc_configure, .control = cdc_control, .dma_transmit = cdc_transmit };
 
-rt_err_t usbd_serial_register(struct cdc_device* cdc, void* data)
+static rt_err_t usbd_serial_register(struct cdc_device *cdc)
 {
-    int                     ret;
-    struct serial_configure config;
+    int ret;
+    struct serial_configure config = RT_SERIAL_CONFIG_DEFAULT;
 
+    config.baud_rate = BAUD_RATE_2000000;
     config.bufsz = CDC_READ_BUFFER_SIZE * 4;
 
     cdc->serial.ops    = &cdc_ops;
     cdc->serial.config = config;
+    cdc_sync_line_coding_from_serial_config(cdc, &config);
 
-    ret = rt_hw_serial_register(&cdc->serial, "ttyUSB", RT_DEVICE_FLAG_RDWR | RT_DEVICE_FLAG_DMA_RX | RT_DEVICE_FLAG_DMA_TX,
-                                cdc);
+    ret = rt_hw_serial_register(&cdc->serial, cdc->dev_name, RT_DEVICE_FLAG_RDWR | RT_DEVICE_FLAG_DMA_RX | RT_DEVICE_FLAG_DMA_TX, cdc);
 
     return ret;
 }
 
 void canmv_usb_device_cdc_init(void)
 {
-    struct cdc_device* cdc;
-    uint8_t            busid = USB_DEVICE_BUS_ID;
-    uint8_t            in_ep = CDC_IN_EP, out_ep = CDC_OUT_EP;
+    uint8_t busid = USB_DEVICE_BUS_ID;
 
-    struct usbd_endpoint cdc_out_ep = { .ep_addr = out_ep, .ep_cb = usbd_cdc_acm_bulk_out };
+    for (size_t i = 0; i < CANMV_USB_CDC_ACM_COUNT; i++) {
+        struct cdc_device *cdc = &g_usbd_serial_cdc_acm[i];
+        struct usbd_endpoint cdc_out_ep = {
+            .ep_addr = g_usbd_serial_cdc_acm_out_ep[i],
+            .ep_cb_ex = usbd_cdc_acm_bulk_out,
+            .ep_arg = cdc,
+        };
+        struct usbd_endpoint cdc_in_ep = {
+            .ep_addr = g_usbd_serial_cdc_acm_in_ep[i],
+            .ep_cb_ex = usbd_cdc_acm_bulk_in,
+            .ep_arg = cdc,
+        };
 
-    struct usbd_endpoint cdc_in_ep = { .ep_addr = in_ep, .ep_cb = usbd_cdc_acm_bulk_in };
+        cdc->is_open = RT_FALSE;
+        cdc->busid = busid;
+        cdc->port_index = i;
+        cdc->in_ep = g_usbd_serial_cdc_acm_in_ep[i];
+        cdc->out_ep = g_usbd_serial_cdc_acm_out_ep[i];
+        cdc->int_ep = g_usbd_serial_cdc_acm_int_ep[i];
+        cdc->dev_name = g_usbd_serial_cdc_acm_name[i];
+        cdc->line_coding.dwDTERate = BAUD_RATE_2000000;
+        cdc->line_coding.bCharFormat = 0;
+        cdc->line_coding.bParityType = 0;
+        cdc->line_coding.bDataBits = 8;
 
-    cdc = &g_usbd_serial_cdc_acm;
+        usbd_add_interface(busid, usbd_cdc_acm_init_intf(busid, &cdc->intf_ctrl));
+        usbd_add_interface(busid, usbd_cdc_acm_init_intf(busid, &cdc->intf_data));
+        usbd_add_endpoint(busid, &cdc_out_ep);
+        usbd_add_endpoint(busid, &cdc_in_ep);
 
-    cdc->is_open = RT_FALSE;
-    cdc->busid   = busid;
-    cdc->in_ep   = in_ep;
-    cdc->out_ep  = out_ep;
-
-    usbd_add_interface(busid, usbd_cdc_acm_init_intf(busid, &cdc->intf_ctrl));
-    usbd_add_interface(busid, usbd_cdc_acm_init_intf(busid, &cdc->intf_data));
-    usbd_add_endpoint(busid, &cdc_out_ep);
-    usbd_add_endpoint(busid, &cdc_in_ep);
-
-    if (usbd_serial_register(cdc, NULL) != RT_EOK) {
-        USB_LOG_ERR("Failed to register usb_serial device\n");
+        if (usbd_serial_register(cdc) != RT_EOK) {
+            USB_LOG_ERR("Failed to register usb serial device %s\n", cdc->dev_name);
+        }
     }
 }
 
 #else
-
-#include "dfs_file.h"
-#include "dfs_poll.h"
-#include "ipc/waitqueue.h"
-
-#define CDC_MAX_MPS USB_DEVICE_MAX_MPS
-
-/*****************************************************************************/
-static int      cdc_poll_flag;
-static uint32_t actual_read;
-
-static USB_MEM_ALIGNX uint8_t usb_read_buffer[4096];
-
-static struct rt_device     cdc_device;
-static struct rt_semaphore  cdc_read_sem, cdc_write_sem;
-static struct rt_completion cdc_write_done;
-static int                  cdc_dtr = 0;
-
-static int cdc_open(struct dfs_fd* fd) { return 0; }
-
-static int cdc_close(struct dfs_fd* fd) { return 0; }
-
-static int cdc_read(struct dfs_fd* fd, void* buf, size_t count)
-{
-    int      read_count = -1;
-    rt_err_t error      = RT_ERROR;
-
-    if (RT_EOK == (error = rt_sem_take(&cdc_read_sem, rt_tick_from_millisecond(100)))) {
-        read_count  = actual_read;
-        actual_read = 0;
-
-        if (0 < read_count) {
-            memcpy(buf, usb_read_buffer, read_count);
-        }
-    } else {
-        if (actual_read) {
-            USB_LOG_WRN("read %d but not copy\n", actual_read);
-        }
-
-        if ((-RT_ETIMEOUT) == error) {
-            read_count = 0;
-
-            USB_LOG_WRN("read timeout\n");
-        }
-    }
-
-    usbd_ep_start_read(USB_DEVICE_BUS_ID, CDC_OUT_EP, usb_read_buffer, sizeof(usb_read_buffer));
-
-    return read_count;
-}
-
-static int cdc_write(struct dfs_fd* fd, const void* buf, size_t count)
-{
-    rt_err_t   error   = RT_ERROR;
-    rt_int32_t timeout = RT_WAITING_FOREVER;
-
-    if (count == 0 || (false == g_usb_device_connected)) {
-        return -1; /* error */
-    }
-
-    if (RT_EOK != (error = rt_sem_take(&cdc_write_sem, timeout))) {
-        if (error == -RT_ETIMEOUT) {
-            rt_kprintf("sem timeout len = %d\n", count);
-        } else {
-            rt_kprintf("sem error %d\n", error);
-        }
-    } else {
-        usbd_ep_start_write(USB_DEVICE_BUS_ID, CDC_IN_EP, buf, count);
-        if (RT_EOK != (error = rt_completion_wait(&cdc_write_done, timeout))) {
-            if (error == -RT_ETIMEOUT) {
-                rt_kprintf("completion timeout len = %d\n", count);
-            } else {
-                rt_kprintf("completion error %d\n", error);
-            }
-        } else {
-            return count;
-        }
-    }
-
-    return 0;
-}
-
-static int cdc_ioctl(struct dfs_fd* fd, int cmd, void* args)
-{
-    int ret = RT_EOK;
-
-    switch (cmd) {
-    case UART_IOCTL_GET_DTR:
-        if (sizeof(int) != lwp_put_to_user(args, &cdc_dtr, sizeof(int))) {
-            USB_LOG_ERR("lwp put error size\n");
-            ret = -RT_EINVAL;
-        }
-        break;
-    default:
-        USB_LOG_ERR("Unsupport cmd %d in %s\n", cmd, __func__);
-        ret = -RT_ERROR;
-        break;
-    }
-
-    return ret;
-}
-
-static int cdc_poll(struct dfs_fd* fd, struct rt_pollreq* req)
-{
-    rt_poll_add(&cdc_device.wait_queue, req);
-    int tmp       = cdc_poll_flag;
-    cdc_poll_flag = 0;
-    return tmp;
-}
-
-static const struct dfs_file_ops cdc_ops
-    = { .open = cdc_open, .close = cdc_close, .read = cdc_read, .write = cdc_write, .ioctl = cdc_ioctl, .poll = cdc_poll };
-
-static void cdc_device_init(void)
-{
-    rt_err_t err = rt_device_register(&cdc_device, "ttyUSB", RT_DEVICE_OFLAG_RDWR);
-    if (err != RT_EOK) {
-        rt_kprintf("[usb] register device error\n");
-        return;
-    }
-    cdc_device.fops = &cdc_ops;
-    rt_sem_init(&cdc_read_sem, "cdc_read", 0, RT_IPC_FLAG_FIFO);
-    rt_sem_init(&cdc_write_sem, "cdc_write", 1, RT_IPC_FLAG_FIFO);
-    rt_completion_init(&cdc_write_done);
-}
-
-/*****************************************************************************/
-static void usbd_cdc_acm_bulk_out(uint8_t busid, uint8_t ep, uint32_t nbytes)
-{
-    actual_read = nbytes;
-    cdc_poll_flag |= POLLIN;
-    rt_wqueue_wakeup(&cdc_device.wait_queue, (void*)POLLIN);
-    rt_sem_release(&cdc_read_sem);
-}
-
-static void usbd_cdc_acm_bulk_in(uint8_t busid, uint8_t ep, uint32_t nbytes)
-{
-    if (nbytes && (0x00 == (nbytes % CDC_MAX_MPS))) {
-        usbd_ep_start_write(USB_DEVICE_BUS_ID, CDC_IN_EP, NULL, 0);
-    } else {
-        rt_completion_done(&cdc_write_done);
-        rt_sem_release(&cdc_write_sem);
-    }
-}
-
-static struct usbd_interface usbd_cdc_intf;
-static struct usbd_interface usbd_cdc_data_unuse;
-
-static struct usbd_endpoint cdc_out_ep = { .ep_addr = CDC_OUT_EP, .ep_cb = usbd_cdc_acm_bulk_out };
-
-static struct usbd_endpoint cdc_in_ep = { .ep_addr = CDC_IN_EP, .ep_cb = usbd_cdc_acm_bulk_in };
-
-void canmv_usb_device_cdc_on_connected(void)
-{
-    actual_read = -1;
-    rt_sem_control(&cdc_read_sem, RT_IPC_CMD_RESET, (void*)1);
-    rt_sem_control(&cdc_write_sem, RT_IPC_CMD_RESET, (void*)1);
-    // TODO
-    rt_completion_done(&cdc_write_done);
-    rt_completion_init(&cdc_write_done);
-
-    cdc_dtr = 0;
-    usbd_ep_start_read(USB_DEVICE_BUS_ID, CDC_OUT_EP, usb_read_buffer, sizeof(usb_read_buffer));
-}
-
-void canmv_usb_device_cdc_init(void)
-{
-    usbd_cdc_acm_init_intf(USB_DEVICE_BUS_ID, &usbd_cdc_intf);
-    usbd_add_interface(USB_DEVICE_BUS_ID, &usbd_cdc_intf);
-    usbd_add_interface(USB_DEVICE_BUS_ID, &usbd_cdc_data_unuse);
-    usbd_add_endpoint(USB_DEVICE_BUS_ID, &cdc_out_ep);
-    usbd_add_endpoint(USB_DEVICE_BUS_ID, &cdc_in_ep);
-
-    cdc_device_init();
-}
-
-void usbd_cdc_acm_set_dtr(uint8_t busid, uint8_t intf, bool dtr)
-{
-    cdc_poll_flag |= POLLERR;
-
-    cdc_dtr = (int)dtr;
-    rt_wqueue_wakeup(&cdc_device.wait_queue, (void*)POLLERR);
-
-    last_dtr_state = dtr;
-}
-
+#error "RT_SERIAL_USING_DMA is not defined!"
 #endif
 
-void usbd_cdc_acm_set_line_coding(uint8_t busid, uint8_t intf, struct cdc_line_coding* line_coding) {
-    if(!line_coding) {
+void usbd_cdc_acm_set_line_coding(uint8_t busid, uint8_t intf, struct cdc_line_coding *line_coding)
+{
+    struct cdc_device *cdc;
+
+    (void)busid;
+
+    if (!line_coding) {
         return;
     }
 
-    last_dtr_state = false;
-    last_rts_state = false;
-    send_break_flag = false;
-    usb_memcpy((void *)&s_line_coding, line_coding, sizeof(s_line_coding));
-
-    if(CDC_ACM_MAGIC_REBOOT_BAUDRATE != line_coding->dwDTERate) {
+    cdc = cdc_find_by_intf(intf);
+    if (!cdc) {
         return;
     }
 
-    if(CDC_ACM_MAGIC_REBOOT_STOPBITS != line_coding->bCharFormat) {
+    cdc->last_dtr_state = false;
+    cdc->last_rts_state = false;
+    cdc->send_break_flag = false;
+    cdc->pending_magic_reset = false;
+    usb_memcpy((void *)&cdc->line_coding, line_coding, sizeof(cdc->line_coding));
+    cdc_sync_serial_config_from_line_coding(cdc, line_coding);
+
+    if (cdc->port_index != CDC_ACM_MAGIC_REBOOT_PORT) {
         return;
     }
 
-    if(CDC_ACM_MAGIC_REBOOT_PARITY != line_coding->bParityType) {
+    if (CDC_ACM_MAGIC_REBOOT_BAUDRATE != line_coding->dwDTERate) {
         return;
     }
 
-    if(CDC_ACM_MAGIC_REBOOT_DATABITS != line_coding->bDataBits) {
+    if (CDC_ACM_MAGIC_REBOOT_STOPBITS != line_coding->bCharFormat) {
         return;
     }
 
-    pending_magic_reset = true;
+    if (CDC_ACM_MAGIC_REBOOT_PARITY != line_coding->bParityType) {
+        return;
+    }
+
+    if (CDC_ACM_MAGIC_REBOOT_DATABITS != line_coding->bDataBits) {
+        return;
+    }
+
+    cdc->pending_magic_reset = true;
 }
 
 void usbd_cdc_acm_get_line_coding(uint8_t busid, uint8_t intf, struct cdc_line_coding* line_coding)
 {
-    usb_memcpy((void *)line_coding, &s_line_coding, sizeof(s_line_coding));
+    struct cdc_device *cdc;
+
+    (void)busid;
+
+    if (!line_coding) {
+        return;
+    }
+
+    cdc = cdc_find_by_intf(intf);
+    if (!cdc) {
+        line_coding->dwDTERate = BAUD_RATE_2000000;
+        line_coding->bCharFormat = 0;
+        line_coding->bParityType = 0;
+        line_coding->bDataBits = 8;
+        return;
+    }
+
+    usb_memcpy((void *)line_coding, &cdc->line_coding, sizeof(cdc->line_coding));
 }
 
-void usbd_cdc_acm_set_rts(uint8_t busid, uint8_t intf, bool rts) {
-    if(!pending_magic_reset) {
+void usbd_cdc_acm_set_rts(uint8_t busid, uint8_t intf, bool rts)
+{
+    struct cdc_device *cdc;
+
+    (void)busid;
+
+    cdc = cdc_find_by_intf(intf);
+    if (!cdc) {
         return;
     }
 
-    if(!last_dtr_state) {
+    cdc->last_rts_state = rts;
+
+    if (cdc->port_index != CDC_ACM_MAGIC_REBOOT_PORT) {
         return;
     }
 
-    if(!send_break_flag) {
+    if (!cdc->pending_magic_reset) {
         return;
     }
 
-    if(!rts) {
+    if (!cdc->last_dtr_state) {
+        return;
+    }
+
+    if (!cdc->send_break_flag) {
+        return;
+    }
+
+    if (!rts) {
         return;
     }
 
@@ -471,6 +498,18 @@ void usbd_cdc_acm_set_rts(uint8_t busid, uint8_t intf, bool rts) {
     reboot_to_upgrade();
 }
 
-void usbd_cdc_acm_send_break(uint8_t busid, uint8_t intf) { send_break_flag = true; }
+void usbd_cdc_acm_send_break(uint8_t busid, uint8_t intf)
+{
+    struct cdc_device *cdc;
+
+    (void)busid;
+
+    cdc = cdc_find_by_intf(intf);
+    if (!cdc) {
+        return;
+    }
+
+    cdc->send_break_flag = true;
+}
 
 #endif

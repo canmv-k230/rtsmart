@@ -45,11 +45,14 @@ enum usbd_event_type {
 
 typedef int (*usbd_request_handler)(uint8_t busid, struct usb_setup_packet *setup, uint8_t **data, uint32_t *len);
 typedef void (*usbd_endpoint_callback)(uint8_t busid, uint8_t ep, uint32_t nbytes);
+typedef void (*usbd_endpoint_callback_ex)(uint8_t busid, uint8_t ep, uint32_t nbytes, void *arg);
 typedef void (*usbd_notify_handler)(uint8_t busid, uint8_t event, void *arg);
 
 struct usbd_endpoint {
     uint8_t ep_addr;
     usbd_endpoint_callback ep_cb;
+    usbd_endpoint_callback_ex ep_cb_ex;
+    void *ep_arg;
 };
 
 struct usbd_interface {

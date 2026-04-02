@@ -47,6 +47,8 @@
 #define CONFIG_USB_DWC2_TX2_FIFO_SIZE (256 / 4)
 #define CONFIG_USB_DWC2_TX3_FIFO_SIZE (2048 / 4)
 #define CONFIG_USB_DWC2_TX4_FIFO_SIZE (256 / 4)
+#define CONFIG_USB_DWC2_TX5_FIFO_SIZE (2048 / 4)
+#define CONFIG_USB_DWC2_TX6_FIFO_SIZE (256 / 4)
 
 /* Ep0 max transfer buffer, specially for receiving data from ep0 out */
 #define CONFIG_USBDEV_REQUEST_BUFFER_LEN 256

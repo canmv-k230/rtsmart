@@ -22,6 +22,8 @@ struct usbd_tx_rx_msg {
     uint8_t ep;
     uint32_t nbytes;
     usbd_endpoint_callback cb;
+    usbd_endpoint_callback_ex cb_ex;
+    void *arg;
 };
 
 USB_NOCACHE_RAM_SECTION struct usbd_core_priv {
@@ -1114,14 +1116,18 @@ void usbd_event_ep0_out_complete_handler(uint8_t busid, uint8_t ep, uint32_t nby
 
 void usbd_event_ep_in_complete_handler(uint8_t busid, uint8_t ep, uint32_t nbytes)
 {
-    if (g_usbd_core[busid].tx_msg[ep & 0x7f].cb) {
+    if (g_usbd_core[busid].tx_msg[ep & 0x7f].cb_ex) {
+        g_usbd_core[busid].tx_msg[ep & 0x7f].cb_ex(busid, ep, nbytes, g_usbd_core[busid].tx_msg[ep & 0x7f].arg);
+    } else if (g_usbd_core[busid].tx_msg[ep & 0x7f].cb) {
         g_usbd_core[busid].tx_msg[ep & 0x7f].cb(busid, ep, nbytes);
     }
 }
 
 void usbd_event_ep_out_complete_handler(uint8_t busid, uint8_t ep, uint32_t nbytes)
 {
-    if (g_usbd_core[busid].rx_msg[ep & 0x7f].cb) {
+    if (g_usbd_core[busid].rx_msg[ep & 0x7f].cb_ex) {
+        g_usbd_core[busid].rx_msg[ep & 0x7f].cb_ex(busid, ep, nbytes, g_usbd_core[busid].rx_msg[ep & 0x7f].arg);
+    } else if (g_usbd_core[busid].rx_msg[ep & 0x7f].cb) {
         g_usbd_core[busid].rx_msg[ep & 0x7f].cb(busid, ep, nbytes);
     }
 }
@@ -1180,12 +1186,23 @@ void usbd_add_interface(uint8_t busid, struct usbd_interface *intf)
 
 void usbd_add_endpoint(uint8_t busid, struct usbd_endpoint *ep)
 {
+    uint8_t ep_idx = ep->ep_addr & 0x7f;
+
+    if (ep_idx >= CONFIG_USBDEV_EP_NUM) {
+        USB_LOG_ERR("endpoint 0x%02x overflow, max index %u\r\n", ep->ep_addr, CONFIG_USBDEV_EP_NUM - 1);
+        return;
+    }
+
     if (ep->ep_addr & 0x80) {
-        g_usbd_core[busid].tx_msg[ep->ep_addr & 0x7f].ep = ep->ep_addr;
-        g_usbd_core[busid].tx_msg[ep->ep_addr & 0x7f].cb = ep->ep_cb;
+        g_usbd_core[busid].tx_msg[ep_idx].ep = ep->ep_addr;
+        g_usbd_core[busid].tx_msg[ep_idx].cb = ep->ep_cb;
+        g_usbd_core[busid].tx_msg[ep_idx].cb_ex = ep->ep_cb_ex;
+        g_usbd_core[busid].tx_msg[ep_idx].arg = ep->ep_arg;
     } else {
-        g_usbd_core[busid].rx_msg[ep->ep_addr & 0x7f].ep = ep->ep_addr;
-        g_usbd_core[busid].rx_msg[ep->ep_addr & 0x7f].cb = ep->ep_cb;
+        g_usbd_core[busid].rx_msg[ep_idx].ep = ep->ep_addr;
+        g_usbd_core[busid].rx_msg[ep_idx].cb = ep->ep_cb;
+        g_usbd_core[busid].rx_msg[ep_idx].cb_ex = ep->ep_cb_ex;
+        g_usbd_core[busid].rx_msg[ep_idx].arg = ep->ep_arg;
     }
 }
 
