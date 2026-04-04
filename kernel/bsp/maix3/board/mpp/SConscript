@@ -2,15 +2,26 @@
 
 from building import *
 import os
+
 cwd     = GetCurrentDir()
-libdir  = os.getenv('MPP_SRC_DIR')
+
 src     = Glob('*.c')
-CPPPATH = ['include', libdir + '/include']
-if os.path.exists(str(libdir) + '/kernel/lib'):
-    libdir = libdir + '/kernel/lib'
+
+mpp_dir = os.getenv('MPP_SRC_DIR')
+
+CPPPATH = [
+    mpp_dir + '/include',
+    mpp_dir + '/include/comm',
+    mpp_dir + '/include/ioctl',
+]
+
+if os.path.exists(str(mpp_dir) + '/kernel/lib'):
+    libdir = mpp_dir + '/kernel/lib'
 else:
     libdir = cwd + '/lib'
+
 LIBPATH = [libdir]
+
 libname = ''
 liblist = os.listdir(str(libdir))
 for item in liblist:

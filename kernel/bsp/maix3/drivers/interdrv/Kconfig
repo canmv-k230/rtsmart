@@ -33,6 +33,11 @@ menu "InterDriver"
         bool "Enable GNNE driver for ai"
         default y
 
+    config RT_USING_FFT
+        bool "Enable FFT driver"
+        default n
+        depends on RT_USING_MPP
+
     menuconfig RT_USING_GPIO
         bool "Enable GPIO Driver"
         default n
