@@ -1,7 +1,19 @@
 menu "InterDriver"
-    config RT_USING_ADC
+    menuconfig RT_USING_ADC
         bool "Using ADC device drivers"
         default n
+
+        if RT_USING_ADC
+            config RT_ADC_ENABLE_ACODEC_HP_DETECT
+                bool "Enable acodec headphone detect"
+                default n
+
+            config RT_ADC_ACODEC_HP_DETECT_CHANNEL
+                int "Acodec headphone detect ADC channel"
+                range 0 5
+                default 5
+                depends on RT_ADC_ENABLE_ACODEC_HP_DETECT
+        endif
 
     menuconfig RT_USING_CIPHER
         bool "Enable CIPHER"

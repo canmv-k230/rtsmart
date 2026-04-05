@@ -33,6 +33,435 @@
     #include "lwp_arch.h"
 #endif
 
+extern rt_ubase_t __text_start[];
+extern rt_ubase_t __text_end[];
+extern rt_ubase_t __stack_start__[];
+extern rt_ubase_t __stack_cpu0[];
+
+/* Forward declarations for crash diagnostics. */
+static const char *get_exception_msg(int id);
+void dump_regs(struct rt_hw_stack_frame *regs);
+
+/* Re-entrancy guard: prevent infinite recursive crash reports. */
+static volatile int crash_handler_depth = 0;
+
+/*
+ * Try to safely read one word from a kernel address.
+ * Returns 0 on success and stores the value in *out.
+ * Returns -1 if the address is clearly invalid (NULL, unaligned, outside kernel range).
+ */
+static int safe_read_kern(rt_ubase_t addr, rt_ubase_t *out)
+{
+    if (addr == 0 || (addr & (sizeof(rt_ubase_t) - 1)) != 0)
+        return -1;
+
+    /* Accept kernel text/data/bss range and ISR stack range. */
+    if (addr >= (rt_ubase_t)&__text_start && addr < (rt_ubase_t)&__stack_cpu0 + 0x10000)
+    {
+        *out = *(volatile rt_ubase_t *)addr;
+        return 0;
+    }
+
+    /* Also accept dynamically allocated kernel heap (rough range). */
+    if (addr >= 0x100000 && addr < 0x80000000UL)
+    {
+        *out = *(volatile rt_ubase_t *)addr;
+        return 0;
+    }
+
+    return -1;
+}
+
+/*
+ * Dump raw stack memory around an address.
+ */
+static void dump_stack_memory(rt_ubase_t sp, int words_before, int words_after)
+{
+    rt_ubase_t start, end, addr, val;
+
+    start = (sp - words_before * sizeof(rt_ubase_t)) & ~(rt_ubase_t)0x7;
+    end   = sp + words_after  * sizeof(rt_ubase_t);
+
+    rt_kprintf("------------- Stack Memory Dump -------------\n");
+    rt_kprintf("  sp = 0x%016lx\n", (unsigned long)sp);
+
+    for (addr = start; addr < end; addr += sizeof(rt_ubase_t))
+    {
+        if (safe_read_kern(addr, &val) == 0)
+        {
+            rt_kprintf("  %s0x%016lx: 0x%016lx",
+                       (addr == sp) ? ">" : " ",
+                       (unsigned long)addr, (unsigned long)val);
+
+            /* Annotate if value looks like a kernel text address. */
+            if (val >= (rt_ubase_t)&__text_start && val < (rt_ubase_t)&__text_end)
+                rt_kprintf("  <- kernel text");
+
+            rt_kprintf("\n");
+        }
+        else
+        {
+            rt_kprintf("   0x%016lx: <inaccessible>\n", (unsigned long)addr);
+        }
+    }
+}
+
+/*
+ * Walk the RISC-V frame pointer chain and print a full backtrace.
+ * For -fno-omit-frame-pointer compiled code, the convention is:
+ *   fp[-1]  = saved ra  (return address)
+ *   fp[-2]  = saved fp  (previous frame pointer)
+ */
+static void dump_backtrace_fp_chain(rt_ubase_t fp, rt_ubase_t sepc)
+{
+    rt_ubase_t ra, prev_fp;
+    rt_ubase_t addrs[33];
+    int naddr = 0;
+    int depth;
+    int is_kernel;
+    rt_ubase_t text_lo, text_hi;
+
+    rt_kprintf("------------- Frame Pointer Backtrace -------\n");
+
+    if (sepc)
+        rt_kprintf("  #0  pc = 0x%016lx\n", (unsigned long)sepc);
+
+    if (fp >= USER_VADDR_START && fp < USER_VADDR_TOP)
+    {
+        is_kernel = 0;
+        text_lo = USER_VADDR_START;
+        text_hi = USER_VADDR_TOP;
+    }
+    else
+    {
+        is_kernel = 1;
+        text_lo = (rt_ubase_t)&__text_start;
+        text_hi = (rt_ubase_t)&__text_end;
+    }
+
+    for (depth = 1; depth < 32; depth++)
+    {
+        if (fp == 0 || (fp & (sizeof(rt_ubase_t) - 1)) != 0)
+        {
+            rt_kprintf("  -- fp=0x%lx invalid (NULL or unaligned), stop\n",
+                       (unsigned long)fp);
+            break;
+        }
+
+        if (is_kernel)
+        {
+            if (safe_read_kern(fp - 1 * sizeof(rt_ubase_t), &ra) != 0 ||
+                safe_read_kern(fp - 2 * sizeof(rt_ubase_t), &prev_fp) != 0)
+            {
+                rt_kprintf("  -- fp=0x%lx inaccessible, stop\n", (unsigned long)fp);
+                break;
+            }
+        }
+        else
+        {
+            /* User-space: need lwp copy — skip for now. */
+            rt_kprintf("  -- user-space backtrace not supported\n");
+            break;
+        }
+
+        rt_kprintf("  #%d  ra = 0x%016lx  (fp was 0x%016lx)",
+                   depth, (unsigned long)ra, (unsigned long)fp);
+
+        if (ra >= text_lo && ra < text_hi)
+            rt_kprintf("  [kernel]");
+        else if (ra >= USER_VADDR_START && ra < USER_VADDR_TOP)
+            rt_kprintf("  [user]");
+        else
+            rt_kprintf("  [INVALID]");
+
+        rt_kprintf("\n");
+
+        if (naddr < 33)
+            addrs[naddr++] = ra;
+
+        if (ra < text_lo || ra > text_hi)
+        {
+            rt_kprintf("  -- ra out of text range, likely corrupted. stop\n");
+            break;
+        }
+
+        if (prev_fp == 0)
+        {
+            rt_kprintf("  -- reached bottom of stack (prev_fp=0)\n");
+            break;
+        }
+
+        if (is_kernel && prev_fp <= fp)
+        {
+            rt_kprintf("  -- prev_fp(0x%lx) <= fp(0x%lx), stack corrupted. stop\n",
+                       (unsigned long)prev_fp, (unsigned long)fp);
+            break;
+        }
+
+        fp = prev_fp;
+    }
+
+    /* Print a single addr2line command with all addresses. */
+    rt_kprintf("------------- addr2line command --------------\n");
+    rt_kprintf("riscv64-unknown-linux-musl-addr2line -e rtthread.elf -a -f");
+    if (sepc)
+        rt_kprintf(" 0x%lx", (unsigned long)sepc);
+    {
+        int i;
+        for (i = 0; i < naddr; i++)
+            rt_kprintf(" 0x%lx", (unsigned long)addrs[i]);
+    }
+    rt_kprintf("\n");
+}
+
+/*
+ * Dump the instruction bytes around the crash point.
+ */
+static void dump_instructions(rt_ubase_t sepc)
+{
+    rt_ubase_t addr;
+    rt_ubase_t val;
+
+    if (!sepc)
+        return;
+
+    rt_kprintf("------------- Code Around sepc --------------\n");
+
+    /* Show 8 halfwords before and 8 after sepc (RISC-V instructions are 16 or 32 bit). */
+    for (addr = (sepc & ~(rt_ubase_t)1) - 16; addr <= sepc + 16; addr += 2)
+    {
+        rt_ubase_t hw;
+
+        rt_ubase_t aligned = addr & ~(rt_ubase_t)(sizeof(rt_ubase_t) - 1);
+
+        if (safe_read_kern(aligned, &val) != 0)
+        {
+            rt_kprintf("  0x%08lx: <inaccessible>\n", (unsigned long)addr);
+            continue;
+        }
+
+        /* Extract the 16-bit halfword from the 8-byte word. */
+        hw = (val >> (8 * (addr - aligned))) & 0xffff;
+
+        rt_kprintf("  %s0x%08lx: %04lx",
+                   (addr == (sepc & ~(rt_ubase_t)1)) ? ">>>" : "   ",
+                   (unsigned long)addr,
+                   (unsigned long)hw);
+
+        /* If this is a 32-bit instruction (low 2 bits of opcode == 0b11), show next halfword too. */
+        if ((hw & 0x3) == 0x3 && addr + 2 <= sepc + 16)
+        {
+            rt_ubase_t hw2;
+            rt_ubase_t addr2 = addr + 2;
+
+            rt_ubase_t aligned2 = addr2 & ~(rt_ubase_t)(sizeof(rt_ubase_t) - 1);
+
+            if (safe_read_kern(aligned2, &val) == 0)
+            {
+                hw2 = (val >> (8 * (addr2 - aligned2))) & 0xffff;
+                rt_kprintf(" %04lx", (unsigned long)hw2);
+            }
+        }
+
+        rt_kprintf("\n");
+    }
+}
+
+/*
+ * Dump current thread information.
+ */
+static void dump_thread_info(void)
+{
+    rt_thread_t thread = rt_thread_self();
+
+    if (!thread)
+    {
+        rt_kprintf("  current thread: <none>\n");
+        return;
+    }
+
+    rt_kprintf("------------- Thread Info -------------------\n");
+    rt_kprintf("  name        : %s\n", thread->name);
+    rt_kprintf("  status      : 0x%02x\n", thread->stat);
+    rt_kprintf("  stack_addr  : 0x%016lx\n", (unsigned long)(rt_ubase_t)thread->stack_addr);
+    rt_kprintf("  stack_size  : 0x%x (%u)\n", thread->stack_size, thread->stack_size);
+    rt_kprintf("  stack_top   : 0x%016lx\n",
+               (unsigned long)((rt_ubase_t)thread->stack_addr + thread->stack_size));
+
+    /* Show stack usage: scan from bottom for fill pattern.
+     * RTSmart uses '#' (0x23) for thread stacks (rt_thread_init),
+     * or 0xdeadbeef in some configurations. Check both.
+     */
+    {
+        rt_uint8_t *bottom = (rt_uint8_t *)thread->stack_addr;
+        rt_uint8_t *top    = (rt_uint8_t *)((rt_ubase_t)thread->stack_addr + thread->stack_size);
+        rt_uint8_t *p;
+        rt_uint32_t used;
+        rt_uint8_t fill = *bottom;  /* Read what the first byte actually is. */
+
+        /* Only scan if the bottom looks like a fill pattern. */
+        if (fill == '#' || fill == 0xef || fill == 0x23)
+        {
+            for (p = bottom; p < top; p++)
+            {
+                if (*p != fill)
+                    break;
+            }
+
+            used = (rt_uint32_t)((rt_ubase_t)top - (rt_ubase_t)p);
+            rt_kprintf("  stack_used  : 0x%x (%u) = %d%% of %u  (fill=0x%02x)\n",
+                       used, used, (used * 100) / thread->stack_size,
+                       thread->stack_size, fill);
+
+            if (used >= thread->stack_size - 64)
+                rt_kprintf("  *** STACK OVERFLOW DETECTED ***\n");
+            else if (used >= (thread->stack_size * 90) / 100)
+                rt_kprintf("  *** WARNING: stack usage > 90%% ***\n");
+        }
+        else
+        {
+            rt_kprintf("  stack_used  : unknown (no fill pattern, first byte=0x%02x)\n",
+                       fill);
+        }
+    }
+}
+
+/*
+ * Scan ALL threads and report stack usage, especially overflows.
+ * This helps identify which thread is the corruption source.
+ */
+static void dump_all_thread_stacks(void)
+{
+    struct rt_object_information *info;
+    struct rt_list_node *list, *node;
+    struct rt_thread *thread;
+    int count = 0;
+
+    info = rt_object_get_information(RT_Object_Class_Thread);
+    if (!info)
+        return;
+
+    rt_kprintf("------------- All Thread Stacks -------------\n");
+    rt_kprintf("  %-20s  %10s  %10s  %5s  %s\n",
+               "THREAD", "STACK_ADDR", "SIZE", "USED%", "STATUS");
+
+    list = &info->object_list;
+    for (node = list->next; node != list && count < 64; node = node->next, count++)
+    {
+        rt_uint8_t *p;
+        rt_uint32_t used = 0;
+        int pct = -1;
+        int overflow = 0;
+
+        thread = rt_list_entry(node, struct rt_thread, list);
+
+        if (thread->stack_addr == RT_NULL || thread->stack_size == 0)
+            continue;
+
+        /* Detect the actual fill byte: '#' (0x23) for LWP, could differ. */
+        p = (rt_uint8_t *)thread->stack_addr;
+        {
+            rt_uint8_t fill = *p;
+            if (fill == '#' || fill == 0x23)
+            {
+                rt_uint8_t *top = (rt_uint8_t *)thread->stack_addr + thread->stack_size;
+                while (p < top && *p == fill)
+                    p++;
+                used = (rt_uint32_t)((rt_ubase_t)top - (rt_ubase_t)p);
+                pct = (used * 100) / thread->stack_size;
+                if (used >= thread->stack_size - 64)
+                    overflow = 1;
+            }
+        }
+
+        if (pct >= 0)
+        {
+            rt_kprintf("  %-20.*s  0x%08lx  %10u  %3d%%%s%s\n",
+                       RT_NAME_MAX, thread->name,
+                       (unsigned long)(rt_ubase_t)thread->stack_addr,
+                       thread->stack_size,
+                       pct,
+                       overflow ? "  *** OVERFLOW! ***" : "",
+                       (pct >= 80) ? "  [HIGH]" : "");
+        }
+        else
+        {
+            rt_kprintf("  %-20.*s  0x%08lx  %10u   ???\n",
+                       RT_NAME_MAX, thread->name,
+                       (unsigned long)(rt_ubase_t)thread->stack_addr,
+                       thread->stack_size);
+        }
+    }
+    rt_kprintf("  Total: %d threads\n", count);
+}
+
+/*
+ * Enhanced crash diagnostics — called from both handle_user and handle_trap.
+ */
+static void dump_crash_info(rt_size_t scause, rt_size_t stval, rt_size_t sepc,
+                            struct rt_hw_stack_frame *sp)
+{
+    rt_size_t id = __MASKVALUE(scause, __MASK(63UL));
+    int is_supervisor = (sp->sstatus & 0x100) ? 1 : 0;
+
+    crash_handler_depth++;
+    if (crash_handler_depth > 1)
+    {
+        rt_kprintf("\n*** RECURSIVE CRASH (depth=%d) at sepc=0x%lx stval=0x%lx ***\n",
+                   crash_handler_depth, (unsigned long)sepc, (unsigned long)stval);
+        rt_kprintf("*** Halting to prevent infinite loop ***\n");
+        while (1) ;
+    }
+
+    rt_kprintf("\n============ CRASH REPORT ===================\n");
+    rt_kprintf("Exception %ld: %s\n", id, get_exception_msg(id));
+    rt_kprintf("  scause = 0x%016lx\n", (unsigned long)scause);
+    rt_kprintf("  stval  = 0x%016lx  (fault address)\n", (unsigned long)stval);
+    rt_kprintf("  sepc   = 0x%016lx  (program counter)\n", (unsigned long)sepc);
+    rt_kprintf("  ra     = 0x%016lx  (return address)\n", (unsigned long)sp->ra);
+    rt_kprintf("  sp     = 0x%016lx\n", (unsigned long)sp->user_sp_exc_stack);
+    rt_kprintf("  frame  = 0x%016lx  (trap frame on stack)\n", (unsigned long)(rt_ubase_t)sp);
+    if (sp->user_sp_exc_stack >= (rt_ubase_t)__stack_start__ &&
+        sp->user_sp_exc_stack < (rt_ubase_t)__stack_cpu0 + 0x10000)
+        rt_kprintf("  sp     : ON ISR/BOOT STACK [0x%lx - 0x%lx] => INTERRUPT CONTEXT!\n",
+                   (unsigned long)(rt_ubase_t)__stack_start__,
+                   (unsigned long)(rt_ubase_t)__stack_cpu0);
+    rt_kprintf("  fp/s0  = 0x%016lx\n", (unsigned long)sp->s0_fp);
+    rt_kprintf("  mode   = %s (SPP=%d)\n",
+               is_supervisor ? "SUPERVISOR" : "USER", is_supervisor);
+
+    /* Check if sepc is within known code ranges. */
+    if (sepc >= (rt_ubase_t)&__text_start && sepc < (rt_ubase_t)&__text_end)
+        rt_kprintf("  sepc   : in kernel text [0x%lx - 0x%lx]\n",
+                   (unsigned long)(rt_ubase_t)&__text_start,
+                   (unsigned long)(rt_ubase_t)&__text_end);
+    else if (sepc >= USER_VADDR_START && sepc < USER_VADDR_TOP)
+        rt_kprintf("  sepc   : in user space\n");
+    else
+        rt_kprintf("  sepc   : OUTSIDE any known code range!\n");
+
+    /* Check if stval is a valid address. */
+    if (stval == 0)
+        rt_kprintf("  stval  : NULL pointer dereference\n");
+    else if (stval >= (rt_ubase_t)&__text_start && stval < (rt_ubase_t)&__stack_cpu0 + 0x10000)
+        rt_kprintf("  stval  : in kernel memory\n");
+    else if (stval >= USER_VADDR_START && stval < USER_VADDR_TOP)
+        rt_kprintf("  stval  : in user space\n");
+    else
+        rt_kprintf("  stval  : INVALID address (unmapped?)\n");
+
+    rt_kprintf("=============================================\n\n");
+
+    dump_regs(sp);
+    dump_thread_info();
+    dump_instructions(sepc);
+    dump_backtrace_fp_chain(sp->s0_fp, sepc);
+    dump_stack_memory(sp->user_sp_exc_stack, 8, 24);
+
+    /* Dump ALL thread stacks FIRST — this is the most important info. */
+    dump_all_thread_stacks();
+}
+
 void dump_regs(struct rt_hw_stack_frame *regs)
 {
     rt_kprintf("--------------Dump Registers-----------------\n");
@@ -231,10 +660,11 @@ void handle_user(rt_size_t scause, rt_size_t stval, rt_size_t sepc, struct rt_hw
         }
     }
 #endif
-    LOG_E("[FATAL ERROR] Exception %ld:%s", id, get_exception_msg(id));
-    LOG_E("scause:0x%p,stval:0x%p,sepc:0x%p", scause, stval, sepc);
-    dump_regs(sp);
 
+    /* Enhanced crash dump with full diagnostics. */
+    dump_crash_info(scause, stval, sepc, sp);
+
+    /* Also print the legacy addr2line command for convenience. */
     rt_hw_backtrace((uint32_t *)sp->s0_fp, sepc);
 
     LOG_E("User Fault, killing thread: %s", rt_thread_self()->name);
@@ -354,8 +784,9 @@ void handle_trap(rt_size_t scause,rt_size_t stval,rt_size_t sepc,struct rt_hw_st
         rt_kprintf("Unhandled Exception %ld:%s\n", id, get_exception_msg(id));
     }
 
-    rt_kprintf("scause:0x%p,stval:0x%p,sepc:0x%p\n", scause, stval, sepc);
-    dump_regs(sp);
+    /* Enhanced crash dump for kernel exceptions too. */
+    dump_crash_info(scause, stval, sepc, sp);
+
     rt_kprintf("--------------Thread list--------------\n");
     rt_kprintf("current thread: %s\n", rt_thread_self()->name);
     list_process();

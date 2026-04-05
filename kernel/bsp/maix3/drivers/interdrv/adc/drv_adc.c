@@ -58,6 +58,24 @@ struct adc_inst {
 
 static struct adc_inst k230_adc_inst;
 
+rt_bool_t k230_adc_acodec_hp_detect_enabled(void)
+{
+#ifdef RT_ADC_ENABLE_ACODEC_HP_DETECT
+    return RT_TRUE;
+#else
+    return RT_FALSE;
+#endif
+}
+
+rt_uint32_t k230_adc_acodec_hp_detect_channel(void)
+{
+#ifdef RT_ADC_ACODEC_HP_DETECT_CHANNEL
+    return RT_ADC_ACODEC_HP_DETECT_CHANNEL;
+#else
+    return 0;
+#endif
+}
+
 static int k230_adc_init(void)
 {
     int ret;

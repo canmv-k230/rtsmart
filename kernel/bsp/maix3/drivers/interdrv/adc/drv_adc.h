@@ -26,6 +26,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <rtdef.h>
 
 #define K_ADC_MAX_CHANNEL (6)
 
@@ -143,3 +144,6 @@ struct k_adc_reg {
     volatile struct k_adc_data_reg data[6]; // 0x14 - 0x28: Input channel N Digital signal output
     volatile struct k_adc_data_reg dma_data[3]; // 0x2C - 0x34: Continuous sampling channel N digital signal output
 };
+
+rt_bool_t k230_adc_acodec_hp_detect_enabled(void);
+rt_uint32_t k230_adc_acodec_hp_detect_channel(void);
