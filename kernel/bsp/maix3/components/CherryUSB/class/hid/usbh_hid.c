@@ -46,6 +46,7 @@ static int usbh_hid_get_report_descriptor(struct usbh_hid *hid_class, uint8_t *b
 {
     struct usb_setup_packet *setup = hid_class->hport->setup;
     int ret;
+    int desc_len;
 
     setup->bmRequestType = USB_REQUEST_DIR_IN | USB_REQUEST_STANDARD | USB_REQUEST_RECIPIENT_INTERFACE;
     setup->bRequest = USB_REQUEST_GET_DESCRIPTOR;
@@ -57,7 +58,14 @@ static int usbh_hid_get_report_descriptor(struct usbh_hid *hid_class, uint8_t *b
     if (ret < 0) {
         return ret;
     }
-    usb_memcpy(buffer, g_hid_buf, ret - 8);
+    desc_len = ret;
+    if (desc_len > (int)sizeof(hid_class->report_desc)) {
+        desc_len = sizeof(hid_class->report_desc);
+
+        USB_LOG_WRN("The report descriptor is too long, only the first %d bytes will be used\r\n", desc_len);
+    }
+    hid_class->report_desc_len = desc_len;
+    usb_memcpy(buffer, g_hid_buf, desc_len);
     return ret;
 }
 
@@ -100,7 +108,7 @@ int usbh_hid_set_protocol(struct usbh_hid *hid_class, uint8_t protocol)
     setup->bmRequestType = USB_REQUEST_DIR_OUT | USB_REQUEST_CLASS | USB_REQUEST_RECIPIENT_INTERFACE;
     setup->bRequest = HID_REQUEST_SET_PROTOCOL;
     setup->wValue = protocol;
-    setup->wIndex = 0;
+    setup->wIndex = hid_class->intf;
     setup->wLength = 0;
 
     return usbh_control_transfer(hid_class->hport, setup, NULL);
@@ -162,17 +170,19 @@ int usbh_hid_disconnect(struct usbh_hubport *hport, uint8_t intf)
     struct usbh_hid *hid_class = (struct usbh_hid *)hport->config.intf[intf].priv;
 
     if (hid_class) {
+        /* Stop HID first so callbacks see hid_class==NULL and won't resubmit
+         * URBs while usbh_kill_urb races with the deferred giveback workqueue */
+        if (hport->config.intf[intf].devname[0] != '\0') {
+            USB_LOG_INFO("Unregister HID Class:%s\r\n", hport->config.intf[intf].devname);
+            usbh_hid_stop(hid_class);
+        }
+
         if (hid_class->intin) {
             usbh_kill_urb(&hid_class->intin_urb);
         }
 
         if (hid_class->intout) {
             usbh_kill_urb(&hid_class->intout_urb);
-        }
-
-        if (hport->config.intf[intf].devname[0] != '\0') {
-            USB_LOG_INFO("Unregister HID Class:%s\r\n", hport->config.intf[intf].devname);
-            usbh_hid_stop(hid_class);
         }
 
         usbh_hid_class_free(hid_class);

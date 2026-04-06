@@ -721,8 +721,52 @@ static void usbh_hub_events(struct usbh_hub *hub)
 #if 0
                     usb_osal_thread_create("usbh_enum", CONFIG_USBHOST_PSC_STACKSIZE, CONFIG_USBHOST_PSC_PRIO + 1, usbh_hubport_enumerate_thread, (void *)child);
 #else
-                    if (usbh_enumerate(child) < 0) {
-                        /** release child sources */
+                    for (uint8_t enum_retry = 0; enum_retry < 3; enum_retry++) {
+                        ret = usbh_enumerate(child);
+                        if (ret >= 0)
+                            break;
+
+                        USB_LOG_WRN("Port %u enumerate attempt %u failed (%d), re-resetting\r\n",
+                                    child->port, enum_retry + 1, ret);
+                        usbh_hubport_release(child);
+
+                        /* Re-reset the port so the PHY re-initialises */
+                        ret = usbh_hub_set_feature(hub, port + 1, HUB_PORT_FEATURE_RESET);
+                        if (ret < 0)
+                            break;
+                        usb_osal_msleep(DELAY_TIME_AFTER_RESET);
+
+                        /* Re-read port status after reset */
+                        ret = usbh_hub_get_portstatus(hub, port + 1, &port_status);
+                        if (ret < 0)
+                            break;
+                        portstatus = port_status.wPortStatus;
+                        if (!(portstatus & HUB_PORT_STATUS_ENABLE))
+                            break;
+
+                        usb_memset(child, 0, sizeof(struct usbh_hubport));
+                        child->parent = hub;
+                        child->connected = true;
+                        child->port = port + 1;
+                        child->speed = speed;
+                        child->bus = hub->bus;
+                        child->mutex = usb_osal_mutex_create();
+#ifdef CHERRY_USB_HC_DRV_DWC2
+                        if (hub->parent) {
+                            if (speed != USB_SPEED_HIGH &&
+                                hub->parent->speed == USB_SPEED_HIGH) {
+                                if (!hub->tt.hub)
+                                    break;
+                                child->tt = &hub->tt;
+                                child->ttport = port + 1;
+                            }
+                        } else {
+                            child->tt = &hub->tt;
+                            child->ttport = 1;
+                        }
+#endif
+                    }
+                    if (ret < 0) {
                         usbh_hubport_release(child);
                         USB_LOG_ERR("Port %u enumerate fail\r\n", child->port);
                     }

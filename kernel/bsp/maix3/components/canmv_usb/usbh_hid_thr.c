@@ -1,35 +1,18 @@
 #include <rthw.h>
 #include <rtthread.h>
-#include <rtdevice.h>
+
+#include "rt_input_event.h"
 #include "usbh_core.h"
 #include "usbh_hid.h"
+#include "usbh_hid_report_parser.h"
 
-#ifdef RT_USING_POSIX
-#include <dfs_file.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <poll.h>
-#include <sys/ioctl.h>
-#endif
+#define HID_POINTER_BUTTON_MASK 0x1f
 
-#define HID_RX_BUFSIZE 512
-
-#define EV_SYN      0x00  /* Synchronization event */
-#define EV_KEY      0x01  /* Key press/release event */
-
-/* Synchronization event codes */
-#define SYN_REPORT  0     /* Synchronize: report event frame boundary */
-
-/* Key event values */
-#define KEY_RELEASED    0  /* Key released */
-#define KEY_PRESSED     1  /* Key pressed */
-
-/* HID Keyboard Event - Exposed to userspace */
-struct hid_keyboard_event
+enum hid_device_type
 {
-    uint16_t type;      /* Event type (EV_SYN, EV_KEY) */
-    uint16_t code;      /* Key code (Linux keycode) */
-    uint32_t value;     /* KEY_PRESSED or KEY_RELEASED */
+    HID_DEV_KEYBOARD = 0,
+    HID_DEV_MOUSE,
+    HID_DEV_TOUCH,
 };
 
 static const unsigned char usb_kbd_keycode[256] = {
@@ -51,224 +34,91 @@ static const unsigned char usb_kbd_keycode[256] = {
     150,158,159,128,136,177,178,176,142,152,173,140
 };
 
-/* HID Device Receive FIFO */
-struct rt_hid_rx_fifo
+struct hid_device
 {
-    struct rt_ringbuffer rb;
-    /* software fifo */
-    rt_uint8_t buffer[];
-};
-
-/* HID Device Structure */
-struct rt_hid_device
-{
-    struct rt_device parent;
+    struct rt_input_dev input;
     struct usbh_hid *hid_class;
-    struct rt_hid_rx_fifo *rx_fifo;
-    rt_size_t rx_bufsz;
-
-    /* Last state for key press/release detection */
+    enum hid_device_type type;
+    rt_bool_t use_boot_protocol;
+    rt_bool_t registered;
     rt_uint8_t last_report[8];
+    rt_uint8_t last_buttons;
+    struct hid_report_map report_map;
 };
 
-/* USB HID buffer */
-USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t hid_buffer[128];
+USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t hid_kbd_buffer[128];
+USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t hid_pointer_buffer[128];
 
-/* Global HID device instance */
-static struct rt_hid_device hid_dev;
+static struct hid_device hid_kbd_dev;
+static struct hid_device hid_pointer_dev;
 
-/* Forward declarations */
-static void usbh_hid_callback(void *arg, int nbytes);
+static void usbh_hid_kbd_callback(void *arg, int nbytes);
+static void usbh_hid_pointer_callback(void *arg, int nbytes);
 
-#ifdef RT_USING_POSIX
-/* fops for HID */
-static rt_err_t hid_fops_rx_ind(rt_device_t dev, rt_size_t size)
+static void hid_prepare_device(struct hid_device *hid)
 {
-    rt_wqueue_wakeup(&(dev->wait_queue), (void*)POLLIN);
-    return RT_EOK;
-}
-
-static int hid_fops_open(struct dfs_fd *fd)
-{
-    rt_err_t ret = 0;
-    rt_uint16_t flags = 0;
-    rt_device_t device;
-    struct rt_hid_device *hid;
-
-    device = (rt_device_t)fd->fnode->data;
-    RT_ASSERT(device != RT_NULL);
-
-    hid = (struct rt_hid_device *)device;
-
-    if (NULL == hid->hid_class) {
-        return -ENODEV;
-    }
-
-    if ((fd->flags & O_ACCMODE) != O_WRONLY)
-        rt_device_set_rx_indicate(device, hid_fops_rx_ind);
-
-    ret = rt_device_open(device, flags);
-    if (ret == RT_EOK) return 0;
-
-    return ret;
-}
-
-static int hid_fops_close(struct dfs_fd *fd)
-{
-    rt_device_t device;
-    struct rt_hid_device *hid;
-
-    device = (rt_device_t)fd->fnode->data;
-
-    hid = (struct rt_hid_device *)device;
-
-    if (NULL == hid->hid_class) {
-        return 0;
-    }
-
-    rt_device_set_rx_indicate(device, RT_NULL);
-    rt_device_close(device);
-
-    return 0;
-}
-
-static int hid_fops_ioctl(struct dfs_fd *fd, int cmd, void *args)
-{
-    rt_device_t device;
-    struct rt_hid_device *hid;
-
-    device = (rt_device_t)fd->fnode->data;
-    hid = device;
-
-    if (NULL == hid->hid_class) {
-        return -ENODEV;
-    }
-
-    return rt_device_control(device, cmd, args);
-}
-
-static int hid_fops_read(struct dfs_fd *fd, void *buf, size_t count)
-{
-    int size = 0;
-    rt_device_t device;
-    struct rt_hid_device *hid;
-
-    device = (rt_device_t)fd->fnode->data;
-    hid = device;
-
-    if (NULL == hid->hid_class) {
-        return -ENODEV;
-    }
-
-    do {
-        size = rt_device_read(device, -1, buf, count);
-        if (size <= 0) {
-            if (fd->flags & O_NONBLOCK) {
-                size = -EAGAIN;
-                break;
-            }
-
-            rt_wqueue_wait(&(device->wait_queue), 0, RT_WAITING_FOREVER);
-        }
-    } while (size <= 0);
-
-    return size;
-}
-
-static int hid_fops_write(struct dfs_fd *fd, const void *buf, size_t count)
-{
-    /* HID keyboard is read-only */
-    return 0;
-}
-
-static int hid_fops_poll(struct dfs_fd *fd, struct rt_pollreq *req)
-{
-    int mask = 0;
-    int flags = 0;
-    rt_device_t device;
-    struct rt_hid_device *hid;
-
-    device = (rt_device_t)fd->fnode->data;
-    RT_ASSERT(device != RT_NULL);
-
-    hid = (struct rt_hid_device *)device;
-
-    if (NULL == hid->hid_class) {
-        return -ENODEV;
-    }
-
-    flags = fd->flags & O_ACCMODE;
-    if (flags == O_RDONLY || flags == O_RDWR) {
-        rt_base_t level;
-        struct rt_hid_rx_fifo *rx_fifo;
-
-        rt_poll_add(&(device->wait_queue), req);
-
-        rx_fifo = hid->rx_fifo;
-        if (rx_fifo) {
-            level = rt_hw_interrupt_disable();
-            if (rt_ringbuffer_data_len(&rx_fifo->rb))
-                mask |= POLLIN;
-            rt_hw_interrupt_enable(level);
-        }
-    }
-
-    return mask;
-}
-
-const static struct dfs_file_ops _hid_fops =
-{
-    hid_fops_open,
-    hid_fops_close,
-    hid_fops_ioctl,
-    hid_fops_read,
-    hid_fops_write,
-    RT_NULL, /* flush */
-    RT_NULL, /* lseek */
-    RT_NULL, /* getdents */
-    hid_fops_poll,
-};
-#endif /* RT_USING_POSIX */
-
-/* Helper function to put event into ringbuffer */
-static void hid_put_event(struct rt_hid_device *hid, uint16_t code, uint32_t value)
-{
-    struct hid_keyboard_event event;
-    struct rt_hid_rx_fifo *rx_fifo = hid->rx_fifo;
-    rt_base_t level;
-    rt_size_t put_len;
-
-    if (rx_fifo == RT_NULL)
+    if (!hid->registered) {
+        rt_memset(hid, 0, sizeof(*hid));
+        hid->input.id = -1;
         return;
-
-    /* Determine event type based on code */
-    if (code == SYN_REPORT) {
-        event.type = EV_SYN;
-        event.code = SYN_REPORT;
-        event.value = 0;
-    } else {
-        event.type = EV_KEY;
-        event.code = code;
-        event.value = value;
     }
 
-    level = rt_hw_interrupt_disable();
-    put_len = rt_ringbuffer_put(&(rx_fifo->rb), (uint8_t*)&event, sizeof(event));
-    rt_hw_interrupt_enable(level);
+    hid->hid_class = RT_NULL;
+    hid->last_buttons = 0;
+    rt_memset(hid->last_report, 0, sizeof(hid->last_report));
+    rt_memset(&hid->report_map, 0, sizeof(hid->report_map));
+    rt_memset(&hid->input.info, 0, sizeof(hid->input.info));
+}
 
-    /* Notify readers when SYN_REPORT is sent (end of event frame) */
-    if (put_len > 0 && code == SYN_REPORT) {
-        if (hid->parent.rx_indicate != RT_NULL) {
-            hid->parent.rx_indicate(&hid->parent, put_len);
-        }
+static rt_uint16_t hid_button_code(rt_uint8_t index)
+{
+    switch (index) {
+    case 0:
+        return BTN_LEFT;
+    case 1:
+        return BTN_RIGHT;
+    case 2:
+        return BTN_MIDDLE;
+    case 3:
+        return BTN_SIDE;
+    case 4:
+        return BTN_EXTRA;
+    case 5:
+        return BTN_FORWARD;
+    case 6:
+        return BTN_BACK;
+    default:
+        return BTN_EXTRA;
     }
+}
+
+static void hid_report_pointer_buttons(struct hid_device *hid, rt_uint8_t current_buttons)
+{
+    rt_uint8_t changed;
+    rt_uint8_t index;
+
+    changed = hid->last_buttons ^ current_buttons;
+    if (changed == 0) {
+        hid->last_buttons = current_buttons;
+        return;
+    }
+
+    for (index = 0; index < 7; index++) {
+        rt_uint8_t mask = 1u << index;
+
+        if (changed & mask)
+            rt_input_report(&hid->input, EV_KEY, hid_button_code(index), (current_buttons & mask) ? KEY_PRESSED : KEY_RELEASED);
+    }
+
+    hid->last_buttons = current_buttons;
 }
 
 /* Process HID keyboard data - Generate key events (Linux-style) */
-static void hid_process_keyboard(struct rt_hid_device *hid, const rt_uint8_t *data, int nbytes)
+static void hid_process_keyboard(struct hid_device *hid, const rt_uint8_t *data, int nbytes)
 {
     struct usb_hid_kbd_report *report = (struct usb_hid_kbd_report *)data;
     int i;
+    rt_bool_t changed = RT_FALSE;
 
     if (nbytes < sizeof(struct usb_hid_kbd_report))
         return;
@@ -285,7 +135,8 @@ static void hid_process_keyboard(struct rt_hid_device *hid, const rt_uint8_t *da
             int new_state = (report->modifier >> i) & 1;
 
             if (old_state != new_state) {
-                hid_put_event(hid, keycode, new_state);
+                rt_input_report(&hid->input, EV_KEY, keycode, new_state ? KEY_PRESSED : KEY_RELEASED);
+                changed = RT_TRUE;
             }
         }
     }
@@ -310,7 +161,8 @@ static void hid_process_keyboard(struct rt_hid_device *hid, const rt_uint8_t *da
                 /* Key was released */
                 unsigned char keycode = usb_kbd_keycode[hid->last_report[i]];
                 if (keycode) {
-                    hid_put_event(hid, keycode, KEY_RELEASED);
+                    rt_input_report(&hid->input, EV_KEY, keycode, KEY_RELEASED);
+                    changed = RT_TRUE;
                 }
             }
         }
@@ -334,245 +186,382 @@ static void hid_process_keyboard(struct rt_hid_device *hid, const rt_uint8_t *da
                 /* New key pressed */
                 unsigned char keycode = usb_kbd_keycode[report->key[i]];
                 if (keycode) {
-                    hid_put_event(hid, keycode, KEY_PRESSED);
+                    rt_input_report(&hid->input, EV_KEY, keycode, KEY_PRESSED);
+                    changed = RT_TRUE;
                 }
             }
         }
     }
 
-    /* Send SYN_REPORT to indicate end of event frame */
-    hid_put_event(hid, SYN_REPORT, 0);
+    if (changed)
+        rt_input_sync(&hid->input);
 
     /* Save current state for next comparison */
     rt_memcpy(hid->last_report, data, 8);
 }
 
-/* USB HID callback */
-void usbh_hid_callback(void *arg, int nbytes)
+static void hid_process_mouse_boot(struct hid_device *hid, const rt_uint8_t *data, int nbytes)
 {
-    struct usbh_hid *hid_class = (struct usbh_hid *)arg;
+    rt_uint8_t buttons;
+    rt_int8_t dx;
+    rt_int8_t dy;
+    rt_bool_t changed = RT_FALSE;
 
-    if (nbytes > 0) {
-        /* Process HID data */
-        hid_process_keyboard(&hid_dev, hid_buffer, nbytes);
+    if (nbytes < 3)
+        return;
 
-        /* Re-submit URB for next data */
-        usbh_submit_urb(&hid_class->intin_urb);
-    } else if (nbytes == -USB_ERR_NAK) {
-        /* for dwc2 */
-        usbh_submit_urb(&hid_class->intin_urb);
+    buttons = data[0] & HID_POINTER_BUTTON_MASK;
+    dx = (rt_int8_t)data[1];
+    dy = (rt_int8_t)data[2];
+
+    if (hid->last_buttons != buttons)
+        changed = RT_TRUE;
+    hid_report_pointer_buttons(hid, buttons);
+
+    if (dx != 0) {
+        rt_input_report(&hid->input, EV_REL, REL_X, dx);
+        changed = RT_TRUE;
     }
+    if (dy != 0) {
+        rt_input_report(&hid->input, EV_REL, REL_Y, dy);
+        changed = RT_TRUE;
+    }
+    if (nbytes >= 4 && (rt_int8_t)data[3] != 0) {
+        rt_input_report(&hid->input, EV_REL, REL_WHEEL, (rt_int8_t)data[3]);
+        changed = RT_TRUE;
+    }
+
+    if (changed)
+        rt_input_sync(&hid->input);
 }
 
-/* RT-Thread Device Interface */
-
-/* HID device init */
-static rt_err_t rt_hid_init(struct rt_device *dev)
+static void hid_process_pointer_report(struct hid_device *hid, const rt_uint8_t *data, int nbytes)
 {
-    struct rt_hid_device *hid;
+    const rt_uint8_t *report = data;
+    rt_uint8_t current_buttons = 0;
+    rt_int32_t value;
+    rt_uint8_t index;
+    rt_bool_t changed = RT_FALSE;
 
-    RT_ASSERT(dev != RT_NULL);
-    hid = (struct rt_hid_device *)dev;
+    if (hid->report_map.pointer_has_report_id) {
+        if (nbytes <= 0 || data[0] != hid->report_map.pointer_report_id)
+            return;
+        report = data;
+    }
 
-    /* Initialize rx FIFO */
-    hid->rx_fifo = RT_NULL;
-    rt_memset(hid->last_report, 0, sizeof(hid->last_report));
-
-    return RT_EOK;
-}
-
-/* HID device open */
-static rt_err_t rt_hid_open(struct rt_device *dev, rt_uint16_t oflag)
-{
-    struct rt_hid_device *hid;
-    struct rt_hid_rx_fifo *rx_fifo;
-
-    RT_ASSERT(dev != RT_NULL);
-    hid = (struct rt_hid_device *)dev;
-
-    /* Allocate RX FIFO if not allocated */
-    if (hid->rx_fifo == RT_NULL) {
-        rx_fifo = (struct rt_hid_rx_fifo *)rt_malloc(sizeof(struct rt_hid_rx_fifo) + hid->rx_bufsz);
-        if (rx_fifo == RT_NULL) {
-            USB_LOG_ERR("Failed to allocate HID RX FIFO\n");
-            return -RT_ENOMEM;
+    if (hid->type == HID_DEV_TOUCH) {
+        if (hid->report_map.x_index >= 0) {
+            value = hid_extract_field(report, &hid->report_map.fields[hid->report_map.x_index]);
+            rt_input_report(&hid->input, EV_ABS, ABS_X, value);
+            changed = RT_TRUE;
         }
 
-        rt_ringbuffer_init(&(rx_fifo->rb), rx_fifo->buffer, hid->rx_bufsz);
-        hid->rx_fifo = rx_fifo;
+        if (hid->report_map.y_index >= 0) {
+            value = hid_extract_field(report, &hid->report_map.fields[hid->report_map.y_index]);
+            rt_input_report(&hid->input, EV_ABS, ABS_Y, value);
+            changed = RT_TRUE;
+        }
+
+        if (hid->report_map.pressure_index >= 0) {
+            value = hid_extract_field(report, &hid->report_map.fields[hid->report_map.pressure_index]);
+            rt_input_report(&hid->input, EV_ABS, ABS_PRESSURE, value);
+            changed = RT_TRUE;
+        }
+
+        if (hid->report_map.tip_index >= 0) {
+            current_buttons = hid_extract_field(report, &hid->report_map.fields[hid->report_map.tip_index]) ? 1 : 0;
+        } else if (hid->report_map.button_count > 0) {
+            current_buttons = hid_extract_field(report, &hid->report_map.fields[hid->report_map.button_indices[0]]) ? 1 : 0;
+        }
+
+        if ((hid->last_buttons ^ current_buttons) & 0x01) {
+            rt_input_report(&hid->input, EV_KEY, BTN_TOUCH, current_buttons ? KEY_PRESSED : KEY_RELEASED);
+            hid->last_buttons = current_buttons;
+            changed = RT_TRUE;
+        }
+    } else {
+        for (index = 0; index < hid->report_map.button_count; index++) {
+            const struct hid_report_field *field;
+
+            field = &hid->report_map.fields[hid->report_map.button_indices[index]];
+            if (hid_extract_field(report, field))
+                current_buttons |= 1u << index;
+        }
+        if (hid->last_buttons != current_buttons)
+            changed = RT_TRUE;
+        hid_report_pointer_buttons(hid, current_buttons);
+
+        if (hid->report_map.x_index >= 0) {
+            value = hid_extract_field(report, &hid->report_map.fields[hid->report_map.x_index]);
+            if (value != 0) {
+                rt_input_report(&hid->input, EV_REL, REL_X, value);
+                changed = RT_TRUE;
+            }
+        }
+
+        if (hid->report_map.y_index >= 0) {
+            value = hid_extract_field(report, &hid->report_map.fields[hid->report_map.y_index]);
+            if (value != 0) {
+                rt_input_report(&hid->input, EV_REL, REL_Y, value);
+                changed = RT_TRUE;
+            }
+        }
+
+        if (hid->report_map.wheel_index >= 0) {
+            value = hid_extract_field(report, &hid->report_map.fields[hid->report_map.wheel_index]);
+            if (value != 0) {
+                rt_input_report(&hid->input, EV_REL, REL_WHEEL, value);
+                changed = RT_TRUE;
+            }
+        }
+    }
+
+    if (changed)
+        rt_input_sync(&hid->input);
+}
+
+static void usbh_hid_kbd_callback(void *arg, int nbytes)
+{
+    struct hid_device *hid = (struct hid_device *)arg;
+    struct usbh_hid *hid_class = hid->hid_class;
+
+    if (hid_class == RT_NULL || !hid->input.connected)
+        return;
+
+    if (nbytes > 0) {
+        hid_process_keyboard(hid, hid_kbd_buffer, nbytes);
+        usbh_submit_urb(&hid_class->intin_urb);
+    } else if (nbytes == -USB_ERR_NAK) {
+        usbh_submit_urb(&hid_class->intin_urb);
+    }
+}
+
+static void usbh_hid_pointer_callback(void *arg, int nbytes)
+{
+    struct hid_device *hid = (struct hid_device *)arg;
+    struct usbh_hid *hid_class = hid->hid_class;
+
+    if (hid_class == RT_NULL || !hid->input.connected)
+        return;
+
+    if (nbytes > 0) {
+        if (hid->use_boot_protocol)
+            hid_process_mouse_boot(hid, hid_pointer_buffer, nbytes);
+        else
+            hid_process_pointer_report(hid, hid_pointer_buffer, nbytes);
+
+        usbh_submit_urb(&hid_class->intin_urb);
+    } else if (nbytes == -USB_ERR_NAK) {
+        usbh_submit_urb(&hid_class->intin_urb);
+    }
+}
+
+static void hid_cleanup_device(struct hid_device *hid)
+{
+    if (!hid->registered)
+        return;
+
+    rt_input_dev_disconnect(&hid->input);
+    hid->registered = (hid->input.id >= 0);
+    hid->hid_class = RT_NULL;
+    hid->last_buttons = 0;
+    rt_memset(hid->last_report, 0, sizeof(hid->last_report));
+    rt_memset(&hid->report_map, 0, sizeof(hid->report_map));
+}
+
+static int hid_start_device(struct hid_device *hid, rt_uint8_t *buffer, usbh_complete_callback_t callback)
+{
+    int ret;
+
+    rt_memset(&hid->input.info, 0, sizeof(hid->input.info));
+
+    if (hid->type == HID_DEV_KEYBOARD) {
+        rt_input_set_name(&hid->input, "usb-hid-keyboard");
+        rt_input_set_kind(&hid->input, RT_INPUT_KIND_KEYBOARD);
+        rt_input_set_capability(&hid->input, EV_KEY, KEY_A);
+        rt_input_set_capability(&hid->input, EV_KEY, KEY_ENTER);
+    } else if (hid->type == HID_DEV_TOUCH) {
+        rt_input_set_name(&hid->input, "usb-hid-touch");
+        rt_input_set_kind(&hid->input, RT_INPUT_KIND_TOUCH);
+        rt_input_set_capability(&hid->input, EV_KEY, BTN_TOUCH);
+        rt_input_set_capability(&hid->input, EV_ABS, ABS_X);
+        rt_input_set_capability(&hid->input, EV_ABS, ABS_Y);
+        rt_input_set_capability(&hid->input, EV_ABS, ABS_PRESSURE);
+    } else {
+        rt_input_set_name(&hid->input, "usb-hid-mouse");
+        rt_input_set_kind(&hid->input, RT_INPUT_KIND_MOUSE);
+        rt_input_set_capability(&hid->input, EV_KEY, BTN_LEFT);
+        rt_input_set_capability(&hid->input, EV_REL, REL_X);
+        rt_input_set_capability(&hid->input, EV_REL, REL_Y);
+        rt_input_set_capability(&hid->input, EV_REL, REL_WHEEL);
+    }
+
+    if (hid->registered) {
+        ret = rt_input_dev_reconnect(&hid->input);
+    } else {
+        ret = rt_input_dev_register(&hid->input);
+        if (ret == RT_EOK)
+            hid->registered = RT_TRUE;
+    }
+
+    if (ret != RT_EOK)
+        return ret;
+
+    usbh_int_urb_fill(&hid->hid_class->intin_urb,
+                      hid->hid_class->hport,
+                      hid->hid_class->intin,
+                      buffer,
+                      hid->hid_class->intin->wMaxPacketSize,
+                      0,
+                      callback,
+                      hid);
+
+    ret = usbh_submit_urb(&hid->hid_class->intin_urb);
+    if (ret < 0) {
+        hid_cleanup_device(hid);
+        return ret;
     }
 
     return RT_EOK;
-}
-
-/* HID device close */
-static rt_err_t rt_hid_close(struct rt_device *dev)
-{
-    struct rt_hid_device *hid;
-
-    RT_ASSERT(dev != RT_NULL);
-    hid = (struct rt_hid_device *)dev;
-
-    /* Free RX FIFO if this is the last user */
-    if (dev->ref_count <= 1 && hid->rx_fifo != RT_NULL) {
-        rt_free(hid->rx_fifo);
-        hid->rx_fifo = RT_NULL;
-    }
-
-    return RT_EOK;
-}
-
-/* HID device read */
-static rt_size_t rt_hid_read(struct rt_device *dev, rt_off_t pos, void *buffer, rt_size_t size)
-{
-    struct rt_hid_device *hid;
-    struct rt_hid_rx_fifo *rx_fifo;
-    rt_size_t recv_len;
-    rt_base_t level;
-
-    RT_ASSERT(dev != RT_NULL);
-    if (size == 0) return 0;
-
-    hid = (struct rt_hid_device *)dev;
-    rx_fifo = hid->rx_fifo;
-
-    if (rx_fifo == RT_NULL) return 0;
-
-    level = rt_hw_interrupt_disable();
-    recv_len = rt_ringbuffer_get(&(rx_fifo->rb), buffer, size);
-    rt_hw_interrupt_enable(level);
-
-    return recv_len;
-}
-
-/* HID device write (not supported) */
-static rt_size_t rt_hid_write(struct rt_device *dev, rt_off_t pos, const void *buffer, rt_size_t size)
-{
-    /* HID keyboard is read-only */
-    return 0;
-}
-
-/* HID device control */
-static rt_err_t rt_hid_control(struct rt_device *dev, int cmd, void *args)
-{
-    /* Add control commands if needed */
-    return RT_EOK;
-}
-
-#ifdef RT_USING_DEVICE_OPS
-const static struct rt_device_ops hid_ops =
-{
-    rt_hid_init,
-    rt_hid_open,
-    rt_hid_close,
-    rt_hid_read,
-    rt_hid_write,
-    rt_hid_control
-};
-#endif
-
-/* Register HID device */
-rt_err_t rt_hw_hid_register(struct rt_hid_device *hid, const char *name, rt_uint32_t flag, void *data)
-{
-    rt_err_t ret;
-    struct rt_device *device;
-
-    RT_ASSERT(hid != RT_NULL);
-
-    device = &(hid->parent);
-
-    device->type = RT_Device_Class_Char;
-    device->rx_indicate = RT_NULL;
-    device->tx_complete = RT_NULL;
-
-#ifdef RT_USING_DEVICE_OPS
-    device->ops = &hid_ops;
-#else
-    device->init = rt_hid_init;
-    device->open = rt_hid_open;
-    device->close = rt_hid_close;
-    device->read = rt_hid_read;
-    device->write = rt_hid_write;
-    device->control = rt_hid_control;
-#endif
-    device->user_data = data;
-
-    ret = rt_device_register(device, name, flag);
-
-#ifdef RT_USING_POSIX
-    device->fops = &_hid_fops;
-#endif
-
-    return ret;
 }
 
 /* Start HID device */
 void usbh_hid_run(struct usbh_hid *hid_class)
 {
     int ret;
+    rt_bool_t prefer_report_protocol = RT_FALSE;
     struct usb_interface_descriptor *intf_desc;
 
     /* Get interface descriptor to check protocol */
     intf_desc = &hid_class->hport->config.intf[hid_class->intf].altsetting[0].intf_desc;
 
-    /* Only handle keyboard devices (protocol = 0x01)
-     * HID_PROTOCOL_KEYBOARD = 0x01 (from usb_hid.h)
-     * HID_PROTOCOL_MOUSE    = 0x02
-     * HID_PROTOCOL_NONE     = 0x00 (need to parse report descriptor)
-     */
-    if ((HID_PROTOCOL_KEYBOARD != intf_desc->bInterfaceProtocol) ||
-        (HID_SUBCLASS_BOOTIF != intf_desc->bInterfaceSubClass) ||
-        (0x1 != intf_desc->bNumEndpoints) || (NULL == hid_class->intin)) {
-        USB_LOG_INFO("HID device protocol 0x%02x subclass 0x%02x have %d ep num is not keyboard, skipping\n",
-                   intf_desc->bInterfaceProtocol, intf_desc->bInterfaceSubClass, intf_desc->bNumEndpoints);
+    if ((NULL == hid_class->intin) || (0x1 != intf_desc->bNumEndpoints)) {
+        USB_LOG_INFO("HID device protocol 0x%02x subclass 0x%02x have %d ep num unsupported\n",
+                     intf_desc->bInterfaceProtocol, intf_desc->bInterfaceSubClass, intf_desc->bNumEndpoints);
         return;
     }
 
-    rt_kprintf("HID Keyboard detected (protocol=0x%02x, subclass=0x%02x)\n",
-               intf_desc->bInterfaceProtocol, intf_desc->bInterfaceSubClass);
+    if ((intf_desc->bInterfaceProtocol == HID_PROTOCOL_KEYBOARD) &&
+        (intf_desc->bInterfaceSubClass == HID_SUBCLASS_BOOTIF)) {
+        if (hid_kbd_dev.registered) {
+            if (!hid_kbd_dev.input.connected) {
+                hid_prepare_device(&hid_kbd_dev);
+            } else {
+                USB_LOG_WRN("Only one HID keyboard device is supported at a time\n");
+                return;
+            }
+        } else {
+            hid_prepare_device(&hid_kbd_dev);
+        }
 
-    /* Initialize HID device structure */
-    rt_memset(&hid_dev, 0, sizeof(hid_dev));
-    hid_dev.hid_class = hid_class;
-    hid_dev.rx_bufsz = HID_RX_BUFSIZE;
+        hid_kbd_dev.hid_class = hid_class;
+        hid_kbd_dev.type = HID_DEV_KEYBOARD;
+        hid_kbd_dev.use_boot_protocol = RT_TRUE;
 
-    /* Register HID device */
-    ret = rt_hw_hid_register(&hid_dev, "hidk0", RT_DEVICE_FLAG_RDONLY, hid_class);
+        ret = hid_start_device(&hid_kbd_dev, hid_kbd_buffer, usbh_hid_kbd_callback);
+        if (ret != RT_EOK) {
+            USB_LOG_ERR("Failed to start HID keyboard: %d\n", ret);
+            return;
+        }
+
+        rt_kprintf("HID keyboard started on /dev/%s\n", hid_kbd_dev.input.parent.parent.name);
+        return;
+    }
+
+    if (hid_pointer_dev.registered) {
+        if (!hid_pointer_dev.input.connected) {
+            hid_prepare_device(&hid_pointer_dev);
+        } else {
+            USB_LOG_WRN("Only one HID pointer device is supported at a time\n");
+            return;
+        }
+    } else {
+        hid_prepare_device(&hid_pointer_dev);
+    }
+
+    hid_pointer_dev.hid_class = hid_class;
+
+    if ((intf_desc->bInterfaceProtocol == HID_PROTOCOL_MOUSE) &&
+        (intf_desc->bInterfaceSubClass == HID_SUBCLASS_BOOTIF)) {
+        prefer_report_protocol = RT_TRUE;
+    }
+
+    if ((intf_desc->bInterfaceProtocol == HID_PROTOCOL_MOUSE) ||
+        (intf_desc->bInterfaceProtocol == HID_PROTOCOL_NONE)) {
+        if (hid_class->report_desc_len == 0) {
+            if (!prefer_report_protocol) {
+                USB_LOG_WRN("HID report descriptor is empty, skipping pointer device\n");
+                return;
+            }
+        }
+
+        if (prefer_report_protocol) {
+            ret = usbh_hid_set_protocol(hid_class, 0x1);
+            if (ret < 0) {
+                USB_LOG_WRN("Failed to switch mouse to report protocol, fallback to boot protocol\n");
+            }
+        }
+
+        if (hid_class->report_desc_len > 0) {
+            ret = hid_parse_report_descriptor(hid_class->report_desc, hid_class->report_desc_len, &hid_pointer_dev.report_map);
+            if (ret >= 0) {
+                hid_pointer_dev.type = hid_pointer_dev.report_map.is_absolute ? HID_DEV_TOUCH : HID_DEV_MOUSE;
+                hid_pointer_dev.use_boot_protocol = RT_FALSE;
+            } else if (prefer_report_protocol) {
+                hid_pointer_dev.type = HID_DEV_MOUSE;
+                hid_pointer_dev.use_boot_protocol = RT_TRUE;
+            } else {
+                USB_LOG_WRN("Unsupported HID report descriptor on intf %u, skipping (ret=%d len=%u)\n",
+                            hid_class->intf, ret, hid_class->report_desc_len);
+                USB_LOG_WRN("Report descriptor hex dump:\n");
+                for (uint32_t i = 0; i < hid_class->report_desc_len; i += 16) {
+                    uint32_t j, end = i + 16;
+                    if (end > hid_class->report_desc_len) end = hid_class->report_desc_len;
+                    rt_kprintf("  %04x: ", i);
+                    for (j = i; j < end; j++)
+                        rt_kprintf("%02x ", hid_class->report_desc[j]);
+                    rt_kprintf("\n");
+                }
+                return;
+            }
+        } else if (prefer_report_protocol) {
+            hid_pointer_dev.type = HID_DEV_MOUSE;
+            hid_pointer_dev.use_boot_protocol = RT_TRUE;
+        } else {
+            USB_LOG_WRN("HID report descriptor is empty, skipping pointer device\n");
+            return;
+        }
+    } else {
+        USB_LOG_INFO("HID device protocol 0x%02x subclass 0x%02x is not handled\n",
+                     intf_desc->bInterfaceProtocol, intf_desc->bInterfaceSubClass);
+        return;
+    }
+
+    ret = hid_start_device(&hid_pointer_dev, hid_pointer_buffer, usbh_hid_pointer_callback);
     if (ret != RT_EOK) {
-        USB_LOG_ERR("Failed to register HID device: %d\n", ret);
+        USB_LOG_ERR("Failed to start HID pointer device: %d\n", ret);
         return;
     }
 
-    /* Setup and submit URB */
-    usbh_int_urb_fill(&hid_class->intin_urb, hid_class->hport, hid_class->intin,
-                      hid_buffer, hid_class->intin->wMaxPacketSize, 0,
-                      usbh_hid_callback, hid_class);
-
-    ret = usbh_submit_urb(&hid_class->intin_urb);
-    if (ret < 0) {
-        USB_LOG_ERR("URB submit failed: %d\n", ret);
-        rt_device_unregister(&hid_dev.parent);
-        return;
-    }
-
-    rt_kprintf("HID keyboard started successfully\n");
+    rt_kprintf("HID %s started on /dev/%s\n",
+               hid_pointer_dev.type == HID_DEV_TOUCH ? "touch" : "mouse",
+               hid_pointer_dev.input.parent.parent.name);
+    rt_kprintf("  report_id=%u has_id=%d x=%d y=%d buttons=%d wheel=%d absolute=%d\n",
+               hid_pointer_dev.report_map.pointer_report_id,
+               hid_pointer_dev.report_map.pointer_has_report_id,
+               hid_pointer_dev.report_map.x_index,
+               hid_pointer_dev.report_map.y_index,
+               hid_pointer_dev.report_map.button_count,
+               hid_pointer_dev.report_map.wheel_index,
+               hid_pointer_dev.report_map.is_absolute);
 }
 
 /* Stop HID device */
 void usbh_hid_stop(struct usbh_hid *hid_class)
 {
-    if (!hid_dev.hid_class) {
-        return;
-    }
+    if (hid_kbd_dev.registered && hid_kbd_dev.hid_class == hid_class)
+        hid_cleanup_device(&hid_kbd_dev);
 
-    hid_dev.hid_class = NULL;
-
-    /* Unregister device */
-    rt_device_unregister(&hid_dev.parent);
-
-    /* Free RX FIFO if allocated */
-    if (hid_dev.rx_fifo != RT_NULL) {
-        rt_free(hid_dev.rx_fifo);
-        hid_dev.rx_fifo = RT_NULL;
-    }
+    if (hid_pointer_dev.registered && hid_pointer_dev.hid_class == hid_class)
+        hid_cleanup_device(&hid_pointer_dev);
 }

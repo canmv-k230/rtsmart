@@ -1031,10 +1031,14 @@ static int dwc2_update_non_isoc_urb_state_ddma(struct dwc2_hsotg *hsotg,
 {
     struct dwc2_hcd_urb *urb = qtd->urb;
     u16 remain = 0;
+    int short_read = 0;
 
     if (chan->ep_is_in)
         remain = (dma_desc->status & HOST_DMA_NBYTES_MASK) >>
             HOST_DMA_NBYTES_SHIFT;
+
+    if (chan->ep_is_in && chan->max_packet)
+        short_read = (remain != 0) && ((remain % chan->max_packet) != 0);
 
     dev_vdbg(hsotg->dev, "remain=%d dwc2_urb=%p\n", remain, urb);
 
@@ -1077,7 +1081,7 @@ static int dwc2_update_non_isoc_urb_state_ddma(struct dwc2_hsotg *hsotg,
     if (chan->ep_type == USB_ENDPOINT_XFER_CONTROL) {
         if (qtd->control_phase == DWC2_CONTROL_DATA) {
             urb->actual_length += n_bytes - remain;
-            if (remain || urb->actual_length >= urb->length) {
+            if (short_read || urb->actual_length >= urb->length) {
                 /*
                  * For Control Data stage do not set urb->status
                  * to 0, to prevent URB callback. Set it when

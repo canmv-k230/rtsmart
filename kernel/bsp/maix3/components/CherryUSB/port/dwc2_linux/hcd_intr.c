@@ -193,6 +193,37 @@ static void dwc2_hprt0_enable(struct dwc2_hsotg *hsotg, u32 hprt0,
         HFIR_FRINT_MASK;
     dwc2_writel(hsotg, hfir, HFIR);
 
+    /*
+     * Always configure HCFG.FSLSPCLKSEL for the connected device speed,
+     * even when not using the low-power PHY clock path.  Without this,
+     * a HS-capable controller keeps the 30/60 MHz clock setting and
+     * FS/LS packet reception is unreliable (e.g. multi-packet EP0 IN
+     * returns zeros for the 2nd/3rd packets on devices with MPS=8).
+     */
+    prtspd = (hprt0 & HPRT0_SPD_MASK) >> HPRT0_SPD_SHIFT;
+    if (prtspd == HPRT0_SPD_LOW_SPEED || prtspd == HPRT0_SPD_FULL_SPEED) {
+        hcfg = dwc2_readl(hsotg, HCFG);
+        fslspclksel = (hcfg & HCFG_FSLSPCLKSEL_MASK) >>
+            HCFG_FSLSPCLKSEL_SHIFT;
+
+        if (prtspd == HPRT0_SPD_LOW_SPEED &&
+            params->host_ls_low_power_phy_clk) {
+            if (fslspclksel != HCFG_FSLSPCLKSEL_6_MHZ) {
+                fslspclksel = HCFG_FSLSPCLKSEL_6_MHZ;
+                hcfg &= ~HCFG_FSLSPCLKSEL_MASK;
+                hcfg |= fslspclksel << HCFG_FSLSPCLKSEL_SHIFT;
+                dwc2_writel(hsotg, hcfg, HCFG);
+            }
+        } else {
+            if (fslspclksel != HCFG_FSLSPCLKSEL_48_MHZ) {
+                fslspclksel = HCFG_FSLSPCLKSEL_48_MHZ;
+                hcfg &= ~HCFG_FSLSPCLKSEL_MASK;
+                hcfg |= fslspclksel << HCFG_FSLSPCLKSEL_SHIFT;
+                dwc2_writel(hsotg, hcfg, HCFG);
+            }
+        }
+    }
+
     /* Check if we need to adjust the PHY clock speed for low power */
     if (!params->host_support_fs_ls_low_power) {
         /* Port has been enabled, set the reset change flag */
@@ -509,7 +540,15 @@ static u32 dwc2_get_actual_xfer_length(struct dwc2_hsotg *hsotg,
                 TSIZ_XFERSIZE_SHIFT;
             length = chan->xfer_len - count;
             if (short_read)
-                *short_read = (count != 0);
+                /*
+                 * This controller can raise XFRC for an IN transfer before
+                 * the whole programmed xfer_len has completed. Treat the
+                 * transfer as short only when the residual byte count is not
+                 * an integer number of max packets; a whole-packet residual
+                 * means more full-size packets are still expected.
+                 */
+                *short_read = (count != 0) &&
+                              ((count % chan->max_packet) != 0);
         } else if (chan->qh->do_split) {
             length = qtd->ssplit_out_xfer_count;
         } else {

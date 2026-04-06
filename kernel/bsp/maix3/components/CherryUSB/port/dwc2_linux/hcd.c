@@ -3650,8 +3650,15 @@ int usbh_enqueue_urb(struct usbh_urb *urb)
                                          urb->iso_packet[i].offset,
                                          urb->iso_packet[i].length);
 
-    urb->hcpriv = dwc2_urb;
     qh = (struct dwc2_qh *)ep->hcpriv;
+
+    if (qh && (qh->maxp != usb_endpoint_maxp(urb->ep) ||
+               qh->maxp_mult != usb_endpoint_maxp_mult(urb->ep))) {
+        ep->hcpriv = NULL;
+        dwc2_hcd_qh_free(hsotg, qh);
+        qh = NULL;
+    }
+
     /* Create QH for the endpoint if it doesn't exist */
     if (!qh) {
         qh = dwc2_hcd_qh_create(hsotg, dwc2_urb, mem_flags);
@@ -3675,6 +3682,10 @@ int usbh_enqueue_urb(struct usbh_urb *urb)
     DDD("canaan ++ qtd = %d\n", sizeof(*qtd));
 
     level = rt_spin_lock_irqsave(&hsotg->lock);
+
+    /* Set hcpriv under spinlock to prevent race with _dwc2_hcd_urb_dequeue
+     * which reads hcpriv under the same lock */
+    urb->hcpriv = dwc2_urb;
 
     if (atomic_read(&urb->reject)) {
         retval = -EPERM;

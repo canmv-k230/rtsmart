@@ -32,6 +32,8 @@ if GetDepend(['ENABLE_CHERRY_USB_HOST']):
 
     if GetDepend(['CHERRY_USB_HOST_ENABLE_CLASS_HID']):
         src += Glob('usbh_hid_thr.c')
+        src += Glob('rt_input_event.c')
+        src += Glob('usbh_hid_report_parser.c')
 
     if GetDepend(['CHERRY_USB_HOST_ENABLE_CLASS_UVC']):
         src += Glob('usbh_uvc_thr.c')

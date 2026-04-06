@@ -137,6 +137,84 @@ int cmd_cat(int argc, char **argv)
 }
 MSH_CMD_EXPORT_ALIAS(cmd_cat, cat, Concatenate FILE(s));
 
+static void msh_hexdump_line(rt_off_t offset, const unsigned char *buffer, int length)
+{
+    int index;
+
+    rt_kprintf("%08x  ", (unsigned int)offset);
+    for (index = 0; index < 16; index++)
+    {
+        if (index < length)
+            rt_kprintf("%02x ", buffer[index]);
+        else
+            rt_kprintf("   ");
+
+        if (index == 7)
+            rt_kprintf(" ");
+    }
+
+    rt_kprintf(" | ");
+    for (index = 0; index < length; index++)
+    {
+        char ch = (char)buffer[index];
+
+        if (ch >= 0x20 && ch <= 0x7e)
+            rt_kprintf("%c", ch);
+        else
+            rt_kprintf(".");
+    }
+    rt_kprintf("\n");
+}
+
+static void msh_hexdump(const char *filename)
+{
+    int fd;
+    int read_size;
+    rt_off_t offset = 0;
+    unsigned char buffer[16];
+
+    fd = open(filename, O_RDONLY, 0);
+    if (fd < 0)
+    {
+        rt_kprintf("open file:%s failed!\n", filename);
+        return;
+    }
+
+    rt_kprintf("%s:\n", filename);
+    while ((read_size = read(fd, buffer, sizeof(buffer))) > 0)
+    {
+        msh_hexdump_line(offset, buffer, read_size);
+        offset += read_size;
+    }
+
+    if (read_size < 0)
+    {
+        rt_kprintf("read file:%s failed!\n", filename);
+    }
+
+    close(fd);
+}
+
+int cmd_hexdump(int argc, char **argv)
+{
+    int index;
+
+    if (argc == 1)
+    {
+        rt_kprintf("Usage: hexdump [FILE]...\n");
+        rt_kprintf("Dump FILE(s) in hexadecimal.\n");
+        return 0;
+    }
+
+    for (index = 1; index < argc; index++)
+    {
+        msh_hexdump(argv[index]);
+    }
+
+    return 0;
+}
+MSH_CMD_EXPORT_ALIAS(cmd_hexdump, hexdump, Dump FILE(s) in hexadecimal.);
+
 static void msh_deltree(const char *pathname, char f, char v)
 {
     DIR *dir = NULL;

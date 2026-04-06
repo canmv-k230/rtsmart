@@ -507,9 +507,28 @@ int usbh_enumerate(struct usbh_hubport *hport)
     setup->wIndex = 0;
     setup->wLength = USB_SIZEOF_DEVICE_DESC;
 
-    ret = usbh_control_transfer(hport, setup, ep0_request_buffer[hport->bus->busid]);
-    if (ret < 0) {
-        USB_LOG_ERR("Failed to get full device descriptor,errorcode:%d\r\n", ret);
+    for (uint8_t dev_attempt = 0; dev_attempt < 3; dev_attempt++) {
+        ret = usbh_control_transfer(hport, setup, ep0_request_buffer[hport->bus->busid]);
+        if (ret < 0) {
+            USB_LOG_ERR("Failed to get full device descriptor,errorcode:%d\r\n", ret);
+            goto errout;
+        }
+
+        dev_desc = (struct usb_device_descriptor *)ep0_request_buffer[hport->bus->busid];
+        if (dev_desc->bLength == USB_SIZEOF_DEVICE_DESC &&
+            dev_desc->bDescriptorType == USB_DESCRIPTOR_TYPE_DEVICE &&
+            dev_desc->idVendor != 0)
+            break;
+
+        USB_LOG_WRN("Device descriptor corrupt (VID=0x%04x bLen=%u bType=%u) attempt %u, retrying\r\n",
+                    dev_desc->idVendor, dev_desc->bLength, dev_desc->bDescriptorType, dev_attempt + 1);
+        usb_osal_msleep(10);
+    }
+
+    dev_desc = (struct usb_device_descriptor *)ep0_request_buffer[hport->bus->busid];
+    if (dev_desc->idVendor == 0 && dev_desc->idProduct == 0) {
+        USB_LOG_ERR("Device descriptor still corrupt after retries\r\n");
+        ret = -USB_ERR_INVAL;
         goto errout;
     }
 
@@ -539,10 +558,19 @@ int usbh_enumerate(struct usbh_hubport *hport)
     setup->wIndex = 0;
     setup->wLength = USB_SIZEOF_CONFIG_DESC;
 
-    ret = usbh_control_transfer(hport, setup, ep0_request_buffer[hport->bus->busid]);
-    if (ret < 0) {
-        USB_LOG_ERR("Failed to get config descriptor,errorcode:%d\r\n", ret);
-        goto errout;
+    for (uint8_t cfg_attempt = 0; cfg_attempt < 3; cfg_attempt++) {
+        ret = usbh_control_transfer(hport, setup, ep0_request_buffer[hport->bus->busid]);
+        if (ret < 0) {
+            USB_LOG_ERR("Failed to get config descriptor,errorcode:%d\r\n", ret);
+            goto errout;
+        }
+
+        if (ep0_request_buffer[hport->bus->busid][0] == USB_SIZEOF_CONFIG_DESC)
+            break;
+
+        USB_LOG_WRN("Config header bLength 0x%02x invalid (attempt %u), retrying\r\n",
+                    ep0_request_buffer[hport->bus->busid][0], cfg_attempt + 1);
+        usb_osal_msleep(5);
     }
 
     parse_config_descriptor(hport, (struct usb_configuration_descriptor *)ep0_request_buffer[hport->bus->busid], USB_SIZEOF_CONFIG_DESC);
