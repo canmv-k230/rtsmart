@@ -120,11 +120,11 @@ static int reset(struct drv_touch_dev* dev)
 {
     if ((0 <= dev->pin.rst) && (63 >= dev->pin.rst)) {
         kd_pin_write(dev->pin.rst, 1 - dev->pin.rst_valid);
-        rt_thread_mdelay(10);
+        rt_thread_mdelay(5);
         kd_pin_write(dev->pin.rst, dev->pin.rst_valid);
-        rt_thread_mdelay(10);
+        rt_thread_mdelay(3);
         kd_pin_write(dev->pin.rst, 1 - dev->pin.rst_valid);
-        rt_thread_mdelay(150);
+        rt_thread_mdelay(10);
     }
 
     return 0;
