@@ -18,10 +18,12 @@
 #include <dfs_fs.h>
 #include <ioremap.h>
 #include "riscv_mmu.h"
+#include "riscv_io.h"
 
 #include <msh.h>
 
 #include "./config.h"
+#include "board.h"
 #include "dfs_posix.h"
 #include "sdk_version.h"
 
@@ -240,6 +242,16 @@ int main(void) {
 #endif // ENABLE_CHERRY_USB_DEVICE
 
 #endif //ENABLE_CHERRY_USB
+
+#if defined CONFIG_BOARD_K230D_CANMV_LABPLUS_AI_CAMERA \
+  || CONFIG_BOARD_K230D_CANMV_LABPLUS_AI_CAMERA_V2
+
+  writel(0x8009900d, (volatile void *)(uintptr_t)(CMU_BASE_ADDR + 0x04UL));
+  writel(0x8000040d, (volatile void *)(uintptr_t)(CMU_BASE_ADDR + 0x08UL));
+  writel(0x80000c67, (volatile void *)(uintptr_t)(CMU_BASE_ADDR + 0x0CUL));
+  writel(0x800002c2, (volatile void *)(uintptr_t)(CMU_BASE_ADDR + 0x80UL));
+
+#endif
 
   {
     size_t cmd_length = rt_strlen(CONFIG_RTT_AUTO_EXEC_CMD);
