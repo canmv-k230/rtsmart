@@ -352,4 +352,8 @@ menu "InterDriver"
         bool "Using Watch Dog device drivers"
         default n
 
+    config RT_USING_GZIP_DECOMP
+        bool "Using HW gzip decompress driver"
+        default n
+
 endmenu
