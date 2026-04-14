@@ -83,13 +83,13 @@
 #define DWC_MSHC_ATDL_CNFG (DWC_MSHC_PTR_PHY_REGS + 0x21)
 
 #define DWC_MSHC_PHY_PAD_SD_CLK \
-    ((1 << TXSLEW_N_LSB) | (3 << TXSLEW_P_LSB) | (0 << WEAKPULL_EN_LSB) | (2 << RXSEL_LSB))
+    ((1 << TXSLEW_N_LSB) | (3 << TXSLEW_P_LSB) | (1 << WEAKPULL_EN_LSB) | (2 << RXSEL_LSB))
 #define DWC_MSHC_PHY_PAD_SD_DAT \
     ((1 << TXSLEW_N_LSB) | (3 << TXSLEW_P_LSB) | (1 << WEAKPULL_EN_LSB) | (2 << RXSEL_LSB))
 #define DWC_MSHC_PHY_PAD_SD_STB \
     ((1 << TXSLEW_N_LSB) | (3 << TXSLEW_P_LSB) | (2 << WEAKPULL_EN_LSB) | (2 << RXSEL_LSB))
 #define DWC_MSHC_PHY_PAD_EMMC_CLK \
-    ((2 << TXSLEW_N_LSB) | (2 << TXSLEW_P_LSB) | (0 << WEAKPULL_EN_LSB) | (1 << RXSEL_LSB))
+    ((2 << TXSLEW_N_LSB) | (2 << TXSLEW_P_LSB) | (1 << WEAKPULL_EN_LSB) | (1 << RXSEL_LSB))
 #define DWC_MSHC_PHY_PAD_EMMC_DAT \
     ((2 << TXSLEW_N_LSB) | (2 << TXSLEW_P_LSB) | (1 << WEAKPULL_EN_LSB) | (1 << RXSEL_LSB))
 #define DWC_MSHC_PHY_PAD_EMMC_STB \

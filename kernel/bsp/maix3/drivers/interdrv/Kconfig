@@ -233,6 +233,10 @@ menu "InterDriver"
                 default n
 
             if RT_USING_SDIO0
+                config RT_SDIO0_EMMC
+                    bool "SDIO0 device is emmc"
+                    default n
+
                 config RT_SDIO0_1V8
                     bool "SDIO0 device is 1.8V"
                     default n

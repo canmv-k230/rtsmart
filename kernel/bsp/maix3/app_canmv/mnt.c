@@ -9,6 +9,9 @@ const struct romfs_dirent _root_dirent[] = {
     {ROMFS_DIRENT_DIR, "sdcard",  RT_NULL, 0},
     {ROMFS_DIRENT_DIR, "data",     RT_NULL, 0},
     {ROMFS_DIRENT_DIR, "udisk",   RT_NULL, 0},
+#ifdef MOUNT_SECOND_CARD
+    {ROMFS_DIRENT_DIR, "ext_data",  RT_NULL, 0},
+#endif
 #ifdef RT_USING_DFS_DEVFS
     {ROMFS_DIRENT_DIR, "dev",     RT_NULL, 0},
 #endif

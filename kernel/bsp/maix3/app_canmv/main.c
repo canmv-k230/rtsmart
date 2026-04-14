@@ -74,8 +74,7 @@ static const struct dfs_mount_tbl* const auto_mount_table[SYSCTL_BOOT_MAX] = {
         { "sd00", "/bin", "elm", 0, 0 },
 #if CONFIG_RT_PARTITION_NUMBER == 2
         { "sd01", "/data", "elm", 0, 0 },
-#endif
-#if CONFIG_RT_PARTITION_NUMBER == 3
+#elif CONFIG_RT_PARTITION_NUMBER == 3
         { "sd01", "/sdcard", "elm", 0, 0 },
         { "sd02", "/data", "elm", 0, 0 },
 #endif
@@ -86,8 +85,7 @@ static const struct dfs_mount_tbl* const auto_mount_table[SYSCTL_BOOT_MAX] = {
         { "sd10", "/bin", "elm", 0, 0 },
 #if CONFIG_RT_PARTITION_NUMBER == 2
         { "sd11", "/data", "elm", 0, 0 },
-#endif
-#if CONFIG_RT_PARTITION_NUMBER == 3
+#elif CONFIG_RT_PARTITION_NUMBER == 3
         { "sd11", "/sdcard", "elm", 0, 0 },
         { "sd12", "/data", "elm", 0, 0 },
 #endif
@@ -161,6 +159,42 @@ static void mnt_mount_table(void)
     }
 }
 
+#ifdef MOUNT_SECOND_CARD
+
+extern void kd_sdhci_change(int id);
+
+static void mount_second_card(void)
+{
+    int      ret;
+    int      err         = 0;
+    uint32_t wait_sd_cnt = 0;
+
+    sysctl_boot_mode_e boot_mode;
+    boot_mode = sysctl_boot_get_boot_mode();
+    boot_mode &= 0x03;
+
+    const char* device_name = (SYSCTL_BOOT_EMMC == boot_mode) ? "sd10" : "sd01";
+
+    if (SYSCTL_BOOT_EMMC == boot_mode) {
+        kd_sdhci_change(1);
+    } else if (SYSCTL_BOOT_SDCARD == boot_mode) {
+        kd_sdhci_change(0);
+    }
+
+    while (mmcsd_wait_cd_changed(100) != MMCSD_HOST_PLUGED) {
+        if (++wait_sd_cnt > 5) {
+            rt_kprintf("no second mmc device\n");
+            break;
+        }
+    }
+
+    if (0x00 != (ret = dfs_mount(device_name, "/ext_data", "elm", 0, 0))) {
+        err = errno;
+        rt_kprintf("mount fs[elm] on /ext_data failed(%d), error %d.\n", ret, err);
+    }
+}
+#endif
+
 static void check_bank_voltage(void)
 {
 #define MAP_SIZE    PAGE_SIZE
@@ -211,6 +245,10 @@ int main(void) {
 
   mnt_mount_table();
   excute_sdcard_config();
+
+#if defined (RT_USING_SDIO) && defined (MOUNT_SECOND_CARD)
+  mount_second_card();
+#endif // MOUNT_SECOND_CARD
 
 #if defined (RT_RECOVERY_MPY_AUTO_EXEC_PY)
   extern int check_delete_file_mark(void);
