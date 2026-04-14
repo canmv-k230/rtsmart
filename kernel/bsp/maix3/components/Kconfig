@@ -49,6 +49,9 @@ menu "Components Configuration"
                             config CHERRY_USB_DEVICE_ENABLE_CLASS_CDC_ACM
                                 bool "Enable CDC ACM"
 
+                            config CHERRY_USB_DEVICE_ENABLE_CLASS_HID
+                                bool "Enable HID"
+
                             config CHERRY_USB_DEVICE_ENABLE_CLASS_MSC
                                 bool "Enable MSC"
 
@@ -97,8 +100,16 @@ menu "Components Configuration"
                         config CHERRY_USB_DEVICE_FUNC_CDC
                             bool "CDC"
                             select CHERRY_USB_DEVICE_ENABLE_CLASS_CDC_ACM
+                        config CHERRY_USB_DEVICE_FUNC_HID
+                            bool "HID Serial"
+                            select CHERRY_USB_DEVICE_ENABLE_CLASS_HID
                         config CHERRY_USB_DEVICE_FUNC_CDC_MTP
                             bool "CDC + MTP"
+                            select CHERRY_USB_DEVICE_ENABLE_CLASS_CDC_ACM
+                            select CHERRY_USB_DEVICE_ENABLE_CLASS_MTP
+                        config CHERRY_USB_DEVICE_FUNC_HID_CDC_MTP
+                            bool "HID Serial + CDC + MTP"
+                            select CHERRY_USB_DEVICE_ENABLE_CLASS_HID
                             select CHERRY_USB_DEVICE_ENABLE_CLASS_CDC_ACM
                             select CHERRY_USB_DEVICE_ENABLE_CLASS_MTP
                         config CHERRY_USB_DEVICE_FUNC_CDC_ADB
@@ -112,6 +123,21 @@ menu "Components Configuration"
                             bool "UVC"
                             select CHERRY_USB_DEVICE_ENABLE_CLASS_UVC
                     endchoice
+
+                    config CHERRY_USB_DEVICE_FUNC_HID_DEVICE_NAME
+                        string "HID Serial Device Name"
+                        default "ttyHS0"
+                        depends on CHERRY_USB_DEVICE_FUNC_HID || CHERRY_USB_DEVICE_FUNC_HID_CDC_MTP
+                        help
+                          The RT-Thread device name for the HID Serial adapter (default: ttyHS0).
+
+                    config CHERRY_USB_DEVICE_FUNC_HID_DEBUG
+                        bool "Enable HID Serial Debug MSH Commands"
+                        default n
+                        depends on CHERRY_USB_DEVICE_FUNC_HID || CHERRY_USB_DEVICE_FUNC_HID_CDC_MTP
+                        help
+                          Enable hid_rd and hid_wr command in MSH to read/write HID serial device.
+
                 endif
 
             menuconfig ENABLE_CHERRY_USB_HOST

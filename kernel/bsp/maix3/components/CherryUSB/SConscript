@@ -39,6 +39,9 @@ if GetDepend(['ENABLE_CHERRY_USB_DEVICE']):
     if GetDepend(['CHERRY_USB_DEVICE_ENABLE_CLASS_CDC_ACM']):
         src += Glob('class/cdc/usbd_cdc.c')
 
+    if GetDepend(['CHERRY_USB_DEVICE_ENABLE_CLASS_HID']):
+        src += Glob('class/hid/usbd_hid.c')
+
     if GetDepend(['CHERRY_USB_DEVICE_ENABLE_CLASS_MSC']):
         src += Glob('class/msc/usbd_msc.c')
 

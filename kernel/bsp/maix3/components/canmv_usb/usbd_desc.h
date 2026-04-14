@@ -37,8 +37,16 @@
 #include "usbd_desc_cdc.h"
 #endif
 
+#ifdef CHERRY_USB_DEVICE_FUNC_HID
+#include "usbd_desc_hid.h"
+#endif
+
 #ifdef CHERRY_USB_DEVICE_FUNC_CDC_MTP
 #include "usbd_desc_cdc_mtp.h"
+#endif
+
+#ifdef CHERRY_USB_DEVICE_FUNC_HID_CDC_MTP
+#include "usbd_desc_hid_cdc_mtp.h"
 #endif
 
 #ifdef CHERRY_USB_DEVICE_FUNC_CDC_ADB
@@ -57,6 +65,9 @@ extern bool g_usb_device_connected;
 
 extern void canmv_usb_device_cdc_on_connected(void);
 extern void canmv_usb_device_cdc_init(void);
+
+extern void canmv_usb_device_hid_on_connected(void);
+extern void canmv_usb_device_hid_init(void);
 
 extern void canmv_usb_device_mtp_init(void);
 

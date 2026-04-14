@@ -10,7 +10,7 @@
 
 #include "usb_osal.h"
 
-#if defined (CHERRY_USB_DEVICE_FUNC_CDC_MTP)
+#if defined (CHERRY_USB_DEVICE_FUNC_CDC_MTP) || defined (CHERRY_USB_DEVICE_FUNC_HID_CDC_MTP)
 /* Max USB packet size */
 #define MTP_BULK_EP_MPS USB_DEVICE_MAX_MPS
 
