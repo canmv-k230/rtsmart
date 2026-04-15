@@ -172,6 +172,24 @@ int lwp_signal_check(void)
     return have_signal;
 }
 
+int lwp_user_return_need_work(void)
+{
+    struct rt_thread *thread;
+
+    thread = rt_thread_self();
+    if (!thread || !thread->lwp)
+    {
+        return 0;
+    }
+
+    if (thread->exit_request == LWP_EXIT_REQUEST_TRIGGERED)
+    {
+        return 1;
+    }
+
+    return lwp_thread_signal_check(thread, RT_NULL);
+}
+
 int lwp_signal_backup(void *user_sp, void *user_pc, void* user_flag)
 {
     rt_base_t level;

@@ -99,11 +99,43 @@ copy_context_loop_interrupt:
         jal lwp_mmu_switch
     #endif
 
-spurious_interrupt:
     LOAD t0, 2 * REGBYTES(sp)
     andi t0, t0, 0x100
     beqz t0, arch_ret_to_user
 
+    RESTORE_ALL
+    sret
+
+spurious_interrupt:
+    LOAD t0, 2 * REGBYTES(sp)
+    andi t0, t0, 0x100
+    bnez t0, 1f
+
+    mv s2, sp
+    call lwp_user_return_need_work
+    beqz a0, 1f
+
+    la a0, rt_current_thread
+    LOAD a0, 0(a0)
+    jal get_thread_kernel_stack_top
+    mv t0, a0
+
+    mv t1, s2
+    mv sp, t0
+    addi sp, sp, -CTX_REG_NR * REGBYTES
+    li s0, CTX_REG_NR
+    mv t2, sp
+
+2:
+    LOAD t0, 0(t1)
+    STORE t0, 0(t2)
+    addi s0, s0, -1
+    addi t1, t1, 8
+    addi t2, t2, 8
+    bnez s0, 2b
+
+    j arch_ret_to_user
+1:
     RESTORE_ALL
     sret
 
