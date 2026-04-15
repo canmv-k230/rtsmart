@@ -331,6 +331,10 @@ static void touch_read_thread(void* args)
                         LOG_E("reset touch failed");
                     }
 
+                    while (RT_EOK == rt_mq_recv(&dev->thr.read_mq, &dump[0], sizeof(dump), RT_WAITING_NO)) {
+                        // clear read message
+                    }
+
                     rt_thread_delay(rt_tick_from_millisecond(30));
 
                     rt_sem_release(&dev->thr.ctrl_sem);
@@ -358,7 +362,7 @@ static rt_size_t drv_touch_read(struct rt_touch_device* touch, void* buf, rt_siz
         rt_thread_mdelay(1);
     }
 
-    if (RT_EOK == rt_mq_recv(&dev->thr.read_mq, &reg, sizeof(reg), rt_tick_from_millisecond(33))) {
+    if (RT_EOK == rt_mq_recv(&dev->thr.read_mq, &reg, sizeof(reg), 0)) {
         have_new_data = RT_TRUE;
     } else {
         if (last_finger_num <= 0) {
