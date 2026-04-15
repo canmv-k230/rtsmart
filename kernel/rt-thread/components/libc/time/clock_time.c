@@ -215,7 +215,7 @@ int clock_nanosleep(clockid_t clockid, int flags, const struct timespec *rqtp, s
     case CLOCK_REALTIME:
     {
         rt_tick_t tick, tick_old = rt_tick_get();
-        if (flags & TIMER_ABSTIME == TIMER_ABSTIME)
+        if ((flags & TIMER_ABSTIME) == TIMER_ABSTIME)
         {
             tick = (rqtp->tv_sec - _timevalue.tv_sec) * RT_TICK_PER_SECOND + (rqtp->tv_nsec - _timevalue.tv_usec) * (RT_TICK_PER_SECOND / NANOSECOND_PER_SECOND);
             rt_tick_t rt_tick = rt_tick_get();
@@ -225,16 +225,21 @@ int clock_nanosleep(clockid_t clockid, int flags, const struct timespec *rqtp, s
         {
             tick = rqtp->tv_sec * RT_TICK_PER_SECOND + ((uint64_t)(rqtp->tv_nsec) * RT_TICK_PER_SECOND) / NANOSECOND_PER_SECOND;
         }
+
+        if (tick >= RT_TICK_MAX / 2) {
+            tick = RT_TICK_MAX / 2 - 1; // Prevent RT_ASSERT(timer->init_tick < RT_TICK_MAX / 2) trap on extreme/underflow sleeps
+        }
+
         rt_thread_delay(tick);
 
         if (rt_get_errno() == -RT_EINTR)
         {
             rt_tick_t tick_now = rt_tick_get();
-            if (tick_old + tick > tick_now)
+            if ((tick_now - tick_old) < tick)
             {
                 if (rmtp)
                 {
-                    tick = tick_old + tick - tick_now;
+                    tick = tick - (tick_now - tick_old);
                     /* get the passed time */
                     rmtp->tv_sec = tick / RT_TICK_PER_SECOND;
                     rmtp->tv_nsec = (tick % RT_TICK_PER_SECOND) * (NANOSECOND_PER_SECOND / RT_TICK_PER_SECOND);
@@ -257,20 +262,25 @@ int clock_nanosleep(clockid_t clockid, int flags, const struct timespec *rqtp, s
         rt_tick_t tick;
         float unit = clock_cpu_getres();
 
-        cpu_tick = (rqtp->tv_sec * NANOSECOND_PER_SECOND + rqtp->tv_nsec * (NANOSECOND_PER_SECOND / NANOSECOND_PER_SECOND)) / unit;
-        if (flags & TIMER_ABSTIME == TIMER_ABSTIME)
+        cpu_tick = ((uint64_t)rqtp->tv_sec * NANOSECOND_PER_SECOND + rqtp->tv_nsec) / unit;
+        if ((flags & TIMER_ABSTIME) == TIMER_ABSTIME)
             cpu_tick = cpu_tick < cpu_tick_old ? 0 : cpu_tick - cpu_tick_old;
         tick = (unit * cpu_tick) / (NANOSECOND_PER_SECOND / RT_TICK_PER_SECOND);
+
+        if (tick >= RT_TICK_MAX / 2) {
+            tick = RT_TICK_MAX / 2 - 1; // Prevent RT_ASSERT trap
+        }
+
         rt_thread_delay(tick);
 
         if (rt_get_errno() == -RT_EINTR)
         {
             uint64_t rmtp_cpu_tick = clock_cpu_gettime();
-            if (cpu_tick_old + cpu_tick > rmtp_cpu_tick)
+            if ((rmtp_cpu_tick - cpu_tick_old) < cpu_tick)
             {
                 if (rmtp)
                 {
-                    rmtp_cpu_tick = cpu_tick_old + cpu_tick - rmtp_cpu_tick;
+                    rmtp_cpu_tick = cpu_tick - (rmtp_cpu_tick - cpu_tick_old);
                     rmtp->tv_sec = ((int)(rmtp_cpu_tick * unit)) / NANOSECOND_PER_SECOND;
                     rmtp->tv_nsec = ((int)(rmtp_cpu_tick * unit)) % NANOSECOND_PER_SECOND;
                 }
@@ -307,18 +317,21 @@ int nanosleep(const struct timespec *rqtp, struct timespec *rmtp)
     rt_tick_t tick;
     float unit = clock_cpu_getres();
 
-    cpu_tick = (rqtp->tv_sec * NANOSECOND_PER_SECOND + ((uint64_t)rqtp->tv_nsec * NANOSECOND_PER_SECOND) / NANOSECOND_PER_SECOND)/unit;
+    cpu_tick = ((uint64_t)rqtp->tv_sec * NANOSECOND_PER_SECOND + rqtp->tv_nsec) / unit;
     tick = (unit * cpu_tick) / (NANOSECOND_PER_SECOND / RT_TICK_PER_SECOND);
+    if (tick >= RT_TICK_MAX / 2) {
+        tick = RT_TICK_MAX / 2 - 1; // Prevent RT_ASSERT trap
+    }
     rt_thread_delay(tick);
 
     if (rt_get_errno() == -RT_EINTR)
     {
         uint64_t rmtp_cpu_tick = clock_cpu_gettime();
-        if (cpu_tick_old + cpu_tick > rmtp_cpu_tick)
+        if ((rmtp_cpu_tick - cpu_tick_old) < cpu_tick)
         {
             if (rmtp)
             {
-                rmtp_cpu_tick = cpu_tick_old + cpu_tick - rmtp_cpu_tick;
+                rmtp_cpu_tick = cpu_tick - (rmtp_cpu_tick - cpu_tick_old);
                 rmtp->tv_sec = ((int)(rmtp_cpu_tick * unit)) / NANOSECOND_PER_SECOND;
                 rmtp->tv_nsec = ((int)(rmtp_cpu_tick * unit)) % NANOSECOND_PER_SECOND;
             }
@@ -333,12 +346,15 @@ int nanosleep(const struct timespec *rqtp, struct timespec *rmtp)
 #else
     rt_tick_t tick, tick_old = rt_tick_get();
     tick = rqtp->tv_sec * RT_TICK_PER_SECOND + ((uint64_t)rqtp->tv_nsec * RT_TICK_PER_SECOND) / NANOSECOND_PER_SECOND;
+    if (tick >= RT_TICK_MAX / 2) {
+        tick = RT_TICK_MAX / 2 - 1; // Prevent RT_ASSERT trap
+    }
     rt_thread_delay(tick);
 
     if (rt_get_errno() == -RT_EINTR)
     {
         rt_tick_t tick_now = rt_tick_get();
-        if (tick_old + tick > tick_now)
+        if ((tick_now - tick_old) < tick)
         {
             if (rmtp)
             {
