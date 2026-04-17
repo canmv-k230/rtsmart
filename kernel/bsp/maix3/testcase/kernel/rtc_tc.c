@@ -26,7 +26,7 @@
 #include <rtthread.h>
 #include <rtdevice.h>
 #include <time.h>
-#include <drv_rtc.h>
+#include <drv_pmu.h>
 
 #include "utest.h"
 

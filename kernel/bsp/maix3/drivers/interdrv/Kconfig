@@ -218,10 +218,21 @@ menu "InterDriver"
                     default n
         endif
 
-    config RT_USING_RTC_PMU
-        bool "Using RTC device drivers"
+    menuconfig RT_USING_RTC_PMU
+        bool "Using RTC/PMU device drivers"
         default n
         select RT_USING_RTC
+
+    if RT_USING_RTC_PMU
+        config RT_PMU_SOFT_SHUTDOWN_SECONDS
+            int "PMU long press shutdown seconds"
+            default 5
+            range 1 30
+            help
+                Software long-press shutdown time in seconds while the
+                system is running. This does not change the PMU hardware
+                wakeup long-press threshold after poweroff.
+    endif
 
     menuconfig RT_USING_SDIO
         bool "Enable SDIO Driver"

@@ -103,17 +103,21 @@ void rt_hw_context_switch_interrupt(rt_ubase_t from, rt_ubase_t to, rt_thread_t 
 }
 #endif /* end of RT_USING_SMP */
 
+RT_WEAK void rt_hw_board_shutdown(void)
+{
+}
+
 /** shutdown CPU */
 void rt_hw_cpu_shutdown()
 {
-    rt_uint32_t level;
     rt_kprintf("shutdown...\n");
 
-    level = rt_hw_interrupt_disable();
-    while (level)
-    {
-        RT_ASSERT(0);
-    }
+    rt_hw_interrupt_disable();
+
+    rt_hw_board_shutdown();
+
+    while (1)
+        asm volatile("wfi");
 }
 
 int rt_hw_cpu_id(void)
