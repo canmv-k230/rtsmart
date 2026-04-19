@@ -62,6 +62,9 @@ void pufs_rt_module_init(uint32_t rt_offset);
  */
 #define OTP_KEY_BITS 256
 #define OTP_KEY_LEN OTP_KEY_BITS / 8
+#define OTP_CDE_START 0x400
+#define OTP_CDE_USER_START 0xC00 // user can use 1KiB from 0xC00 to 0xFFF, which is divided into 8 segments of 128 bytes each, and each segment can be locked separately
+#define OTP_TOTAL_LEN 4096
 /**
  * @brief Construct mask bit for pufs_post_mask()
  *
@@ -104,15 +107,15 @@ typedef enum {
     PUFSLOT_2, ///< PUF slot 2, 256 bits
     PUFSLOT_3, ///< PUF slot 3, 256 bits
     // OTP key slots
-    OTPKEY_0,  ///< OTP key slot 0, 256 bits
-    OTPKEY_1,  ///< OTP key slot 1, 256 bits
-    OTPKEY_2,  ///< OTP key slot 2, 256 bits
-    OTPKEY_3,  ///< OTP key slot 3, 256 bits
-    OTPKEY_4,  ///< OTP key slot 4, 256 bits
-    OTPKEY_5,  ///< OTP key slot 5, 256 bits
-    OTPKEY_6,  ///< OTP key slot 6, 256 bits
-    OTPKEY_7,  ///< OTP key slot 7, 256 bits
-    OTPKEY_8,  ///< OTP key slot 8, 256 bits
+    OTPKEY_0,  ///< OTP key slot 0, 256 bits, used by BROM
+    OTPKEY_1,  ///< OTP key slot 1, 256 bits, used by BROM
+    OTPKEY_2,  ///< OTP key slot 2, 256 bits, use for secure boot, store bootloader aes256 key 1
+    OTPKEY_3,  ///< OTP key slot 3, 256 bits, use for secure boot, store bootloader aes256 key 2
+    OTPKEY_4,  ///< OTP key slot 4, 256 bits, use for secure boot, store bootloader sm4 key 1
+    OTPKEY_5,  ///< OTP key slot 5, 256 bits, use for secure boot, store bootloader sm4 key 2
+    OTPKEY_6,  ///< OTP key slot 6, 256 bits, use for secure boot, store bootloader rsa pubkey hash
+    OTPKEY_7,  ///< OTP key slot 7, 256 bits, use for secure boot, store bootloader sm2 pubkey hash
+    OTPKEY_8,  ///< OTP key slot 8, 256 bits, below OTP key slots are for general use, not used by BROM
     OTPKEY_9,  ///< OTP key slot 9, 256 bits
     OTPKEY_10, ///< OTP key slot 10, 256 bits
     OTPKEY_11, ///< OTP key slot 11, 256 bits
@@ -235,6 +238,8 @@ pufs_status_t pufs_lock_otp(pufs_otp_addr_t addr, uint32_t len,
  * @param[in] slot     OTP key slot.
  * @param[in] key      The plaintext key to be imported.
  * @param[in] keybits  Key length in bits. (max key bit length: 2047)
+ * @param[in] lock     Lock state after programming. Use N_OTP_LOCK_T to skip
+ *                     locking, NA to set No-Access, RO for Read-Only.
  * @return             SUCCESS on success, otherwise an error code.
  *
  * @note Each OTP key slot is 256-bit. For a key of length \f$b\f$ bits, the
@@ -244,7 +249,7 @@ pufs_status_t pufs_lock_otp(pufs_otp_addr_t addr, uint32_t len,
  *       OTPKEY_2, and so forth.
  */
 pufs_status_t pufs_program_key2otp(pufs_rt_slot_t slot, const uint8_t* key,
-                                   uint32_t keybits);
+                                   uint32_t keybits, pufs_otp_lock_t lock);
 /**
  * @brief Zeroize PUF slot
  *
@@ -279,6 +284,47 @@ pufs_status_t pufs_rt_version(uint32_t* version, uint32_t* features);
  * @return          The rwlck bits.
  */
 pufs_otp_lock_t pufs_get_otp_rwlck(pufs_otp_addr_t addr);
+/**
+ * @brief Unified OTP read (flat 0-4095 address space)
+ *
+ * Dispatches to RT (0x000-0x3FF) or CDE (0x400-0xFFF).
+ *
+ * @param[out] outbuf  OTP data.
+ * @param[in]  len     The length of data in bytes.
+ * @param[in]  addr    Starting address (0-4095).
+ * @return             SUCCESS on success, otherwise an error code.
+ */
+pufs_status_t pufs_otp_read(uint8_t* outbuf, uint32_t len, pufs_otp_addr_t addr);
+/**
+ * @brief Unified OTP write (flat 0-4095 address space)
+ *
+ * Dispatches to RT (0x000-0x3FF) or CDE (0x400-0xFFF).
+ * BROM patch area (0x400-0xAFF) is write-protected.
+ *
+ * @param[in] inbuf  The data to be written.
+ * @param[in] len    The length of data in bytes.
+ * @param[in] addr   Starting address (0-4095).
+ * @return           SUCCESS on success, otherwise an error code.
+ */
+pufs_status_t pufs_otp_write(const uint8_t* inbuf, uint32_t len,
+                             pufs_otp_addr_t addr);
+/**
+ * @brief Unified OTP lock get (flat 0-4095 address space)
+ *
+ * @param[in] addr  The address (0-4095).
+ * @return          The lock state.
+ */
+pufs_otp_lock_t pufs_otp_get_lock(pufs_otp_addr_t addr);
+/**
+ * @brief Unified OTP lock set (flat 0-4095 address space)
+ *
+ * @param[in] addr  Starting address (0-4095).
+ * @param[in] len   Length in bytes.
+ * @param[in] lock  The lock state.
+ * @return          SUCCESS on success, otherwise an error code.
+ */
+pufs_status_t pufs_otp_set_lock(pufs_otp_addr_t addr, uint32_t len,
+                                pufs_otp_lock_t lock);
 
 #ifdef PSIOT_012CW01D_B12C
 

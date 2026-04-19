@@ -24,9 +24,7 @@
  */
 
 #include <rtthread.h>
-#include <lwp_user_mm.h>
 #include "drv_hash.h"
-#include "drv_pufs.h"
 #include <rtdbg.h>
 
 #define DBG_TAG "HASH"
@@ -37,76 +35,26 @@
 #endif
 #define DBG_COLOR
 
-static int _hash_init(union rt_hash_control_args* ctl)
-{
-    int ret;
-    pufs_hash_init_t arg;
-
-    arg.mode = ctl->init.mode;
-
-    ret = hash_init(&arg);
-
-    return ret;
-}
-
-static int _hash_update(union rt_hash_control_args* ctl)
-{
-    int ret;
-    pufs_hash_update_t arg;
-
-    arg.msg = ctl->update.msg;
-    arg.msglen = ctl->update.msglen;
-
-    ret = hash_update(&arg);
-
-    return ret;
-}
-
-static int _hash_final(union rt_hash_control_args* ctl)
-{
-    int ret;
-    pufs_hash_final_t arg;
-
-    arg.dgst = ctl->final.dgst;
-    arg.dlen = ctl->final.dlen;
-
-    ret = hash_final(&arg);
-
-    return ret;
-}
+/*
+ * Legacy /dev/hash stub — all crypto now goes through /dev/pufs.
+ * This device is kept for backward compatibility; all operations
+ * return -ENOSYS.
+ */
 
 static rt_err_t hash_control(rt_device_t dev, int cmd, void* args)
 {
-    int ret;
-    union rt_hash_control_args ctl;
-
-    lwp_get_from_user(&ctl, args, sizeof(ctl));
-
-    switch (cmd) {
-    case RT_HASH_INIT:
-        ret = _hash_init(&ctl);
-        break;
-    case RT_HASH_UPDATE:
-        ret = _hash_update(&ctl);
-        break;
-    case RT_HASH_FINAL:
-        ret = _hash_final(&ctl);
-        break;
-    default:
-        ret = -EINVAL;
-    }
-    return ret;
+    (void)dev; (void)cmd; (void)args;
+    return -RT_ENOSYS;
 }
 
 static rt_err_t hash_open(rt_device_t dev, rt_uint16_t oflag)
 {
+    rt_kprintf("WARNING: /dev/hash is deprecated, use /dev/pufs instead\n");
     return RT_EOK;
 }
 
 static rt_err_t hash_close(rt_device_t dev)
 {
-    hash_deinit();
-
     return RT_EOK;
 }
 

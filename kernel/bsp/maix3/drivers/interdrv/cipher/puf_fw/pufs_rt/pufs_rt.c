@@ -25,6 +25,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <rtconfig.h>
 #include "pufs_internal.h"
 #include "pufs_rt_internal.h"
 
@@ -216,14 +217,10 @@ pufs_otp_lock_t pufs_get_otp_rwlck(pufs_otp_addr_t addr)
     uint32_t lck = (rt_regs->pif[idx] >> (group_index * WORD_SIZE)) & 0xF;
 
     switch (lck) {
-    case PUFRT_VALUE4(0x0):
-        return NA;
-    case PUFRT_VALUE4(0xC):
-        return RO;
-    case PUFRT_VALUE4(0xF):
-        return RW;
-    default:
-        return N_OTP_LOCK_T;
+    case PUFRT_VALUE4(0x0): return NA;
+    case PUFRT_VALUE4(0xC): return RO;
+    case PUFRT_VALUE4(0xF): return RW;
+    default: return N_OTP_LOCK_T;
     }
 }
 
@@ -279,11 +276,9 @@ pufs_status_t _pufs_get_uid(pufs_uid_st* uid, pufs_rt_slot_t slot)
         return E_INVALID;
     }
 
-    memcpy(uid->uid, (void*)(rt_regs->puf + index), UIDLEN);
-
     uid32 = (uint32_t*)uid->uid;
     for (size_t i = 0; i < (UIDLEN / 4); ++i)
-        *(uid32 + i) = be2le(*(uid32 + i));
+        uid32[i] = be2le(rt_regs->puf[index + i]);
 
     return SUCCESS;
 }
@@ -300,6 +295,9 @@ pufs_status_t _pufs_rand(uint8_t* rand, uint32_t numblks)
 
     return SUCCESS;
 }
+
+static const char *lock_state_name(pufs_otp_lock_t lock);
+
 /**
  * pufs_read_otp()
  */
@@ -315,17 +313,15 @@ pufs_status_t pufs_read_otp(uint8_t* outbuf, uint32_t len, pufs_otp_addr_t addr)
     start_index = addr / WORD_SIZE;
 
     if (wlen > 0) {
-        memcpy(outbuf, (void*)(rt_regs->otp + start_index), wlen * WORD_SIZE);
-
         uint32_t* out32 = (uint32_t*)outbuf;
         for (size_t i = 0; i < wlen; ++i)
-            *(out32 + i) = be2le(*(out32 + i));
+            out32[i] = be2le(rt_regs->otp[start_index + i]);
     }
 
     if (len % WORD_SIZE != 0) {
         outbuf += wlen * WORD_SIZE;
-        word = be2le(*(rt_regs->otp + start_index + wlen));
-        memcpy(outbuf, &word, len % WORD_SIZE);
+        word = be2le(rt_regs->otp[start_index + wlen]);
+        rt_memcpy(outbuf, &word, len % WORD_SIZE);
     }
 
     return SUCCESS;
@@ -342,23 +338,65 @@ pufs_status_t pufs_program_otp(const uint8_t* inbuf, uint32_t len,
     if ((check = otp_range_check(addr, len)) != SUCCESS)
         return check;
 
+    // check lock state for entire range
+    for (uint32_t off = 0; off < len; off += WORD_SIZE) {
+        pufs_otp_lock_t lck = pufs_get_otp_rwlck(addr + off);
+        if (lck != RW) {
+            LOG_WARN("OTP WRITE DENIED: addr=0x%03x locked (%s)",
+                     addr + off, lock_state_name(lck));
+            return E_DENY;
+        }
+    }
+
+    // check for 0->1 bit violations (RT OTP only goes 1->0)
+    for (uint32_t i = 0; i < len; i += WORD_SIZE) {
+        uint32_t cur = be2le(rt_regs->otp[start_index + (i / WORD_SIZE)]);
+        for (uint32_t j = 0; j < WORD_SIZE && (i + j) < len; j++) {
+            uint8_t cur_byte = (cur >> (j * 8)) & 0xFF;
+            uint8_t new_byte = inbuf[i + j];
+            if (~cur_byte & new_byte) {
+                LOG_WARN("OTP WRITE DENIED: addr=0x%03x+%u bit 0->1"
+                         " (cur=0x%02x new=0x%02x)",
+                         addr, i + j, cur_byte, new_byte);
+                return E_DENY;
+            }
+        }
+    }
+
+#ifndef RT_PUFS_OTP_WRITE_ENABLE
+    LOG_WARN("OTP WRITE DRY-RUN: addr=0x%03x len=%" PRIu32
+             " (enable RT_PUFS_OTP_WRITE_ENABLE to commit)", addr, len);
+    return SUCCESS;
+#else
+    LOG_WARN("OTP WRITE: addr=0x%03x len=%" PRIu32, addr, len);
     // program
     for (uint32_t i = 0; i < len; i += 4) {
         union {
             uint32_t word;
             uint8_t byte[4];
         } otp_word;
-        for (int8_t j = 3; j >= 0; j--) // reserve, default 0xff
+        for (int8_t j = 3; j >= 0; j--) // reverse, default 0xff
             otp_word.byte[j] = ((i + 3 - j) < len) ? inbuf[i + 3 - j] : 0xff;
 
         rt_regs->otp[start_index + (i / 4)] = otp_word.word;
     }
 
     return SUCCESS;
+#endif
 }
 /**
  * pufs_lock_otp
  */
+static const char *lock_state_name(pufs_otp_lock_t lock)
+{
+    switch (lock) {
+    case NA: return "NA";
+    case RO: return "RO";
+    case RW: return "RW";
+    default: return "?";
+    }
+}
+
 pufs_status_t pufs_lock_otp(pufs_otp_addr_t addr, uint32_t len,
     pufs_otp_lock_t lock)
 {
@@ -382,6 +420,15 @@ pufs_status_t pufs_lock_otp(pufs_otp_addr_t addr, uint32_t len,
         return E_INVALID;
     }
 
+#ifndef RT_PUFS_OTP_WRITE_ENABLE
+    LOG_WARN("OTP LOCK DRY-RUN: addr=0x%03x len=%" PRIu32 " lock=%s"
+             " (enable RT_PUFS_OTP_WRITE_ENABLE to commit)",
+             addr, len, lock_state_name(lock));
+    return SUCCESS;
+#else
+    LOG_WARN("OTP LOCK: addr=0x%03x len=%" PRIu32 " lock=%s",
+             addr, len, lock_state_name(lock));
+
     end = (len + 3) / 4;
     start = addr / WORD_SIZE;
 
@@ -403,14 +450,20 @@ pufs_status_t pufs_lock_otp(pufs_otp_addr_t addr, uint32_t len,
     }
 
     return SUCCESS;
+#endif
 }
 /**
  * pufs_program_key2otp
  */
 pufs_status_t pufs_program_key2otp(pufs_rt_slot_t slot, const uint8_t* key,
-    uint32_t keybits)
+    uint32_t keybits, pufs_otp_lock_t lock)
 {
     pufs_status_t check;
+
+    // OTPKEY_0 is used by BROM (unlocked), reject writes to protect it
+    if (slot == OTPKEY_0)
+        return E_INVALID;
+
     // check OTP key slot by key length
     if ((check = otpkey_slot_check(slot, keybits)) != SUCCESS)
         return check;
@@ -418,11 +471,16 @@ pufs_status_t pufs_program_key2otp(pufs_rt_slot_t slot, const uint8_t* key,
     // XXX programmed check
     // write key by pufs_program_otp()
     pufs_otp_addr_t addr = (slot - OTPKEY_0) * OTP_KEY_LEN;
+    LOG_WARN("KEY2OTP: slot=%u addr=0x%03x keybits=%" PRIu32 " lock=%s",
+             slot, addr, keybits, lock_state_name(lock));
     if ((check = pufs_program_otp(key, b2B(keybits), addr)) != SUCCESS)
         return check;
 
-    // set rwlck to 3'b000
-    return pufs_lock_otp(addr, b2B(keybits), NA);
+    // set lock state (default N_OTP_LOCK_T = skip locking)
+    if (lock < N_OTP_LOCK_T)
+        return pufs_lock_otp(addr, b2B(keybits), lock);
+
+    return SUCCESS;
 }
 /**
  * pufs_zeroize()
@@ -445,6 +503,13 @@ pufs_status_t pufs_zeroize(pufs_rt_slot_t slot)
         return E_INVALID;
     }
 
+#ifndef RT_PUFS_OTP_WRITE_ENABLE
+    LOG_WARN("ZEROIZE DRY-RUN: slot=%u"
+             " (enable RT_PUFS_OTP_WRITE_ENABLE to commit)", slot);
+    return SUCCESS;
+#else
+    LOG_WARN("ZEROIZE: slot=%u", slot);
+
     if (slot < OTPKEY_0)
         rt_regs->puf_zeroize = val32;
     else
@@ -457,6 +522,7 @@ pufs_status_t pufs_zeroize(pufs_rt_slot_t slot)
         return E_ERROR;
     }
     return SUCCESS;
+#endif
 }
 /**
  * pufs_post_mask()
@@ -464,6 +530,13 @@ pufs_status_t pufs_zeroize(pufs_rt_slot_t slot)
 pufs_status_t pufs_post_mask(uint64_t maskslots)
 {
     uint32_t otp_psmsk_0, otp_psmsk_1, puf_psmsk, val32_0 = 0, val32_1 = 0;
+
+#ifndef RT_PUFS_OTP_WRITE_ENABLE
+    LOG_WARN("POST_MASK DRY-RUN: maskslots=0x%016" PRIx64
+             " (enable RT_PUFS_OTP_WRITE_ENABLE to commit)", maskslots);
+    return SUCCESS;
+#else
+    LOG_WARN("POST_MASK: maskslots=0x%016" PRIx64, maskslots);
 
     puf_psmsk = (maskslots & 0xf);
     otp_psmsk_0 = ((maskslots >> 4) & 0x0000ffff);
@@ -489,6 +562,7 @@ pufs_status_t pufs_post_mask(uint64_t maskslots)
     rt_regs->puf_psmsk = val32_0;
 
     return SUCCESS;
+#endif
 }
 /**
  * pufs_rt_version()
@@ -547,4 +621,69 @@ pufs_status_t rt_write_set_flag(pufs_ptm_flag_t flag, uint32_t* status)
         *status = res;
 
     return SUCCESS;
+}
+
+/*****************************************************************************
+ * Unified OTP wrappers (flat 0-4095 address space)
+ *
+ * Dispatches to RT (0x000-0x3FF) or CDE (0x400-0xFFF) drivers.
+ * BROM patch area (0x400-0xBFF) is write-protected.
+ ****************************************************************************/
+static pufs_status_t otp_unified_range_check(pufs_otp_addr_t addr, uint32_t len)
+{
+    if ((addr % WORD_SIZE) != 0)
+        return E_ALIGN;
+    if (addr + len > OTP_TOTAL_LEN)
+        return E_OVERFLOW;
+    if (addr < OTP_LEN && (addr + len) > OTP_LEN)
+        return E_INVALID; /* cross-boundary RT/CDE not allowed */
+    return SUCCESS;
+}
+
+pufs_status_t pufs_otp_read(uint8_t* outbuf, uint32_t len, pufs_otp_addr_t addr)
+{
+    pufs_status_t check;
+    if ((check = otp_unified_range_check(addr, len)) != SUCCESS)
+        return check;
+    if (addr < OTP_LEN)
+        return pufs_read_otp(outbuf, len, addr);
+    return pufs_read_cde(outbuf, len, addr - OTP_LEN);
+}
+
+pufs_status_t pufs_otp_write(const uint8_t* inbuf, uint32_t len,
+    pufs_otp_addr_t addr)
+{
+    pufs_status_t check;
+    if ((check = otp_unified_range_check(addr, len)) != SUCCESS)
+        return check;
+    /* protect BROM patch area (0x400-0xAFF) */
+    if (addr >= OTP_CDE_START && addr < OTP_CDE_USER_START) {
+        LOG_WARN("OTP WRITE DENIED: addr=0x%03x in BROM patch area", addr);
+        return E_DENY;
+    }
+    if (addr < OTP_LEN)
+        return pufs_program_otp(inbuf, len, addr);
+    return pufs_program_cde(inbuf, len, addr - OTP_LEN);
+}
+
+pufs_otp_lock_t pufs_otp_get_lock(pufs_otp_addr_t addr)
+{
+    if (addr < OTP_LEN)
+        return pufs_get_otp_rwlck(addr);
+    if (addr >= OTP_TOTAL_LEN)
+        return N_OTP_LOCK_T;
+    return rt_cde_read_lock(addr - OTP_LEN);
+}
+
+pufs_status_t pufs_otp_set_lock(pufs_otp_addr_t addr, uint32_t len,
+    pufs_otp_lock_t lock)
+{
+    pufs_status_t check;
+    if ((check = otp_unified_range_check(addr, len)) != SUCCESS)
+        return check;
+    if (addr < OTP_LEN)
+        return pufs_lock_otp(addr, len, lock);
+    if (lock == NA)
+        return E_INVALID; /* CDE has no NA state */
+    return rt_cde_write_lock(addr - OTP_LEN, len, lock);
 }

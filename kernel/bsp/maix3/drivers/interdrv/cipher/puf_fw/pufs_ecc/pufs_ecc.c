@@ -290,12 +290,12 @@ void get_z(pufs_ec_name_t name, uint8_t* z, const uint8_t* md, size_t mdlen)
 {
     // Step 0: zeroize
     uint32_t elen = ecc_param[name].len;
-    memset(z, 0, elen);
+    rvv_memset(z, 0, elen);
 
     // Step 1: retrieve the value
     uint32_t nbits = ecc_param[name].nbits;
     if (nbits >= (8 * mdlen)) { // pad leading 0's
-        memcpy(z + (elen - mdlen), md, mdlen);
+        rvv_memcpy(z + (elen - mdlen), md, mdlen);
     } else { // extract first nbits bits
         uint8_t rlen = ((nbits % 8) ? (nbits % 8) : 8);
         // The length of padding 0's to form a byte-aligned value

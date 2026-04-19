@@ -24,9 +24,7 @@
  */
 
 #include <rtthread.h>
-#include <lwp_user_mm.h>
 #include "drv_aes.h"
-#include "drv_pufs.h"
 #include <rtdbg.h>
 
 #define DBG_TAG "AES"
@@ -37,89 +35,26 @@
 #endif
 #define DBG_COLOR
 
-static int aes_init(union rt_aes_control_args* ctl)
-{
-    int ret;
-    pufs_skcipher_init_t cfg;
-
-    cfg.cipher = SK_AES;
-    cfg.mode = ctl->init.mode;
-    cfg.encrypt = ctl->init.encrypt ? 1 : 0;
-    cfg.aes.keytype = ctl->init.keytype;
-    cfg.aes.keyaddr = ctl->init.key;
-    cfg.aes.keybits = ctl->init.keylen << 3;
-    cfg.aes.iv = ctl->init.iv;
-    cfg.aes.ivlen = ctl->init.ivlen;
-
-    ret = skcipher_init(&cfg);
-
-    return ret;
-}
-
-static int aes_update(union rt_aes_control_args* ctl)
-{
-    int ret;
-    pufs_skcipher_update_t arg;
-
-    arg.out = ctl->update.out;
-    arg.outlen = ctl->update.outlen;
-    arg.in = ctl->update.in;
-    arg.inlen = ctl->update.inlen;
-
-    ret = skcipher_update(&arg);
-
-    return ret;
-}
-
-static int aes_final(union rt_aes_control_args* ctl)
-{
-    int ret;
-    pufs_skcipher_final_t arg;
-
-    arg.out = ctl->final.out;
-    arg.outlen = ctl->final.outlen;
-    arg.tag = ctl->final.tag;
-    arg.taglen = ctl->final.taglen;
-
-    ret = skcipher_final(&arg);
-
-    return ret;
-}
+/*
+ * Legacy /dev/aes stub — all crypto now goes through /dev/pufs.
+ * This device is kept for backward compatibility; all operations
+ * return -ENOSYS.
+ */
 
 static rt_err_t aes_control(rt_device_t dev, int cmd, void* args)
 {
-    int ret;
-    union rt_aes_control_args ctl;
-
-    if (lwp_get_from_user(&ctl, args, sizeof(ctl)) == 0)
-        memcpy(&ctl, args, sizeof(ctl));
-
-    switch (cmd) {
-    case RT_AES_INIT:
-        ret = aes_init(&ctl);
-        break;
-    case RT_AES_UPDATE:
-        ret = aes_update(&ctl);
-        break;
-    case RT_AES_FINAL:
-        ret = aes_final(&ctl);
-        break;
-    default:
-        ret = -EINVAL;
-    }
-
-    return ret;
+    (void)dev; (void)cmd; (void)args;
+    return -RT_ENOSYS;
 }
 
 static rt_err_t aes_open(rt_device_t dev, rt_uint16_t oflag)
 {
+    rt_kprintf("WARNING: /dev/aes is deprecated, use /dev/pufs instead\n");
     return RT_EOK;
 }
 
 static rt_err_t aes_close(rt_device_t dev)
 {
-    skcipher_deinit();
-
     return RT_EOK;
 }
 

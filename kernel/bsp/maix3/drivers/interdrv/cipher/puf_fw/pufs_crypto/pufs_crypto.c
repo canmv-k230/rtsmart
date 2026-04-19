@@ -68,7 +68,7 @@ static void read_data(uint8_t* dst, uint32_t* src, size_t length, bool le)
         else
             last_word = src[word_nums];
 
-        memcpy(dst + (word_nums * 4), &last_word, rest);
+        rvv_memcpy(dst + (word_nums * 4), &last_word, rest);
     }
 }
 
@@ -256,7 +256,7 @@ pufs_crypto_io_ctx_st* crypto_new_crypto_io_ctx(void)
     // FIXME: To handle virtual address to physical address translation, we simply use parts of memory area of descriptor.
     // Change it if we have a better translation way.
     addr = VIRT_ADDR(sg_mem.base_addr + (DEFAULT_DESC_MEM_SIZE - (CRYPTO_IO_CTX_SIZE * (index + 1))));
-    memset((void*)addr, 0x0, CRYPTO_IO_CTX_SIZE);
+    rvv_memset((void*)addr, 0x0, CRYPTO_IO_CTX_SIZE);
 
     return (pufs_crypto_io_ctx_st*)addr;
 }

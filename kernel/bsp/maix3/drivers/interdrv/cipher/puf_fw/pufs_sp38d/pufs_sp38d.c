@@ -155,7 +155,7 @@ static pufs_status_t sp38d_ctx_init(sp38d_op op,
     if (op != SP38D_GHASH) {
         if (j0 == NULL)
             return E_INVALID;
-        memcpy(sp38d_ctx->j0, j0, BC_BLOCK_SIZE);
+        rvv_memcpy(sp38d_ctx->j0, j0, BC_BLOCK_SIZE);
     }
 
     // initialize for block-cipher GCM mode
@@ -170,7 +170,7 @@ static pufs_status_t sp38d_ctx_init(sp38d_op op,
     sp38d_ctx->stage = SP38D_NONE;
     sp38d_ctx->crypto_io_ctx = NULL;
 
-    memset(sp38d_ctx->ghash, 0, BC_BLOCK_SIZE);
+    rvv_memset(sp38d_ctx->ghash, 0, BC_BLOCK_SIZE);
 
     // set key
     sp38d_ctx->keybits = keybits;
@@ -178,7 +178,7 @@ static pufs_status_t sp38d_ctx_init(sp38d_op op,
     if (keytype != SWKEY)
         sp38d_ctx->keyslot = (uint32_t)keyaddr;
     else
-        memcpy(sp38d_ctx->key, (const void*)keyaddr, b2B(keybits));
+        rvv_memcpy(sp38d_ctx->key, (const void*)keyaddr, b2B(keybits));
 
     return SUCCESS;
 }
@@ -400,8 +400,7 @@ static pufs_status_t sp38d_ctx_update(sp38d_op op,
                 sp38d_ctx->buflen += segs.seg[i].len;
             } else // copy into the buffer
             {
-                if (lwp_get_from_user(sp38d_ctx->buff + sp38d_ctx->buflen, (void*)segs.seg[i].addr, segs.seg[i].len) == 0)
-                    memcpy(sp38d_ctx->buff + sp38d_ctx->buflen, segs.seg[i].addr, segs.seg[i].len);
+                rvv_memcpy(sp38d_ctx->buff + sp38d_ctx->buflen, segs.seg[i].addr, segs.seg[i].len);
                 sp38d_ctx->buflen += segs.seg[i].len;
             }
         }
@@ -492,7 +491,7 @@ static pufs_status_t sp38d_tag(pufs_sp38d_ctx* sp38d_ctx, uint8_t* tag, uint32_t
     } tmp;
 
     if (sp38d_ctx->op == SP38D_GHASH) {
-        memcpy(tag, sp38d_ctx->ghash, taglen);
+        rvv_memcpy(tag, sp38d_ctx->ghash, taglen);
         return SUCCESS;
     }
 
@@ -517,7 +516,7 @@ static pufs_status_t sp38d_tag(pufs_sp38d_ctx* sp38d_ctx, uint8_t* tag, uint32_t
             || (tmplen != BC_BLOCK_SIZE))
             return E_FIRMWARE;
 
-        memcpy(tag, tmp.uc, taglen);
+        rvv_memcpy(tag, tmp.uc, taglen);
         return SUCCESS;
     }
 
@@ -695,8 +694,8 @@ static pufs_status_t sp38d_build_j0(uint8_t* j0,
         return E_INVALID;
 
     if (ivlen == 12) {
-        memcpy(j0, iv, ivlen);
-        memset(j0 + ivlen, 0, 3);
+        rvv_memcpy(j0, iv, ivlen);
+        rvv_memset(j0 + ivlen, 0, 3);
         *(j0 + 15) = 1;
         return SUCCESS;
     }
@@ -708,7 +707,7 @@ static pufs_status_t sp38d_build_j0(uint8_t* j0,
         return check;
     if ((check = sp38d_ghash_update(&sp38d_ctx, iv, ivlen)) != SUCCESS)
         return check;
-    memset(tmp, 0, BC_BLOCK_SIZE);
+    rvv_memset(tmp, 0, BC_BLOCK_SIZE);
     if ((ivlen % BC_BLOCK_SIZE) != 0) {
         uint32_t padlen = BC_BLOCK_SIZE - (ivlen % BC_BLOCK_SIZE);
         if ((check = sp38d_ghash_update(&sp38d_ctx, tmp, padlen)) != SUCCESS)
@@ -844,7 +843,7 @@ pufs_sp38d_ctx* pufs_sp38d_ctx_new(void)
     ret = malloc(sizeof(pufs_sp38d_ctx));
     if (ret != NULL) {
         ret->op = SP38D_AVAILABLE;
-        memset(ret, 0x0, sizeof(pufs_sp38d_ctx));
+        rvv_memset(ret, 0x0, sizeof(pufs_sp38d_ctx));
     }
 
     return ret;
@@ -855,7 +854,7 @@ pufs_sp38d_ctx* pufs_sp38d_ctx_new(void)
 void pufs_sp38d_ctx_free(pufs_sp38d_ctx* sp38d_ctx)
 {
     if (sp38d_ctx != NULL) {
-        memset(sp38d_ctx, 0, sizeof(pufs_sp38d_ctx));
+        rvv_memset(sp38d_ctx, 0, sizeof(pufs_sp38d_ctx));
         sp38d_ctx->op = SP38D_AVAILABLE;
     }
     free(sp38d_ctx);

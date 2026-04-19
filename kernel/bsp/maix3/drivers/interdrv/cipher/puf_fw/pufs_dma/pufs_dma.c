@@ -34,6 +34,11 @@ struct pufs_dma pufs_dma = { .regs = NULL,
     .write_virt_addr = 0x0,
     .buff_size = 0 };
 
+#ifdef DMADIRECT
+static uint8_t pufs_dma_write_bounce[CHUNK_MAXLEN] __attribute__((aligned(64)));
+static uint8_t pufs_dma_read_bounce[CHUNK_MAXLEN] __attribute__((aligned(64)));
+#endif
+
 /*****************************************************************************
  * Macros
  ****************************************************************************/
@@ -157,7 +162,7 @@ int dma_write_rwcfg(const uint8_t* out, const uint8_t* in, uint32_t len)
     if (in != NULL) {
         if (len > pufs_dma.buff_size)
             errx(1, "The input exceeds DMA buffer size 0x%08" PRIxPTR ".\n", pufs_dma.buff_size);
-        memcpy((void*)pufs_dma.write_virt_addr, in, len);
+        rvv_memcpy((void*)pufs_dma.write_virt_addr, in, len);
     }
 
     pufs_dma.regs->dsc_cfg_0 = pufs_dma.write_addr;
@@ -169,28 +174,25 @@ int dma_write_rwcfg(const uint8_t* out, const uint8_t* in, uint32_t len)
     pufs_dma.read_virt_addr = 0;
     pufs_dma.buff_size = len;
     if (len && in) {
-        if ((((uint64_t)in > USER_VADDR_START) && ((uint64_t)in < USER_VADDR_TOP)) || (len & 0x3f) || ((uint64_t)in & 0x3f)) {
-            pufs_dma.write_virt_addr = (uintptr_t)rt_malloc(len);
-            if (pufs_dma.write_virt_addr == 0) {
-                LOG_ERROR("No memory");
-                return -ENOMEM;
-            }
-            if (0 == lwp_get_from_user((void*)pufs_dma.write_virt_addr, (void*)in, len))
-                memcpy((void*)pufs_dma.write_virt_addr, in, len);
+        if (len > CHUNK_MAXLEN) {
+            LOG_ERROR("DMA input length too large: %u", len);
+            return -EINVAL;
+        }
+        if ((len & 0x3f) || ((uint64_t)in & 0x3f)) {
+            pufs_dma.write_virt_addr = (uintptr_t)pufs_dma_write_bounce;
+            rvv_memcpy((void*)pufs_dma.write_virt_addr, in, len);
         } else {
             pufs_dma.write_virt_addr = (uint64_t)in;
         }
         rt_hw_cpu_dcache_clean((void*)pufs_dma.write_virt_addr, len);
     }
     if (len && out) {
-        if ((((uint64_t)out > USER_VADDR_START) && ((uint64_t)out < USER_VADDR_TOP)) || (len & 0x3f) || ((uint64_t)out & 0x3f)) {
-            pufs_dma.read_virt_addr = (uintptr_t)rt_malloc(len);
-            if (pufs_dma.read_virt_addr == 0) {
-                if (pufs_dma.write_virt_addr && pufs_dma.write_virt_addr != pufs_dma.write_addr)
-                    rt_free((void*)pufs_dma.write_virt_addr);
-                LOG_ERROR("No memory");
-                return -ENOMEM;
-            }
+        if (len > CHUNK_MAXLEN) {
+            LOG_ERROR("DMA output length too large: %u", len);
+            return -EINVAL;
+        }
+        if ((len & 0x3f) || ((uint64_t)out & 0x3f)) {
+            pufs_dma.read_virt_addr = (uintptr_t)pufs_dma_read_bounce;
         } else {
             pufs_dma.read_virt_addr = (uint64_t)out;
         }
@@ -217,13 +219,10 @@ int dma_wait_done(void)
     if (pufs_dma.read_virt_addr) {
         rt_hw_cpu_dcache_invalidate((void*)pufs_dma.read_virt_addr, pufs_dma.buff_size);
         if (pufs_dma.read_virt_addr != pufs_dma.read_addr) {
-            if (0 == lwp_put_to_user((void*)pufs_dma.read_addr, (void*)pufs_dma.read_virt_addr, pufs_dma.buff_size))
-                memcpy((void*)pufs_dma.read_addr, (void*)pufs_dma.read_virt_addr, pufs_dma.buff_size);
-            rt_free((void*)pufs_dma.read_virt_addr);
+            rvv_memcpy((void*)pufs_dma.read_addr, (void*)pufs_dma.read_virt_addr, pufs_dma.buff_size);
+            rt_hw_cpu_dcache_clean((void*)pufs_dma.read_addr, pufs_dma.buff_size);
         }
     }
-    if (pufs_dma.write_virt_addr && pufs_dma.write_virt_addr != pufs_dma.write_addr)
-        rt_free((void*)pufs_dma.write_virt_addr);
 
     return ret;
 }
@@ -252,7 +251,7 @@ pufs_status_t dma_write_sgcfg(pufs_dma_sg_desc_st* descs, uint32_t descs_len, pu
 #ifndef DMADIRECT
 void clear_dma_read(uint32_t len)
 {
-    memset((void*)pufs_dma.read_virt_addr, 0x0, len);
+    rvv_memset((void*)pufs_dma.read_virt_addr, 0x0, len);
 }
 #endif /* DMADIRECT */
 
@@ -298,7 +297,7 @@ pufs_status_t pufs_dump_rand_dma(uint8_t* rand, uint32_t len, bool entropy)
 #ifndef DMADIRECT
 void dma_read_output(uint8_t* addr, uint32_t len)
 {
-    memcpy(addr, (void*)pufs_dma.read_virt_addr, len);
+    rvv_memcpy(addr, (void*)pufs_dma.read_virt_addr, len);
 }
 #endif /* DMADIRECT */
 
@@ -478,7 +477,7 @@ void pufs_dma_prepare_sg_descs_offset(pufs_dma_sg_desc_st* descs,
 #else
     addr = pufs_dma.read_addr;
 #endif /* DMADIRECT */
-    memcpy((void*)(addr + start_offset), msg, msglen);
+    rvv_memcpy((void*)(addr + start_offset), msg, msglen);
 
     if (len == 0) {
         descs[0].length = 0;
@@ -535,9 +534,9 @@ void pufs_dma_prepare_sg_descs(pufs_dma_sg_desc_st* descs,
 void pufs_dma_read_output(uint8_t* addr, uint32_t len)
 {
 #ifndef DMADIRECT
-    memcpy(addr, (void*)(pufs_dma.read_virt_addr + 512), len);
+    rvv_memcpy(addr, (void*)(pufs_dma.read_virt_addr + 512), len);
 #else
-    memcpy(addr, (void*)(pufs_dma.read_addr + 512), len);
+    rvv_memcpy(addr, (void*)(pufs_dma.read_addr + 512), len);
 #endif /* DMADIRECT */
 }
 

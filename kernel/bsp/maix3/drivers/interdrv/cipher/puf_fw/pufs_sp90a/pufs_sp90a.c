@@ -79,10 +79,10 @@ static pufs_status_t pufs_drbg_update(uint32_t cfg,
     drbg_regs->cfg = cfg;
 
     uint32_t val32;
-    memset(pufs_buffer, 0, PRE_SEED_LEN);
+    rvv_memset(pufs_buffer, 0, PRE_SEED_LEN);
     if (inlen > PRE_SEED_LEN)
         inlen = PRE_SEED_LEN;
-    memcpy(pufs_buffer, in, inlen);
+    rvv_memcpy(pufs_buffer, in, inlen);
 
     uint32_t* puf32 = (uint32_t*)pufs_buffer;
     for (int i = 0; i < (PRE_SEED_LEN / 4); ++i)
@@ -143,7 +143,7 @@ pufs_status_t bc_df(uint32_t* dflen, uint32_t algo, bool entropy,
 
     // prepare input: IV + inlen + outlen + input + 0x80 + padding 0's
     *dflen = b2B(keybits) + blocklen;
-    memset(tmp.uc, 0, PRE_SEED_LEN);
+    rvv_memset(tmp.uc, 0, PRE_SEED_LEN);
     tmp.u32[blocklen / 4] = be2le(entlen + in1len + in2len);
     tmp.u32[blocklen / 4 + 1] = be2le(*dflen);
     tmp.uc[blocklen + 8] = 0x80;
@@ -211,7 +211,7 @@ pufs_status_t bc_df(uint32_t* dflen, uint32_t algo, bool entropy,
     }
 
     // Put 1st round K, X into tmp
-    memcpy(tmp.uc, dfbuf, *dflen);
+    rvv_memcpy(tmp.uc, dfbuf, *dflen);
 
     const uint8_t* key = tmp.uc;
     uint8_t* out = dfbuf;
@@ -262,7 +262,7 @@ void pufs_drbg_testmode_entropy(const uint8_t* entropy, uint32_t entlen)
             intentlen, INT_ENTROPY_MAXLEN);
         intentlen = INT_ENTROPY_MAXLEN;
     }
-    memcpy(intent, entropy, intentlen);
+    rvv_memcpy(intent, entropy, intentlen);
 }
 
 /*****************************************************************************
@@ -343,8 +343,8 @@ pufs_status_t pufs_drbg_instantiate(pufs_drbg_t mode,
             for (uint32_t i = 0; i < pstrlen; i++)
                 intent[i] ^= pstr[i];
         } else {
-            memset(intent, 0, PRE_SEED_LEN);
-            memcpy(intent, pstr, pstrlen);
+            rvv_memset(intent, 0, PRE_SEED_LEN);
+            rvv_memcpy(intent, pstr, pstrlen);
         }
         return pufs_drbg_update((((uint32_t)algo) << 0 | 0 << 8 | 0 << 24),
             intent, PRE_SEED_LEN);
@@ -385,8 +385,8 @@ pufs_status_t pufs_drbg_reseed(bool df, const uint8_t* adin, uint32_t adinlen)
             for (uint32_t i = 0; i < adinlen; i++)
                 intent[i] ^= adin[i];
         } else {
-            memset(intent, 0, PRE_SEED_LEN);
-            memcpy(intent, adin, adinlen);
+            rvv_memset(intent, 0, PRE_SEED_LEN);
+            rvv_memcpy(intent, adin, adinlen);
         }
         return pufs_drbg_update((algo << 0 | 1 << 8 | 0 << 24), intent, PRE_SEED_LEN);
     }
@@ -461,7 +461,7 @@ pufs_status_t _pufs_drbg_generate(uint8_t* out,
             return E_ERROR;
         }
         // read the result
-        // memcpy(rbits.byte, (void *)drbg_regs->rbits, blocklen);
+        // rvv_memcpy(rbits.byte, (void *)drbg_regs->rbits, blocklen);
         for (uint32_t i = 0; i < (blocklen / 4); i++)
             // rbits.word[i] = be2le(rbits.word[i]);
             rbits.word[i] = be2le(drbg_regs->rbits[i]);
@@ -469,7 +469,7 @@ pufs_status_t _pufs_drbg_generate(uint8_t* out,
         uint32_t pick = outlen - i;
         if (pick > blocklen)
             pick = blocklen;
-        memcpy(out + i, rbits.byte, pick);
+        rvv_memcpy(out + i, rbits.byte, pick);
         i += pick;
     }
 

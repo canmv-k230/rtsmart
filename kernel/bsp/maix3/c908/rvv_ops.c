@@ -1,9 +1,17 @@
 #include "rvv_ops.h"
 
 #include "rtthread.h"
+#include "encoding.h"
 
 #include <stdint.h>
 #include <string.h>
+
+static inline int rvv_available(void)
+{
+    size_t sstatus;
+    asm volatile("csrr %0, sstatus" : "=r"(sstatus));
+    return (sstatus & SSTATUS_VS) != 0;
+}
 
 void *rvv_memcpy(void *dst, const void *src, size_t n)
 {
@@ -11,7 +19,7 @@ void *rvv_memcpy(void *dst, const void *src, size_t n)
     uint8_t *d = (uint8_t *)dst;
     size_t remaining = n;
 
-    if ((64 >= n) || (0x00 < rt_interrupt_get_nest())) {
+    if ((8 > n) || !rvv_available()) {
         return rt_memcpy(dst, src, n);
     }
 
@@ -43,7 +51,7 @@ void *rvv_memset(void *dst, int value, size_t n)
     size_t remaining = n;
     uintptr_t fill = (uint8_t)value;
 
-    if ((64 >= n) || (0x00 < rt_interrupt_get_nest())) {
+    if ((8 > n) || !rvv_available()) {
         return rt_memset(dst, value, n);
     }
 

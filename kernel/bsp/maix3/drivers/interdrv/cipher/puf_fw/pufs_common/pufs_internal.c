@@ -26,7 +26,6 @@
 #endif /* __USE_POSIX199309 */
 #include <time.h>
 #include "pufs_internal.h"
-#include <lwp_user_mm.h>
 
 /*****************************************************************************
  * Variables
@@ -69,8 +68,7 @@ blsegs segment(uint8_t* buf, uint32_t buflen, const uint8_t* in,
                 proclen += blocksize;
                 nprocblocks--;
             }
-            if (lwp_get_from_user(buf + buflen, (void*)start, proclen - buflen) == 0)
-                memcpy(buf + buflen, start, proclen - buflen);
+            rvv_memcpy(buf + buflen, start, proclen - buflen);
             ret.seg[ret.nsegs++] = (segstr) { true, buf, proclen };
             start += (proclen - buflen);
             inlen -= (proclen - buflen);

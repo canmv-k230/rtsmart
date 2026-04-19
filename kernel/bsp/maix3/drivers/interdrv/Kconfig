@@ -34,6 +34,22 @@ menu "InterDriver"
                     config RT_USING_PUFS_FILE_HASH
                         bool "Enable calculate file hash with pufs"
                         default n
+
+                    config RT_PUFS_OTP_WRITE_ENABLE
+                        bool "Enable OTP write and lock operations (DANGER: irreversible)"
+                        default n
+                        help
+                            When enabled, OTP write, lock, key-program and zeroize
+                            operations will actually program the one-time-programmable
+                            fuses.  This is IRREVERSIBLE.
+
+                            When disabled (default), these operations only print what
+                            would be done and return success without touching hardware.
+                            Use this dry-run mode to verify your OTP programming flow
+                            before committing.
+
+                            User-accessible OTP range: 0x100-0x3FF (OTPKEY_8..31).
+                            Addresses below 0x100 are reserved for system keys.
                 endif
         endif
 

@@ -28,7 +28,6 @@
 #include "pufs_ecp_internal.h"
 #include "pufs_hmac_internal.h"
 #include "pufs_ecp_regs.h"
-#include <lwp_user_mm.h>
 
 /*****************************************************************************
  * Static functions
@@ -38,8 +37,7 @@ static int get_from(void* dst, void* src, size_t size)
     if (!dst || !src || !size)
         return 0;
 
-    if (lwp_get_from_user(dst, src, size) == 0)
-        memcpy(dst, src, size);
+    rvv_memcpy(dst, src, size);
 
     return size;
 }
@@ -49,8 +47,7 @@ static int put_to(void* dst, void* src, size_t size)
     if (!dst || !src || !size)
         return 0;
 
-    if (lwp_put_to_user(dst, src, size) == 0)
-        memcpy(dst, src, size);
+    rvv_memcpy(dst, src, size);
 
     return size;
 }
@@ -71,21 +68,21 @@ static pufs_status_t pufs_sm2_kex_kdf(uint8_t* key,
 
     uint32_t i, j;
 
-    memset(pufs_buffer, 0x0, length);
+    rvv_memset(pufs_buffer, 0x0, length);
 
-    memcpy(pufs_buffer, UxUy->x, UxUy->qlen);
+    rvv_memcpy(pufs_buffer, UxUy->x, UxUy->qlen);
     offset += UxUy->qlen;
-    memcpy(pufs_buffer + offset, UxUy->y, UxUy->qlen);
+    rvv_memcpy(pufs_buffer + offset, UxUy->y, UxUy->qlen);
     offset += UxUy->qlen;
-    memcpy(pufs_buffer + offset, za->dgst, za->dlen);
+    rvv_memcpy(pufs_buffer + offset, za->dgst, za->dlen);
     offset += za->dlen;
-    memcpy(pufs_buffer + offset, zb->dgst, zb->dlen);
+    rvv_memcpy(pufs_buffer + offset, zb->dgst, zb->dlen);
     offset += zb->dlen;
 
     // The length of digest is 32 bytes.
     for (i = 0, j = (keylen + 31) / 32; i < j; i++) {
         temp = le2be(counter);
-        memcpy(pufs_buffer + offset, &temp, 4);
+        rvv_memcpy(pufs_buffer + offset, &temp, 4);
 
         if ((status = pufs_hash(&md, pufs_buffer, length, SM3)) != SUCCESS)
             return status;
@@ -119,32 +116,32 @@ static pufs_status_t pufs_sm2_kex_hash(pufs_dgst_st* s2,
     // step1. SM3_HASH(Ux | Za | Zb | x1 | y1 | x2 | y2)
     length = SM2_EC_FIELD_LENGTH * 7;
 
-    memset(pufs_buffer, 0x0, length);
+    rvv_memset(pufs_buffer, 0x0, length);
 
-    memcpy(pufs_buffer, key->x, key->qlen);
+    rvv_memcpy(pufs_buffer, key->x, key->qlen);
     offset += key->qlen;
-    memcpy(pufs_buffer + offset, za->dgst, za->dlen);
+    rvv_memcpy(pufs_buffer + offset, za->dgst, za->dlen);
     offset += za->dlen;
-    memcpy(pufs_buffer + offset, zb->dgst, zb->dlen);
+    rvv_memcpy(pufs_buffer + offset, zb->dgst, zb->dlen);
     offset += zb->dlen;
-    memcpy(pufs_buffer + offset, tpukl->x, tpukl->qlen);
+    rvv_memcpy(pufs_buffer + offset, tpukl->x, tpukl->qlen);
     offset += tpukl->qlen;
-    memcpy(pufs_buffer + offset, tpukl->y, tpukl->qlen);
+    rvv_memcpy(pufs_buffer + offset, tpukl->y, tpukl->qlen);
     offset += tpukl->qlen;
-    memcpy(pufs_buffer + offset, tpukr->x, tpukr->qlen);
+    rvv_memcpy(pufs_buffer + offset, tpukr->x, tpukr->qlen);
     offset += tpukr->qlen;
-    memcpy(pufs_buffer + offset, tpukr->y, tpukr->qlen);
+    rvv_memcpy(pufs_buffer + offset, tpukr->y, tpukr->qlen);
 
     if ((status = pufs_hash(&partial, pufs_buffer, length, SM3)) != SUCCESS)
         return status;
 
     // step2. SM3_HASH({0x2,0x3}| Uy | dgst from step1)
     length = partial.dlen + SM2_EC_FIELD_LENGTH + 1;
-    memset(pufs_buffer, 0x0, length);
+    rvv_memset(pufs_buffer, 0x0, length);
     pufs_buffer[0] = 0x2;
 
-    memcpy(pufs_buffer + 1, key->y, key->qlen);
-    memcpy(pufs_buffer + 1 + key->qlen, partial.dgst, partial.dlen);
+    rvv_memcpy(pufs_buffer + 1, key->y, key->qlen);
+    rvv_memcpy(pufs_buffer + 1 + key->qlen, partial.dgst, partial.dlen);
 
     if ((status = pufs_hash(s2, pufs_buffer, length, SM3)) != SUCCESS)
         return status;

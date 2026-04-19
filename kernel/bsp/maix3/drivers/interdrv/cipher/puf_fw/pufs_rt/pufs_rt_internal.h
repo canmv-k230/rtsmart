@@ -44,9 +44,21 @@ extern "C" {
 
 extern struct pufs_rt_regs *rt_regs;
 
-#define WORD_SIZE 4 // 4 bytes = 32 bits = an otp block
-#define RWLOCK_GROUP_OTP 8
-#define MAX_RWLOCK_GROUPS OTP_LEN / WORD_SIZE / RWLOCK_GROUP_OTP  // a group contains 8 otp blocks
+/* CDE OTP area (0x400-0xFFF) */
+#define PUFS_CDE_SEGMENT          128
+#define PIF_CDE_RWLCK_START_INDEX   4
+#define PIF_CDE_RWLCK_MAX_GROUP    24
+
+struct pufs_rt_cde_regs {
+    volatile uint32_t otp[768];
+};
+extern struct pufs_rt_cde_regs *rt_cde_regs;
+void pufs_rt_cde_init(uint32_t rt_cde_offset);
+pufs_status_t pufs_read_cde(uint8_t* outbuf, uint32_t len, uint32_t addr);
+pufs_status_t pufs_program_cde(const uint8_t* inbuf, uint32_t len, uint32_t addr);
+pufs_status_t rt_cde_write_lock(uint32_t offset, uint32_t length, pufs_otp_lock_t lock);
+pufs_otp_lock_t rt_cde_read_lock(uint32_t offset);
+pufs_status_t rt_cde_write_mask(uint32_t offset);
 
 /*****************************************************************************
  * Enumerations

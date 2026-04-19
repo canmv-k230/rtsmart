@@ -464,8 +464,8 @@ pufs_status_t pufs_import_plaintext_key(pufs_key_type_t keytype,
     val32 |= get_key_slot_idx(keytype, slot) << 20;
     kwp_regs->cfg = val32;
 
-    memset(pufs_buffer, 0, KWP_KEY_MAXLEN);
-    memcpy(pufs_buffer, key, b2B(keybits));
+    rvv_memset(pufs_buffer, 0, KWP_KEY_MAXLEN);
+    rvv_memcpy(pufs_buffer, key, b2B(keybits));
 
     uint32_t* buf = (uint32_t*)pufs_buffer;
     for (int i = 0; i < KWP_KEY_MAXLEN / 4; ++i)
@@ -519,11 +519,9 @@ pufs_status_t pufs_export_plaintext_key(
     if ((check = pufs_kwp_start()) != SUCCESS)
         return check;
 
-    memcpy(key, (void*)kwp_regs->key, b2B(keybits));
-
     uint32_t* key32 = (uint32_t*)key;
     for (size_t i = 0; i < b2B(keybits) / 4; ++i)
-        key32[i] = be2le(key32[i]);
+        key32[i] = be2le(kwp_regs->key[i]);
 
     return SUCCESS;
 }
@@ -620,8 +618,8 @@ pufs_status_t _pufs_import_wrapped_key(
             kwp_regs->iv[i] = be2le(iv32[i]);
     }
 
-    memset(pufs_buffer, 0, KWP_KEY_MAXLEN);
-    memcpy(pufs_buffer, key, inkeylen);
+    rvv_memset(pufs_buffer, 0, KWP_KEY_MAXLEN);
+    rvv_memcpy(pufs_buffer, key, inkeylen);
 
     uint32_t* buf = (uint32_t*)pufs_buffer;
     for (int i = 0; i < KWP_KEY_MAXLEN / 4; ++i)
@@ -733,11 +731,9 @@ pufs_status_t _pufs_export_wrapped_key(
     if ((check = pufs_kwp_start()) != SUCCESS)
         return check;
 
-    memcpy(key, (void*)kwp_regs->key, outkeylen);
-
     uint32_t* key32 = (uint32_t*)key;
     for (size_t i = 0; i < outkeylen / 4; ++i)
-        key32[i] = be2le(key32[i]);
+        key32[i] = be2le(kwp_regs->key[i]);
 
     return SUCCESS;
 }

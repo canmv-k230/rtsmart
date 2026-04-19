@@ -2,20 +2,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <rtconfig.h>
 #include "pufs_internal.h"
 #include "pufs_rt_internal.h"
 
-// for PSIOT_012CW01D_B12C project
+struct pufs_rt_cde_regs *rt_cde_regs = NULL;
 
-#define PUFS_CDE_SEGMENT 128 // 1K bits
-#define PIF_CDE_RWLCK_START_INDEX 4
-#define PIF_CDE_RWLCK_MAX_GROUP 24
-
-struct pufs_rt_cde_regs {
-    volatile uint32_t otp[768]; // 24K-bit OTP
-};
-
-static struct pufs_rt_cde_regs* rt_cde_regs = NULL;
+void pufs_rt_cde_init(uint32_t rt_cde_offset)
+{
+    rt_cde_regs = (struct pufs_rt_cde_regs *)(pufs_context.base_addr + rt_cde_offset);
+}
 
 static int rt_cde_select_index(uint32_t idx)
 {
@@ -24,19 +20,72 @@ static int rt_cde_select_index(uint32_t idx)
     if (group >= PIF_CDE_RWLCK_MAX_GROUP)
         return -1;
 
-    return PIF_CDE_RWLCK_START_INDEX + group;
+    return PIF_CDE_RWLCK_START_INDEX + group; 
 }
 
-void pufs_rt_cde_init(uint32_t rt_cde_offset)
+/**
+ * pufs_read_otp()
+ */
+pufs_status_t pufs_read_cde(uint8_t* outbuf, uint32_t len, uint32_t addr)
 {
-    rt_cde_regs = (struct pufs_rt_cde_regs*)(pufs_context.base_addr + rt_cde_offset);
+    for (uint32_t index = 0; index < len; index+=4)
+    {
+        *(uint32_t* )(outbuf + index) = rt_cde_regs->otp[(addr+index)/4];
+    }
+
+    return SUCCESS;
+}
+
+/**
+ * pufs_program_cde()
+ */
+pufs_status_t pufs_program_cde(const uint8_t* inbuf, uint32_t len, uint32_t addr)
+{
+    // check lock state for each segment in range
+    uint32_t seg_s = addr / PUFS_CDE_SEGMENT;
+    uint32_t seg_e = (addr + len + PUFS_CDE_SEGMENT - 1) / PUFS_CDE_SEGMENT;
+    for (uint32_t seg = seg_s; seg < seg_e; seg++) {
+        pufs_otp_lock_t lck = rt_cde_read_lock(seg * PUFS_CDE_SEGMENT);
+        if (lck != RW) {
+            LOG_WARN("CDE WRITE DENIED: offset=0x%03x segment locked",
+                     seg * PUFS_CDE_SEGMENT);
+            return E_DENY;
+        }
+    }
+
+    // check for 1->0 bit violations (CDE OTP only goes 0->1)
+    for (uint32_t index = 0; index < len; index += 4) {
+        uint32_t cur = rt_cde_regs->otp[(addr + index) / 4];
+        uint32_t new_val = *(uint32_t*)(inbuf + index);
+        if (cur & ~new_val) {
+            LOG_WARN("CDE WRITE DENIED: offset=0x%03x bit 1->0"
+                     " (cur=0x%08" PRIx32 " new=0x%08" PRIx32 ")",
+                     addr + index, cur, new_val);
+            return E_DENY;
+        }
+    }
+
+#ifndef RT_PUFS_OTP_WRITE_ENABLE
+    LOG_WARN("CDE WRITE DRY-RUN: offset=0x%03x len=%" PRIu32
+             " (enable RT_PUFS_OTP_WRITE_ENABLE to commit)", addr, len);
+    return SUCCESS;
+#else
+    LOG_WARN("CDE WRITE: offset=0x%03x len=%" PRIu32, addr, len);
+    for (uint32_t index = 0; index < len; index += 4) {
+        if (*(uint32_t*)(inbuf + index) == 0) continue;
+        if (rt_cde_regs->otp[(addr + index) / 4] == *(uint32_t*)(inbuf + index)) continue;
+        rt_cde_regs->otp[(addr + index) / 4] = *(uint32_t*)(inbuf + index);
+    }
+    return SUCCESS;
+#endif
 }
 
 pufs_status_t rt_cde_write_lock(uint32_t offset, uint32_t length, pufs_otp_lock_t lock)
 {
     uint32_t lock_val = 0, end = 0, start = 0, val32 = 0, rwlock_index, shift, mask = 0;
 
-    switch (lock) {
+    switch (lock)
+    {
     case RO:
         lock_val = PUFRT_VALUE4(0xC);
         break;
@@ -47,10 +96,20 @@ pufs_status_t rt_cde_write_lock(uint32_t offset, uint32_t length, pufs_otp_lock_
         return E_INVALID;
     }
 
+#ifndef RT_PUFS_OTP_WRITE_ENABLE
+    LOG_WARN("CDE LOCK DRY-RUN: offset=0x%03x len=%" PRIu32 " lock=%s"
+             " (enable RT_PUFS_OTP_WRITE_ENABLE to commit)",
+             offset, length, lock == RO ? "RO" : "RW");
+    return SUCCESS;
+#else
+    LOG_WARN("CDE LOCK: offset=0x%03x len=%" PRIu32 " lock=%s",
+             offset, length, lock == RO ? "RO" : "RW");
+
     end = (length + (PUFS_CDE_SEGMENT - 1)) / PUFS_CDE_SEGMENT;
     start = offset / PUFS_CDE_SEGMENT;
 
-    for (uint32_t i = 0; i < end; i++) {
+    for (uint32_t i = 0; i < end; i++)
+    {
         int idx = start + i;
         rwlock_index = rt_cde_select_index(idx);
 
@@ -58,7 +117,8 @@ pufs_status_t rt_cde_write_lock(uint32_t offset, uint32_t length, pufs_otp_lock_
         val32 |= lock_val << shift;
         mask |= 0xF << shift;
 
-        if (shift == 28 || i == end - 1) {
+        if (shift == 28 || i == end - 1)
+        {
             val32 |= (rt_regs->pif[rwlock_index] & (~mask));
             rt_regs->pif[rwlock_index] = val32;
 
@@ -67,6 +127,7 @@ pufs_status_t rt_cde_write_lock(uint32_t offset, uint32_t length, pufs_otp_lock_
         }
     }
     return SUCCESS;
+#endif
 }
 
 pufs_otp_lock_t rt_cde_read_lock(uint32_t offset)
@@ -82,7 +143,10 @@ pufs_otp_lock_t rt_cde_read_lock(uint32_t offset)
 
     lck = (rt_regs->pif[idx] >> (group_index * 4)) & 0xF;
 
-    switch (lck) {
+    switch (lck)
+    {
+    case PUFRT_VALUE4(0x0):
+        return RO;
     case PUFRT_VALUE4(0xC):
         return RO;
     case PUFRT_VALUE4(0xF):
@@ -108,69 +172,5 @@ pufs_status_t rt_cde_write_mask(uint32_t offset)
     reg |= 0x3 << (group_index * 2);
     rt_regs->ptm[group] = reg;
 
-    return SUCCESS;
-}
-
-// CDE OTP index range = 0 - 31
-pufs_status_t pufs_rt_cde_read_write_test(void)
-{
-    uint32_t rand, expected;
-    uint32_t old_val[32];
-    pufs_rand((uint8_t*)&rand);
-
-    for (uint32_t index = 0; index < 32; index++)
-        old_val[index] = rt_cde_regs->otp[index];
-
-    for (uint32_t index = 0; index < 32; index++) {
-        rt_cde_regs->otp[index] = rand;
-        expected = old_val[index] | rand;
-        if (rt_cde_regs->otp[index] != expected) {
-            LOG_ERROR("expected value 0x%08" PRIx32 " but got 0x%08" PRIx32 "", expected, rt_cde_regs->otp[index]);
-            return E_VERFAIL;
-        }
-    }
-
-    return SUCCESS;
-}
-
-// CDE OTP index range = 32 - 63
-pufs_status_t pufs_rt_cde_rolck_test(void)
-{
-    pufs_status_t check;
-    pufs_otp_lock_t lock;
-    uint32_t value, cde_index = 0, start_offset = 256, length = 256; // (2 segment)
-
-    if ((check = rt_cde_write_lock(start_offset, 256, RO)) != SUCCESS)
-        return check;
-
-    for (uint32_t offset = start_offset; offset < (start_offset + length); offset += 4) {
-        lock = rt_cde_read_lock(offset);
-        if (lock != RO) {
-            LOG_ERROR("expected value %d but got %d", RO, lock);
-            return E_VERFAIL;
-        }
-        cde_index = offset / WORD_SIZE;
-        value = rt_cde_regs->otp[cde_index];
-        rt_cde_regs->otp[cde_index] |= 0X0C0C0C0C;
-        if (rt_cde_regs->otp[cde_index] != value) {
-            LOG_ERROR("expected value 0x%08" PRIx32 " but got 0x%08" PRIx32 "", value, rt_cde_regs->otp[cde_index]);
-            return E_VERFAIL;
-        }
-    }
-    return SUCCESS;
-}
-
-// CDE OTP index range = 128 - 191
-pufs_status_t pufs_rt_cde_psmsk_test(void)
-{
-    uint32_t start_index = 128;
-    rt_cde_write_mask(128 * WORD_SIZE);
-
-    for (uint32_t index = start_index; index < start_index + 32; index++) {
-        if (rt_cde_regs->otp[index] != 0xDEADDEAD) {
-            LOG_ERROR("%s", "expected the OTP value cannot be read");
-            return E_VERFAIL;
-        }
-    }
     return SUCCESS;
 }

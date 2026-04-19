@@ -26,21 +26,8 @@
 #ifndef __DRV_OTP__
 #define __DRV_OTP__
 
-#include <rtdef.h>
-
-#define OTP_READ_OFFSET             0x3500
-#define OTP_WRITE_OFFSET            0x3500
-
-#define WORD_SIZE   4
-
-
-typedef enum
-{
-    OTP_BYPASS_STATUS               = 0,
-    OTP_MAX_STATUS                  = 1,
-} k_otp_status_e;
-
-rt_size_t otp_device_read(rt_device_t dev, rt_off_t pos, void *buffer, rt_size_t size);
-rt_size_t otp_device_write(rt_device_t dev, rt_off_t pos, const void *buffer, rt_size_t size);
+/*
+ * Legacy /dev/otp stub — all OTP access now goes through /dev/pufs.
+ */
 
 #endif /*__DRV_OTP__*/

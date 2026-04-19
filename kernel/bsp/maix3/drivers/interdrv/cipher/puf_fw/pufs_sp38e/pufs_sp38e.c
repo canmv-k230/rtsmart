@@ -152,7 +152,7 @@ static pufs_status_t sp38e_ctx_init(pufs_sp38e_ctx* sp38e_ctx,
     sp38e_ctx->j = j;
     sp38e_ctx->start = false;
     sp38e_ctx->crypto_io_ctx = NULL;
-    memcpy(sp38e_ctx->i, i, BC_BLOCK_SIZE);
+    rvv_memcpy(sp38e_ctx->i, i, BC_BLOCK_SIZE);
 
     // set key
     sp38e_ctx->keybits = keybits;
@@ -161,11 +161,11 @@ static pufs_status_t sp38e_ctx_init(pufs_sp38e_ctx* sp38e_ctx,
     if (keytype1 != SWKEY)
         sp38e_ctx->keyslot1 = (uint32_t)keyaddr1;
     else
-        memcpy(sp38e_ctx->key1, (const void*)keyaddr1, b2B(keybits));
+        rvv_memcpy(sp38e_ctx->key1, (const void*)keyaddr1, b2B(keybits));
     if (keytype2 != SWKEY)
         sp38e_ctx->keyslot2 = (uint32_t)keyaddr2;
     else
-        memcpy(sp38e_ctx->key2, (const void*)keyaddr2, b2B(keybits));
+        rvv_memcpy(sp38e_ctx->key2, (const void*)keyaddr2, b2B(keybits));
 
     return SUCCESS;
 }
@@ -395,8 +395,7 @@ static pufs_status_t sp38e_ctx_update(pufs_sp38e_ctx* sp38e_ctx,
                 sp38e_ctx->buflen += segs.seg[i].len;
             } else // copy into the buffer
             {
-                if (lwp_get_from_user(sp38e_ctx->buff + sp38e_ctx->buflen, (void*)segs.seg[i].addr, segs.seg[i].len) == 0)
-                    memcpy(sp38e_ctx->buff + sp38e_ctx->buflen, segs.seg[i].addr, segs.seg[i].len);
+                rvv_memcpy(sp38e_ctx->buff + sp38e_ctx->buflen, segs.seg[i].addr, segs.seg[i].len);
                 sp38e_ctx->buflen += segs.seg[i].len;
             }
         }
@@ -573,7 +572,7 @@ pufs_sp38e_ctx* pufs_sp38e_ctx_new(void)
     ret = malloc(sizeof(pufs_sp38e_ctx));
     if (ret != NULL) {
         ret->op = SP38E_AVAILABLE;
-        memset(ret, 0x0, sizeof(pufs_sp38e_ctx));
+        rvv_memset(ret, 0x0, sizeof(pufs_sp38e_ctx));
     }
 
     return ret;
@@ -584,7 +583,7 @@ pufs_sp38e_ctx* pufs_sp38e_ctx_new(void)
 void pufs_sp38e_ctx_free(pufs_sp38e_ctx* sp38e_ctx)
 {
     if (sp38e_ctx != NULL) {
-        memset(sp38e_ctx, 0, sizeof(pufs_sp38e_ctx));
+        rvv_memset(sp38e_ctx, 0, sizeof(pufs_sp38e_ctx));
         sp38e_ctx->op = SP38E_AVAILABLE;
     }
     free(sp38e_ctx);

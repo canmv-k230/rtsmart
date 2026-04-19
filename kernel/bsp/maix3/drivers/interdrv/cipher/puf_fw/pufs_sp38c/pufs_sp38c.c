@@ -93,7 +93,7 @@ static void sp38c_dec_change_sgdma_descriptors(pufs_dma_sg_desc_st* descs,
 
 static void clear_ctx_buffer(pufs_sp38c_ctx* ctx)
 {
-    memset(ctx->buff, 0x0, BC_BLOCK_SIZE);
+    rvv_memset(ctx->buff, 0x0, BC_BLOCK_SIZE);
     ctx->buflen = 0x0;
 }
 
@@ -148,7 +148,7 @@ static pufs_status_t _sp38c_ctx_update(pufs_sp38c_ctx* ctx,
 
     sp38c_regs->cfg = val32;
 
-    dma_write_rwcfg(out, in, inlen);
+    dma_write_rwcfg(cbcmac ? NULL : out, in, inlen);
     dma_write_start();
     if (dma_wait_done()) {
         LOG_ERROR("pufs dma wait timeout\n");
@@ -223,14 +223,14 @@ static pufs_status_t formatting_ctrl_info(pufs_sp38c_ctx* ctx,
     if (ctx->taglen < 4 || ctx->taglen > 16 || (ctx->taglen % 2) != 0)
         return E_INVALID;
 
-    memset(out, 0x0, BC_BLOCK_SIZE);
+    rvv_memset(out, 0x0, BC_BLOCK_SIZE);
 
     // format the flag byte of B0
     out[0] = (ctx->aadlen > 0) ? 0x40 : 0x00;
     out[0] |= ((ctx->taglen - 2) / 2) << 3;
     out[0] |= ctx->qlen - 1;
 
-    memcpy(out + 1, nonce, noncelen);
+    rvv_memcpy(out + 1, nonce, noncelen);
 
     Q = ctx->inlen;
     for (size_t index = 0; index < ctx->qlen; index++, Q >>= 8)
@@ -279,12 +279,12 @@ static uint32_t formatting_aad(pufs_sp38c_ctx* ctx,
     uint32_t inlen)
 {
     uint32_t pos = 0, len = 0;
-    memset(ctx->buff, 0x0, BC_BLOCK_SIZE);
+    rvv_memset(ctx->buff, 0x0, BC_BLOCK_SIZE);
 
     pos = pufs_ccm_formatting_aad_header(ctx->buff, ctx->aadlen);
 
     len = (16 - pos) >= inlen ? inlen : 16 - pos;
-    memcpy(ctx->buff + pos, in, len);
+    rvv_memcpy(ctx->buff + pos, in, len);
 
     ctx->aadlen -= len;
     ctx->buflen = pos + len;
@@ -303,7 +303,7 @@ static pufs_status_t initialize_cbcmac(pufs_sp38c_ctx* ctx,
     if (formatting_ctrl_info(ctx, nonce, noncelen, ctx->buff) != SUCCESS)
         return E_FIRMWARE;
 
-    memset(ctx->cbcmac, 0x0, BC_BLOCK_SIZE);
+    rvv_memset(ctx->cbcmac, 0x0, BC_BLOCK_SIZE);
     if (sp38c_ctx_update(ctx, ctx->cbcmac, NULL, ctx->buff, BC_BLOCK_SIZE, false, ctx->cbcmac) != SUCCESS)
         return E_FIRMWARE;
 
@@ -318,9 +318,9 @@ static void initialize_counter(pufs_sp38c_ctx* ctx,
     const uint8_t* nonce,
     uint32_t noncelen)
 {
-    memset(ctx->ctri, 0x0, BC_BLOCK_SIZE);
+    rvv_memset(ctx->ctri, 0x0, BC_BLOCK_SIZE);
     ctx->ctri[0] |= ctx->qlen - 1;
-    memcpy(ctx->ctri + 1, nonce, noncelen);
+    rvv_memcpy(ctx->ctri + 1, nonce, noncelen);
 }
 
 static pufs_status_t check_sp38c_crypto(pufs_cipher_t cipher,
@@ -377,9 +377,9 @@ static pufs_status_t sp38c_ctx_init(pufs_sp38c_ctx* ctx,
     ctx->ctr_start = false;
     ctx->phybuf_list = NULL;
 
-    memset(ctx->key, 0x0, SW_KEY_MAXLEN);
+    rvv_memset(ctx->key, 0x0, SW_KEY_MAXLEN);
     if (keytype == SWKEY)
-        memcpy(ctx->key, (const void*)keyaddr, b2B(keybits));
+        rvv_memcpy(ctx->key, (const void*)keyaddr, b2B(keybits));
     else
         ctx->keyslot = (uint32_t)keyaddr;
 
@@ -398,7 +398,7 @@ static size_t fill_incomplete_block(pufs_sp38c_ctx* ctx, const uint8_t* start_of
     size_t len = 0;
     if (ctx->buflen < BC_BLOCK_SIZE) {
         len = (BC_BLOCK_SIZE - ctx->buflen) < inlen ? BC_BLOCK_SIZE - ctx->buflen : inlen;
-        memcpy(ctx->buff + ctx->buflen, start_offset, len);
+        rvv_memcpy(ctx->buff + ctx->buflen, start_offset, len);
         ctx->buflen += len;
     }
     return len;
@@ -411,7 +411,7 @@ static size_t cut_blocks(pufs_sp38c_ctx* ctx, const uint8_t* start_offset, uint3
 
     clear_ctx_buffer(ctx);
     if (last_block) {
-        memcpy(ctx->buff, start_offset + (blocks * BC_BLOCK_SIZE), last_block);
+        rvv_memcpy(ctx->buff, start_offset + (blocks * BC_BLOCK_SIZE), last_block);
         ctx->buflen = last_block;
     }
 
@@ -561,7 +561,7 @@ static pufs_dma_sg_desc_st* sp38c_format_descs(pufs_sp38c_ctx* ctx,
         ret[ridx].write_addr = sp38c_request_phybuf(ctx, BC_BLOCK_SIZE, 0);
         if (!ret[ridx].write_addr)
             return NULL;
-        memcpy((void*)VIRT_ADDR(ret[ridx].write_addr), (void*)DMA_RBUF_VIRT_ADDR(descs[idx].write_addr + align_len),
+        rvv_memcpy((void*)VIRT_ADDR(ret[ridx].write_addr), (void*)DMA_RBUF_VIRT_ADDR(descs[idx].write_addr + align_len),
             unalign_len);
 
         if (descs[idx].read_addr != 0x0) {
@@ -734,7 +734,7 @@ static pufs_status_t pufs_ccm_text_update(pufs_sp38c_ctx* ctx,
                 clear_ctx_buffer(ctx);
                 previous_updated = true;
 
-                ctx->currentlen += ctx->buflen;
+                ctx->currentlen += BC_BLOCK_SIZE;
             }
         }
         break;
@@ -766,6 +766,31 @@ static pufs_status_t pufs_ccm_text_update(pufs_sp38c_ctx* ctx,
     *outlen = (blocks * BC_BLOCK_SIZE);
     if (previous_updated)
         *outlen += BC_BLOCK_SIZE;
+
+    /*
+     * Mbed TLS CCM streaming expects the final update() call to emit all
+     * remaining text bytes; finish() only returns the tag. Flush the last
+     * partial block here when this call consumed the end of the message.
+     */
+    if (ctx->buflen > 0 && (ctx->currentlen + ctx->buflen) == ctx->inlen) {
+        uint32_t tail_len = ctx->buflen;
+        uint8_t *tail_out = out + *outlen;
+
+        if ((status = sp38c_ctx_update(ctx, NULL, ctx->ctri, ctx->buff, tail_len, true, tail_out)) != SUCCESS)
+            return status;
+
+        if (!ctx->encrypt) {
+            rvv_memset(ctx->buff, 0x0, BC_BLOCK_SIZE);
+            rvv_memcpy(ctx->buff, tail_out, tail_len);
+        }
+        if ((status = sp38c_ctx_update(ctx, ctx->cbcmac, NULL, ctx->buff, BC_BLOCK_SIZE, true, ctx->cbcmac)) != SUCCESS)
+            return status;
+
+        ctx->currentlen += tail_len;
+        *outlen += tail_len;
+        clear_ctx_buffer(ctx);
+    }
+
     ctx->stage = SP38C_TEXT;
     return SUCCESS;
 }
@@ -780,8 +805,8 @@ static pufs_status_t pufs_ccm_text_final(pufs_sp38c_ctx* ctx,
             return status;
 
         if (!ctx->encrypt) {
-            memset(ctx->buff, 0x0, BC_BLOCK_SIZE);
-            memcpy(ctx->buff, out, ctx->buflen);
+            rvv_memset(ctx->buff, 0x0, BC_BLOCK_SIZE);
+            rvv_memcpy(ctx->buff, out, ctx->buflen);
         }
         if ((status = sp38c_ctx_update(ctx, ctx->cbcmac, NULL, ctx->buff, BC_BLOCK_SIZE, true, ctx->cbcmac)) != SUCCESS)
             return status;
@@ -875,7 +900,7 @@ static void sp38c_release_phybuf(pufs_sp38c_ctx* ctx)
 
     while (cur != NULL) {
         if (cur->writeback_addr != 0) {
-            memcpy((void*)DMA_RBUF_VIRT_ADDR(cur->writeback_addr), (void*)VIRT_ADDR(cur->buf_addr),
+            rvv_memcpy((void*)DMA_RBUF_VIRT_ADDR(cur->writeback_addr), (void*)VIRT_ADDR(cur->buf_addr),
                 cur->size);
         }
 
@@ -933,7 +958,7 @@ pufs_sp38c_ctx* pufs_sp38c_ctx_new(void)
     ctx = malloc(sizeof(pufs_sp38c_ctx));
     if (ctx != NULL) {
         ctx->op = SP38C_AVAILABLE;
-        memset(ctx, 0x0, sizeof(pufs_sp38c_ctx));
+        rvv_memset(ctx, 0x0, sizeof(pufs_sp38c_ctx));
     }
 
     return ctx;
@@ -944,7 +969,7 @@ pufs_sp38c_ctx* pufs_sp38c_ctx_new(void)
 void pufs_sp38c_ctx_free(pufs_sp38c_ctx* ctx)
 {
     if (ctx != NULL) {
-        memset(ctx, 0, sizeof(pufs_sp38c_ctx));
+        rvv_memset(ctx, 0, sizeof(pufs_sp38c_ctx));
         ctx->op = SP38C_AVAILABLE;
     }
     free(ctx);
@@ -1129,7 +1154,7 @@ pufs_status_t pufs_dec_ccm_sg_append(pufs_sp38c_ctx* sp38c_ctx,
 pufs_status_t pufs_dec_ccm_sg_done(pufs_sp38c_ctx* sp38c_ctx, const uint8_t* tag)
 {
     pufs_status_t check;
-    memset(sp38c_ctx->buff, 0x0, BC_BLOCK_SIZE);
+    rvv_memset(sp38c_ctx->buff, 0x0, BC_BLOCK_SIZE);
 
     if ((check = sp38c_ctx_sg_done(sp38c_ctx, sp38c_ctx->buff)) != SUCCESS)
         return check;
@@ -1151,7 +1176,7 @@ pufs_status_t pufs_dec_ccm_final_tag(pufs_sp38c_ctx* sp38c_ctx,
     if ((status = pufs_ccm_text_final(sp38c_ctx, out, outlen)) != SUCCESS)
         goto release;
 
-    memset(tag, 0x0, BC_BLOCK_SIZE);
+    rvv_memset(tag, 0x0, BC_BLOCK_SIZE);
 
     if ((status = pufs_ccm_tag(sp38c_ctx, tag, false)) != SUCCESS)
         goto release;

@@ -263,8 +263,8 @@ static pufs_status_t pufs_kdf_cfg_dma(pufs_key_type_t keytype,
     // handle salt
     if ((salt != NULL) && (B2b(saltlen) > 512))
         return E_OVERFLOW;
-    memset(pufs_buffer, 0, DGST_INT_STATE_LEN);
-    memcpy(pufs_buffer, salt, saltlen);
+    rvv_memset(pufs_buffer, 0, DGST_INT_STATE_LEN);
+    rvv_memcpy(pufs_buffer, salt, saltlen);
 
     crypto_write_dgst(pufs_buffer, DGST_INT_STATE_LEN);
 
@@ -284,16 +284,16 @@ static pufs_status_t pufs_kdf_cfg_dma(pufs_key_type_t keytype,
             err(1, "malloc failed");
             return E_OVERFLOW;
         }
-        memcpy(minfo, info, cutlen);
-        memset(minfo + cutlen, 0, ctrlen);
-        memcpy(minfo + cutlen + ctrlen, info + cutlen, infolen - cutlen);
+        rvv_memcpy(minfo, info, cutlen);
+        rvv_memset(minfo + cutlen, 0, ctrlen);
+        rvv_memcpy(minfo + cutlen + ctrlen, info + cutlen, infolen - cutlen);
         dma_write_rwcfg(out, minfo, minfolen);
     }
 
     // DMA key
     if (keytype == SWKEY) {
-        memset(pufs_buffer, 0, SW_KEY_MAXLEN);
-        memcpy(pufs_buffer, (const void*)keyaddr, b2B(keybits));
+        rvv_memset(pufs_buffer, 0, SW_KEY_MAXLEN);
+        rvv_memcpy(pufs_buffer, (const void*)keyaddr, b2B(keybits));
         crypto_write_sw_key(pufs_buffer, SW_KEY_MAXLEN);
     }
 
@@ -319,8 +319,8 @@ static pufs_status_t pufs_kdf_start(uint32_t cfg, uint32_t cnt, uint32_t outbits
     kdf_regs->salt_len = saltlen;
 
     if (iv != NULL) {
-        memset(pufs_buffer, 0, KDF_IV_LEN);
-        memcpy(pufs_buffer, iv, ivlen);
+        rvv_memset(pufs_buffer, 0, KDF_IV_LEN);
+        rvv_memcpy(pufs_buffer, iv, ivlen);
         for (int i = 0; i < KDF_IV_LEN; i += 4) {
             val32 = be2le(*((uint32_t*)(pufs_buffer + i)));
             *((uint32_t*)(kdf_regs->iv + i)) = val32;

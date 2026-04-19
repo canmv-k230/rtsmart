@@ -70,7 +70,7 @@ static inline void* memcpy4b(void* dest, const void* src, int count)
 static void _write_ecp_operand(uint32_t pos, const uint8_t* op, uint32_t elen)
 {
     uint32_t wlen = ((elen + 3) / 4) * 4;
-    memset(pufs_buffer, 0, wlen);
+    rvv_memset(pufs_buffer, 0, wlen);
     if (op != NULL)
         reverse(pufs_buffer, op, elen);
     memcpy4b((uint8_t*)ecp_regs->data + wlen * pos, pufs_buffer, wlen);
@@ -279,7 +279,7 @@ static pufs_status_t pufs_rsa_verify_calc(uint8_t* msg,
     if (val32)
         return E_VERFAIL;
 
-    memset(msg, 0, BUFFER_SIZE);
+    rvv_memset(msg, 0, BUFFER_SIZE);
     read_ecp_operand(2, msg, elen);
 
     return SUCCESS;
@@ -355,7 +355,7 @@ static pufs_status_t pufs_rsa_pss_mgf(uint8_t* mask,
         uint32_t picklen = masklen - curlen;
         if (picklen > md.dlen)
             picklen = md.dlen;
-        memcpy(mask + curlen, md.dgst, picklen);
+        rvv_memcpy(mask + curlen, md.dgst, picklen);
         curlen += picklen;
     }
 
@@ -597,10 +597,10 @@ pufs_status_t pufs_ecp_sm2_kekdf(pufs_ec_point_st* key,
     ecp_regs->keysel = val32;
 
     // the format of T value is T[255] = 1, T[254:128] = X1[126:0], T[127] = 1, T[126:0] = X2[126:0]
-    memset(buf, 0x0, 32);
-    memcpy(buf, tpukr->x + 16, 16);
+    rvv_memset(buf, 0x0, 32);
+    rvv_memcpy(buf, tpukr->x + 16, 16);
     buf[0] |= (1 << 7);
-    memcpy(buf + 16, tpukl->x + 16, 16);
+    rvv_memcpy(buf + 16, tpukl->x + 16, 16);
     buf[16] |= (1 << 7);
 
     write_ecp_operand(6, buf, elen);
@@ -705,12 +705,12 @@ pufs_status_t _pufs_rsa_sign(uint8_t* sig,
     pufs_rsa_mprog_st* prog = &(rsa_mprog[ecp_version][rsatype]);
     pufs_rsa_mprog_cmac_st* cmac = prog->cmac[mp_version];
 
-    // memcpy((void *)ecp_regs->mac, cmac->prk, ECP_MPMAC_SIZE);
+    // rvv_memcpy((void *)ecp_regs->mac, cmac->prk, ECP_MPMAC_SIZE);
     //  for(int j=0; j<ECP_MPMAC_SIZE/4; j++)
     //  {
     //      ecp_regs->mac[j] = *((uint32_t *)cmac->prk + j);
     //  }
-    //  memcpy((void *)ecp_regs->program, prog->func->prk, ECP_MPROG_SIZE);
+    //  rvv_memcpy((void *)ecp_regs->program, prog->func->prk, ECP_MPROG_SIZE);
     memcpy4b((void*)ecp_regs->mac, cmac->prk, ECP_MPMAC_SIZE);
     memcpy4b((void*)ecp_regs->program, prog->func->prk, ECP_MPROG_SIZE);
 
@@ -816,9 +816,9 @@ pufs_status_t _pufs_rsa_x931_sign(uint8_t* sig,
         return check;
 
     em[0] = 0x6b;
-    memset(em + 1, 0xbb, elen - 4 - md.dlen);
+    rvv_memset(em + 1, 0xbb, elen - 4 - md.dlen);
     em[elen - 3 - md.dlen] = 0xba;
-    memcpy(em + elen - 2 - md.dlen, md.dgst, md.dlen);
+    rvv_memcpy(em + elen - 2 - md.dlen, md.dgst, md.dlen);
 
     switch (hash) {
     case SHA_224:
@@ -852,7 +852,7 @@ pufs_status_t _pufs_rsa_x931_sign(uint8_t* sig,
     if ((check = pufs_bn_sub(em, n, sig, elen)) != SUCCESS)
         return check;
     if (pufs_bn_cmp(sig, em, elen) > 0)
-        memcpy(sig, em, elen);
+        rvv_memcpy(sig, em, elen);
 
     return SUCCESS;
 }
@@ -964,7 +964,7 @@ pufs_status_t _pufs_rsa_p1v15_sign(uint8_t* sig,
 
     em[0] = 0x00;
     em[1] = 0x01;
-    memset(em + 2, 0xff, elen - 22 - md.dlen);
+    rvv_memset(em + 2, 0xff, elen - 22 - md.dlen);
     em[elen - 20 - md.dlen] = 0x00;
 
     switch (hash) {
@@ -1001,9 +1001,9 @@ pufs_status_t _pufs_rsa_p1v15_sign(uint8_t* sig,
     default:
         return E_INVALID;
     }
-    memcpy(em + elen - 19 - md.dlen, pret, 19);
+    rvv_memcpy(em + elen - 19 - md.dlen, pret, 19);
 
-    memcpy(em + elen - md.dlen, md.dgst, md.dlen);
+    rvv_memcpy(em + elen - md.dlen, md.dgst, md.dlen);
 
     return pufs_rsa_sign(sig, rsatype, n, puk, prk, em, phi);
 }
@@ -1055,7 +1055,7 @@ pufs_status_t pufs_rsa_pss_verify(const uint8_t* sig,
 
     if ((check = pufs_hash(&md, msg, msglen, hash)) != SUCCESS)
         return check;
-    memcpy(mask, md.dgst, md.dlen);
+    rvv_memcpy(mask, md.dgst, md.dlen);
 
     pufs_hash_ctx* hash_ctx = pufs_hash_ctx_new();
     if (hash_ctx == NULL)
@@ -1096,8 +1096,8 @@ pufs_status_t _pufs_rsa_pss_sign(uint8_t* sig,
     if ((md.dlen + saltlen + 2) > elen)
         return E_INVALID;
 
-    memcpy(mask, md.dgst, md.dlen);
-    memcpy(mask + md.dlen, salt, saltlen);
+    rvv_memcpy(mask, md.dgst, md.dlen);
+    rvv_memcpy(mask + md.dlen, salt, saltlen);
     pufs_hash_ctx* hash_ctx = pufs_hash_ctx_new();
     if (hash_ctx == NULL)
         return E_UNAVAIL;
@@ -1110,13 +1110,13 @@ pufs_status_t _pufs_rsa_pss_sign(uint8_t* sig,
         != SUCCESS)
         return check;
 
-    memset(em, 0, elen - saltlen - md.dlen - 2);
+    rvv_memset(em, 0, elen - saltlen - md.dlen - 2);
     em[elen - saltlen - md.dlen - 2] = 0x01;
-    memcpy(em + elen - saltlen - md.dlen - 1, salt, saltlen);
+    rvv_memcpy(em + elen - saltlen - md.dlen - 1, salt, saltlen);
     for (uint32_t i = 0; i < elen - md.dlen - 1; i++)
         em[i] ^= mask[i];
     em[0] &= 0x7f;
-    memcpy(em + elen - md.dlen - 1, md.dgst, md.dlen);
+    rvv_memcpy(em + elen - md.dlen - 1, md.dgst, md.dlen);
     em[elen - 1] = 0xbc;
 
     return pufs_rsa_sign(sig, rsatype, n, puk, prk, em, phi);
@@ -1213,8 +1213,8 @@ pufs_status_t pufs_ecp_gen_sprk(pufs_ka_slot_t slot, pufs_key_type_t keytype,
         program = (void*)ecdp_set.mprog->prks_gen;
     }
 
-    // memcpy((void *)ecp_regs->mac, mac, ECP_MPMAC_SIZE);
-    // memcpy((void *)ecp_regs->program, program, ECP_MPROG_SIZE);
+    // rvv_memcpy((void *)ecp_regs->mac, mac, ECP_MPMAC_SIZE);
+    // rvv_memcpy((void *)ecp_regs->program, program, ECP_MPROG_SIZE);
     memcpy4b((void*)ecp_regs->mac, mac, ECP_MPMAC_SIZE);
     memcpy4b((void*)ecp_regs->program, program, ECP_MPROG_SIZE);
 
@@ -1343,8 +1343,8 @@ pufs_status_t _pufs_ecp_validate_puk(pufs_ec_point_st puk, bool full)
         if ((ecdp_set.mpmac->pukv_p == NULL) || (ecdp_set.mprog->pukv_p == NULL))
             return E_UNSUPPORT;
 
-        // memcpy((void *)ecp_regs->mac, ecdp_set.mpmac->pukv_p, ECP_MPMAC_SIZE);
-        // memcpy((void *)ecp_regs->program, ecdp_set.mprog->pukv_p, ECP_MPROG_SIZE);
+        // rvv_memcpy((void *)ecp_regs->mac, ecdp_set.mpmac->pukv_p, ECP_MPMAC_SIZE);
+        // rvv_memcpy((void *)ecp_regs->program, ecdp_set.mprog->pukv_p, ECP_MPROG_SIZE);
         memcpy4b((void*)ecp_regs->mac, ecdp_set.mpmac->pukv_p, ECP_MPMAC_SIZE);
         memcpy4b((void*)ecp_regs->program, ecdp_set.mprog->pukv_p, ECP_MPROG_SIZE);
     }
@@ -1566,8 +1566,8 @@ pufs_status_t pufs_ecp_ecdsa_verify_dgst_otpkey(
     if ((ecdp_set.mpmac->ecdsa_v_otpk == NULL) || (ecdp_set.mprog->ecdsa_v_otpk == NULL))
         return E_UNSUPPORT;
 
-    // memcpy((void *)ecp_regs->mac, ecdp_set.mpmac->ecdsa_v_otpk, ECP_MPMAC_SIZE);
-    // memcpy((void *)ecp_regs->program, ecdp_set.mprog->ecdsa_v_otpk, ECP_MPROG_SIZE);
+    // rvv_memcpy((void *)ecp_regs->mac, ecdp_set.mpmac->ecdsa_v_otpk, ECP_MPMAC_SIZE);
+    // rvv_memcpy((void *)ecp_regs->program, ecdp_set.mprog->ecdsa_v_otpk, ECP_MPROG_SIZE);
     memcpy4b((void*)ecp_regs->mac, ecdp_set.mpmac->ecdsa_v_otpk, ECP_MPMAC_SIZE);
     memcpy4b((void*)ecp_regs->program, ecdp_set.mprog->ecdsa_v_otpk, ECP_MPROG_SIZE);
 

@@ -28,7 +28,6 @@ extern "C" {
 
 #include <stdint.h>
 #include "pufs_common.h"
-#include <lwp_user_mm.h>
 
 typedef enum {
     ALGO_TYPE_HKDF = 0,

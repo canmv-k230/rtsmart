@@ -211,8 +211,8 @@ static pufs_status_t hmac_ctx_init(hmac_op op,
     if (keytype != SWKEY)
         hmac_ctx->keyslot = (uint32_t)keyaddr;
     else {
-        memset(hmac_ctx->key, 0, HMAC_BLOCK_MAXLEN);
-        memcpy(hmac_ctx->key, (const void*)keyaddr, b2B(keybits));
+        rvv_memset(hmac_ctx->key, 0, HMAC_BLOCK_MAXLEN);
+        rvv_memcpy(hmac_ctx->key, (const void*)keyaddr, b2B(keybits));
     }
 
     return SUCCESS;
@@ -367,8 +367,7 @@ static pufs_status_t hmac_ctx_update(hmac_op op,
                 hmac_ctx->buflen += segs.seg[i].len;
             } else // copy into the buffer
             {
-                if (lwp_get_from_user(hmac_ctx->buff + hmac_ctx->buflen, (void*)segs.seg[i].addr, segs.seg[i].len) == 0)
-                    memcpy(hmac_ctx->buff + hmac_ctx->buflen, segs.seg[i].addr, segs.seg[i].len);
+                rvv_memcpy(hmac_ctx->buff + hmac_ctx->buflen, segs.seg[i].addr, segs.seg[i].len);
                 hmac_ctx->buflen += segs.seg[i].len;
             }
         }
@@ -529,7 +528,7 @@ pufs_hmac_ctx* pufs_hmac_ctx_new(void)
     ret = malloc(sizeof(pufs_hmac_ctx));
     if (ret != NULL) {
         ret->op = HMAC_AVAILABLE;
-        memset(ret, 0x0, sizeof(pufs_hmac_ctx));
+        rvv_memset(ret, 0x0, sizeof(pufs_hmac_ctx));
     }
 
     return ret;
@@ -541,7 +540,7 @@ pufs_hmac_ctx* pufs_hmac_ctx_new(void)
 void pufs_hmac_ctx_free(pufs_hmac_ctx* hmac_ctx)
 {
     if (hmac_ctx != NULL) {
-        memset(hmac_ctx, 0, sizeof(pufs_hmac_ctx));
+        rvv_memset(hmac_ctx, 0, sizeof(pufs_hmac_ctx));
         hmac_ctx->op = HMAC_AVAILABLE;
     }
     free(hmac_ctx);

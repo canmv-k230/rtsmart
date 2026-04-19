@@ -45,7 +45,7 @@ static pufs_dma_sg_internal_desc_st* dma_sg_new_decriptor(void)
     }
 
     addr = VIRT_ADDR(sg_mem.base_addr + (SGDMA_DESCRIPTOR_SIZE * index));
-    memset((void*)addr, 0x0, SGDMA_DESCRIPTOR_SIZE);
+    rvv_memset((void*)addr, 0x0, SGDMA_DESCRIPTOR_SIZE);
 
     sg_mem.desc_bitmap |= (1 << index);
 

@@ -213,7 +213,7 @@ static pufs_status_t sp38a_ctx_init(sp38a_op op,
         if (iv == NULL)
             return E_INVALID;
         else
-            memcpy(sp38a_ctx->iv, iv, BC_BLOCK_SIZE);
+            rvv_memcpy(sp38a_ctx->iv, iv, BC_BLOCK_SIZE);
     }
 
     // initialize for block-cipher mode of operation
@@ -229,7 +229,7 @@ static pufs_status_t sp38a_ctx_init(sp38a_op op,
     if (keytype != SWKEY)
         sp38a_ctx->keyslot = (uint32_t)keyaddr;
     else
-        memcpy(sp38a_ctx->key, (const void*)keyaddr, b2B(keybits));
+        rvv_memcpy(sp38a_ctx->key, (const void*)keyaddr, b2B(keybits));
 
     // set mode of operation, and the minimum length of the last input
     if (op == SP38A_ECB_CLR) {
@@ -570,8 +570,7 @@ static pufs_status_t sp38a_ctx_update(sp38a_op op,
                 sp38a_ctx->buflen += segs.seg[i].len;
             } else // copy into the buffer
             {
-                if (lwp_get_from_user(sp38a_ctx->buff + sp38a_ctx->buflen, (void*)segs.seg[i].addr, segs.seg[i].len) == 0)
-                    memcpy(sp38a_ctx->buff + sp38a_ctx->buflen, segs.seg[i].addr, segs.seg[i].len);
+                rvv_memcpy(sp38a_ctx->buff + sp38a_ctx->buflen, segs.seg[i].addr, segs.seg[i].len);
                 sp38a_ctx->buflen += segs.seg[i].len;
             }
         }
@@ -648,7 +647,7 @@ pufs_sp38a_ctx* pufs_sp38a_ctx_new(void)
     ret = malloc(sizeof(pufs_sp38a_ctx));
     if (ret != NULL) {
         ret->op = SP38A_AVAILABLE;
-        memset(ret, 0x0, sizeof(pufs_sp38a_ctx));
+        rvv_memset(ret, 0x0, sizeof(pufs_sp38a_ctx));
     }
 
     return ret;
@@ -659,7 +658,7 @@ pufs_sp38a_ctx* pufs_sp38a_ctx_new(void)
 void pufs_sp38a_ctx_free(pufs_sp38a_ctx* sp38a_ctx)
 {
     if (sp38a_ctx != NULL) {
-        memset(sp38a_ctx, 0, sizeof(pufs_sp38a_ctx));
+        rvv_memset(sp38a_ctx, 0, sizeof(pufs_sp38a_ctx));
         sp38a_ctx->op = SP38A_AVAILABLE;
     }
     free(sp38a_ctx);
