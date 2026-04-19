@@ -261,13 +261,6 @@ int __attribute__((weak)) pm_core_init(void)
 extern int pm_core_init(void);
 /****************************************************/
 
-/*************fft device*************/
-int __attribute__((weak)) fft_device_init(void)
-{
-    rt_kprintf("no fft_device_init library!\n");
-    return -1;
-}
-extern int fft_device_init(void);
 /****************************************************/
 
 /*************nonai_2d device*************/
@@ -308,7 +301,6 @@ static int mpp_device_init(void)
     dpu_init();
     dewarp_init();
     pm_core_init();
-    fft_device_init();
     nonai_2d_init();
     vg_lite_init();
     return 0;
