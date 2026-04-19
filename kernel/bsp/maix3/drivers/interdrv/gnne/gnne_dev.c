@@ -77,6 +77,36 @@ static struct rt_event g_gnne_event = {0};
 void *gnne_base_addr = RT_NULL;
 static hardlock_type g_kpu_lock = HARDLOCK_MAX;
 
+#define KPU_DATA_SET_REG_ADDR     0x91301d8cU
+#define KPU_DATA_BW_REG_ADDR      0x91301d90U
+#define KPU_DATA_REG_PAGE_BASE    (KPU_DATA_SET_REG_ADDR & ~RT_MM_PAGE_MASK)
+#define KPU_DATA_SET_REG_OFFSET   (KPU_DATA_SET_REG_ADDR - KPU_DATA_REG_PAGE_BASE)
+#define KPU_DATA_BW_REG_OFFSET    (KPU_DATA_BW_REG_ADDR - KPU_DATA_REG_PAGE_BASE)
+#define KPU_DATA_SET_ENABLE       0x1U
+#define KPU_DATA_BW_VALUE         0x0a00U
+
+static int gnne_setup_kpu_bandwidth(void)
+{
+    volatile char *reg_page;
+    volatile rt_uint32_t *reg_kpu_data_set;
+    volatile rt_uint32_t *reg_kpu_data_bw;
+
+    reg_page = (volatile char *)rt_ioremap((void *)KPU_DATA_REG_PAGE_BASE, RT_MM_PAGE_SIZE);
+    if (reg_page == RT_NULL) {
+        gnne_err("map kpu bandwidth register page 0x%08x failed", KPU_DATA_REG_PAGE_BASE);
+        return -RT_ENOMEM;
+    }
+
+    reg_kpu_data_set = (volatile rt_uint32_t *)(reg_page + KPU_DATA_SET_REG_OFFSET);
+    reg_kpu_data_bw = (volatile rt_uint32_t *)(reg_page + KPU_DATA_BW_REG_OFFSET);
+
+    writel(KPU_DATA_SET_ENABLE, reg_kpu_data_set);
+    writel(KPU_DATA_BW_VALUE, reg_kpu_data_bw);
+    rt_iounmap((void *)reg_page);
+
+    return RT_EOK;
+}
+
 static int gnne_device_open(struct dfs_fd *file)
 {
     struct gnne_dev_handle *handle;
@@ -212,10 +242,16 @@ int gnne_device_init(void)
     } else {
         g_kpu_lock  = HARDLOCK_KPU;
     }
+
+    ret = gnne_setup_kpu_bandwidth();
+    if (ret != RT_EOK) {
+        gnne_err("setup kpu bandwidth failed, ret=%d\n", ret);
+        return ret;
+    }
+
 #ifndef RT_FASTBOOT
-    if(!ret)
-        gnne_info("%s OK\n", __func__);
+    gnne_info("%s done.\n", __func__);
 #endif
+
     return ret;
 }
-
