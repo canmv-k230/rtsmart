@@ -14,6 +14,13 @@
 #include "dlmodule.h"
 #include "dlelf.h"
 
+/* dlmodule/dlopen load native code from the filesystem, so they must not be
+ * built together with the preload-only secure-boot runtime policy.
+ */
+#if defined(CONFIG_SECURE_BOOT_FIRMWARE_ENABLE) && defined(RT_USING_MODULE)
+#error "RT_USING_MODULE must stay disabled when CONFIG_SECURE_BOOT_FIRMWARE_ENABLE is enabled"
+#endif
+
 #if defined(RT_USING_POSIX)
 #include <dfs_posix.h>
 #endif

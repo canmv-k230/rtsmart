@@ -55,6 +55,7 @@ typedef struct {
 
 struct pufs_context {
     uintptr_t base_addr;
+    uintptr_t phys_base_addr;
     size_t    size;
 };
 

@@ -45,18 +45,20 @@ static char* status_msg[] = {
     "Unspecific error",
 };
 
-struct pufs_context pufs_context = { .base_addr = 0x0 };
+struct pufs_context pufs_context = { .base_addr = 0x0, .phys_base_addr = 0x0 };
 
 /*****************************************************************************
  * API functions
  ****************************************************************************/
 
-void pufs_module_init(uintptr_t base_addr, size_t size)
+void pufs_module_init(uintptr_t base_addr, uintptr_t phys_base_addr, size_t size)
 {
 #ifndef BAREMETAL
     pufs_context.base_addr = (uintptr_t)get_mapped_addr(base_addr, &size);
+    pufs_context.phys_base_addr = base_addr;
 #else
     pufs_context.base_addr = base_addr;
+    pufs_context.phys_base_addr = phys_base_addr;
 #endif /* BAREMETAL */
     pufs_context.size = size;
 }

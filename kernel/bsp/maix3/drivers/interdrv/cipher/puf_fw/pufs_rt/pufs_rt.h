@@ -154,6 +154,16 @@ typedef enum {
 typedef struct {
     uint8_t uid[UIDLEN]; ///< UID container
 } pufs_uid_st;
+
+typedef struct {
+    uint8_t disable_jtag;
+    uint8_t force_secure_boot;
+    uint8_t disable_isp;
+    uint8_t disable_spi2axi;
+    pufs_otp_lock_t jtag_word_lock;
+    pufs_otp_lock_t boot_ctrl_word_lock;
+    pufs_otp_lock_t spi2axi_word_lock;
+} pufs_otp_security_state_st;
 /**
  * @brief OTP addressing type.
  */
@@ -325,6 +335,79 @@ pufs_otp_lock_t pufs_otp_get_lock(pufs_otp_addr_t addr);
  */
 pufs_status_t pufs_otp_set_lock(pufs_otp_addr_t addr, uint32_t len,
                                 pufs_otp_lock_t lock);
+/**
+ * @brief Program device security config bits in OTP.
+ *
+ * This helper applies the logical OTP config values documented for the
+ * device security words:
+ * - 0x0000 bit5: disable SPI2AXI
+ * - 0x0004 bit0: disable JTAG
+ * - 0x000C bit0: force secure boot
+ * - 0x000C bit1: disable ISP boot/programming
+ *
+ * The helper updates the documented config word bits directly, preserving
+ * unrelated bits in the same word.
+ *
+ * @param[in] disable_spi2axi    Set logical SPI2AXI-disable bit.
+ * @param[in] disable_jtag       Set logical JTAG-disable bit.
+ * @param[in] force_secure_boot  Set logical force-secure-boot bit.
+ * @param[in] disable_isp        Set logical ISP-disable bit.
+ * @return                       SUCCESS on success, otherwise an error code.
+ */
+pufs_status_t pufs_otp_apply_security_config(bool disable_spi2axi,
+                                             bool disable_jtag,
+                                             bool force_secure_boot,
+                                             bool disable_isp);
+/**
+ * @brief Set the logical OTP bit that disables SPI2AXI access.
+ *
+ * @return          SUCCESS on success, otherwise an error code.
+ */
+pufs_status_t pufs_otp_disable_spi2axi(void);
+/**
+ * @brief Set the logical OTP bit that disables JTAG access.
+ *
+ * @return          SUCCESS on success, otherwise an error code.
+ */
+pufs_status_t pufs_otp_disable_jtag(void);
+/**
+ * @brief Set the logical OTP bit that forces secure boot.
+ *
+ * @return          SUCCESS on success, otherwise an error code.
+ */
+pufs_status_t pufs_otp_force_secure_boot(void);
+/**
+ * @brief Set the logical OTP bit that disables ISP boot/programming.
+ *
+ * @return          SUCCESS on success, otherwise an error code.
+ */
+pufs_status_t pufs_otp_disable_isp(void);
+/**
+ * @brief Query the current OTP security config bits and word lock states.
+ *
+ * The returned state reflects the current logical values of:
+ * - 0x0000 bit5: disable SPI2AXI
+ * - 0x0004 bit0: disable JTAG
+ * - 0x000C bit0: force secure boot
+ * - 0x000C bit1: disable ISP boot/programming
+ *
+ * The helper also reports the current lock state of the three config words.
+ *
+ * @param[out] state  Current security config state.
+ * @return            SUCCESS on success, otherwise an error code.
+ */
+pufs_status_t pufs_otp_get_security_config_state(
+    pufs_otp_security_state_st *state);
+/**
+ * @brief Lock the security config words at 0x0000, 0x0004 and 0x000C as RO.
+ *
+ * Call this only after all desired security-option bits have been programmed.
+ * Once the words are locked RO, later helper calls can no longer update other
+ * bits in the same words.
+ *
+ * @return          SUCCESS on success, otherwise an error code.
+ */
+pufs_status_t pufs_otp_lock_security_config_words(void);
 
 #ifdef PSIOT_012CW01D_B12C
 

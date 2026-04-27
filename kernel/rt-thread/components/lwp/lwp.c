@@ -28,6 +28,8 @@
 #include "board.h"
 #include "k230_atag.h"
 
+#define K230_TRUSTED_PRELOAD_CMD "@preload"
+
 #define DBG_TAG "LWP"
 #define DBG_LVL DBG_WARNING
 #include <rtdbg.h>
@@ -372,7 +374,7 @@ static inline rt_uint64_t get_preload_size(void)
     if (k230_atag_get_rtapp_size(&size)) {
         return size;
     } else {
-        LOG_E("ATAG: No valid boot flag found, falling back to filename check");
+        LOG_E("ATAG: No valid preloaded rtapp size found");
         return 0;
     }
 
@@ -385,9 +387,14 @@ static inline rt_uint64_t get_preload_addr(void)
     if (k230_atag_get_rtapp_loadaddr(&load_addr)) {
         return load_addr;
     } else {
-        LOG_E("ATAG: No valid boot flag found, falling back to filename check");
+        LOG_E("ATAG: No valid preloaded rtapp address found");
         return 0;
     }
+}
+
+static inline rt_bool_t is_trusted_preload_cmd(const char *filename)
+{
+    return rt_strcmp(filename, K230_TRUSTED_PRELOAD_CMD) == 0;
 }
 
 /**
@@ -454,7 +461,23 @@ static int is_preloaded_elf_valid(void)
 
 static inline rt_bool_t should_use_preloaded_elf(const char *filename)
 {
-    return (rt_strcmp(filename, "/bin/preload") == 0) && is_preloaded_elf_valid();
+    /* Under secure boot, @preload is only a trigger name for the
+     * trusted ATAG-preloaded rtapp image, not a filesystem trust exception.
+     */
+    return is_trusted_preload_cmd(filename) && is_preloaded_elf_valid();
+}
+
+static inline rt_bool_t should_reject_filesystem_elf(const char *filename)
+{
+#ifdef CONFIG_SECURE_BOOT_FIRMWARE_ENABLE
+    /* Filesystem ELF is outside the firmware secure-boot trust chain. */
+    LOG_E("Secure Boot rejects filesystem ELF: %s", filename);
+    return RT_TRUE;
+#else
+    (void)filename;
+#endif
+
+    return RT_FALSE;
 }
 
 typedef struct
@@ -1184,16 +1207,30 @@ RT_WEAK int lwp_load(const char *filename, struct rt_lwp *lwp, uint8_t *load_add
         ptr = RT_NULL;
     }
 
+    if (is_trusted_preload_cmd(lwp->cmd))
+    {
+        if (should_use_preloaded_elf(lwp->cmd))
+        {
+            len = get_preload_size();
+            goto _load_elf;
+        }
+
+        LOG_E("Trusted preload is unavailable: missing or invalid ATAG-preloaded rtapp image");
+        ret = -RT_ERROR;
+        goto out;
+    }
+
+    if (should_reject_filesystem_elf(filename))
+    {
+        ret = -RT_ERROR;
+        goto out;
+    }
+
     fd = open(filename, O_BINARY | O_RDONLY, 0);
     if (fd < 0)
     {
         LOG_E("ERROR: Can't open elf file %s!", filename);
         goto out;
-    }
-
-    if (should_use_preloaded_elf(lwp->cmd)) {
-        len = get_preload_size();
-        goto _load_elf;
     }
 
     len = lseek(fd, 0, SEEK_END);

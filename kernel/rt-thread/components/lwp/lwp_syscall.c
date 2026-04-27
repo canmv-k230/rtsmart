@@ -2130,6 +2130,15 @@ int load_ldso(struct rt_lwp *lwp, char *exec_name, char *const argv[], char *con
     struct lwp_args_info args_info;
     struct process_aux *aux;
 
+#ifdef CONFIG_SECURE_BOOT_FIRMWARE_ENABLE
+    /* Dynamic ELF would require /lib/ld.so from the filesystem, which is
+     * intentionally outside the secure-boot trust boundary.
+     */
+    LOG_E("Secure Boot does not allow loading /lib/ld.so from the filesystem");
+    SET_ERRNO(EPERM);
+    return GET_ERRNO();
+#endif
+
     size = sizeof(char *);
     if (argv)
     {

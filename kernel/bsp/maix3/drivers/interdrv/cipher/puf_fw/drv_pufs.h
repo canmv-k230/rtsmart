@@ -54,8 +54,9 @@ enum pufs_op_type {
 #define PUFS_OTP_RWLCK_GET  _IOWR('P', 0x05, int)
 #define PUFS_RT_VERSION     _IOWR('P', 0x06, int)
 #define PUFS_KEY2OTP        _IOWR('P', 0x07, int)
-#define PUFS_ZEROIZE        _IOWR('P', 0x08, int)
-#define PUFS_POST_MASK      _IOWR('P', 0x09, int)
+#define PUFS_OTP_SEC_CFG    _IOWR('P', 0x0A, int)
+#define PUFS_OTP_SEC_LOCK   _IOWR('P', 0x0B, int)
+#define PUFS_OTP_SEC_STATE  _IOWR('P', 0x0C, int)
 #define PUFS_KEY_INOUT      _IOWR('P', 0x10, int)
 #define PUFS_KEY_DERIVE     _IOWR('P', 0x11, int)
 #define PUFS_ECC_PRK_GEN    _IOWR('P', 0x40, int)
@@ -451,12 +452,22 @@ typedef struct {
 } pufs_key2otp_t;
 
 typedef struct {
-    uint8_t  slot;    /* pufs_rt_slot_t: PUFSLOT_0..3 */
-} pufs_zeroize_t;
+    uint8_t disable_spi2axi;
+    uint8_t disable_jtag;
+    uint8_t force_secure_boot;
+    uint8_t disable_isp;
+} pufs_otp_security_cfg_t;
 
 typedef struct {
-    uint64_t maskslots;
-} pufs_post_mask_t;
+    uint8_t disable_spi2axi;
+    uint8_t disable_jtag;
+    uint8_t force_secure_boot;
+    uint8_t disable_isp;
+    uint8_t spi2axi_word_lock;
+    uint8_t jtag_word_lock;
+    uint8_t boot_ctrl_word_lock;
+    uint8_t reserved0;
+} pufs_otp_security_state_t;
 
 typedef struct {
     uint8_t  mode;    /* pufs_drbg_type_t */

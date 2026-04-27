@@ -20,7 +20,7 @@
 
 /* Describe EndPoints configuration */
 static struct usbd_endpoint mtp_ep_data[3];
-static mtp_ctx *mtp_context;
+static mtp_ctx *mtp_context = NULL;
 static usb_osal_thread_t mtp_tid;
 static rt_event_t mtp_event;
 static volatile uint32_t read_size;
@@ -64,6 +64,8 @@ int write_usb(void * ctx, int channel, unsigned char * buffer, int size)
 
 int mtp_fs_db_valid(void)
 {
+    if (!mtp_context)
+        return 0;
     return mtp_context->fs_db ? 1 : 0;
 }
 

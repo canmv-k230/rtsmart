@@ -19,6 +19,7 @@
 #include "rvv_ops.h"
 
 #include "drv_pufs.h"
+#include "drv_pufs_internal.h"
 
 #include "pufs_dma.h"
 #include "pufs_internal.h"
@@ -100,6 +101,16 @@ static inline int pufs_hw_lock(void)
 static inline void pufs_hw_unlock(void)
 {
     rt_mutex_release(&pufs_dev.lock);
+}
+
+int pufs_drv_hw_lock(void)
+{
+    return pufs_hw_lock();
+}
+
+void pufs_drv_hw_unlock(void)
+{
+    pufs_hw_unlock();
 }
 
 /* ===== User/kernel data copy helpers ===== */
@@ -908,12 +919,15 @@ static int key2otp_handler(pufs_key2otp_t *arg)
     return 0;
 }
 
-static int zeroize_handler(pufs_zeroize_t *arg)
+static int otp_sec_cfg_handler(pufs_otp_security_cfg_t *arg)
 {
     int ret;
 
     if (pufs_hw_lock() != 0) return -EBUSY;
-    ret = pufs_zeroize(arg->slot);
+    ret = pufs_otp_apply_security_config(arg->disable_spi2axi != 0,
+                                         arg->disable_jtag != 0,
+                                         arg->force_secure_boot != 0,
+                                         arg->disable_isp != 0);
     pufs_hw_unlock();
 
     if (ret != SUCCESS) {
@@ -923,18 +937,48 @@ static int zeroize_handler(pufs_zeroize_t *arg)
     return 0;
 }
 
-static int post_mask_handler(pufs_post_mask_t *arg)
+static int otp_sec_lock_handler(pufs_otp_security_cfg_t *arg)
 {
     int ret;
 
+    (void)arg;
+
     if (pufs_hw_lock() != 0) return -EBUSY;
-    ret = pufs_post_mask(arg->maskslots);
+    ret = pufs_otp_lock_security_config_words();
     pufs_hw_unlock();
 
     if (ret != SUCCESS) {
         LOG_D("%s: %s\n", __func__, pufs_strstatus(ret));
         return -ret;
     }
+    return 0;
+}
+
+static int otp_sec_state_handler(pufs_otp_security_state_t *arg)
+{
+    int ret;
+    pufs_otp_security_state_st state;
+
+    rvv_memset(&state, 0, sizeof(state));
+
+    if (pufs_hw_lock() != 0) return -EBUSY;
+    ret = pufs_otp_get_security_config_state(&state);
+    pufs_hw_unlock();
+
+    if (ret != SUCCESS) {
+        LOG_D("%s: %s\n", __func__, pufs_strstatus(ret));
+        return -ret;
+    }
+
+    arg->disable_spi2axi = state.disable_spi2axi;
+    arg->disable_jtag = state.disable_jtag;
+    arg->force_secure_boot = state.force_secure_boot;
+    arg->disable_isp = state.disable_isp;
+    arg->spi2axi_word_lock = state.spi2axi_word_lock;
+    arg->jtag_word_lock = state.jtag_word_lock;
+    arg->boot_ctrl_word_lock = state.boot_ctrl_word_lock;
+    arg->reserved0 = 0;
+
     return 0;
 }
 
@@ -1674,15 +1718,21 @@ static rt_err_t pufs_control(rt_device_t dev, int cmd, void *args)
         IOCTL_COPY_BACK(arg);
         break;
     }
-    case PUFS_ZEROIZE: {
-        IOCTL_COPY_IN(pufs_zeroize_t, arg);
-        ret = zeroize_handler(&arg);
+    case PUFS_OTP_SEC_CFG: {
+        IOCTL_COPY_IN(pufs_otp_security_cfg_t, arg);
+        ret = otp_sec_cfg_handler(&arg);
         IOCTL_COPY_BACK(arg);
         break;
     }
-    case PUFS_POST_MASK: {
-        IOCTL_COPY_IN(pufs_post_mask_t, arg);
-        ret = post_mask_handler(&arg);
+    case PUFS_OTP_SEC_LOCK: {
+        IOCTL_COPY_IN(pufs_otp_security_cfg_t, arg);
+        ret = otp_sec_lock_handler(&arg);
+        IOCTL_COPY_BACK(arg);
+        break;
+    }
+    case PUFS_OTP_SEC_STATE: {
+        IOCTL_COPY_IN(pufs_otp_security_state_t, arg);
+        ret = otp_sec_state_handler(&arg);
         IOCTL_COPY_BACK(arg);
         break;
     }
@@ -1902,7 +1952,7 @@ int pufs_device_init(void)
         return ret;
     }
 
-    pufs_module_init((uintptr_t)pufs_dev.base, SECURITY_IO_SIZE);
+    pufs_module_init((uintptr_t)pufs_dev.base, SECURITY_BASE_ADDR, SECURITY_IO_SIZE);
     pufs_dma_module_init(DMA_ADDR_OFFSET, NULL);
     pufs_rt_module_init(RT_ADDR_OFFSET);
     pufs_ka_module_init(KA_ADDR_OFFSET);

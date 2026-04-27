@@ -34,6 +34,27 @@ menu "InterDriver"
                     config RT_USING_PUFS_FILE_HASH
                         bool "Enable calculate file hash with pufs"
                         default n
+                        depends on RT_USING_MSH
+                        help
+                            Enable the PUFS file-hash MSH commands for calculating a
+                            file digest with the PUFS hash engine.
+
+                            Command provided:
+                            - sha256 <path>
+                            - pufs_file_hash <path> [sha224|sha256|sha384|sha512|sha512_224|sha512_256|sm3]
+
+                    config RT_PUFS_ENABLE_BUILTIN_CMD
+                        bool "Enable pufs msh commands"
+                        default n
+                        depends on RT_USING_MSH
+                        help
+                            Enable built-in MSH commands for the PUFS driver.
+
+                            Commands provided:
+                            - pufs_otp read <addr> <len>
+                            - pufs_otp_sec query
+                            - pufs_otp_sec write <jtag|secure_boot|isp|all> [...]
+                            - pufs_otp_sec lock
 
                     config RT_PUFS_OTP_WRITE_ENABLE
                         bool "Enable OTP write and lock operations (DANGER: irreversible)"

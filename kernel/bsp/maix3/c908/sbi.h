@@ -121,7 +121,17 @@
 #define SBI_REMOTE_SFENCE_VMA       6
 #define SBI_REMOTE_SFENCE_VMA_ASID  7
 #define SBI_SHUTDOWN                8
-#define SBI_PMP_WRITE_ENABLE        9
+
+/* Kendryte Extensions */
+#define SBI_EXT_PMP                 0x09000002
+
+#define SBI_EXT_PMP_SET             0
+#define SBI_EXT_PMP_GET             1
+#define SBI_EXT_ATAG_COPY           2
+
+#define SBI_PMP_PERM_R              0x01
+#define SBI_PMP_PERM_W              0x02
+#define SBI_PMP_PERM_X              0x04
 
 #define SBI_CALL0(e, f)                     SBI_CALL5(e, f, 0, 0, 0, 0, 0)
 #define SBI_CALL1(e, f, p1)                 SBI_CALL5(e, f, p1, 0, 0, 0, 0)
@@ -236,10 +246,24 @@ sbi_shutdown(void)
     (void)SBI_CALL0(SBI_SHUTDOWN, 0);
 }
 
-static __inline void
-sbi_pmp_write_enable(int write_enable)
+static __inline struct sbi_ret
+sbi_pmp_set(uintptr_t addr, size_t len, unsigned long perm)
 {
-    (void)SBI_CALL1(SBI_PMP_WRITE_ENABLE, 0, write_enable);
+    return SBI_CALL3(SBI_EXT_PMP, SBI_EXT_PMP_SET, addr, len, perm);
+}
+
+static __inline struct sbi_ret
+sbi_pmp_get(uintptr_t addr, size_t len, unsigned long *perm,
+        unsigned long *index)
+{
+    return SBI_CALL4(SBI_EXT_PMP, SBI_EXT_PMP_GET, addr, len,
+             (uintptr_t)perm, (uintptr_t)index);
+}
+
+static __inline struct sbi_ret
+sbi_atag_copy(void *dst, size_t len)
+{
+	return SBI_CALL2(SBI_EXT_PMP, SBI_EXT_ATAG_COPY, (uintptr_t)dst, len);
 }
 
 void sbi_print_version(void);

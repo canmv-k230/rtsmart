@@ -43,6 +43,7 @@ extern "C" {
  ****************************************************************************/
 
 extern struct pufs_rt_regs *rt_regs;
+extern uintptr_t rt_regs_phys;
 
 /* CDE OTP area (0x400-0xFFF) */
 #define PUFS_CDE_SEGMENT          128
@@ -53,6 +54,7 @@ struct pufs_rt_cde_regs {
     volatile uint32_t otp[768];
 };
 extern struct pufs_rt_cde_regs *rt_cde_regs;
+extern uintptr_t rt_cde_regs_phys;
 void pufs_rt_cde_init(uint32_t rt_cde_offset);
 pufs_status_t pufs_read_cde(uint8_t* outbuf, uint32_t len, uint32_t addr);
 pufs_status_t pufs_program_cde(const uint8_t* inbuf, uint32_t len, uint32_t addr);

@@ -34,6 +34,8 @@
 #include "sysctl_pwr.h"
 #include "sysctl_boot.h"
 
+#define K230_TRUSTED_PRELOAD_CMD "@preload"
+
 #ifdef ENABLE_CHERRY_USB
 
 #ifdef ENABLE_CHERRY_USB_DEVICE
@@ -55,6 +57,8 @@
 
 bool g_fs_mount_data_succ = false;
 bool g_fs_mount_sdcard_succ = false;
+
+pid_t exec(char *filename, int debug, int argc, char **argv);
 
 static const struct dfs_mount_tbl* const auto_mount_table[SYSCTL_BOOT_MAX] = {
     (const struct dfs_mount_tbl[]) {
@@ -219,6 +223,68 @@ static void check_bank_voltage(void)
   rt_iounmap(map_base);
 }
 
+static rt_bool_t auto_exec_cmd_is_trusted_preload(const char *cmd)
+{
+  rt_size_t leading = 0;
+  rt_size_t cmd0_size = 0;
+
+  while (cmd[leading] == ' ' || cmd[leading] == '\t') {
+    leading++;
+  }
+
+  cmd += leading;
+
+  while (cmd[cmd0_size] != '\0' && cmd[cmd0_size] != ' ' && cmd[cmd0_size] != '\t') {
+    cmd0_size++;
+  }
+
+  return cmd0_size == (sizeof(K230_TRUSTED_PRELOAD_CMD) - 1)
+      && rt_strncmp(cmd, K230_TRUSTED_PRELOAD_CMD, cmd0_size) == 0;
+}
+
+static void auto_exec_trusted_preload(const char *cmd_line)
+{
+  char *cmd_copy;
+  char *cursor;
+  char *argv[8];
+  int argc = 0;
+
+  cmd_copy = rt_strdup(cmd_line);
+  if (cmd_copy == RT_NULL) {
+    rt_kprintf("auto exec trusted preload failed: no memory\n");
+    return;
+  }
+
+  rt_memset(argv, 0x00, sizeof(argv));
+  cursor = cmd_copy;
+  while (*cursor != '\0' && argc < (int)(sizeof(argv) / sizeof(argv[0]))) {
+    while (*cursor == ' ' || *cursor == '\t') {
+      *cursor = '\0';
+      cursor++;
+    }
+
+    if (*cursor == '\0') {
+      break;
+    }
+
+    argv[argc++] = cursor;
+
+    while (*cursor != '\0' && *cursor != ' ' && *cursor != '\t') {
+      cursor++;
+    }
+  }
+
+  if (argc > 0 && rt_strcmp(argv[argc - 1], "&") == 0) {
+    argv[--argc] = RT_NULL;
+  }
+
+  if (argc <= 0 || exec(argv[0], 0, argc, argv) <= 0) {
+    rt_kprintf("trusted preload image unavailable, enable fast boot and ensure U-Boot preloads rtapp\n");
+  }
+
+  rt_free(cmd_copy);
+}
+
 int main(void) {
   sysctl_pwr_off(SYSCTL_PD_CPU0);
   sysctl_pwr_off(SYSCTL_PD_DPU);
@@ -295,7 +361,15 @@ int main(void) {
     size_t cmd_length = rt_strlen(CONFIG_RTT_AUTO_EXEC_CMD);
 
     if(cmd_length) {
+#ifdef CONFIG_SECURE_BOOT_FIRMWARE_ENABLE
+      if (auto_exec_cmd_is_trusted_preload(CONFIG_RTT_AUTO_EXEC_CMD)) {
+        auto_exec_trusted_preload(CONFIG_RTT_AUTO_EXEC_CMD);
+      } else {
+        rt_kprintf("secure boot requires CONFIG_RTT_AUTO_EXEC_CMD to start with @preload; skip auto exec\n");
+      }
+#else
       msh_exec(CONFIG_RTT_AUTO_EXEC_CMD, cmd_length);
+#endif
     }
   }
 

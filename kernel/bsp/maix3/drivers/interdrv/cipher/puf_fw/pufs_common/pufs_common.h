@@ -134,7 +134,7 @@ typedef struct {
  * @param[in] base_addr  base address of PUFs memory map
  * @param[in] size  total size of PUFs memory map
  */
-void pufs_module_init(uintptr_t base_addr, size_t size);
+void pufs_module_init(uintptr_t base_addr, uintptr_t phys_base_addr, size_t size);
 
 /**
  * @brief Release PUFs module

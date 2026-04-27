@@ -18,6 +18,7 @@
  * ANY WAY RELATED TO THIS SOFTWARE WILL NOT EXCEED THE AMOUNT OF FEES,
  * IF ANY, THAT YOU HAVE PAID DIRECTLY TO PUFSECURITY FOR THIS SOFTWARE.
  */
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,10 +27,21 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <rtconfig.h>
+#include "rtthread.h"
+#include "sbi.h"
 #include "pufs_internal.h"
 #include "pufs_rt_internal.h"
 
 struct pufs_rt_regs* rt_regs = NULL;
+uintptr_t rt_regs_phys = 0;
+
+#define OTP_CFG_SPI2AXI_ADDR             ((pufs_otp_addr_t)0x0000)
+#define OTP_CFG_DISABLE_SPI2AXI_BIT      (1u << 5)
+#define OTP_CFG_JTAG_ADDR                ((pufs_otp_addr_t)0x0004)
+#define OTP_CFG_JTAG_DISABLE_BIT         (1u << 0)
+#define OTP_CFG_BOOT_CTRL_ADDR           ((pufs_otp_addr_t)0x000C)
+#define OTP_CFG_FORCE_SECURE_BOOT_BIT    (1u << 0)
+#define OTP_CFG_DISABLE_ISP_BIT          (1u << 1)
 
 /*****************************************************************************
  * Static functions
@@ -176,6 +188,12 @@ void pufs_ptr_ptc_ctrl(bool on)
 {
     pufs_ptm_cfg_set(PTM_CFG_REG_PTR_PTC_MASK, on);
 }
+
+static void puf_pgm_ign_ctrl(bool on)
+{
+    pufs_ptm_cfg_set(PTM_CFG_REG_PGM_IGN_MASK, on);
+}
+
 /**
  * @brief Deep standby control (active low)
  *
@@ -251,6 +269,7 @@ void rt_write_rngclk(bool enable)
 void pufs_rt_module_init(uint32_t rt_offset)
 {
     rt_regs = (struct pufs_rt_regs*)(pufs_context.base_addr + rt_offset);
+    rt_regs_phys = pufs_context.phys_base_addr + rt_offset;
     version_check(PUFSRT_VERSION, rt_regs->version);
 }
 /**
@@ -297,6 +316,43 @@ pufs_status_t _pufs_rand(uint8_t* rand, uint32_t numblks)
 }
 
 static const char *lock_state_name(pufs_otp_lock_t lock);
+
+static pufs_status_t pufs_rt_pmp_set(unsigned long perm)
+{
+    struct sbi_ret ret = sbi_pmp_set(rt_regs_phys, 0x1000, perm);
+
+    if (ret.error == SBI_SUCCESS)
+        return SUCCESS;
+
+    LOG_ERROR("SBI PMP set failed: addr=0x%lx len=0x%lx perm=0x%lx error=%ld value=%ld",
+              (unsigned long)rt_regs_phys, (unsigned long)0x1000, perm,
+              ret.error, ret.value);
+
+    return (ret.error == SBI_ERR_DENIED) ? E_DENY : E_ERROR;
+}
+
+static uint32_t otp_pack_program_word(const uint8_t *inbuf, uint32_t offset,
+    uint32_t len)
+{
+    union {
+        uint32_t word;
+        uint8_t byte[WORD_SIZE];
+    } otp_word;
+
+    for (int8_t index = WORD_SIZE - 1; index >= 0; index--)
+        otp_word.byte[index] = ((offset + WORD_SIZE - 1 - index) < len) ?
+            inbuf[offset + WORD_SIZE - 1 - index] : 0x00;
+
+    return otp_word.word;
+}
+
+static void otp_word_to_bytes(uint8_t out[WORD_SIZE], uint32_t word)
+{
+    out[0] = (word >> 24) & 0xff;
+    out[1] = (word >> 16) & 0xff;
+    out[2] = (word >> 8) & 0xff;
+    out[3] = word & 0xff;
+}
 
 /**
  * pufs_read_otp()
@@ -348,14 +404,14 @@ pufs_status_t pufs_program_otp(const uint8_t* inbuf, uint32_t len,
         }
     }
 
-    // check for 0->1 bit violations (RT OTP only goes 1->0)
+    // check for 1->0 bit violations (RT OTP only goes 0->1)
     for (uint32_t i = 0; i < len; i += WORD_SIZE) {
         uint32_t cur = be2le(rt_regs->otp[start_index + (i / WORD_SIZE)]);
         for (uint32_t j = 0; j < WORD_SIZE && (i + j) < len; j++) {
             uint8_t cur_byte = (cur >> (j * 8)) & 0xFF;
             uint8_t new_byte = inbuf[i + j];
-            if (~cur_byte & new_byte) {
-                LOG_WARN("OTP WRITE DENIED: addr=0x%03x+%u bit 0->1"
+            if (cur_byte & ~new_byte) {
+                LOG_WARN("OTP WRITE DENIED: addr=0x%03x+%u bit 1->0"
                          " (cur=0x%02x new=0x%02x)",
                          addr, i + j, cur_byte, new_byte);
                 return E_DENY;
@@ -366,20 +422,44 @@ pufs_status_t pufs_program_otp(const uint8_t* inbuf, uint32_t len,
 #ifndef RT_PUFS_OTP_WRITE_ENABLE
     LOG_WARN("OTP WRITE DRY-RUN: addr=0x%03x len=%" PRIu32
              " (enable RT_PUFS_OTP_WRITE_ENABLE to commit)", addr, len);
+    for (uint32_t i = 0; i < len; i += 4) {
+        uint32_t cur_word = rt_regs->otp[start_index + (i / 4)];
+        uint32_t program_word = otp_pack_program_word(inbuf, i, len);
+        uint8_t cur_bytes[WORD_SIZE];
+        uint8_t write_bytes[WORD_SIZE];
+
+        otp_word_to_bytes(cur_bytes, cur_word);
+        otp_word_to_bytes(write_bytes, program_word);
+
+        LOG_WARN("OTP WRITE DRY-RUN WORD: addr=0x%03x cur=[%02x %02x %02x %02x]"
+                 " write=[%02x %02x %02x %02x]",
+                 addr + i,
+                 cur_bytes[0], cur_bytes[1], cur_bytes[2], cur_bytes[3],
+                 write_bytes[0], write_bytes[1], write_bytes[2], write_bytes[3]);
+    }
     return SUCCESS;
 #else
     LOG_WARN("OTP WRITE: addr=0x%03x len=%" PRIu32, addr, len);
+
+    if ((check = pufs_rt_pmp_set(SBI_PMP_PERM_R | SBI_PMP_PERM_W)) != SUCCESS)
+        return check;
+
+    puf_pgm_ign_ctrl(true);
+
     // program
     for (uint32_t i = 0; i < len; i += 4) {
-        union {
-            uint32_t word;
-            uint8_t byte[4];
-        } otp_word;
-        for (int8_t j = 3; j >= 0; j--) // reverse, default 0xff
-            otp_word.byte[j] = ((i + 3 - j) < len) ? inbuf[i + 3 - j] : 0xff;
+        uint32_t program_word = otp_pack_program_word(inbuf, i, len);
 
-        rt_regs->otp[start_index + (i / 4)] = otp_word.word;
+        if (program_word == 0x0)
+            continue;
+        if (rt_regs->otp[start_index + (i / 4)] == program_word)
+            continue;
+
+        rt_regs->otp[start_index + (i / 4)] = program_word;
     }
+
+    if ((check = pufs_rt_pmp_set(SBI_PMP_PERM_R)) != SUCCESS)
+        return check;
 
     return SUCCESS;
 #endif
@@ -429,6 +509,9 @@ pufs_status_t pufs_lock_otp(pufs_otp_addr_t addr, uint32_t len,
     LOG_WARN("OTP LOCK: addr=0x%03x len=%" PRIu32 " lock=%s",
              addr, len, lock_state_name(lock));
 
+    if ((check = pufs_rt_pmp_set(SBI_PMP_PERM_R | SBI_PMP_PERM_W)) != SUCCESS)
+        return check;
+
     end = (len + 3) / 4;
     start = addr / WORD_SIZE;
 
@@ -448,6 +531,9 @@ pufs_status_t pufs_lock_otp(pufs_otp_addr_t addr, uint32_t len,
             mask = 0;
         }
     }
+
+    if ((check = pufs_rt_pmp_set(SBI_PMP_PERM_R)) != SUCCESS)
+        return check;
 
     return SUCCESS;
 #endif
@@ -510,6 +596,11 @@ pufs_status_t pufs_zeroize(pufs_rt_slot_t slot)
 #else
     LOG_WARN("ZEROIZE: slot=%u", slot);
 
+    pufs_status_t check;
+
+    if ((check = pufs_rt_pmp_set(SBI_PMP_PERM_R | SBI_PMP_PERM_W)) != SUCCESS)
+        return check;
+
     if (slot < OTPKEY_0)
         rt_regs->puf_zeroize = val32;
     else
@@ -518,9 +609,17 @@ pufs_status_t pufs_zeroize(pufs_rt_slot_t slot)
     val32 = wait_status();
 
     if ((val32 & 0x0000001e) != 0) {
+        check = pufs_rt_pmp_set(SBI_PMP_PERM_R);
+        if (check != SUCCESS)
+            return check;
+
         LOG_ERROR("PUFRT status: 0x%08" PRIx32 "\n", val32);
         return E_ERROR;
     }
+
+    if ((check = pufs_rt_pmp_set(SBI_PMP_PERM_R)) != SUCCESS)
+        return check;
+
     return SUCCESS;
 #endif
 }
@@ -537,6 +636,11 @@ pufs_status_t pufs_post_mask(uint64_t maskslots)
     return SUCCESS;
 #else
     LOG_WARN("POST_MASK: maskslots=0x%016" PRIx64, maskslots);
+
+    pufs_status_t check;
+
+    if ((check = pufs_rt_pmp_set(SBI_PMP_PERM_R | SBI_PMP_PERM_W)) != SUCCESS)
+        return check;
 
     puf_psmsk = (maskslots & 0xf);
     otp_psmsk_0 = ((maskslots >> 4) & 0x0000ffff);
@@ -560,6 +664,9 @@ pufs_status_t pufs_post_mask(uint64_t maskslots)
     }
 
     rt_regs->puf_psmsk = val32_0;
+
+    if ((check = pufs_rt_pmp_set(SBI_PMP_PERM_R)) != SUCCESS)
+        return check;
 
     return SUCCESS;
 #endif
@@ -640,6 +747,7 @@ static pufs_status_t otp_unified_range_check(pufs_otp_addr_t addr, uint32_t len)
     return SUCCESS;
 }
 
+/* Little-Endian Data Serialize as Big-Endian */
 pufs_status_t pufs_otp_read(uint8_t* outbuf, uint32_t len, pufs_otp_addr_t addr)
 {
     pufs_status_t check;
@@ -650,6 +758,7 @@ pufs_status_t pufs_otp_read(uint8_t* outbuf, uint32_t len, pufs_otp_addr_t addr)
     return pufs_read_cde(outbuf, len, addr - OTP_LEN);
 }
 
+/* Little-Endian Data Serialize as Big-Endian */
 pufs_status_t pufs_otp_write(const uint8_t* inbuf, uint32_t len,
     pufs_otp_addr_t addr)
 {
@@ -686,4 +795,163 @@ pufs_status_t pufs_otp_set_lock(pufs_otp_addr_t addr, uint32_t len,
     if (lock == NA)
         return E_INVALID; /* CDE has no NA state */
     return rt_cde_write_lock(addr - OTP_LEN, len, lock);
+}
+
+static uint32_t otp_config_word_from_bytes(const uint8_t word_bytes[WORD_SIZE])
+{
+    // Parse as Big-Endian to match the underlying OTP read API
+    return ((uint32_t)word_bytes[3]) |
+           ((uint32_t)word_bytes[2] << 8) |
+           ((uint32_t)word_bytes[1] << 16) |
+           ((uint32_t)word_bytes[0] << 24);
+}
+
+static void otp_config_word_to_bytes(uint8_t word_bytes[WORD_SIZE], uint32_t word)
+{
+    // Serialize as Big-Endian to match the underlying OTP write API
+    word_bytes[3] = word & 0xff;
+    word_bytes[2] = (word >> 8) & 0xff;
+    word_bytes[1] = (word >> 16) & 0xff;
+    word_bytes[0] = (word >> 24) & 0xff;
+}
+
+static pufs_status_t otp_update_config_word(pufs_otp_addr_t addr,
+    uint32_t logical_set_bits)
+{
+    pufs_status_t check;
+    uint8_t word_bytes[WORD_SIZE] = {0};
+    uint32_t raw_word;
+    uint32_t updated_raw_word;
+
+    if ((check = pufs_otp_read(word_bytes, sizeof(word_bytes), addr)) != SUCCESS)
+        return check;
+
+    raw_word = otp_config_word_from_bytes(word_bytes);
+
+    /* Config words are updated by directly setting the documented bit from
+     * 0 -> 1 while preserving the rest of the word.
+     */
+    updated_raw_word = raw_word | logical_set_bits;
+
+    if (updated_raw_word != raw_word)
+    {
+        otp_config_word_to_bytes(word_bytes, updated_raw_word);
+        check = pufs_otp_write(word_bytes, sizeof(word_bytes), addr);
+        if (check != SUCCESS)
+            return check;
+    }
+
+    return SUCCESS;
+}
+
+pufs_status_t pufs_otp_apply_security_config(bool disable_spi2axi,
+    bool disable_jtag,
+    bool force_secure_boot, bool disable_isp)
+{
+    pufs_status_t check;
+    uint32_t boot_ctrl_bits = 0;
+
+    if (disable_spi2axi)
+    {
+        check = otp_update_config_word(OTP_CFG_SPI2AXI_ADDR,
+                                       OTP_CFG_DISABLE_SPI2AXI_BIT | 7 << 8);
+        if (check != SUCCESS)
+            return check;
+    }
+
+    if (disable_jtag)
+    {
+        check = otp_update_config_word(OTP_CFG_JTAG_ADDR,
+                                       OTP_CFG_JTAG_DISABLE_BIT);
+        if (check != SUCCESS)
+            return check;
+    }
+
+    if (force_secure_boot)
+        boot_ctrl_bits |= OTP_CFG_FORCE_SECURE_BOOT_BIT;
+
+    if (disable_isp)
+        boot_ctrl_bits |= OTP_CFG_DISABLE_ISP_BIT;
+
+    if (boot_ctrl_bits != 0)
+        return otp_update_config_word(OTP_CFG_BOOT_CTRL_ADDR,
+                                      boot_ctrl_bits);
+
+    return SUCCESS;
+}
+
+pufs_status_t pufs_otp_disable_spi2axi(void)
+{
+    return pufs_otp_apply_security_config(true, false, false, false);
+}
+
+pufs_status_t pufs_otp_disable_jtag(void)
+{
+    return pufs_otp_apply_security_config(false, true, false, false);
+}
+
+pufs_status_t pufs_otp_force_secure_boot(void)
+{
+    return pufs_otp_apply_security_config(false, false, true, false);
+}
+
+pufs_status_t pufs_otp_disable_isp(void)
+{
+    return pufs_otp_apply_security_config(false, false, false, true);
+}
+
+pufs_status_t pufs_otp_get_security_config_state(
+    pufs_otp_security_state_st *state)
+{
+    pufs_status_t check;
+    uint8_t word_bytes[WORD_SIZE];
+    uint32_t raw_word;
+
+    if (state == NULL)
+        return E_INVALID;
+
+    memset(state, 0, sizeof(*state));
+
+    check = pufs_otp_read(word_bytes, sizeof(word_bytes), OTP_CFG_SPI2AXI_ADDR);
+    if (check != SUCCESS)
+        return check;
+
+    raw_word = otp_config_word_from_bytes(word_bytes);
+    state->disable_spi2axi = (raw_word & OTP_CFG_DISABLE_SPI2AXI_BIT) ? 1 : 0;
+    state->spi2axi_word_lock = pufs_otp_get_lock(OTP_CFG_SPI2AXI_ADDR);
+
+    check = pufs_otp_read(word_bytes, sizeof(word_bytes), OTP_CFG_JTAG_ADDR);
+    if (check != SUCCESS)
+        return check;
+
+    raw_word = otp_config_word_from_bytes(word_bytes);
+    state->disable_jtag = (raw_word & OTP_CFG_JTAG_DISABLE_BIT) ? 1 : 0;
+    state->jtag_word_lock = pufs_otp_get_lock(OTP_CFG_JTAG_ADDR);
+
+    check = pufs_otp_read(word_bytes, sizeof(word_bytes), OTP_CFG_BOOT_CTRL_ADDR);
+    if (check != SUCCESS)
+        return check;
+
+    raw_word = otp_config_word_from_bytes(word_bytes);
+    state->force_secure_boot =
+        (raw_word & OTP_CFG_FORCE_SECURE_BOOT_BIT) ? 1 : 0;
+    state->disable_isp = (raw_word & OTP_CFG_DISABLE_ISP_BIT) ? 1 : 0;
+    state->boot_ctrl_word_lock = pufs_otp_get_lock(OTP_CFG_BOOT_CTRL_ADDR);
+
+    return SUCCESS;
+}
+
+pufs_status_t pufs_otp_lock_security_config_words(void)
+{
+    pufs_status_t check;
+
+    check = pufs_otp_set_lock(OTP_CFG_SPI2AXI_ADDR, WORD_SIZE, RO);
+    if (check != SUCCESS)
+        return check;
+
+    check = pufs_otp_set_lock(OTP_CFG_JTAG_ADDR, WORD_SIZE, RO);
+    if (check != SUCCESS)
+        return check;
+
+    return pufs_otp_set_lock(OTP_CFG_BOOT_CTRL_ADDR, WORD_SIZE, RO);
 }
