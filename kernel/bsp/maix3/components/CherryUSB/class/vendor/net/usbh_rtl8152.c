@@ -2360,3 +2360,13 @@ CLASS_INFO_DEFINE const struct usbh_class_info rtl8152_class_info = {
     .pid = 0x8152,
     .class_driver = &rtl8152_class_driver
 };
+
+CLASS_INFO_DEFINE const struct usbh_class_info sr9900_rtl8152_class_info = {
+    .match_flags = USB_CLASS_MATCH_VENDOR | USB_CLASS_MATCH_PRODUCT | USB_CLASS_MATCH_INTF_CLASS,
+    .class = 0xff,
+    .subclass = 0x00,
+    .protocol = 0x00,
+    .vid = 0x0FE6,
+    .pid = 0x9900,
+    .class_driver = &rtl8152_class_driver
+};

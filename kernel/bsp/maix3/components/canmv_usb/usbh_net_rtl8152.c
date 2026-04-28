@@ -18,6 +18,16 @@
 
 static struct eth_device rtl8152_dev;
 
+static void rt_usbh_rtl8152_sync_hwaddr(struct usbh_rtl8152 *rtl8152_class)
+{
+    if (rtl8152_dev.netif == RT_NULL) {
+        return;
+    }
+
+    rtl8152_dev.netif->hwaddr_len = 6;
+    rt_memcpy(rtl8152_dev.netif->hwaddr, rtl8152_class->mac, 6);
+}
+
 static rt_err_t rt_usbh_rtl8152_control(rt_device_t dev, int cmd, void *args)
 {
     struct usbh_rtl8152 *rtl8152_class = (struct usbh_rtl8152 *)dev->user_data;
@@ -64,8 +74,6 @@ static rt_err_t rt_usbh_rtl8152_eth_tx(rt_device_t dev, struct pbuf *p)
 
 void usbh_rtl8152_run(struct usbh_rtl8152 *rtl8152_class)
 {
-    struct netdev *netdev;
-
     usb_memset(&rtl8152_dev, 0, sizeof(struct eth_device));
 
     rtl8152_dev.parent.ops         = &rtl8152_device_ops;
@@ -75,7 +83,7 @@ void usbh_rtl8152_run(struct usbh_rtl8152 *rtl8152_class)
     rtl8152_dev.parent.user_data = rtl8152_class;
 
     eth_device_init(&rtl8152_dev, CANMV_USB_HOST_NET_RTL8152_DEV_NAME);
-    // eth_device_linkchange(&rtl8152_dev, RT_TRUE);
+    rt_usbh_rtl8152_sync_hwaddr(rtl8152_class);
 
     usb_osal_thread_create("usbh_rtl8152_rx", 4096, 15, usbh_rtl8152_rx_thread, rtl8152_dev.netif);
 }
