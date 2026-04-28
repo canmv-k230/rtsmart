@@ -274,10 +274,6 @@ static void auto_exec_trusted_preload(const char *cmd_line)
     }
   }
 
-  if (argc > 0 && rt_strcmp(argv[argc - 1], "&") == 0) {
-    argv[--argc] = RT_NULL;
-  }
-
   if (argc <= 0 || exec(argv[0], 0, argc, argv) <= 0) {
     rt_kprintf("trusted preload image unavailable, enable fast boot and ensure U-Boot preloads rtapp\n");
   }
