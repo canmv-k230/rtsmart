@@ -361,14 +361,17 @@ int main(void) {
     size_t cmd_length = rt_strlen(CONFIG_RTT_AUTO_EXEC_CMD);
 
     if(cmd_length) {
-#ifdef CONFIG_SECURE_BOOT_FIRMWARE_ENABLE
       if (auto_exec_cmd_is_trusted_preload(CONFIG_RTT_AUTO_EXEC_CMD)) {
         auto_exec_trusted_preload(CONFIG_RTT_AUTO_EXEC_CMD);
-      } else {
+      }
+#ifdef CONFIG_SECURE_BOOT_FIRMWARE_ENABLE
+      else {
         rt_kprintf("secure boot requires CONFIG_RTT_AUTO_EXEC_CMD to start with @preload; skip auto exec\n");
       }
 #else
-      msh_exec(CONFIG_RTT_AUTO_EXEC_CMD, cmd_length);
+      else {
+        msh_exec(CONFIG_RTT_AUTO_EXEC_CMD, cmd_length);
+      }
 #endif
     }
   }
