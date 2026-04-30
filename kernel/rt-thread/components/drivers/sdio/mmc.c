@@ -185,6 +185,7 @@ static int mmc_get_ext_csd(struct rt_mmcsd_card *card, rt_uint8_t **new_ext_csd)
 static int mmc_parse_ext_csd(struct rt_mmcsd_card *card, rt_uint8_t *ext_csd)
 {
     rt_uint64_t card_capacity = 0;
+    rt_uint32_t erase_group_size;
     struct rt_mmcsd_host *host;
     if (card == RT_NULL || ext_csd == RT_NULL)
     {
@@ -214,6 +215,17 @@ static int mmc_parse_ext_csd(struct rt_mmcsd_card *card, rt_uint8_t *ext_csd)
     card_capacity *= card->card_blksize;
     card_capacity >>= 10; /* unit:KB */
     card->card_capacity = card_capacity;
+
+    if (ext_csd[EXT_CSD_ERASE_GROUP_DEF] & 0x1)
+    {
+        erase_group_size = ext_csd[EXT_CSD_HC_ERASE_GRP_SIZE];
+        if (erase_group_size != 0)
+        {
+            /* HC erase group size is reported in 512 KiB units. */
+            card->erase_size = erase_group_size * 1024;
+        }
+    }
+
     LOG_I("emmc card capacity %d KB, card sec count:%d.", card->card_capacity, card->card_sec_cnt);
 
     return 0;

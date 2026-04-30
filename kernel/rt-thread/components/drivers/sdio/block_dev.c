@@ -26,6 +26,16 @@ static rt_list_t blk_devices = RT_LIST_OBJECT_INIT(blk_devices);
 
 #define BLK_MIN(a, b) ((a) < (b) ? (a) : (b))
 
+static rt_uint32_t mmcsd_geometry_block_size(const struct rt_mmcsd_card *card)
+{
+    if (card->erase_size != 0)
+    {
+        return card->erase_size << 9;
+    }
+
+    return card->card_blksize;
+}
+
 struct mmcsd_blk_device
 {
     struct rt_mmcsd_card *card;
@@ -452,7 +462,7 @@ rt_int32_t gpt_device_probe(struct rt_mmcsd_card *card)
     blk_dev->card = card;
 
     blk_dev->geometry.bytes_per_sector = 1 << 9;
-    blk_dev->geometry.block_size = card->card_blksize;
+    blk_dev->geometry.block_size = mmcsd_geometry_block_size(card);
     blk_dev->geometry.sector_count =
         card->card_capacity * (1024 / 512);
 
@@ -498,7 +508,7 @@ rt_int32_t gpt_device_probe(struct rt_mmcsd_card *card)
             blk_dev->card = card;
 
             blk_dev->geometry.bytes_per_sector = 1 << 9;
-            blk_dev->geometry.block_size = card->card_blksize;
+            blk_dev->geometry.block_size = mmcsd_geometry_block_size(card);
             blk_dev->geometry.sector_count = blk_dev->part.size;
 
             blk_dev->dev.user_data = blk_dev;
@@ -584,7 +594,7 @@ rt_int32_t mbr_device_probe(struct rt_mmcsd_card *card)
         blk_dev->card = card;
 
         blk_dev->geometry.bytes_per_sector = 1 << 9;
-        blk_dev->geometry.block_size = card->card_blksize;
+        blk_dev->geometry.block_size = mmcsd_geometry_block_size(card);
         blk_dev->geometry.sector_count =
             card->card_capacity * (1024 / 512);
 
@@ -629,7 +639,7 @@ rt_int32_t mbr_device_probe(struct rt_mmcsd_card *card)
                 blk_dev->card = card;
 
                 blk_dev->geometry.bytes_per_sector = 1 << 9;
-                blk_dev->geometry.block_size = card->card_blksize;
+                blk_dev->geometry.block_size = mmcsd_geometry_block_size(card);
                 blk_dev->geometry.sector_count = blk_dev->part.size;
 
                 blk_dev->dev.user_data = blk_dev;

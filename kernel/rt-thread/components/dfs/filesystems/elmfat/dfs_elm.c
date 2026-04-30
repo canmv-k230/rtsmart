@@ -276,7 +276,7 @@ int dfs_elm_mkfs(rt_device_t dev_id, const char *fs_name)
     /* [IN] Size of the allocation unit */
     /* [-]  Working buffer */
     /* [IN] Size of working buffer */
-    result = f_mkfs(logic_nbr, FM_ANY | FM_SFD, 0, work, _MAX_SS);
+    result = f_mkfs(logic_nbr, FM_EXFAT | FM_SFD, 0, work, _MAX_SS);
     rt_free(work);
     work = RT_NULL;
 

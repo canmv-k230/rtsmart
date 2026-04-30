@@ -42,6 +42,26 @@ static const rt_uint8_t tacc_value[] =
     35, 40, 45, 50, 55, 60, 70, 80,
 };
 
+static const rt_uint32_t sd_au_size_map[] =
+{
+    0,
+    16 * 1024,
+    32 * 1024,
+    64 * 1024,
+    128 * 1024,
+    256 * 1024,
+    512 * 1024,
+    1024 * 1024,
+    2 * 1024 * 1024,
+    4 * 1024 * 1024,
+    8 * 1024 * 1024,
+    12 * 1024 * 1024,
+    16 * 1024 * 1024,
+    24 * 1024 * 1024,
+    32 * 1024 * 1024,
+    64 * 1024 * 1024,
+};
+
 rt_inline rt_uint32_t GET_BITS(rt_uint32_t *resp,
                                rt_uint32_t  start,
                                rt_uint32_t  size)
@@ -146,6 +166,21 @@ static rt_int32_t mmcsd_parse_scr(struct rt_mmcsd_card *card)
     scr->sd_bus_widths = GET_BITS(resp, 48, 4);
 
     return 0;
+}
+
+static void mmcsd_parse_ssr(struct rt_mmcsd_card *card, const rt_uint8_t *ssr)
+{
+    rt_uint8_t au_size;
+    rt_uint32_t au_bytes;
+
+    au_size = (ssr[10] >> 4) & 0x0F;
+    au_bytes = sd_au_size_map[au_size];
+    if (au_bytes == 0)
+    {
+        return;
+    }
+
+    card->erase_size = au_bytes >> 9;
 }
 
 static rt_int32_t mmcsd_switch(struct rt_mmcsd_card *card)
@@ -475,6 +510,45 @@ rt_err_t mmcsd_get_card_addr(struct rt_mmcsd_host *host, rt_uint32_t *rca)
     (((rt_uint32_t)(x) & (rt_uint32_t)0x00ff0000UL) >>  8) |        \
     (((rt_uint32_t)(x) & (rt_uint32_t)0xff000000UL) >> 24)))
 
+static rt_int32_t mmcsd_get_ssr(struct rt_mmcsd_card *card, rt_uint8_t *ssr)
+{
+    rt_int32_t err;
+    struct rt_mmcsd_req req;
+    struct rt_mmcsd_cmd cmd;
+    struct rt_mmcsd_data data;
+
+    err = mmcsd_app_cmd(card->host, card);
+    if (err)
+        return err;
+
+    rt_memset(&req, 0, sizeof(struct rt_mmcsd_req));
+    rt_memset(&cmd, 0, sizeof(struct rt_mmcsd_cmd));
+    rt_memset(&data, 0, sizeof(struct rt_mmcsd_data));
+
+    req.cmd = &cmd;
+    req.data = &data;
+
+    cmd.cmd_code = SD_APP_SD_STATUS;
+    cmd.arg = 0;
+    cmd.flags = RESP_SPI_R1 | RESP_R1 | CMD_ADTC;
+
+    data.blksize = 64;
+    data.blks = 1;
+    data.flags = DATA_DIR_READ;
+    data.buf = (rt_uint32_t *)ssr;
+
+    mmcsd_set_data_timeout(&data, card);
+
+    mmcsd_send_request(card->host, &req);
+
+    if (cmd.err)
+        return cmd.err;
+    if (data.err)
+        return data.err;
+
+    return 0;
+}
+
 rt_int32_t mmcsd_get_scr(struct rt_mmcsd_card *card, rt_uint32_t *scr)
 {
     rt_int32_t err;
@@ -525,6 +599,7 @@ static rt_int32_t mmcsd_sd_init_card(struct rt_mmcsd_host *host,
     rt_int32_t err;
     rt_uint32_t resp[4];
     rt_uint32_t max_data_rate;
+    rt_uint8_t ssr[64];
 
     mmcsd_go_idle(host);
 
@@ -594,6 +669,12 @@ static rt_int32_t mmcsd_sd_init_card(struct rt_mmcsd_host *host,
         goto err1;
 
     mmcsd_parse_scr(card);
+
+    rt_memset(ssr, 0, sizeof(ssr));
+    if (mmcsd_get_ssr(card, ssr) == RT_EOK)
+    {
+        mmcsd_parse_ssr(card, ssr);
+    }
 
     if (controller_is_spi(host)) 
     {

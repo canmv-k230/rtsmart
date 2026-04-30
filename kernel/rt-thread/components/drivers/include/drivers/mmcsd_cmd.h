@@ -82,6 +82,7 @@ extern "C" {
 
   /* Application commands */
 #define SD_APP_SET_BUS_WIDTH      6   /* ac   [1:0] bus width    R1  */
+#define SD_APP_SD_STATUS         13   /* adtc                    R1  */
 #define SD_APP_SEND_NUM_WR_BLKS  22   /* adtc                    R1  */
 #define SD_APP_OP_COND           41   /* bcr  [31:0] OCR         R3  */
 #define SD_APP_SEND_SCR          51   /* adtc                    R1  */
