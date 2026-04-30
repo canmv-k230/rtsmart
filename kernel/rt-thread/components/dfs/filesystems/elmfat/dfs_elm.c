@@ -551,6 +551,62 @@ int dfs_elm_ioctl(struct dfs_fd *file, int cmd, void *args)
             fd->fptr = fptr;
             return elm_result_to_dfs(result);
         }
+    case RT_FIOPREALLOCATE:
+        {
+            FIL *fd;
+            const struct dfs_preallocate_args *prealloc;
+            unsigned long long target_size;
+            FRESULT result = FR_OK;
+
+            fd = (FIL *)(file->data);
+            RT_ASSERT(fd != RT_NULL);
+
+            prealloc = (const struct dfs_preallocate_args *)args;
+            if (prealloc == RT_NULL || prealloc->offset < 0 || prealloc->len <= 0)
+            {
+                return -EINVAL;
+            }
+
+            if (!(fd->flag & FA_WRITE))
+            {
+                return -EBADF;
+            }
+
+            if (prealloc->offset != 0)
+            {
+                return -EOPNOTSUPP;
+            }
+
+            target_size = (unsigned long long)prealloc->len;
+            if ((unsigned long long)(FSIZE_t)target_size != target_size)
+            {
+                return -EFBIG;
+            }
+
+            if (fd->obj.objsize >= (FSIZE_t)target_size)
+            {
+                return 0;
+            }
+
+            if (fd->obj.objsize != 0)
+            {
+                return -EOPNOTSUPP;
+            }
+
+            result = f_expand(fd, (FSIZE_t)target_size, 1);
+            if (result == FR_OK)
+            {
+                file->fnode->size = f_size(fd);
+                return 0;
+            }
+
+            if (result == FR_DENIED)
+            {
+                return -ENOSPC;
+            }
+
+            return elm_result_to_dfs(result);
+        }
     case F_GETLK:
             return 0;
     case F_SETLK:

@@ -75,6 +75,12 @@ struct dfs_mmap2_args
     void *ret;
 };
 
+struct dfs_preallocate_args
+{
+    off_t offset;
+    off_t len;
+};
+
 void dfs_fnode_mgr_init(void);
 int dfs_file_is_open(const char *pathname);
 int dfs_file_open(struct dfs_fd *fd, const char *path, int flags);
@@ -96,6 +102,7 @@ int dfs_file_mmap2(struct dfs_fd *fd, struct dfs_mmap2_args *mmap2);
 #define RT_FIOFTRUNCATE  0x52540000U
 #define RT_FIOGETADDR    0x52540001U
 #define RT_FIOMMAP2      0x52540002U
+#define RT_FIOPREALLOCATE 0x52540003U
 
 #ifdef __cplusplus
 }
