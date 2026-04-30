@@ -229,6 +229,9 @@
 /  Instead of private sector buffer eliminated from the file object, common sector
 /  buffer in the file system object (FATFS) is used for the file data transfer. */
 
+/* Force enable exFAT */
+#define RT_DFS_ELM_USE_EXFAT
+
 #ifdef RT_DFS_ELM_USE_EXFAT
 #define _FS_EXFAT	1
 #else
