@@ -472,7 +472,7 @@ void canmv_on_micropython_error(void) {
     mark.path_crc32 = gpt_crc32(file_path, mark.path_length);
     strncpy(mark.path, file_path, sizeof(mark.path));
 
-    memcpy(memory_address, &mark, sizeof(mark));
+    memcpy((void *)memory_address, &mark, sizeof(mark));
 
     rt_iounmap(map_base);
     rt_hw_cpu_reset();
@@ -487,8 +487,8 @@ int check_delete_file_mark(void) {
   void *map_base = rt_ioremap_nocache((void *)(target & ~MAP_MASK), MAP_SIZE);
   volatile void *memory_address = map_base + (target & MAP_MASK);
 
-  memcpy(&mark, memory_address, sizeof(mark));
-  memset(memory_address, 0, sizeof(mark));
+  memcpy(&mark, (void *)memory_address, sizeof(mark));
+  memset((void *)memory_address, 0, sizeof(mark));
   rt_iounmap(map_base);
 
   if (mark.magic != 0xDEADBEEF) {
