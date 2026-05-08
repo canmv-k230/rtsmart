@@ -3,6 +3,7 @@
 #include "lwip/pbuf.h"
 #include "lwip/tcpip.h"
 #include "rtdef.h"
+#include "rtthread.h"
 
 #if LWIP_DHCP
 #include "lwip/dhcp.h"
@@ -17,20 +18,15 @@
 #include "usbh_rtl8152.h"
 
 static struct eth_device rtl8152_dev;
-
-static void rt_usbh_rtl8152_sync_hwaddr(struct usbh_rtl8152 *rtl8152_class)
-{
-    if (rtl8152_dev.netif == RT_NULL) {
-        return;
-    }
-
-    rtl8152_dev.netif->hwaddr_len = 6;
-    rt_memcpy(rtl8152_dev.netif->hwaddr, rtl8152_class->mac, 6);
-}
+static bool rtl8152_netdev_inited;
 
 static rt_err_t rt_usbh_rtl8152_control(rt_device_t dev, int cmd, void *args)
 {
     struct usbh_rtl8152 *rtl8152_class = (struct usbh_rtl8152 *)dev->user_data;
+
+    if (rtl8152_class == RT_NULL || rtl8152_class->stop_requested) {
+        return -RT_ERROR;
+    }
 
     switch (cmd) {
         case NIOCTL_GADDR:
@@ -74,27 +70,52 @@ static rt_err_t rt_usbh_rtl8152_eth_tx(rt_device_t dev, struct pbuf *p)
 
 void usbh_rtl8152_run(struct usbh_rtl8152 *rtl8152_class)
 {
-    usb_memset(&rtl8152_dev, 0, sizeof(struct eth_device));
+    rtl8152_class->stop_requested = false;
 
-    rtl8152_dev.parent.ops         = &rtl8152_device_ops;
+    if (!rtl8152_netdev_inited) {
+        usb_memset(&rtl8152_dev, 0, sizeof(struct eth_device));
 
-    rtl8152_dev.eth_rx = NULL;
-    rtl8152_dev.eth_tx = rt_usbh_rtl8152_eth_tx;
-    rtl8152_dev.parent.user_data = rtl8152_class;
+        rtl8152_dev.parent.ops = &rtl8152_device_ops;
+        rtl8152_dev.eth_rx = NULL;
+        rtl8152_dev.eth_tx = rt_usbh_rtl8152_eth_tx;
+        rtl8152_dev.parent.user_data = rtl8152_class;
 
-    eth_device_init(&rtl8152_dev, CANMV_USB_HOST_NET_RTL8152_DEV_NAME);
-    rt_usbh_rtl8152_sync_hwaddr(rtl8152_class);
+        eth_device_init(&rtl8152_dev, CANMV_USB_HOST_NET_RTL8152_DEV_NAME);
+        rtl8152_netdev_inited = true;
+    } else {
+        rtl8152_dev.parent.user_data = rtl8152_class;
+    }
 
+    if (rtl8152_dev.netif) {
+        rt_memcpy(rtl8152_dev.netif->hwaddr, rtl8152_class->mac,
+                  sizeof(rtl8152_class->mac));
+    }
+
+    eth_device_linkchange(&rtl8152_dev, RT_FALSE);
+
+    rtl8152_class->rx_thread_running = true;
     usb_osal_thread_create("usbh_rtl8152_rx", 4096, 15, usbh_rtl8152_rx_thread, rtl8152_dev.netif);
 }
 
 void usbh_rtl8152_stop(struct usbh_rtl8152 *rtl8152_class)
 {
-    eth_device_deinit(&rtl8152_dev);
+    /* plug is already set to false by disconnect before this is called.
+         Wait for RX thread to exit the data path before releasing the class. */
+    rtl8152_class->stop_requested = true;
+    eth_device_linkchange(&rtl8152_dev, RT_FALSE);
+    rtl8152_dev.parent.user_data = RT_NULL;
+
+    while (rtl8152_class->rx_thread_running) {
+        usb_osal_msleep(10);
+    }
+    /* Keep the RT-Thread netdev registered across unplug/replug. Tearing it
+     * down here can block the USB hub disconnect path long enough to miss the
+     * following connect sequence under high CPU load. */
 }
 
 void usbh_rtl8152_link_changed(struct usbh_rtl8152 *rtl8152_class, int state)
 {
+    (void)rtl8152_class;
     if(0x00 == state) {
         eth_device_linkchange(&rtl8152_dev, RT_FALSE);
     } else {

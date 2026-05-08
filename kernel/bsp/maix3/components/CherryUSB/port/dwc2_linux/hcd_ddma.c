@@ -23,6 +23,19 @@
 #define MAX_ISOC_XFER_SIZE_HS	3072
 #define DESCNUM_THRESHOLD	4
 
+static bool dwc2_xacterr_is_expected(struct dwc2_hsotg *hsotg)
+{
+    u32 hprt0 = dwc2_readl(hsotg, HPRT0);
+
+    if (hsotg->flags.b.port_connect_status_change ||
+        !hsotg->flags.b.port_connect_status ||
+        hsotg->new_connection ||
+        !(hprt0 & HPRT0_CONNSTS))
+        return true;
+
+    return false;
+}
+
 static u16 dwc2_desclist_idx_inc(u16 idx, u16 inc, u8 speed)
 {
     return (idx + inc) &
@@ -1059,7 +1072,10 @@ static int dwc2_update_non_isoc_urb_state_ddma(struct dwc2_hsotg *hsotg,
             urb->status = -EOVERFLOW;
             break;
         case DWC2_HC_XFER_XACT_ERR:
-            dev_err(hsotg->dev, "XactErr\n");
+            if (dwc2_xacterr_is_expected(hsotg))
+                dev_vdbg(hsotg->dev, "XactErr during port state transition\n");
+            else
+                dev_err(hsotg->dev, "XactErr\n");
             urb->status = -EPROTO;
             break;
         default:

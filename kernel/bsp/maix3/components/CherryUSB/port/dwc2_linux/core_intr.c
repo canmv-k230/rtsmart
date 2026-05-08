@@ -267,14 +267,14 @@ static void dwc2_handle_disconnect_intr(struct dwc2_hsotg *hsotg)
 {
     dwc2_writel(hsotg, GINTSTS_DISCONNINT, GINTSTS);
 
-    dev_err(hsotg->dev, "++Disconnect Detected Interrupt++ (%s) %s\n",
-            dwc2_is_host_mode(hsotg) ? "Host" : "Device",
-            dwc2_op_state_str(hsotg));
-
 #if 0
     if (hsotg->op_state == OTG_STATE_A_HOST)
 #endif
         dwc2_hcd_disconnect(hsotg, false);
+
+    dev_err(hsotg->dev, "Disconn (%s) %s\n",
+            dwc2_is_host_mode(hsotg) ? "Host" : "Device",
+            dwc2_op_state_str(hsotg));
 }
 
 

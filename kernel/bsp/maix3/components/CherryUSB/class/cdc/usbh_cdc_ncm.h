@@ -30,6 +30,8 @@ struct usbh_cdc_ncm {
 
     uint8_t mac[6];
     bool connect_status;
+    bool stop_requested;
+    bool rx_thread_running;
     uint16_t max_segment_size;
     uint32_t speed[2];
 
@@ -46,6 +48,7 @@ int usbh_cdc_ncm_get_connect_status(struct usbh_cdc_ncm *cdc_ncm_class);
 
 void usbh_cdc_ncm_run(struct usbh_cdc_ncm *cdc_ncm_class);
 void usbh_cdc_ncm_stop(struct usbh_cdc_ncm *cdc_ncm_class);
+void usbh_cdc_ncm_link_changed(struct usbh_cdc_ncm *cdc_ncm_class, bool state);
 
 err_t usbh_cdc_ncm_linkoutput(struct netif *netif, struct pbuf *p);
 void usbh_cdc_ncm_rx_thread(void *argument);

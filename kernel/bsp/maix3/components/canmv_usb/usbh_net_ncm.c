@@ -19,10 +19,15 @@
 struct netif g_cdc_ncm_netif;
 
 static struct eth_device cdc_ncm_dev;
+static bool cdc_ncm_netdev_inited;
 
 static rt_err_t rt_usbh_cdc_ncm_control(rt_device_t dev, int cmd, void *args)
 {
     struct usbh_cdc_ncm *cdc_ncm_class = (struct usbh_cdc_ncm *)dev->user_data;
+
+    if (cdc_ncm_class == RT_NULL || cdc_ncm_class->stop_requested) {
+        return -RT_ERROR;
+    }
 
     switch (cmd) {
         case NIOCTL_GADDR:
@@ -66,22 +71,46 @@ const static struct rt_device_ops net_ncm_device_ops =
 
 void usbh_cdc_ncm_run(struct usbh_cdc_ncm *cdc_ncm_class)
 {
-    struct netdev *netdev;
+    cdc_ncm_class->stop_requested = false;
 
-    usb_memset(&cdc_ncm_dev, 0, sizeof(struct eth_device));
+    if (!cdc_ncm_netdev_inited) {
+        usb_memset(&cdc_ncm_dev, 0, sizeof(struct eth_device));
 
-    cdc_ncm_dev.parent.ops = &net_ncm_device_ops;
-    cdc_ncm_dev.eth_rx = NULL;
-    cdc_ncm_dev.eth_tx = rt_usbh_cdc_ncm_eth_tx;
-    cdc_ncm_dev.parent.user_data = cdc_ncm_class;
+        cdc_ncm_dev.parent.ops = &net_ncm_device_ops;
+        cdc_ncm_dev.eth_rx = NULL;
+        cdc_ncm_dev.eth_tx = rt_usbh_cdc_ncm_eth_tx;
+        cdc_ncm_dev.parent.user_data = cdc_ncm_class;
 
-    eth_device_init(&cdc_ncm_dev, CANMV_USB_HOST_NET_LTE_DEV_NAME);
-    eth_device_linkchange(&cdc_ncm_dev, RT_TRUE);
+        eth_device_init(&cdc_ncm_dev, CANMV_USB_HOST_NET_LTE_DEV_NAME);
+        cdc_ncm_netdev_inited = true;
+    } else {
+        cdc_ncm_dev.parent.user_data = cdc_ncm_class;
+    }
 
+    if (cdc_ncm_dev.netif) {
+        rt_memcpy(cdc_ncm_dev.netif->hwaddr, cdc_ncm_class->mac,
+                  sizeof(cdc_ncm_class->mac));
+    }
+
+    eth_device_linkchange(&cdc_ncm_dev, RT_FALSE);
+
+    cdc_ncm_class->rx_thread_running = true;
     usb_osal_thread_create("usbh_cdc_ncm_rx", 4096, CONFIG_USBHOST_PSC_PRIO + 1, usbh_cdc_ncm_rx_thread, cdc_ncm_dev.netif);
 }
 
 void usbh_cdc_ncm_stop(struct usbh_cdc_ncm *cdc_ncm_class)
 {
-    eth_device_deinit(&cdc_ncm_dev);
+    cdc_ncm_class->stop_requested = true;
+    eth_device_linkchange(&cdc_ncm_dev, RT_FALSE);
+    cdc_ncm_dev.parent.user_data = RT_NULL;
+
+    while (cdc_ncm_class->rx_thread_running) {
+        usb_osal_msleep(10);
+    }
+}
+
+void usbh_cdc_ncm_link_changed(struct usbh_cdc_ncm *cdc_ncm_class, bool state)
+{
+    (void)cdc_ncm_class;
+    eth_device_linkchange(&cdc_ncm_dev, state ? RT_TRUE : RT_FALSE);
 }

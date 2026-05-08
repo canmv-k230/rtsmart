@@ -16,6 +16,8 @@
 #define HUB_DEBOUNCE_STEP      25
 #define HUB_DEBOUNCE_STABLE    100
 #define DELAY_TIME_AFTER_RESET 200
+#define DELAY_TIME_BEFORE_ENUMERATE 20
+#define DELAY_TIME_ENUM_NOTCONN_BACKOFF 100
 
 #define EXTHUB_FIRST_INDEX 2
 
@@ -304,7 +306,6 @@ extern int dwc2_hcd_endpoint_disable(struct usbh_hcd *hcd, struct usb_host_endpo
             }
         }
 #endif
-
         usb_osal_mutex_delete(child->mutex);
     }
 }
@@ -722,9 +723,20 @@ static void usbh_hub_events(struct usbh_hub *hub)
                     usb_osal_thread_create("usbh_enum", CONFIG_USBHOST_PSC_STACKSIZE, CONFIG_USBHOST_PSC_PRIO + 1, usbh_hubport_enumerate_thread, (void *)child);
 #else
                     for (uint8_t enum_retry = 0; enum_retry < 3; enum_retry++) {
+                        /* A fast unplug/replug can report port enable before the
+                         * device is ready for the first EP0 descriptor read.
+                         * The removed printk path used to provide this settle
+                         * time implicitly. */
+                        usb_osal_msleep(DELAY_TIME_BEFORE_ENUMERATE);
                         ret = usbh_enumerate(child);
                         if (ret >= 0)
                             break;
+
+                        if (ret == -USB_ERR_NOTCONN) {
+                            /* The device bounced away during the first GET_DESCRIPTOR.
+                             * Wait for the connect state to settle before re-resetting. */
+                            usb_osal_msleep(DELAY_TIME_ENUM_NOTCONN_BACKOFF);
+                        }
 
                         USB_LOG_WRN("Port %u enumerate attempt %u failed (%d), re-resetting\r\n",
                                     child->port, enum_retry + 1, ret);

@@ -26,6 +26,8 @@ struct usbh_cdc_ecm {
     
     uint8_t mac[6];
     bool connect_status;
+    bool stop_requested;
+    bool rx_thread_running;
     uint16_t max_segment_size;
     uint32_t speed[2];
 
@@ -42,6 +44,7 @@ int usbh_cdc_ecm_get_connect_status(struct usbh_cdc_ecm *cdc_ecm_class);
 
 void usbh_cdc_ecm_run(struct usbh_cdc_ecm *cdc_ecm_class);
 void usbh_cdc_ecm_stop(struct usbh_cdc_ecm *cdc_ecm_class);
+void usbh_cdc_ecm_link_changed(struct usbh_cdc_ecm *cdc_ecm_class, bool state);
 
 err_t usbh_cdc_ecm_linkoutput(struct netif *netif, struct pbuf *p);
 void usbh_cdc_ecm_rx_thread(void *argument);

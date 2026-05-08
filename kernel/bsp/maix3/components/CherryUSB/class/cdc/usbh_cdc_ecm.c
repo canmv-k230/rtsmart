@@ -22,13 +22,43 @@
 #define INTF_DESC_bAlternateSetting 3 /** Alternate setting offset */
 
 #define CONFIG_USBHOST_CDC_ECM_PKT_FILTER     0x000C
-#define CONFIG_USBHOST_CDC_ECM_ETH_MAX_SEGSZE 1544U
+#define CONFIG_USBHOST_CDC_ECM_ETH_MAX_SEGSZE 1522U
 
-static USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t g_cdc_ecm_rx_buffer[USB_ALIGN_UP(CONFIG_USBHOST_CDC_ECM_ETH_MAX_SEGSZE, CONFIG_USB_ALIGN_SIZE)];
-static USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t g_cdc_ecm_tx_buffer[USB_ALIGN_UP(CONFIG_USBHOST_CDC_ECM_ETH_MAX_SEGSZE, CONFIG_USB_ALIGN_SIZE)];
+static USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t g_cdc_ecm_rx_buffer[USB_ALIGN_UP(CONFIG_USBHOST_CDC_ECM_ETH_MAX_SEGSZE * 4, CONFIG_USB_ALIGN_SIZE)];
+static USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t g_cdc_ecm_tx_buffer[USB_ALIGN_UP(CONFIG_USBHOST_CDC_ECM_ETH_MAX_SEGSZE * 4, CONFIG_USB_ALIGN_SIZE)];
 static USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t g_cdc_ecm_inttx_buffer[USB_ALIGN_UP(16, CONFIG_USB_ALIGN_SIZE)];
 
 static struct usbh_cdc_ecm g_cdc_ecm_class;
+static usb_osal_mutex_t g_cdc_ecm_tx_mutex;
+
+static void usbh_cdc_ecm_set_link_state(struct usbh_cdc_ecm *cdc_ecm_class, bool connected)
+{
+    if (cdc_ecm_class->connect_status != connected) {
+        cdc_ecm_class->connect_status = connected;
+        usbh_cdc_ecm_link_changed(cdc_ecm_class, connected);
+    } else {
+        cdc_ecm_class->connect_status = connected;
+    }
+}
+
+static bool usbh_cdc_ecm_is_active(struct usbh_cdc_ecm *cdc_ecm_class)
+{
+    return !cdc_ecm_class->stop_requested &&
+           usbh_find_class_instance(DEV_FORMAT) == cdc_ecm_class;
+}
+
+static bool usbh_cdc_ecm_can_xmit(struct usbh_cdc_ecm *cdc_ecm_class)
+{
+    return usbh_cdc_ecm_is_active(cdc_ecm_class) &&
+           cdc_ecm_class->connect_status &&
+           cdc_ecm_class->hport &&
+           cdc_ecm_class->bulkout;
+}
+
+static void usbh_cdc_ecm_handle_rx_error(struct usbh_cdc_ecm *cdc_ecm_class)
+{
+    usbh_cdc_ecm_set_link_state(cdc_ecm_class, false);
+}
 
 static int usbh_cdc_ecm_set_eth_packet_filter(struct usbh_cdc_ecm *cdc_ecm_class, uint16_t filter_value)
 {
@@ -55,9 +85,9 @@ int usbh_cdc_ecm_get_connect_status(struct usbh_cdc_ecm *cdc_ecm_class)
 
     if (g_cdc_ecm_inttx_buffer[1] == CDC_ECM_NOTIFY_CODE_NETWORK_CONNECTION) {
         if (g_cdc_ecm_inttx_buffer[2] == CDC_ECM_NET_CONNECTED) {
-            cdc_ecm_class->connect_status = true;
+            usbh_cdc_ecm_set_link_state(cdc_ecm_class, true);
         } else {
-            cdc_ecm_class->connect_status = false;
+            usbh_cdc_ecm_set_link_state(cdc_ecm_class, false);
         }
     } else if (g_cdc_ecm_inttx_buffer[1] == CDC_ECM_NOTIFY_CODE_CONNECTION_SPEED_CHANGE) {
         usb_memcpy(cdc_ecm_class->speed, &g_cdc_ecm_inttx_buffer[8], 8);
@@ -76,6 +106,13 @@ static int usbh_cdc_ecm_connect(struct usbh_hubport *hport, uint8_t intf)
     uint8_t mac_str_idx = 0xff;
 
     struct usbh_cdc_ecm *cdc_ecm_class = &g_cdc_ecm_class;
+
+    if (g_cdc_ecm_tx_mutex == NULL) {
+        g_cdc_ecm_tx_mutex = usb_osal_mutex_create();
+        if (g_cdc_ecm_tx_mutex == NULL) {
+            return -USB_ERR_NOMEM;
+        }
+    }
 
     usb_memset(cdc_ecm_class, 0, sizeof(struct usbh_cdc_ecm));
 
@@ -139,8 +176,8 @@ get_mac:
                  cdc_ecm_class->mac[4],
                  cdc_ecm_class->mac[5]);
 
-    if (cdc_ecm_class->max_segment_size > CONFIG_USBHOST_CDC_ECM_ETH_MAX_SEGSZE) {
-        USB_LOG_ERR("CDC ECM Max Segment Size is overflow, default is %u, but now %u\r\n", CONFIG_USBHOST_CDC_ECM_ETH_MAX_SEGSZE, cdc_ecm_class->max_segment_size);
+    if (cdc_ecm_class->max_segment_size > sizeof(g_cdc_ecm_rx_buffer)) {
+        USB_LOG_ERR("CDC ECM Max Segment Size is overflow, buffer is %u, but device reports %u\r\n", (unsigned)sizeof(g_cdc_ecm_rx_buffer), cdc_ecm_class->max_segment_size);
     } else {
         USB_LOG_INFO("CDC ECM Max Segment Size:%u\r\n", cdc_ecm_class->max_segment_size);
     }
@@ -199,10 +236,17 @@ get_mac:
 static int usbh_cdc_ecm_disconnect(struct usbh_hubport *hport, uint8_t intf)
 {
     int ret = 0;
+    bool registered;
 
     struct usbh_cdc_ecm *cdc_ecm_class = (struct usbh_cdc_ecm *)hport->config.intf[intf].priv;
 
     if (cdc_ecm_class) {
+        cdc_ecm_class->stop_requested = true;
+        usbh_cdc_ecm_set_link_state(cdc_ecm_class, false);
+        registered = hport->config.intf[intf].devname[0] != '\0';
+        hport->config.intf[intf].priv = NULL;
+        hport->config.intf[intf].devname[0] = '\0';
+
         if (cdc_ecm_class->bulkin) {
             usbh_kill_urb(&cdc_ecm_class->bulkin_urb);
         }
@@ -215,8 +259,13 @@ static int usbh_cdc_ecm_disconnect(struct usbh_hubport *hport, uint8_t intf)
             usbh_kill_urb(&cdc_ecm_class->intin_urb);
         }
 
-        if (hport->config.intf[intf].devname[0] != '\0') {
-            USB_LOG_INFO("Unregister CDC ECM Class:%s\r\n", hport->config.intf[intf].devname);
+        if (g_cdc_ecm_tx_mutex) {
+            usb_osal_mutex_take(g_cdc_ecm_tx_mutex);
+            usb_osal_mutex_give(g_cdc_ecm_tx_mutex);
+        }
+
+        if (registered) {
+            USB_LOG_INFO("Unregister CDC ECM Class:%s\r\n", DEV_FORMAT);
             usbh_cdc_ecm_stop(cdc_ecm_class);
         }
 
@@ -235,33 +284,66 @@ void usbh_cdc_ecm_rx_thread(void *argument)
     struct netif *netif = (struct netif *)argument;
 
     USB_LOG_INFO("Create cdc ecm rx thread\r\n");
+    g_cdc_ecm_class.rx_thread_running = true;
     // clang-format off
 find_class:
     // clang-format on
-    g_cdc_ecm_class.connect_status = false;
-    if (usbh_find_class_instance("/dev/cdc_ether") == NULL) {
+    usbh_cdc_ecm_set_link_state(&g_cdc_ecm_class, false);
+    if (!usbh_cdc_ecm_is_active(&g_cdc_ecm_class)) {
         goto delete;
     }
 
-    while (g_cdc_ecm_class.connect_status == false) {
+    while (!g_cdc_ecm_class.stop_requested && g_cdc_ecm_class.connect_status == false) {
         ret = usbh_cdc_ecm_get_connect_status(&g_cdc_ecm_class);
         if (ret < 0) {
+            if (!usbh_cdc_ecm_is_active(&g_cdc_ecm_class)) {
+                goto delete;
+            }
             usb_osal_msleep(100);
             goto find_class;
         }
     }
 
+    if (g_cdc_ecm_class.stop_requested) {
+        goto delete;
+    }
+
     g_cdc_ecm_rx_length = 0;
-    while (1) {
-        usbh_bulk_urb_fill(&g_cdc_ecm_class.bulkin_urb, g_cdc_ecm_class.hport, g_cdc_ecm_class.bulkin, &g_cdc_ecm_rx_buffer[g_cdc_ecm_rx_length], USB_GET_MAXPACKETSIZE(g_cdc_ecm_class.bulkin->wMaxPacketSize), USB_OSAL_WAITING_FOREVER, NULL, NULL);
+    while (!g_cdc_ecm_class.stop_requested) {
+        if (!g_cdc_ecm_class.bulkin || !g_cdc_ecm_class.hport || !usbh_cdc_ecm_is_active(&g_cdc_ecm_class)) {
+            goto find_class;
+        }
+
+        uint32_t max_pkt = USB_GET_MAXPACKETSIZE(g_cdc_ecm_class.bulkin->wMaxPacketSize);
+
+        if (g_cdc_ecm_rx_length + max_pkt > sizeof(g_cdc_ecm_rx_buffer)) {
+            USB_LOG_ERR("CDC ECM RX overflow, dropping frame (len=%u)\r\n", g_cdc_ecm_rx_length);
+            /* Drain remaining packets of this frame until short packet (end of frame) */
+            for (int drain = 0; drain < 128; drain++) {
+                usbh_bulk_urb_fill(&g_cdc_ecm_class.bulkin_urb, g_cdc_ecm_class.hport, g_cdc_ecm_class.bulkin, g_cdc_ecm_rx_buffer, max_pkt, USB_OSAL_WAITING_FOREVER, NULL, NULL);
+                ret = usbh_submit_urb(&g_cdc_ecm_class.bulkin_urb);
+                if (ret < 0) {
+                    usbh_cdc_ecm_handle_rx_error(&g_cdc_ecm_class);
+                    goto find_class;
+                }
+                if (g_cdc_ecm_class.bulkin_urb.actual_length != max_pkt) {
+                    break; /* Short packet = end of frame */
+                }
+            }
+            g_cdc_ecm_rx_length = 0;
+            continue;
+        }
+
+        usbh_bulk_urb_fill(&g_cdc_ecm_class.bulkin_urb, g_cdc_ecm_class.hport, g_cdc_ecm_class.bulkin, &g_cdc_ecm_rx_buffer[g_cdc_ecm_rx_length], max_pkt, USB_OSAL_WAITING_FOREVER, NULL, NULL);
         ret = usbh_submit_urb(&g_cdc_ecm_class.bulkin_urb);
         if (ret < 0) {
+            usbh_cdc_ecm_handle_rx_error(&g_cdc_ecm_class);
             goto find_class;
         }
 
         g_cdc_ecm_rx_length += g_cdc_ecm_class.bulkin_urb.actual_length;
 
-        if (g_cdc_ecm_class.bulkin_urb.actual_length != USB_GET_MAXPACKETSIZE(g_cdc_ecm_class.bulkin->wMaxPacketSize)) {
+        if (g_cdc_ecm_class.bulkin_urb.actual_length != max_pkt) {
             USB_LOG_DBG("rxlen:%d\r\n", g_cdc_ecm_rx_length);
 
             p = pbuf_alloc(PBUF_RAW, g_cdc_ecm_rx_length, PBUF_POOL);
@@ -283,6 +365,7 @@ find_class:
     }
     // clang-format off
 delete:
+    g_cdc_ecm_class.rx_thread_running = false;
     USB_LOG_INFO("Delete cdc ecm rx thread\r\n");
     usb_osal_thread_delete(NULL);
     // clang-format on
@@ -294,7 +377,20 @@ err_t usbh_cdc_ecm_linkoutput(struct netif *netif, struct pbuf *p)
     struct pbuf *q;
     uint8_t *buffer = g_cdc_ecm_tx_buffer;
 
-    if (g_cdc_ecm_class.connect_status == false) {
+    if (g_cdc_ecm_tx_mutex == NULL) {
+        return ERR_BUF;
+    }
+
+    usb_osal_mutex_take(g_cdc_ecm_tx_mutex);
+
+    if (!usbh_cdc_ecm_can_xmit(&g_cdc_ecm_class)) {
+        usb_osal_mutex_give(g_cdc_ecm_tx_mutex);
+        return ERR_BUF;
+    }
+
+    if (p->tot_len > sizeof(g_cdc_ecm_tx_buffer)) {
+        USB_LOG_ERR("CDC ECM TX frame too large (%u > %u)\r\n", p->tot_len, (unsigned)sizeof(g_cdc_ecm_tx_buffer));
+        usb_osal_mutex_give(g_cdc_ecm_tx_mutex);
         return ERR_BUF;
     }
 
@@ -313,9 +409,12 @@ err_t usbh_cdc_ecm_linkoutput(struct netif *netif, struct pbuf *p)
 
     ret = usbh_submit_urb(&g_cdc_ecm_class.bulkout_urb);
     if (ret < 0) {
+        usbh_cdc_ecm_set_link_state(&g_cdc_ecm_class, false);
+        usb_osal_mutex_give(g_cdc_ecm_tx_mutex);
         return ERR_BUF;
     }
 
+    usb_osal_mutex_give(g_cdc_ecm_tx_mutex);
     return ERR_OK;
 }
 
@@ -324,6 +423,10 @@ __WEAK void usbh_cdc_ecm_run(struct usbh_cdc_ecm *cdc_ecm_class)
 }
 
 __WEAK void usbh_cdc_ecm_stop(struct usbh_cdc_ecm *cdc_ecm_class)
+{
+}
+
+__WEAK void usbh_cdc_ecm_link_changed(struct usbh_cdc_ecm *cdc_ecm_class, bool state)
 {
 }
 

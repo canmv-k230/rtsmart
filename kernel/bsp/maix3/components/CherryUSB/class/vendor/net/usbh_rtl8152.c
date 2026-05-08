@@ -24,6 +24,25 @@ static USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t g_rtl8152_inttx_buffer[USB
 USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t g_rtl8152_buf[USB_ALIGN_UP(32, CONFIG_USB_ALIGN_SIZE)];
 
 static struct usbh_rtl8152 g_rtl8152_class;
+static usb_osal_mutex_t g_rtl8152_tx_mutex;
+
+static bool usbh_rtl8152_is_active(struct usbh_rtl8152 *rtl8152_class)
+{
+    return rtl8152_class->plug && !rtl8152_class->stop_requested &&
+           usbh_find_class_instance(DEV_FORMAT) == rtl8152_class;
+}
+
+static bool usbh_rtl8152_can_xmit(struct usbh_rtl8152 *rtl8152_class)
+{
+    return usbh_rtl8152_is_active(rtl8152_class) &&
+           rtl8152_class->connect_status &&
+           rtl8152_class->hport &&
+           rtl8152_class->bulkout;
+}
+
+static void usbh_rtl8152_prepare_recovery(struct usbh_rtl8152 *rtl8152_class,
+                                          bool cancel_work,
+                                          bool device_alive);
 
 #define RTL8152_REQ_GET_REGS 0x05
 #define RTL8152_REQ_SET_REGS 0x05
@@ -1984,11 +2003,19 @@ static int usbh_rtl8152_connect(struct usbh_hubport *hport, uint8_t intf)
 
     struct usbh_rtl8152 *rtl8152_class = &g_rtl8152_class;
 
+    if (g_rtl8152_tx_mutex == NULL) {
+        g_rtl8152_tx_mutex = usb_osal_mutex_create();
+        if (g_rtl8152_tx_mutex == NULL) {
+            return -USB_ERR_NOMEM;
+        }
+    }
+
     usb_memset(rtl8152_class, 0, sizeof(struct usbh_rtl8152));
 
     rtl8152_class->hport = hport;
     rtl8152_class->intf = intf;
     rtl8152_class->plug = true;
+    rtl8152_class->stop_requested = false;
 
     hport->config.intf[intf].priv = rtl8152_class;
 
@@ -2106,11 +2133,23 @@ static int usbh_rtl8152_connect(struct usbh_hubport *hport, uint8_t intf)
 static int usbh_rtl8152_disconnect(struct usbh_hubport *hport, uint8_t intf)
 {
     int ret = 0;
+    bool registered;
 
     struct usbh_rtl8152 *rtl8152_class = (struct usbh_rtl8152 *)hport->config.intf[intf].priv;
 
     if (rtl8152_class) {
+        rtl8152_class->stop_requested = true;
         rtl8152_class->plug = false;
+        registered = hport->config.intf[intf].devname[0] != '\0';
+        hport->config.intf[intf].priv = NULL;
+        hport->config.intf[intf].devname[0] = '\0';
+        /* Device is gone: never issue control transfers here (would block hub
+         * thread for many seconds on URB timeouts). Just drop the link state
+         * and clear the pending work flag; the work itself will see plug==0
+         * and bail out without touching the dead device. Do NOT call
+         * rt_work_cancel_sync from the hub disconnect context. */
+        usbh_rtl8152_prepare_recovery(rtl8152_class, false, false);
+
         if (rtl8152_class->bulkin) {
             usbh_kill_urb(&rtl8152_class->bulkin_urb);
         }
@@ -2123,8 +2162,13 @@ static int usbh_rtl8152_disconnect(struct usbh_hubport *hport, uint8_t intf)
             usbh_kill_urb(&rtl8152_class->intin_urb);
         }
 
-        if (hport->config.intf[intf].devname[0] != '\0') {
-            USB_LOG_INFO("Unregister rtl8152 Class:%s\r\n", hport->config.intf[intf].devname);
+        if (g_rtl8152_tx_mutex) {
+            usb_osal_mutex_take(g_rtl8152_tx_mutex);
+            usb_osal_mutex_give(g_rtl8152_tx_mutex);
+        }
+
+        if (registered) {
+            USB_LOG_INFO("Unregister rtl8152 Class:%s\r\n", DEV_FORMAT);
             usbh_rtl8152_stop(rtl8152_class);
         }
 
@@ -2139,6 +2183,29 @@ static int usbh_rtl8152_disconnect(struct usbh_hubport *hport, uint8_t intf)
 #define CHECK_LINK_DEBOUNCE_CNT (5)
 static struct rt_delayed_work link_check;
 
+static void usbh_rtl8152_prepare_recovery(struct usbh_rtl8152 *rtl8152_class,
+                                          bool cancel_work,
+                                          bool device_alive)
+{
+    rtl8152_class->connect_status = false;
+    usbh_rtl8152_link_changed(rtl8152_class, 0);
+
+    if (cancel_work && rtl8152_class->submit_work) {
+        rtl8152_class->submit_work = false;
+        rt_work_cancel_sync(&link_check.work);
+    } else {
+        rtl8152_class->submit_work = false;
+    }
+
+    /* Only touch the device when it is still attached. On a USB disconnect
+     * the control transfers will time out and the FIFO_EMPTY polling loops
+     * (1000 * 1ms each) will run to completion, blocking the hub thread for
+     * many seconds. */
+    if (device_alive && rtl8152_class->rtl_ops.disable) {
+        rtl8152_class->rtl_ops.disable(rtl8152_class);
+    }
+}
+
 static void rtl8152_link_check(struct rt_work *work, void *work_data)
 {
     struct netif *netif = (struct netif *)work_data;
@@ -2152,11 +2219,7 @@ static void rtl8152_link_check(struct rt_work *work, void *work_data)
             /* In general, unplug will never in so don't need lock */
             USB_LOG_ERR("link down then kill urb\n");
 
-            usbh_rtl8152_link_changed(&g_rtl8152_class, 0);
-
-            if (g_rtl8152_class.rtl_ops.disable) {
-                g_rtl8152_class.rtl_ops.disable(&g_rtl8152_class);
-            }
+            usbh_rtl8152_prepare_recovery(&g_rtl8152_class, false, true);
 
             usbh_kill_urb(&g_rtl8152_class.bulkin_urb);
             usbh_kill_urb(&g_rtl8152_class.bulkout_urb);
@@ -2173,6 +2236,21 @@ static void rtl8152_link_check(struct rt_work *work, void *work_data)
 }
 #endif
 
+#ifndef CHERRY_USB_RTL8152_LINKCHECK
+static void usbh_rtl8152_prepare_recovery(struct usbh_rtl8152 *rtl8152_class,
+                                          bool cancel_work,
+                                          bool device_alive)
+{
+    (void)cancel_work;
+    rtl8152_class->connect_status = false;
+    usbh_rtl8152_link_changed(rtl8152_class, 0);
+
+    if (device_alive && rtl8152_class->rtl_ops.disable) {
+        rtl8152_class->rtl_ops.disable(rtl8152_class);
+    }
+}
+#endif
+
 void usbh_rtl8152_rx_thread(void *argument)
 {
     uint32_t g_rtl8152_rx_length;
@@ -2185,6 +2263,7 @@ void usbh_rtl8152_rx_thread(void *argument)
     // uint32_t curr_time_stamp, last_check_link_state_time_stamp;
 
     USB_LOG_INFO("Create rtl8152 rx thread\r\n");
+    g_rtl8152_class.rx_thread_running = true;
 #ifdef CHERRY_USB_RTL8152_LINKCHECK
     rt_delayed_work_init(&link_check, rtl8152_link_check, argument);
 #endif
@@ -2192,17 +2271,25 @@ void usbh_rtl8152_rx_thread(void *argument)
 find_class:
     // clang-format on
     g_rtl8152_class.connect_status = false;
-    if ((!g_rtl8152_class.plug) || (usbh_find_class_instance("/dev/rtl8152") == NULL)) {
+    usbh_rtl8152_link_changed(&g_rtl8152_class, 0);
+    if (!usbh_rtl8152_is_active(&g_rtl8152_class)) {
         goto delete;
     }
 
-    while (g_rtl8152_class.connect_status == false) {
+    while (!g_rtl8152_class.stop_requested && g_rtl8152_class.connect_status == false) {
         ret = usbh_rtl8152_get_connect_status(&g_rtl8152_class);
         if (ret < 0) {
+            if (!usbh_rtl8152_is_active(&g_rtl8152_class)) {
+                goto delete;
+            }
             usb_osal_msleep(100);
             goto find_class;
         }
         usb_osal_msleep(128);
+    }
+
+    if (g_rtl8152_class.stop_requested) {
+        goto delete;
     }
 
     usbh_rtl8152_link_changed(&g_rtl8152_class, 1);
@@ -2224,27 +2311,58 @@ find_class:
 #endif
 
     g_rtl8152_rx_length = 0;
-    while (g_rtl8152_class.plug) {
-        usbh_bulk_urb_fill(&g_rtl8152_class.bulkin_urb, g_rtl8152_class.hport, g_rtl8152_class.bulkin, &g_rtl8152_rx_buffer[g_rtl8152_rx_length], USB_GET_MAXPACKETSIZE(g_rtl8152_class.bulkin->wMaxPacketSize), USB_OSAL_WAITING_FOREVER, NULL, NULL);
+    while (g_rtl8152_class.plug && !g_rtl8152_class.stop_requested) {
+        if (!g_rtl8152_class.bulkin || !g_rtl8152_class.hport || !usbh_rtl8152_is_active(&g_rtl8152_class)) {
+            goto find_class;
+        }
+
+        uint32_t max_pkt = USB_GET_MAXPACKETSIZE(g_rtl8152_class.bulkin->wMaxPacketSize);
+
+        if (g_rtl8152_rx_length + max_pkt > sizeof(g_rtl8152_rx_buffer)) {
+            USB_LOG_ERR("RTL8152 RX overflow, dropping frame (len=%u)\r\n", g_rtl8152_rx_length);
+            /* Drain remaining packets of this frame until short packet (end of frame) */
+            for (int drain = 0; drain < 128; drain++) {
+                usbh_bulk_urb_fill(&g_rtl8152_class.bulkin_urb, g_rtl8152_class.hport, g_rtl8152_class.bulkin, g_rtl8152_rx_buffer, max_pkt, USB_OSAL_WAITING_FOREVER, NULL, NULL);
+                ret = usbh_submit_urb(&g_rtl8152_class.bulkin_urb);
+                if (ret < 0) {
+                    usbh_rtl8152_prepare_recovery(&g_rtl8152_class, true,
+                                                  usbh_rtl8152_is_active(&g_rtl8152_class));
+                    goto find_class;
+                }
+                if (g_rtl8152_class.bulkin_urb.actual_length != max_pkt) {
+                    break; /* Short packet = end of frame */
+                }
+            }
+            g_rtl8152_rx_length = 0;
+            continue;
+        }
+
+        usbh_bulk_urb_fill(&g_rtl8152_class.bulkin_urb, g_rtl8152_class.hport, g_rtl8152_class.bulkin, &g_rtl8152_rx_buffer[g_rtl8152_rx_length], max_pkt, USB_OSAL_WAITING_FOREVER, NULL, NULL);
         ret = usbh_submit_urb(&g_rtl8152_class.bulkin_urb);
         if (ret < 0) {
-#ifdef CHERRY_USB_RTL8152_LINKCHECK
-            g_rtl8152_class.submit_work = false;
-            rt_work_cancel_sync(&link_check.work);
-#endif
+            /* If we are here because the device was unplugged we must not
+             * issue further IO on it; only treat the device as alive when the
+             * hub still owns the class instance. */
+            usbh_rtl8152_prepare_recovery(&g_rtl8152_class, true,
+                                          usbh_rtl8152_is_active(&g_rtl8152_class));
             goto find_class;
         }
 
         g_rtl8152_rx_length += g_rtl8152_class.bulkin_urb.actual_length;
 
-        if (g_rtl8152_class.bulkin_urb.actual_length != USB_GET_MAXPACKETSIZE(g_rtl8152_class.bulkin->wMaxPacketSize)) {
+        if (g_rtl8152_class.bulkin_urb.actual_length != max_pkt) {
             data_offset = 0;
 
             USB_LOG_DBG("rxlen:%d\r\n", g_rtl8152_rx_length);
-            while (g_rtl8152_rx_length > 0) {
+            while (g_rtl8152_rx_length >= sizeof(struct rx_desc)) {
                 struct rx_desc *rx_desc = (struct rx_desc *)&g_rtl8152_rx_buffer[data_offset];
 
                 len = rx_desc->opts1 & RX_LEN_MASK;
+
+                if (len + sizeof(struct rx_desc) > g_rtl8152_rx_length) {
+                    USB_LOG_ERR("RTL8152 RX descriptor len invalid (%u > %u)\r\n", (unsigned)(len + sizeof(struct rx_desc)), g_rtl8152_rx_length);
+                    break;
+                }
 
                 USB_LOG_DBG("data_offset:%d, eth len:%d\r\n", data_offset, len);
 
@@ -2259,14 +2377,19 @@ find_class:
                 } else {
                     USB_LOG_ERR("No memory to alloc pbuf for rtl8152 rx\r\n");
                 }
-                data_offset += (len + sizeof(struct rx_desc));
-                g_rtl8152_rx_length -= (len + sizeof(struct rx_desc));
 
+                uint32_t advance = len + sizeof(struct rx_desc);
                 if (len & (RX_ALIGN - 1)) {
-                    data_offset += (RX_ALIGN - (len & (RX_ALIGN - 1)));
-                    g_rtl8152_rx_length -= (RX_ALIGN - (len & (RX_ALIGN - 1)));
+                    advance += (RX_ALIGN - (len & (RX_ALIGN - 1)));
                 }
+
+                if (advance > g_rtl8152_rx_length) {
+                    break;
+                }
+                data_offset += advance;
+                g_rtl8152_rx_length -= advance;
             }
+            g_rtl8152_rx_length = 0;
         } else {
             // curr_time_stamp = usb_osal_timestamp();
 
@@ -2289,9 +2412,11 @@ delete:
     USB_LOG_INFO("Delete rtl8152 rx thread\r\n");
 #ifdef CHERRY_USB_RTL8152_LINKCHECK
     if (g_rtl8152_class.submit_work) {
+        g_rtl8152_class.submit_work = false;
         rt_work_cancel_sync(&link_check.work);
     }
 #endif
+    g_rtl8152_class.rx_thread_running = false;
     usb_osal_thread_delete(NULL);
     // clang-format on
 }
@@ -2302,8 +2427,22 @@ err_t usbh_rtl8152_linkoutput(struct netif *netif, struct pbuf *p)
     struct pbuf *q;
     uint8_t *buffer;
     struct tx_desc *tx_desc = (struct tx_desc *)g_rtl8152_tx_buffer;
+    uint32_t tx_len = p->tot_len + sizeof(struct tx_desc);
 
-    if (g_rtl8152_class.connect_status == false) {
+    if (g_rtl8152_tx_mutex == NULL) {
+        return ERR_BUF;
+    }
+
+    usb_osal_mutex_take(g_rtl8152_tx_mutex);
+
+    if (!usbh_rtl8152_can_xmit(&g_rtl8152_class)) {
+        usb_osal_mutex_give(g_rtl8152_tx_mutex);
+        return ERR_BUF;
+    }
+
+    if (tx_len > sizeof(g_rtl8152_tx_buffer)) {
+        USB_LOG_ERR("RTL8152 TX frame too large (%u > %u)\r\n", (unsigned)tx_len, (unsigned)sizeof(g_rtl8152_tx_buffer));
+        usb_osal_mutex_give(g_rtl8152_tx_mutex);
         return ERR_BUF;
     }
 
@@ -2317,19 +2456,22 @@ err_t usbh_rtl8152_linkoutput(struct netif *netif, struct pbuf *p)
         buffer += q->len;
     }
 
-    USB_LOG_DBG("txlen:%d\r\n", p->tot_len + sizeof(struct tx_desc));
+    USB_LOG_DBG("txlen:%d\r\n", tx_len);
 
-    usbh_bulk_urb_fill(&g_rtl8152_class.bulkout_urb, g_rtl8152_class.hport, g_rtl8152_class.bulkout, g_rtl8152_tx_buffer, p->tot_len + sizeof(struct tx_desc), USB_OSAL_WAITING_FOREVER, NULL, NULL);
-    if (((p->tot_len + sizeof(struct tx_desc)) % USB_GET_MAXPACKETSIZE(g_rtl8152_class.bulkout->wMaxPacketSize)) == 0) {
+    usbh_bulk_urb_fill(&g_rtl8152_class.bulkout_urb, g_rtl8152_class.hport, g_rtl8152_class.bulkout, g_rtl8152_tx_buffer, tx_len, USB_OSAL_WAITING_FOREVER, NULL, NULL);
+    if ((tx_len % USB_GET_MAXPACKETSIZE(g_rtl8152_class.bulkout->wMaxPacketSize)) == 0) {
         g_rtl8152_class.bulkout_urb.transfer_flags = 0x0;
         g_rtl8152_class.bulkout_urb.transfer_flags |= URB_ZERO_PACKET;
     }
 
     ret = usbh_submit_urb(&g_rtl8152_class.bulkout_urb);
     if (ret < 0) {
+        g_rtl8152_class.connect_status = false;
+        usb_osal_mutex_give(g_rtl8152_tx_mutex);
         return ERR_BUF;
     }
 
+    usb_osal_mutex_give(g_rtl8152_tx_mutex);
     return ERR_OK;
 }
 
