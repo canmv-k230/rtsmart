@@ -215,40 +215,39 @@ config RT_USING_LWIP
 
         config RT_MEMP_NUM_NETCONN
             int "the number of struct netconns"
-            default 8
+            default 32
 
         config RT_MEMP_NUM_TCPIP_MSG_API
             int "the number of struct tcpip_msg ,which are used for callback/timeout API communication"
-            default 16
+            default 48
 
         config RT_MEMP_NUM_TCPIP_MSG_INPKT
             int "the number of struct tcpip_msg ,which are used for incoming packets"
-            default 16            
+            default 64
 
         config RT_LWIP_PBUF_NUM
             int "the number of PBUF"
-            default 16
+            default 160
 
         config RT_LWIP_PBUF_STRUCT_NUM
             int "the number of pbuf struct"
-            default 16            
+            default 32
 
         config RT_LWIP_NETBUF_NUM
             int "the number of netbuf struct"
-            default 16
+            default 64
 
         config RT_LWIP_RAW_PCB_NUM
             int "the number of raw connection"
-            default 4
+            default 8
 
         config RT_LWIP_UDP_PCB_NUM
             int "the number of UDP socket"
-            default 8 if RT_USING_DFS_NFS
-            default 4
+            default 24
 
         config RT_UDP_RECVMBOX_SIZE
             int "the number of udp recv mbox num"
-            default 16
+            default 32
 
         config RT_RECV_BUFSIZE_DEFAULT
             int "this is the default value for recv_bufsize, the unit is KB"
@@ -257,23 +256,23 @@ config RT_USING_LWIP
         if RT_LWIP_TCP
         config RT_LWIP_TCP_PCB_NUM
             int "the number of TCP socket"
-            default 4
+            default 16
 
         config RT_LWIP_TCP_SEG_NUM
             int "the number of TCP segment"
-            default 40
+            default 256
 
         config RT_LWIP_TCP_SND_BUF
             int "the size of send buffer"
-            default 8196
+            default 64240
 
         config RT_LWIP_TCP_WND
             int "the size of TCP send window"
-            default 8196
+            default 64240
 
         config RT_TCP_RECVMBOX_SIZE
             int "the number of tcp recv mbox num"
-            default 16            
+            default 32
         endif
 
         config RT_LWIP_TCPTHREAD_PRIORITY
@@ -282,11 +281,11 @@ config RT_USING_LWIP
 
         config RT_LWIP_TCPTHREAD_MBOX_SIZE
             int "the number of mail in the lwIP thread mailbox"
-            default 8
+            default 32
 
         config RT_LWIP_TCPTHREAD_STACKSIZE
             int "the stack size of lwIP thread"
-            default 1024
+            default 10240
 
         config LWIP_NO_RX_THREAD
             bool "Not use Rx thread"
@@ -302,11 +301,11 @@ config RT_USING_LWIP
 
         config RT_LWIP_ETHTHREAD_STACKSIZE
             int "the stack size of ethernet thread"
-            default 1024
+            default 10240
 
         config RT_LWIP_ETHTHREAD_MBOX_SIZE
             int "the number of mail in the ethernet thread mailbox"
-            default 8
+            default 64
 
         config RT_LWIP_REASSEMBLY_FRAG
             bool "Enable IP reassembly and frag"
