@@ -24,6 +24,8 @@
 #include <ioremap.h>
 #include <riscv_io.h>
 
+#include "board.h"
+
 #include "./config.h"
 #include "sdk_version.h"
 
