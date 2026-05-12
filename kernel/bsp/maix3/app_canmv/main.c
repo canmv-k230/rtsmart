@@ -6,30 +6,28 @@
  * Change Logs:
  * Date           Author       Notes
  */
-#include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdbool.h>
 
+#include <fcntl.h>
+
 #include <rthw.h>
 #include <rtthread.h>
 
-#include <dfs_fs.h>
-#include <ioremap.h>
-#include "riscv_mmu.h"
-#include "riscv_io.h"
-
 #include <msh.h>
 
+#include <dfs_fs.h>
+#include <dfs_posix.h>
+
+#include <ioremap.h>
+#include <riscv_io.h>
+
 #include "./config.h"
-#include "board.h"
-#include "dfs_posix.h"
 #include "sdk_version.h"
 
-#ifdef CONFIG_BOARD_K230_CANMV_LCKFB
 #include "drv_gpio.h"
-#endif // CONFIG_BOARD_K230_CANMV_LCKFB
 
 #include "sysctl_pwr.h"
 #include "sysctl_boot.h"
@@ -199,30 +197,6 @@ static void mount_second_card(void)
 }
 #endif
 
-static void check_bank_voltage(void)
-{
-#define MAP_SIZE    PAGE_SIZE
-#define MAP_MASK    (MAP_SIZE - 1)
-
-  const rt_ubase_t target = 0x91213418UL;
-  void *map_base = rt_ioremap_nocache((void *)(target & ~MAP_MASK), MAP_SIZE);
-  volatile void *virt_addr = map_base + (target & MAP_MASK);
-  volatile rt_uint32_t read_result = *((rt_uint32_t *) virt_addr);
-
-  if(0x00 == read_result) {
-#if !defined (CONFIG_BOARD_K230_CANMV) && !defined (CONFIG_BOARD_K230_CANMV_DONGSHANPI) && !defined (CONFIG_BOARD_K230_CANMV_RTT_EVB)
-    rt_kprintf("\n\n\033[31mTHIS BOARD MAYBE NOT CONFIGURE BANK VOLTAGE!!!\n\n\033[0m");
-#endif
-
-#ifdef CONFIG_BOARD_K230_CANMV_LCKFB
-    kd_pin_mode(62, GPIO_DM_OUTPUT);
-    kd_pin_write(62, GPIO_PV_LOW);
-#endif
-  }
-
-  rt_iounmap(map_base);
-}
-
 static rt_bool_t auto_exec_cmd_is_trusted_preload(const char *cmd)
 {
   rt_size_t leading = 0;
@@ -281,11 +255,29 @@ static void auto_exec_trusted_preload(const char *cmd_line)
   rt_free(cmd_copy);
 }
 
+static void apply_pin_config(void)
+{
+#ifdef CONFIG_BOARD_K230_CANMV_LCKFB
+    kd_pin_mode(62, GPIO_DM_OUTPUT);
+    kd_pin_write(62, GPIO_PV_LOW);
+#elif defined(CONFIG_BOARD_K230D_CANMV_LUSHANPI_LITE)
+    //LED_R
+    kd_pin_mode(65, GPIO_DM_OUTPUT);
+    kd_pin_write(65, GPIO_PV_LOW);
+	// LED_G
+    kd_pin_mode(66, GPIO_DM_OUTPUT);
+    kd_pin_write(66, GPIO_PV_LOW);
+	// LED_B
+    kd_pin_mode(71, GPIO_DM_OUTPUT);
+    kd_pin_write(71, GPIO_PV_LOW);
+#endif
+}
+
 int main(void) {
   sysctl_pwr_off(SYSCTL_PD_CPU0);
   sysctl_pwr_off(SYSCTL_PD_DPU);
 
-  check_bank_voltage();
+  apply_pin_config();
 
   rt_kprintf("\n#############SDK VERSION######################################\n");
   rt_kprintf("SDK   : %s\n", SDK_VERSION_);
