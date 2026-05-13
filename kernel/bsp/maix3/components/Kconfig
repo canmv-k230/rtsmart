@@ -217,7 +217,7 @@ menu "Components Configuration"
                                 if CHERRY_USB_HOST_ENABLE_CLASS_SERIAL
 
                                     config CHERRY_USB_HOST_ENABLE_CLASS_SERIAL_EC200M
-                                    bool "Enable serial EC200M"
+                                    bool "Enable serial EC200M/A7680C or Other Compatible"
                                     default y
 
                                 endif

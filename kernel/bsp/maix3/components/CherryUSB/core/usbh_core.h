@@ -233,6 +233,12 @@ struct usbh_bus {
 #endif
 };
 
+static inline bool usbh_intf_slot_valid(const struct usbh_hubport *hport, uint8_t intf)
+{
+    return intf < CONFIG_USBHOST_MAX_INTERFACES &&
+           hport->config.intf[intf].altsetting_num > 0;
+}
+
 static inline void usbh_control_urb_fill(struct usbh_urb *urb,
                                          struct usbh_hubport *hport,
                                          struct usb_setup_packet *setup,

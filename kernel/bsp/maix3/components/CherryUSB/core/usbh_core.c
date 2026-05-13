@@ -287,7 +287,11 @@ static void usbh_print_hubport_info(struct usbh_hubport *hport)
     USB_LOG_RAW("bmAttributes: 0x%02x        \r\n", hport->config.config_desc.bmAttributes);
     USB_LOG_RAW("bMaxPower: 0x%02x           \r\n", hport->config.config_desc.bMaxPower);
 
-    for (uint8_t i = 0; i < hport->config.config_desc.bNumInterfaces; i++) {
+    for (uint8_t i = 0; i < CONFIG_USBHOST_MAX_INTERFACES; i++) {
+        if (!usbh_intf_slot_valid(hport, i)) {
+            continue;
+        }
+
         for (uint8_t j = 0; j < hport->config.intf[i].altsetting_num; j++) {
             USB_LOG_RAW("\tInterface Descriptor:\r\n");
             USB_LOG_RAW("\tbLength: 0x%02x            \r\n", hport->config.intf[i].altsetting[j].intf_desc.bLength);
@@ -672,13 +676,21 @@ int usbh_enumerate(struct usbh_hubport *hport)
 #endif
     USB_LOG_INFO("Enumeration success, start loading class driver\r\n");
     /*search supported class driver*/
-    for (uint8_t i = 0; i < hport->config.config_desc.bNumInterfaces; i++) {
-        // intf_desc = &hport->config.intf[i].altsetting[0].intf_desc;
-        for(uint8_t j = 0; j < hport->config.intf[i].altsetting_num; j++) {
+    for (uint8_t i = 0; i < CONFIG_USBHOST_MAX_INTERFACES; i++) {
+        if (!usbh_intf_slot_valid(hport, i)) {
+            continue;
+        }
+
+        intf_desc = NULL;
+        for (uint8_t j = 0; j < hport->config.intf[i].altsetting_num; j++) {
             intf_desc = &hport->config.intf[i].altsetting[j].intf_desc;
-            if(0x00 != intf_desc->bNumEndpoints) {
+            if (0x00 != intf_desc->bNumEndpoints) {
                 break;
             }
+        }
+
+        if (intf_desc == NULL) {
+            continue;
         }
 
         struct usbh_class_driver *class_driver = (struct usbh_class_driver *)usbh_find_class_driver(intf_desc->bInterfaceClass, intf_desc->bInterfaceSubClass, intf_desc->bInterfaceProtocol, hport->device_desc.idVendor, hport->device_desc.idProduct);
@@ -820,7 +832,11 @@ void *usbh_find_class_instance(const char *devname)
             for (uint8_t port = 0; port < hub->hub_desc.bNbrPorts; port++) {
                 hport = &hub->child[port];
                 if (hport->connected) {
-                    for (uint8_t itf = 0; itf < hport->config.config_desc.bNumInterfaces; itf++) {
+                    for (uint8_t itf = 0; itf < CONFIG_USBHOST_MAX_INTERFACES; itf++) {
+                        if (!usbh_intf_slot_valid(hport, itf)) {
+                            continue;
+                        }
+
                         if ((strncmp(hport->config.intf[itf].devname, devname, CONFIG_USBHOST_DEV_NAMELEN) == 0) && hport->config.intf[itf].priv)
                             return hport->config.intf[itf].priv;
                     }
@@ -883,7 +899,11 @@ int lsusb(int argc, char **argv)
                 for (uint8_t port = 0; port < hub->hub_desc.bNbrPorts; port++) {
                     hport = &hub->child[port];
                     if (hport->connected) {
-                        for (uint8_t i = 0; i < hport->config.config_desc.bNumInterfaces; i++) {
+                        for (uint8_t i = 0; i < CONFIG_USBHOST_MAX_INTERFACES; i++) {
+                            if (!usbh_intf_slot_valid(hport, i)) {
+                                continue;
+                            }
+
                             if (hport->config.intf[i].class_driver && hport->config.intf[i].class_driver->driver_name) {
                                 USB_LOG_RAW("\t|__Port %u, pid,vid = (0x%x, 0x%x), dev addr:0x%02x, If %u, ClassDriver=%s\r\n",
                                             hport->port,

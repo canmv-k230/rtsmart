@@ -214,10 +214,18 @@ static int usbh_ec200m_connect(struct usbh_hubport *hport, uint8_t intf)
         }
     }
 
+    if ((ec200m->bulkin == NULL) || (ec200m->bulkout == NULL)) {
+        ret = -USB_ERR_INVAL;
+        USB_LOG_ERR("ec200m intf %u missing bulk endpoints\n", intf);
+        hport->config.intf[intf].priv = NULL;
+        goto free_class;
+    }
+
     ec200m->bulkin_buffer = rt_malloc_align(ec200m->bulkin->wMaxPacketSize, ALIGN_SIZE);
     if (ec200m->bulkin_buffer == NULL) {
         ret = -USB_ERR_NOMEM;
         rt_kprintf("Fail to alloc bulk in buffer\n");
+        hport->config.intf[intf].priv = NULL;
         goto free_class;
     }
 
@@ -244,6 +252,7 @@ static int usbh_ec200m_connect(struct usbh_hubport *hport, uint8_t intf)
 
 free_inbuffer:
     rt_free_align(ec200m->bulkin_buffer);
+    hport->config.intf[intf].priv = NULL;
 free_class:
     put_usbh_ec200m(ec200m);
 err_out:
@@ -324,5 +333,15 @@ CLASS_INFO_DEFINE const struct usbh_class_info ml307b_class_info = {
     .protocol = 0xff,
     .vid = 0x2ecc,
     .pid = 0x3012,
+    .class_driver = &ec200m_class_driver
+};
+
+CLASS_INFO_DEFINE const struct usbh_class_info simcom_a7680c_class_info = {
+    .match_flags = USB_CLASS_MATCH_VENDOR | USB_CLASS_MATCH_PRODUCT | USB_CLASS_MATCH_INTF_CLASS,
+    .class = 0xff,
+    .subclass = 0xff,
+    .protocol = 0xff,
+    .vid = 0x1e0e,
+    .pid = 0x9011,
     .class_driver = &ec200m_class_driver
 };

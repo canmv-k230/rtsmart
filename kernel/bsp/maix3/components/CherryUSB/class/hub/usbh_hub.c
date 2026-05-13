@@ -287,7 +287,11 @@ static void usbh_hubport_release(struct usbh_hubport *child)
     if (child->connected) {
         child->connected = false;
         usbh_free_devaddr(child);
-        for (uint8_t i = 0; i < child->config.config_desc.bNumInterfaces; i++) {
+        for (uint8_t i = 0; i < CONFIG_USBHOST_MAX_INTERFACES; i++) {
+            if (!usbh_intf_slot_valid(child, i)) {
+                continue;
+            }
+
             if (child->config.intf[i].class_driver && child->config.intf[i].class_driver->disconnect) {
                 CLASS_DISCONNECT(child, i);
             }
