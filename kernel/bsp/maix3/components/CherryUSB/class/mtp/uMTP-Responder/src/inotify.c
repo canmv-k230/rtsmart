@@ -215,7 +215,7 @@ mtx_free:
 int inotify_handler_init( mtp_ctx * ctx )
 {
 	rt_thread_t tid;
-	mtp_inty_mq = rt_mq_create("mtp_inty", sizeof(file_chg_msg_t), 16, RT_IPC_FLAG_FIFO);
+	mtp_inty_mq = rt_mq_create("mtp_inty", sizeof(file_chg_msg_t), 64, RT_IPC_FLAG_FIFO);
 	tid = rt_thread_create("mtp_inty", inotify_thread, ctx, CONFIG_USBDEV_MTP_STACKSIZE, CONFIG_USBDEV_MTP_PRIO, 10);
 	rt_thread_startup(tid);
 
@@ -239,15 +239,29 @@ int inotify_handler_rmwatch( mtp_ctx * ctx, int wd )
 
 int inotify_handler_filechange(int type, char *path)
 {
+	rt_err_t ret;
+	char *dup_path;
+	file_chg_msg_t msg;
+
 	if (mtp_fs_db_valid() == 0)
 		return 0;
-	file_chg_msg_t msg = {};
+
+	if (!mtp_inty_mq)
+		return -RT_ERROR;
+
+	dup_path = path ? rt_strdup(path) : RT_NULL;
+	if (path && !dup_path)
+		return -RT_ENOMEM;
+
 	msg.type = type;
-	if (path) {
-		msg.path = rt_strdup(path);
+	msg.path = dup_path;
+
+	ret = rt_mq_send(mtp_inty_mq, &msg, sizeof(file_chg_msg_t));
+	if (ret != RT_EOK)
+	{
+		if (dup_path)
+			free(dup_path);
 	}
-	if (mtp_inty_mq) {
-		rt_mq_send_wait(mtp_inty_mq, &msg, sizeof(file_chg_msg_t), RT_WAITING_FOREVER);
-	}
-	return 0;
+
+	return ret;
 }

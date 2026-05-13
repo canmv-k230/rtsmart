@@ -20,7 +20,7 @@
 /**
  * @file   mtp_op_closesession.c
  * @brief  Close session operation.
- * @author Jean-François DEL NERO <Jean-Francois.DELNERO@viveris.fr>
+ * @author Jean-Franï¿½ois DEL NERO <Jean-Francois.DELNERO@viveris.fr>
  */
 
 #include "buildconf.h"
@@ -40,9 +40,12 @@ uint32_t mtp_op_CloseSession(mtp_ctx * ctx,MTP_PACKET_HEADER * mtp_packet_hdr, i
 	if(!ctx->fs_db)
 		return MTP_RESPONSE_SESSION_NOT_OPEN;
 
+	clear_edit_locks(ctx->fs_db);
+
 	deinit_fs_db(ctx->fs_db);
 
 	ctx->fs_db = 0;
+	ctx->session_id = 0;
 
 	return MTP_RESPONSE_OK;
 }

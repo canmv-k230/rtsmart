@@ -501,6 +501,16 @@ int check_handle_access( mtp_ctx * ctx, fs_entry * entry, uint32_t handle, int w
 
 			return 1;
 		}
+
+		if( wraccess && entry->edit_session_id && (entry->edit_session_id != ctx->session_id) )
+		{
+			PRINT_DEBUG("check_handle_access : Handle 0x%.8x is edited by session 0x%.8x", entry->handle, entry->edit_session_id);
+
+			if( response )
+				*response = MTP_RESPONSE_DEVICE_BUSY;
+
+			return 1;
+		}
 	}
 	else
 	{
@@ -513,6 +523,71 @@ int check_handle_access( mtp_ctx * ctx, fs_entry * entry, uint32_t handle, int w
 	}
 
 	return 0;
+}
+
+int begin_edit_object(mtp_ctx * ctx, uint32_t handle, uint32_t * response)
+{
+	fs_entry * entry;
+
+	entry = get_entry_by_handle(ctx->fs_db, handle);
+	if( check_handle_access(ctx, entry, handle, 1, response) )
+		return 1;
+
+	if( entry->edit_session_id == ctx->session_id )
+		return 0;
+
+	if( entry->edit_session_id )
+	{
+		if( response )
+			*response = MTP_RESPONSE_DEVICE_BUSY;
+
+		return 1;
+	}
+
+	entry->edit_session_id = ctx->session_id;
+
+	return 0;
+}
+
+int end_edit_object(mtp_ctx * ctx, uint32_t handle, uint32_t * response)
+{
+	fs_entry * entry;
+
+	entry = get_entry_by_handle(ctx->fs_db, handle);
+	if( !entry )
+	{
+		if( response )
+			*response = MTP_RESPONSE_INVALID_OBJECT_HANDLE;
+
+		return 1;
+	}
+
+	if( entry->edit_session_id && (entry->edit_session_id != ctx->session_id) )
+	{
+		if( response )
+			*response = MTP_RESPONSE_ACCESS_DENIED;
+
+		return 1;
+	}
+
+	entry->edit_session_id = 0;
+
+	return 0;
+}
+
+void clear_edit_locks(fs_handles_db * db)
+{
+	fs_entry * entry_list;
+
+	if(!db)
+		return;
+
+	entry_list = db->entry_list;
+	while( entry_list )
+	{
+		entry_list->edit_session_id = 0;
+		entry_list = entry_list->next;
+	}
 }
 
 int process_in_packet(mtp_ctx * ctx,MTP_PACKET_HEADER * mtp_packet_hdr, int rawsize)

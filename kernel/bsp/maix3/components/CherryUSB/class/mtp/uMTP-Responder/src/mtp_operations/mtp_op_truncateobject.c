@@ -20,7 +20,7 @@
 /**
  * @file   mtp_op_truncateobject.c
  * @brief  truncate object operation.
- * @author Jean-François DEL NERO <Jean-Francois.DELNERO@viveris.fr>
+ * @author Jean-Franï¿½ois DEL NERO <Jean-Francois.DELNERO@viveris.fr>
  */
 
 #include "buildconf.h"
@@ -64,6 +64,12 @@ uint32_t mtp_op_TruncateObject(mtp_ctx * ctx,MTP_PACKET_HEADER * mtp_packet_hdr,
 		{
 			pthread_mutex_unlock( &ctx->inotify_mutex );
 			return response_code;
+		}
+
+		if( entry->edit_session_id != ctx->session_id )
+		{
+			pthread_mutex_unlock( &ctx->inotify_mutex );
+			return MTP_RESPONSE_ACCESS_DENIED;
 		}
 
 		full_path = build_full_path(ctx->fs_db, mtp_get_storage_root(ctx, entry->storage_id), entry);

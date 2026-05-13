@@ -40,6 +40,7 @@ struct fs_entry
 	uint32_t storage_id;
 	char * name;
 	uint32_t flags;
+	uint32_t edit_session_id;
 	mtp_size size;
 	uint32_t date;
 

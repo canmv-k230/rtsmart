@@ -474,6 +474,7 @@ int scan_and_add_folder(fs_handles_db * db, char * base, uint32_t parent, uint32
 					{
 						inotify_handler_rmwatch( db->mtp_ctx, entry->watch_descriptor );
 						entry->watch_descriptor = -1;
+						entry->edit_session_id = 0;
 					}
 				}
 				else

@@ -50,6 +50,8 @@ uint32_t mtp_op_SendObject(mtp_ctx * ctx,MTP_PACKET_HEADER * mtp_packet_hdr, int
 	char * full_path;
 	int file;
 	int sz;
+	int transfer_failed;
+	mtp_size expected_size;
 
 	if(!ctx->fs_db)
 		return MTP_RESPONSE_SESSION_NOT_OPEN;
@@ -74,6 +76,7 @@ uint32_t mtp_op_SendObject(mtp_ctx * ctx,MTP_PACKET_HEADER * mtp_packet_hdr, int
 				entry = get_entry_by_handle(ctx->fs_db, ctx->SendObjInfoHandle);
 				if(entry)
 				{
+					expected_size = ctx->SendObjInfoSize;
 					response_code = MTP_RESPONSE_GENERAL_ERROR;
 
 					if( check_handle_access( ctx, entry, 0x00000000, 1, &response_code) )
@@ -81,6 +84,13 @@ uint32_t mtp_op_SendObject(mtp_ctx * ctx,MTP_PACKET_HEADER * mtp_packet_hdr, int
 						pthread_mutex_unlock( &ctx->inotify_mutex );
 
 						return response_code;
+					}
+
+					if( (mtp_packet_hdr->code == MTP_OPERATION_SEND_PARTIAL_OBJECT) && (entry->edit_session_id != ctx->session_id) )
+					{
+						pthread_mutex_unlock( &ctx->inotify_mutex );
+
+						return MTP_RESPONSE_ACCESS_DENIED;
 					}
 
 					full_path = build_full_path(ctx->fs_db, mtp_get_storage_root(ctx, entry->storage_id), entry);
@@ -100,6 +110,11 @@ uint32_t mtp_op_SendObject(mtp_ctx * ctx,MTP_PACKET_HEADER * mtp_packet_hdr, int
 
 						if( file != -1 )
 						{
+							if( mtp_packet_hdr->code != MTP_OPERATION_SEND_PARTIAL_OBJECT && expected_size > 0 )
+							{
+								ftruncate(file, expected_size);
+							}
+							transfer_failed = 0;
 							ctx->transferring_file_data = 1;
 
 							lseek64(file, ctx->SendObjInfoOffset, SEEK_SET);
@@ -112,7 +127,8 @@ uint32_t mtp_op_SendObject(mtp_ctx * ctx,MTP_PACKET_HEADER * mtp_packet_hdr, int
 							{
 								if( write(file, tmp_ptr, sz) != sz)
 								{
-									// TODO : Handle this error case properly
+									transfer_failed = 1;
+									goto transfer_end;
 								}
 
 								ctx->SendObjInfoSize -= sz;
@@ -137,18 +153,32 @@ uint32_t mtp_op_SendObject(mtp_ctx * ctx,MTP_PACKET_HEADER * mtp_packet_hdr, int
 								{
 									if( write(file, tmp_ptr, sz) != sz)
 									{
-										// TODO : Handle this error case properly
+										transfer_failed = 1;
+										goto transfer_end;
 									}
 
 									ctx->SendObjInfoSize -= sz;
 								}
+								else
+								{
+									transfer_failed = 1;
+								}
 							};
 
+						transfer_end:
 							entry->size = lseek64(file, 0, SEEK_END);
 
 							ctx->transferring_file_data = 0;
 
 							close(file);
+
+							if( transfer_failed || (sz < 0) )
+							{
+								response_code = MTP_RESPONSE_NO_RESPONSE;
+								free( full_path );
+								pthread_mutex_unlock( &ctx->inotify_mutex );
+								return response_code;
+							}
 
 							if(ctx->usb_cfg.val_umask >= 0)
 								chmod(full_path, 0777 & (~ctx->usb_cfg.val_umask));
@@ -183,6 +213,17 @@ uint32_t mtp_op_SendObject(mtp_ctx * ctx,MTP_PACKET_HEADER * mtp_packet_hdr, int
 					pthread_mutex_unlock( &ctx->inotify_mutex );
 
 					return response_code;
+				}
+
+				if( mtp_packet_hdr->code == MTP_OPERATION_SEND_PARTIAL_OBJECT )
+				{
+					entry = get_entry_by_handle(ctx->fs_db, ctx->SendObjInfoHandle);
+					if( !entry || (entry->edit_session_id != ctx->session_id) )
+					{
+						pthread_mutex_unlock( &ctx->inotify_mutex );
+
+						return MTP_RESPONSE_ACCESS_DENIED;
+					}
 				}
 
 				// no response to send, wait for the data...

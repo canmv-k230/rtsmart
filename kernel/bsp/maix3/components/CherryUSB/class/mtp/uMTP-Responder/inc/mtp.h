@@ -158,6 +158,9 @@ char * mtp_get_storage_root(mtp_ctx * ctx, uint32_t storage_id);
 uint32_t mtp_get_storage_flags(mtp_ctx * ctx, uint32_t storage_id);
 
 int check_handle_access( mtp_ctx * ctx, fs_entry * entry, uint32_t handle, int wraccess, uint32_t * response);
+int begin_edit_object(mtp_ctx * ctx, uint32_t handle, uint32_t * response);
+int end_edit_object(mtp_ctx * ctx, uint32_t handle, uint32_t * response);
+void clear_edit_locks(fs_handles_db * db);
 
 int mtp_push_event(mtp_ctx * ctx, uint32_t event, int nbparams, uint32_t * parameters );
 
