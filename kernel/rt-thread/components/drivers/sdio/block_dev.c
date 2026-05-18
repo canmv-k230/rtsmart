@@ -12,6 +12,7 @@
 #include <dfs_fs.h>
 
 #include <drivers/mmcsd_core.h>
+#include <drivers/mmc.h>
 #include <drivers/gpt.h>
 
 #define DBG_TAG               "SDIO"
@@ -109,6 +110,105 @@ static int card_busy_detect(struct rt_mmcsd_card *card, unsigned int timeout_ms,
             (R1_CURRENT_STATE(status) == 7));
 
     return err;
+}
+
+static rt_err_t mmcsd_send_erase_cmd(struct rt_mmcsd_card *card,
+                                     rt_uint32_t cmd_code,
+                                     rt_uint32_t arg,
+                                     rt_uint32_t flags)
+{
+    struct rt_mmcsd_cmd cmd;
+    rt_uint32_t status_errors;
+    rt_err_t err;
+
+    rt_memset(&cmd, 0, sizeof(cmd));
+    cmd.cmd_code = cmd_code;
+    cmd.arg = arg;
+    cmd.flags = flags;
+
+    err = mmcsd_send_cmd(card->host, &cmd, 0);
+    if (err)
+        return err;
+
+    status_errors = cmd.resp[0] & (R1_ERROR | R1_ILLEGAL_COMMAND |
+                                   R1_COM_CRC_ERROR | R1_CC_ERROR |
+                                   R1_ERASE_SEQ_ERROR | R1_ERASE_PARAM |
+                                   R1_WP_ERASE_SKIP | R1_OUT_OF_RANGE);
+    if (status_errors)
+    {
+        LOG_E("erase cmd%d status error 0x%08x", cmd_code, cmd.resp[0]);
+        return -RT_ERROR;
+    }
+
+    return RT_EOK;
+}
+
+static rt_err_t mmcsd_erase_range(struct rt_mmcsd_card *card,
+                                  rt_uint32_t start,
+                                  rt_uint32_t end)
+{
+    rt_uint32_t start_arg;
+    rt_uint32_t end_arg;
+    rt_uint32_t erase_arg = MMC_ERASE_ARG;
+    rt_uint32_t start_cmd;
+    rt_uint32_t end_cmd;
+    rt_err_t err;
+
+    if (!card || end < start)
+        return -RT_EINVAL;
+
+    if (!(card->csd.card_cmd_class & (1 << 5)))
+        return RT_EOK;
+
+    if (card->card_type == CARD_TYPE_SD)
+    {
+        start_cmd = SD_ERASE_WR_BLK_START;
+        end_cmd = SD_ERASE_WR_BLK_END;
+        erase_arg = 0;
+    }
+    else if (card->card_type == CARD_TYPE_MMC)
+    {
+        start_cmd = ERASE_GROUP_START;
+        end_cmd = ERASE_GROUP_END;
+        if (card->emmc_sec_feature_support & EXT_CSD_SEC_GB_CL_EN)
+            erase_arg = MMC_TRIM_ARG;
+    }
+    else
+    {
+        return RT_EOK;
+    }
+
+    start_arg = start;
+    end_arg = end;
+    if (!(card->flags & CARD_FLAG_SDHC))
+    {
+        start_arg <<= 9;
+        end_arg <<= 9;
+    }
+
+    if (card->card_type == CARD_TYPE_MMC)
+    {
+        err = mmc_flush_cache(card);
+        if (err)
+            return err;
+    }
+
+    err = mmcsd_send_erase_cmd(card, start_cmd, start_arg,
+                               RESP_SPI_R1 | RESP_R1 | CMD_AC);
+    if (err)
+        return err;
+
+    err = mmcsd_send_erase_cmd(card, end_cmd, end_arg,
+                               RESP_SPI_R1 | RESP_R1 | CMD_AC);
+    if (err)
+        return err;
+
+    err = mmcsd_send_erase_cmd(card, ERASE, erase_arg,
+                               RESP_SPI_R1B | RESP_R1B | CMD_AC);
+    if (err)
+        return err;
+
+    return card_busy_detect(card, 30000, RT_NULL);
 }
 
 rt_int32_t mmcsd_num_wr_blocks(struct rt_mmcsd_card *card)
@@ -256,6 +356,9 @@ static rt_err_t rt_mmcsd_req_blk(struct rt_mmcsd_card *card,
         return -RT_ERROR;
     }
 
+    if (dir && card->card_type == CARD_TYPE_MMC && card->emmc_cache_enabled)
+        card->emmc_cache_dirty = 1;
+
     return RT_EOK;
 }
 
@@ -284,6 +387,36 @@ static rt_err_t rt_mmcsd_control(rt_device_t dev, int cmd, void *args)
         break;
     case RT_DEVICE_CTRL_BLK_PARTITION:
         rt_memcpy(args, &blk_dev->part, sizeof(struct dfs_partition));
+        break;
+    case RT_DEVICE_CTRL_BLK_SYNC:
+        if (blk_dev && blk_dev->card && blk_dev->card->card_type == CARD_TYPE_MMC)
+        {
+            rt_err_t ret;
+
+            rt_sem_take(blk_dev->part.lock, RT_WAITING_FOREVER);
+            mmcsd_host_lock(blk_dev->card->host);
+            ret = mmc_flush_cache(blk_dev->card);
+            mmcsd_host_unlock(blk_dev->card->host);
+            rt_sem_release(blk_dev->part.lock);
+            return ret;
+        }
+        break;
+    case RT_DEVICE_CTRL_BLK_ERASE:
+        if (blk_dev && blk_dev->card && args)
+        {
+            rt_uint32_t *range = (rt_uint32_t *)args;
+            rt_uint32_t start = blk_dev->part.offset + range[0];
+            rt_uint32_t end = blk_dev->part.offset + range[1];
+            rt_err_t ret;
+
+            rt_sem_take(blk_dev->part.lock, RT_WAITING_FOREVER);
+            mmcsd_host_lock(blk_dev->card->host);
+            ret = mmcsd_erase_range(blk_dev->card, start, end);
+            mmcsd_host_unlock(blk_dev->card->host);
+            rt_sem_release(blk_dev->part.lock);
+            return ret;
+        }
+        return -RT_EINVAL;
     default:
         break;
     }

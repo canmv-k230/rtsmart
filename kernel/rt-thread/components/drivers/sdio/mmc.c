@@ -185,8 +185,11 @@ static int mmc_get_ext_csd(struct rt_mmcsd_card *card, rt_uint8_t **new_ext_csd)
 static int mmc_parse_ext_csd(struct rt_mmcsd_card *card, rt_uint8_t *ext_csd)
 {
     rt_uint64_t card_capacity = 0;
+    rt_uint32_t cache_size = 0;
     rt_uint32_t erase_group_size;
     struct rt_mmcsd_host *host;
+    const char *speed_mode = "legacy";
+
     if (card == RT_NULL || ext_csd == RT_NULL)
     {
         LOG_E("emmc parse ext csd fail, invaild args");
@@ -194,20 +197,43 @@ static int mmc_parse_ext_csd(struct rt_mmcsd_card *card, rt_uint8_t *ext_csd)
     }
 
     host = card->host;
-    if (host->flags & MMCSD_SUP_HS200)
+    if ((host->flags & MMCSD_SUP_HS200_1V8) &&
+        (ext_csd[EXT_CSD_CARD_TYPE] & EXT_CSD_CARD_TYPE_HS200_1_8V))
     {
         card->flags |=  CARD_FLAG_HS200;
         card->hs_max_data_rate = 200000000;
+        speed_mode = "HS200";
     }
-    else if (host->flags & MMCSD_SUP_HIGHSPEED_DDR)
+    else if ((host->flags & MMCSD_SUP_HS200_1V2) &&
+             (ext_csd[EXT_CSD_CARD_TYPE] & EXT_CSD_CARD_TYPE_HS200_1_2V))
+    {
+        card->flags |=  CARD_FLAG_HS200;
+        card->hs_max_data_rate = 200000000;
+        speed_mode = "HS200";
+    }
+    else if ((host->flags & MMCSD_SUP_DDR_1V8) &&
+             (ext_csd[EXT_CSD_CARD_TYPE] & EXT_CSD_CARD_TYPE_DDR_1_8V))
     {
         card->flags |=  CARD_FLAG_HIGHSPEED_DDR;
         card->hs_max_data_rate = 52000000;
+        speed_mode = "DDR52";
     }
-    else
+    else if ((host->flags & MMCSD_SUP_DDR_1V2) &&
+             (ext_csd[EXT_CSD_CARD_TYPE] & EXT_CSD_CARD_TYPE_DDR_1_2V))
+    {
+        card->flags |=  CARD_FLAG_HIGHSPEED_DDR;
+        card->hs_max_data_rate = 52000000;
+        speed_mode = "DDR52";
+    }
+    else if (ext_csd[EXT_CSD_CARD_TYPE] & EXT_CSD_CARD_TYPE_HS)
     {
         card->flags |=  CARD_FLAG_HIGHSPEED;
         card->hs_max_data_rate = 52000000;
+        speed_mode = "HS";
+    }
+    else
+    {
+        card->hs_max_data_rate = card->max_data_rate;
     }
 
     card_capacity = *((rt_uint32_t *)&ext_csd[EXT_CSD_SEC_CNT]);
@@ -215,6 +241,13 @@ static int mmc_parse_ext_csd(struct rt_mmcsd_card *card, rt_uint8_t *ext_csd)
     card_capacity *= card->card_blksize;
     card_capacity >>= 10; /* unit:KB */
     card->card_capacity = card_capacity;
+
+    cache_size = ((rt_uint32_t)ext_csd[EXT_CSD_CACHE_SIZE + 0] << 0) |
+                 ((rt_uint32_t)ext_csd[EXT_CSD_CACHE_SIZE + 1] << 8) |
+                 ((rt_uint32_t)ext_csd[EXT_CSD_CACHE_SIZE + 2] << 16) |
+                 ((rt_uint32_t)ext_csd[EXT_CSD_CACHE_SIZE + 3] << 24);
+    card->emmc_cache_size = cache_size;
+    card->emmc_sec_feature_support = ext_csd[EXT_CSD_SEC_FEATURE_SUPPORT];
 
     if (ext_csd[EXT_CSD_ERASE_GROUP_DEF] & 0x1)
     {
@@ -227,6 +260,9 @@ static int mmc_parse_ext_csd(struct rt_mmcsd_card *card, rt_uint8_t *ext_csd)
     }
 
     LOG_I("emmc card capacity %d KB, card sec count:%d.", card->card_capacity, card->card_sec_cnt);
+    LOG_D("emmc card type 0x%02x, selected speed mode %s, clock %d, cache %d KiB.",
+          ext_csd[EXT_CSD_CARD_TYPE], speed_mode, card->hs_max_data_rate,
+          card->emmc_cache_size);
 
     return 0;
 }
@@ -257,6 +293,102 @@ static int mmc_switch(struct rt_mmcsd_card *card, rt_uint8_t set,
         return err;
 
     return 0;
+}
+
+static int mmc_send_status(struct rt_mmcsd_card *card, rt_uint32_t *status)
+{
+    int err;
+    struct rt_mmcsd_cmd cmd = {0};
+
+    cmd.cmd_code = SEND_STATUS;
+    cmd.arg = card->rca << 16;
+    cmd.flags = RESP_R1 | CMD_AC;
+
+    err = mmcsd_send_cmd(card->host, &cmd, 5);
+    if (err)
+        return err;
+
+    if (status)
+        *status = cmd.resp[0];
+
+    return 0;
+}
+
+static rt_err_t mmc_wait_ready(struct rt_mmcsd_card *card, rt_uint32_t timeout_ms)
+{
+    rt_uint32_t status = 0;
+    rt_tick_t start = rt_tick_get();
+    rt_err_t err;
+
+    do
+    {
+        err = mmc_send_status(card, &status);
+        if (err)
+            return err;
+
+        if ((status & R1_READY_FOR_DATA) && R1_CURRENT_STATE(status) != 7)
+            return RT_EOK;
+
+        mmcsd_delay_ms(1);
+    }
+    while ((rt_tick_get() - start) <= (timeout_ms * RT_TICK_PER_SECOND / 1000));
+
+    LOG_E("wait eMMC ready timeout, status=0x%08x", status);
+    return -RT_ETIMEOUT;
+}
+
+static rt_err_t mmc_enable_cache(struct rt_mmcsd_card *card)
+{
+    rt_err_t err;
+
+    if (!card || card->card_type != CARD_TYPE_MMC || card->emmc_cache_size == 0)
+        return RT_EOK;
+
+    err = mmc_switch(card, EXT_CSD_CMD_SET_NORMAL, EXT_CSD_CACHE_CTRL, 1);
+    if (err)
+    {
+        LOG_W("eMMC cache supported but enable failed, err=%d.", err);
+        return err;
+    }
+
+    err = mmc_wait_ready(card, 1600);
+    if (err)
+    {
+        LOG_W("eMMC cache enable wait ready failed, err=%d.", err);
+        return err;
+    }
+
+    card->emmc_cache_enabled = 1;
+    card->emmc_cache_dirty = 0;
+    LOG_D("eMMC cache enabled, size %d KiB.", card->emmc_cache_size);
+
+    return RT_EOK;
+}
+
+rt_err_t mmc_flush_cache(struct rt_mmcsd_card *card)
+{
+    rt_err_t err;
+
+    if (!card || card->card_type != CARD_TYPE_MMC ||
+        !card->emmc_cache_enabled || !card->emmc_cache_dirty)
+        return RT_EOK;
+
+    err = mmc_switch(card, EXT_CSD_CMD_SET_NORMAL, EXT_CSD_FLUSH_CACHE, 1);
+    if (err)
+    {
+        LOG_E("eMMC cache flush failed, err=%d.", err);
+        return err;
+    }
+
+    err = mmc_wait_ready(card, 3000);
+    if (err)
+    {
+        LOG_E("eMMC cache flush wait ready failed, err=%d.", err);
+        return err;
+    }
+
+    card->emmc_cache_dirty = 0;
+    return RT_EOK;
 }
 
 static int mmc_compare_ext_csds(struct rt_mmcsd_card *card,
@@ -397,13 +529,6 @@ static int mmc_select_bus_width(struct rt_mmcsd_card *card, rt_uint8_t *ext_csd)
         }
     }
 
-    if (!err && ddr)
-    {
-        err = mmc_switch(card, EXT_CSD_CMD_SET_NORMAL,
-                         EXT_CSD_BUS_WIDTH,
-                         ext_csd_bits[idx][1]);
-    }
-
     if (!err)
     {
         if (card->flags & (CARD_FLAG_HIGHSPEED | CARD_FLAG_HIGHSPEED_DDR))
@@ -412,6 +537,25 @@ static int mmc_select_bus_width(struct rt_mmcsd_card *card, rt_uint8_t *ext_csd)
             err = mmc_switch(card, EXT_CSD_CMD_SET_NORMAL,
                              EXT_CSD_HS_TIMING,
                              1);
+        }
+    }
+
+    if (!err && ddr)
+    {
+        err = mmc_switch(card, EXT_CSD_CMD_SET_NORMAL,
+                         EXT_CSD_BUS_WIDTH,
+                         ext_csd_bits[idx][1]);
+        if (err)
+        {
+            LOG_W("switch to DDR52 bus width failed, fallback to HS SDR.");
+            (void)mmc_switch(card, EXT_CSD_CMD_SET_NORMAL,
+                             EXT_CSD_BUS_WIDTH,
+                             ext_csd_bits[idx][0]);
+            mmcsd_set_bus_width(host, bus_width);
+            card->flags &= ~CARD_FLAG_HIGHSPEED_DDR;
+            card->flags |= CARD_FLAG_HIGHSPEED;
+            card->hs_max_data_rate = 52000000;
+            err = 0;
         }
     }
 
@@ -484,6 +628,7 @@ static rt_err_t mmc_set_card_addr(struct rt_mmcsd_host *host, rt_uint32_t rca)
 static int mmc_select_hs200(struct rt_mmcsd_card *card)
 {
     int ret;
+    rt_uint32_t status = 0;
 
     ret = mmc_switch(card, EXT_CSD_CMD_SET_NORMAL,
                      EXT_CSD_HS_TIMING, EXT_CSD_TIMING_HS200);
@@ -492,6 +637,13 @@ static int mmc_select_hs200(struct rt_mmcsd_card *card)
 
     mmcsd_set_timing(card->host, MMCSD_TIMING_MMC_HS200);
     mmcsd_set_clock(card->host, 200000000);
+
+    ret = mmc_send_status(card, &status);
+    if (ret || !(status & R1_READY_FOR_DATA))
+    {
+        LOG_W("eMMC HS200 switch status failed, err=%d, status=0x%08x.", ret, status);
+        return ret ? ret : -RT_ERROR;
+    }
 
     ret = mmcsd_excute_tuning(card);
 
@@ -513,11 +665,42 @@ static int mmc_select_timing(struct rt_mmcsd_card *card)
     }
     else
     {
-        mmcsd_set_timing(card->host, MMCSD_TIMING_UHS_SDR50);
+        mmcsd_set_timing(card->host, MMCSD_TIMING_MMC_HS);
         mmcsd_set_clock(card->host, card->hs_max_data_rate);
     }
 
     return ret;
+}
+
+static void mmc_prepare_speed_retry(struct rt_mmcsd_host *host, rt_uint32_t clear_flags)
+{
+    host->flags &= ~clear_flags;
+
+    mmcsd_set_clock(host, 0);
+    mmcsd_set_timing(host, MMCSD_TIMING_LEGACY);
+    mmcsd_set_bus_width(host, MMCSD_BUS_WIDTH_1);
+    mmcsd_set_bus_mode(host, MMCSD_BUSMODE_OPENDRAIN);
+    mmcsd_set_clock(host, host->freq_min);
+    mmcsd_delay_ms(10);
+}
+
+static rt_bool_t mmc_retry_next_speed(struct rt_mmcsd_host *host, const char *stage)
+{
+    if (host->flags & MMCSD_SUP_HS200)
+    {
+        mmc_prepare_speed_retry(host, MMCSD_SUP_HS200);
+        LOG_W("eMMC HS200 %s failed, retry with DDR52/HS SDR.", stage);
+        return RT_TRUE;
+    }
+
+    if (host->flags & MMCSD_SUP_HIGHSPEED_DDR)
+    {
+        mmc_prepare_speed_retry(host, MMCSD_SUP_HIGHSPEED_DDR);
+        LOG_W("eMMC DDR52 %s failed, retry with HS SDR.", stage);
+        return RT_TRUE;
+    }
+
+    return RT_FALSE;
 }
 
 static rt_int32_t mmcsd_mmc_init_card(struct rt_mmcsd_host *host,
@@ -526,7 +709,6 @@ static rt_int32_t mmcsd_mmc_init_card(struct rt_mmcsd_host *host,
     rt_int32_t err;
     rt_uint32_t resp[4];
     rt_uint32_t rocr = 0;
-    rt_uint32_t max_data_rate;
     rt_uint8_t *ext_csd = RT_NULL;
     struct rt_mmcsd_card *card = RT_NULL;
 
@@ -611,12 +793,6 @@ static rt_int32_t mmcsd_mmc_init_card(struct rt_mmcsd_host *host,
     if (!(card->flags & CARD_FLAG_SDHC) && (rocr & (1 << 30)))
         card->flags |= CARD_FLAG_SDHC;
 
-    /* set bus speed */
-    if (card->flags & (CARD_FLAG_HIGHSPEED | CARD_FLAG_HIGHSPEED_DDR))
-        max_data_rate = card->hs_max_data_rate;
-    else
-        max_data_rate = card->max_data_rate;
-
     /*switch bus width and bus mode*/
     err = mmc_select_bus_width(card, ext_csd);
     if (err)
@@ -631,6 +807,8 @@ static rt_int32_t mmcsd_mmc_init_card(struct rt_mmcsd_host *host,
         LOG_E("mmc select timing fail");
         goto err0;
     }
+
+    (void)mmc_enable_cache(card);
 
     host->card = card;
 
@@ -677,9 +855,14 @@ rt_int32_t init_mmc(struct rt_mmcsd_host *host, rt_uint32_t ocr)
     /*
      * Detect and init the card.
      */
+retry:
     err = mmcsd_mmc_init_card(host, current_ocr);
     if (err)
+    {
+        if (mmc_retry_next_speed(host, "init"))
+            goto retry;
         goto err;
+    }
 
     mmcsd_host_unlock(host);
 
@@ -695,6 +878,8 @@ remove_card:
     rt_mmcsd_blk_remove(host->card);
     rt_free(host->card);
     host->card = RT_NULL;
+    if (mmc_retry_next_speed(host, "block probe"))
+        goto retry;
 err:
 
     LOG_E("init MMC card failed!");

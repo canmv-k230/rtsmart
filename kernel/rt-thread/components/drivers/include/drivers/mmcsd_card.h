@@ -143,6 +143,8 @@ struct rt_mmcsd_card {
 	rt_uint32_t	card_blksize;	/* card block size */
 	rt_uint32_t	card_sec_cnt;   /* card sector count*/
 	rt_uint32_t	erase_size;	/* erase size in sectors */
+	rt_uint32_t	emmc_cache_size; /* eMMC cache size in KiB */
+	rt_uint8_t      emmc_sec_feature_support;
 	rt_uint16_t	card_type;
 #define CARD_TYPE_MMC                   0 /* MMC card */
 #define CARD_TYPE_SD                    1 /* SD card */
@@ -155,6 +157,8 @@ struct rt_mmcsd_card {
 #define CARD_FLAG_SDXC       (1 << 2)   /* SDXC card */
 #define CARD_FLAG_HIGHSPEED_DDR  (1 << 3)   /*HIGH SPEED DDR*/
 #define CARD_FLAG_HS200      (1 << 4)   /* BUS SPEED 200mHz*/
+	rt_uint8_t      emmc_cache_enabled;
+	rt_uint8_t      emmc_cache_dirty;
 	struct rt_sd_scr	scr;
 	struct rt_mmcsd_csd	csd;
 	rt_uint32_t     hs_max_data_rate;  /* max data transfer rate in high speed mode */

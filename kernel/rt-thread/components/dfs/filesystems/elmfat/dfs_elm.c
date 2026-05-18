@@ -1075,11 +1075,13 @@ DRESULT disk_ioctl(BYTE drv, BYTE ctrl, void *buff)
     }
     else if (ctrl == CTRL_SYNC)
     {
-        rt_device_control(device, RT_DEVICE_CTRL_BLK_SYNC, RT_NULL);
+        if (rt_device_control(device, RT_DEVICE_CTRL_BLK_SYNC, RT_NULL) != RT_EOK)
+            return RES_ERROR;
     }
     else if (ctrl == CTRL_TRIM)
     {
-        rt_device_control(device, RT_DEVICE_CTRL_BLK_ERASE, buff);
+        if (rt_device_control(device, RT_DEVICE_CTRL_BLK_ERASE, buff) != RT_EOK)
+            return RES_ERROR;
     }
 
     return RES_OK;
@@ -1175,4 +1177,3 @@ void ff_memfree(void *mem)
     rt_free(mem);
 }
 #endif /* _USE_LFN == 3 */
-

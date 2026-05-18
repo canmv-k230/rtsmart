@@ -136,10 +136,13 @@ extern "C" {
 #define EXT_CSD_TIMING_HS200	        2	/* HS200 */
 #define EXT_CSD_TIMING_HS400	        3	/* HS400 */
 
-#define EXT_CSD_SEC_ER_EN	        BIT(0)
-#define EXT_CSD_SEC_BD_BLK_EN	        BIT(2)
-#define EXT_CSD_SEC_GB_CL_EN	        BIT(4)
-#define EXT_CSD_SEC_SANITIZE	        BIT(6)  /* v4.5 only */
+#define EXT_CSD_SEC_ER_EN	        (1 << 0)
+#define EXT_CSD_SEC_BD_BLK_EN	        (1 << 2)
+#define EXT_CSD_SEC_GB_CL_EN	        (1 << 4)
+#define EXT_CSD_SEC_SANITIZE	        (1 << 6)  /* v4.5 only */
+
+#define MMC_ERASE_ARG                  0x00000000
+#define MMC_TRIM_ARG                   0x00000001
 
 #define EXT_CSD_RST_N_EN_MASK	        0x3
 #define EXT_CSD_RST_N_ENABLED	        1	/* RST_n is enabled on card */
@@ -154,18 +157,18 @@ extern "C" {
 #define EXT_CSD_PWR_CL_8BIT_SHIFT	4
 #define EXT_CSD_PWR_CL_4BIT_SHIFT	0
 
-#define EXT_CSD_PACKED_EVENT_EN	BIT(3)
+#define EXT_CSD_PACKED_EVENT_EN	        (1 << 3)
 
 /*
  * EXCEPTION_EVENT_STATUS field
  */
-#define EXT_CSD_URGENT_BKOPS		BIT(0)
-#define EXT_CSD_DYNCAP_NEEDED		BIT(1)
-#define EXT_CSD_SYSPOOL_EXHAUSTED	BIT(2)
-#define EXT_CSD_PACKED_FAILURE		BIT(3)
+#define EXT_CSD_URGENT_BKOPS		(1 << 0)
+#define EXT_CSD_DYNCAP_NEEDED		(1 << 1)
+#define EXT_CSD_SYSPOOL_EXHAUSTED	(1 << 2)
+#define EXT_CSD_PACKED_FAILURE		(1 << 3)
 
-#define EXT_CSD_PACKED_GENERIC_ERROR	BIT(0)
-#define EXT_CSD_PACKED_INDEXED_ERROR	BIT(1)
+#define EXT_CSD_PACKED_GENERIC_ERROR	(1 << 0)
+#define EXT_CSD_PACKED_INDEXED_ERROR	(1 << 1)
 
 /*
  * BKOPS status level
@@ -182,8 +185,11 @@ extern "C" {
 /*
  * extern function
  */
+struct rt_mmcsd_card;
+
 rt_err_t mmc_send_op_cond(struct rt_mmcsd_host *host, rt_uint32_t ocr, rt_uint32_t *rocr);
 rt_int32_t init_mmc(struct rt_mmcsd_host *host, rt_uint32_t ocr);
+rt_err_t mmc_flush_cache(struct rt_mmcsd_card *card);
 
 #ifdef __cplusplus
 }

@@ -76,6 +76,8 @@ extern "C" {
 /* This is basically the same command as for MMC with some quirks. */
 #define SD_SEND_RELATIVE_ADDR     3   /* bcr                     R6  */
 #define SD_SEND_IF_COND           8   /* bcr  [11:0] See below   R7  */
+#define SD_ERASE_WR_BLK_START    32   /* ac   [31:0] data addr   R1  */
+#define SD_ERASE_WR_BLK_END      33   /* ac   [31:0] data addr   R1  */
 
   /* class 10 */
 #define SD_SWITCH                 6   /* adtc [31:0] See below   R1  */

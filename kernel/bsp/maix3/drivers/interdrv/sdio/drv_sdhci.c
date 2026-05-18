@@ -22,6 +22,7 @@
 #include <cache.h>
 
 #include "sysctl_boot.h"
+#include "tick.h"
 
 #ifdef RT_USING_SDIO
 
@@ -44,9 +45,25 @@
 #define EMMC_CTRL_R (DWC_MSHC_PTR_VENDOR1 + 0x2c)
 #define SDHCI_VENDER_AT_CTRL_REG (DWC_MSHC_PTR_VENDOR1 + 0x40)
 #define SDHCI_VENDER_AT_STAT_REG (DWC_MSHC_PTR_VENDOR1 + 0x44)
+#define SDHCI_TUNE_AT_EN BIT(0)
+#define SDHCI_TUNE_CI_SEL BIT(1)
+#define SDHCI_TUNE_SWIN_TH_EN BIT(2)
+#define SDHCI_TUNE_RPT_TUNE_ERR BIT(3)
+#define SDHCI_TUNE_SW_TUNE_EN BIT(4)
+#define SDHCI_TUNE_WIN_EDGE_SEL_MASK (0xf << 8)
 #define SDHCI_TUNE_CLK_STOP_EN_MASK BIT(16)
+#define SDHCI_TUNE_PRE_CHANGE_DLY_LSB (17)
+#define SDHCI_TUNE_PRE_CHANGE_DLY_MASK (0x3 << SDHCI_TUNE_PRE_CHANGE_DLY_LSB)
+#define SDHCI_TUNE_POST_CHANGE_DLY_LSB (19)
+#define SDHCI_TUNE_POST_CHANGE_DLY_MASK (0x3 << SDHCI_TUNE_POST_CHANGE_DLY_LSB)
 #define SDHCI_TUNE_SWIN_TH_VAL_LSB (24)
-#define SDHCI_TUNE_SWIN_TH_VAL_MASK (0xFF)
+#define SDHCI_TUNE_SWIN_TH_VAL_MASK (0xff << SDHCI_TUNE_SWIN_TH_VAL_LSB)
+#define SDHCI_TUNE_PRE_CHANGE_DLY_VAL (0x1)
+#define SDHCI_TUNE_POST_CHANGE_DLY_VAL (0x3)
+#define SDHCI_TUNE_SWIN_TH_VAL (0x9)
+#define SDHCI_TUNING_LOOP_COUNT 128
+#define SDHCI_TUNING_TIMEOUT_MS 50
+#define SDHCI_TUNING_TOTAL_TIMEOUT_MS 2000
 #define CARD_IS_EMMC 0
 #define EMMC_RST_N 2
 #define EMMC_RST_N_OE 3
@@ -195,19 +212,30 @@ static void dwcmshc_phy_3_3v_init(struct sdhci_host* host)
 
 static void dwcmshc_phy_delay_config(struct sdhci_host* host)
 {
+    uint8_t sdclkdl_cnfg;
+    uint8_t sdclkdl_dc;
+
     sdhci_writeb(host, 1, DWC_MSHC_COMMDL_CNFG);
     if (host->tx_delay_line > 256) {
         LOG_E("host%d: tx_delay_line err\n", host->index);
     } else if (host->tx_delay_line > 128) {
-        sdhci_writeb(host, 0x1, DWC_MSHC_SDCLKDL_CNFG);
-        sdhci_writeb(host, host->tx_delay_line - 128, DWC_MSHC_SDCLKDL_DC);
+        sdclkdl_cnfg = 0x1;
+        sdclkdl_dc = host->tx_delay_line - 128;
     } else {
-        sdhci_writeb(host, 0x0, DWC_MSHC_SDCLKDL_CNFG);
-        sdhci_writeb(host, host->tx_delay_line, DWC_MSHC_SDCLKDL_DC);
+        sdclkdl_cnfg = 0x0;
+        sdclkdl_dc = host->tx_delay_line;
     }
+    sdhci_writeb(host, sdclkdl_cnfg | BIT(4), DWC_MSHC_SDCLKDL_CNFG);
+    sdhci_writeb(host, sdclkdl_dc & 0x7f, DWC_MSHC_SDCLKDL_DC);
+    sdhci_writeb(host, sdclkdl_cnfg, DWC_MSHC_SDCLKDL_CNFG);
     sdhci_writeb(host, host->rx_delay_line, DWC_MSHC_SMPLDL_CNFG);
     sdhci_writeb(host, 0xc, DWC_MSHC_ATDL_CNFG);
-    sdhci_writel(host, (sdhci_readl(host, SDHCI_VENDER_AT_CTRL_REG) | BIT(16) | BIT(17) | BIT(19) | BIT(20)), SDHCI_VENDER_AT_CTRL_REG);
+    sdhci_writel(host, sdhci_readl(host, SDHCI_VENDER_AT_CTRL_REG) |
+        SDHCI_TUNE_AT_EN | SDHCI_TUNE_SWIN_TH_EN | SDHCI_TUNE_CLK_STOP_EN_MASK |
+        (SDHCI_TUNE_PRE_CHANGE_DLY_VAL << SDHCI_TUNE_PRE_CHANGE_DLY_LSB) |
+        (SDHCI_TUNE_POST_CHANGE_DLY_VAL << SDHCI_TUNE_POST_CHANGE_DLY_LSB) |
+        (SDHCI_TUNE_SWIN_TH_VAL << SDHCI_TUNE_SWIN_TH_VAL_LSB),
+        SDHCI_VENDER_AT_CTRL_REG);
     sdhci_writel(host, 0x0, SDHCI_VENDER_AT_STAT_REG);
 }
 
@@ -352,11 +380,13 @@ static void sdhci_send_command(struct sdhci_host* sdhci_host, struct sdhci_comma
     if (sdhci_data != RT_NULL) {
 #ifdef SDHCI_SDMA_ENABLE
         uint32_t start_addr;
-        if (sdhci_data->rxData)
+        if (sdhci_data->rxData) {
             start_addr = (rt_ubase_t)((uint8_t*)sdhci_data->rxData + PV_OFFSET);
-        else
+            rt_hw_cpu_dcache_invalidate(sdhci_data->rxData, sdhci_data->blockSize * sdhci_data->blockCount);
+        } else {
             start_addr = (rt_ubase_t)((uint8_t*)sdhci_data->txData + PV_OFFSET);
-        rt_hw_cpu_dcache_clean((void*)(long)start_addr, sdhci_data->blockSize * sdhci_data->blockCount);
+            rt_hw_cpu_dcache_clean((void*)(long)start_addr, sdhci_data->blockSize * sdhci_data->blockCount);
+        }
         command->flags2 |= sdhci_enable_dma_flag;
         sdhci_writel(sdhci_host, start_addr, SDHCI_DMA_ADDRESS);
 #endif
@@ -576,14 +606,16 @@ static void sdhci_irq(int vector, void* param)
     struct sdhci_host* host = param;
     uint32_t status = sdhci_get_int_status_flag(host);
 
-    if (status & (SDHCI_INT_ERROR | SDHCI_INT_DATA_END | SDHCI_INT_DMA_END | SDHCI_INT_RESPONSE)) {
+    if (status & (SDHCI_INT_ERROR | SDHCI_INT_DATA_END | SDHCI_INT_DMA_END | SDHCI_INT_RESPONSE | SDHCI_INT_DATA_AVAIL)) {
         host->error_code = (status >> 16) & 0xffff;
-        rt_event_send(&host->event, status & (SDHCI_INT_ERROR | SDHCI_INT_DATA_END | SDHCI_INT_DMA_END | SDHCI_INT_RESPONSE));
+        rt_event_send(&host->event, status & (SDHCI_INT_ERROR | SDHCI_INT_DATA_END | SDHCI_INT_DMA_END | SDHCI_INT_RESPONSE | SDHCI_INT_DATA_AVAIL));
     }
     if (status & SDHCI_INT_CARD_INT)
         sdio_irq_wakeup(host->host);
     sdhci_clear_int_status_flag(host, status);
 }
+
+static rt_int32_t sdhci_execute_tuning_cmd(struct rt_mmcsd_host* mmcsd_host, rt_int32_t opcode);
 
 static void kd_mmc_request(struct rt_mmcsd_host* host, struct rt_mmcsd_req* req)
 {
@@ -714,6 +746,191 @@ static void kd_mmc_request(struct rt_mmcsd_host* host, struct rt_mmcsd_req* req)
     mmcsd_req_complete(host);
 }
 
+static rt_tick_t sdhci_ms_to_tick(rt_uint32_t ms)
+{
+    rt_tick_t tick = (rt_tick_t)((ms * RT_TICK_PER_SECOND + 999) / 1000);
+
+    return tick ? tick : 1;
+}
+
+static rt_err_t sdhci_wait_bus_idle(struct sdhci_host* host)
+{
+    uint32_t timeout = 100000;
+
+    while (sdhci_get_present_status_flag(host) & (SDHCI_CMD_INHIBIT | SDHCI_DATA_INHIBIT)) {
+        if (!timeout--)
+            return -RT_ETIMEOUT;
+        cpu_ticks_delay_us(1);
+    }
+
+    return RT_EOK;
+}
+
+static void sdhci_config_tuning_engine(struct sdhci_host* host)
+{
+    uint16_t clk;
+    uint32_t val;
+
+    clk = sdhci_readw(host, SDHCI_CLOCK_CONTROL);
+    sdhci_writew(host, clk & ~SDHCI_CLOCK_CARD_EN, SDHCI_CLOCK_CONTROL);
+
+    sdhci_writeb(host, 0xc, DWC_MSHC_ATDL_CNFG);
+
+    val = sdhci_readl(host, SDHCI_VENDER_AT_CTRL_REG);
+    val &= ~(SDHCI_TUNE_CI_SEL | SDHCI_TUNE_RPT_TUNE_ERR |
+        SDHCI_TUNE_SW_TUNE_EN | SDHCI_TUNE_WIN_EDGE_SEL_MASK |
+        SDHCI_TUNE_PRE_CHANGE_DLY_MASK | SDHCI_TUNE_POST_CHANGE_DLY_MASK |
+        SDHCI_TUNE_SWIN_TH_VAL_MASK);
+    val |= SDHCI_TUNE_AT_EN | SDHCI_TUNE_SWIN_TH_EN |
+        SDHCI_TUNE_CLK_STOP_EN_MASK |
+        (SDHCI_TUNE_PRE_CHANGE_DLY_VAL << SDHCI_TUNE_PRE_CHANGE_DLY_LSB) |
+        (SDHCI_TUNE_POST_CHANGE_DLY_VAL << SDHCI_TUNE_POST_CHANGE_DLY_LSB) |
+        (SDHCI_TUNE_SWIN_TH_VAL << SDHCI_TUNE_SWIN_TH_VAL_LSB);
+    sdhci_writel(host, val, SDHCI_VENDER_AT_CTRL_REG);
+    sdhci_writel(host, 0, SDHCI_VENDER_AT_STAT_REG);
+
+    sdhci_writew(host, clk, SDHCI_CLOCK_CONTROL);
+    if (clk & SDHCI_CLOCK_INT_EN) {
+        while ((sdhci_readw(host, SDHCI_CLOCK_CONTROL) & SDHCI_CLOCK_INT_STABLE) == 0)
+            ;
+    }
+}
+
+static void sdhci_reset_tuning(struct sdhci_host* host)
+{
+    uint16_t ctrl2;
+
+    ctrl2 = sdhci_readw(host, SDHCI_HOST_CONTROL2);
+    ctrl2 &= ~(SDHCI_CTRL_EXEC_TUNING | SDHCI_CTRL_TUNED_CLK);
+    sdhci_writew(host, ctrl2, SDHCI_HOST_CONTROL2);
+}
+
+static rt_err_t sdhci_send_tuning_cmd(struct sdhci_host* host, rt_int32_t opcode)
+{
+    rt_err_t err;
+    rt_uint32_t event;
+    uint16_t block_size;
+    uint16_t cmd;
+    uint32_t i;
+    volatile uint32_t scratch;
+
+    err = sdhci_wait_bus_idle(host);
+    if (err)
+        return err;
+
+    block_size = (host->host->io_cfg.bus_width == MMCSD_BUS_WIDTH_8) ? 128 : 64;
+
+    rt_event_control(&host->event, RT_IPC_CMD_RESET, 0);
+    sdhci_writel(host, SDHCI_INT_ALL_MASK, SDHCI_INT_STATUS);
+    sdhci_writew(host, SDHCI_MAKE_BLKSZ(7, block_size), SDHCI_BLOCK_SIZE);
+    sdhci_writew(host, 1, SDHCI_BLOCK_COUNT);
+    sdhci_writew(host, SDHCI_TRNS_READ, SDHCI_TRANSFER_MODE);
+    sdhci_writel(host, 0, SDHCI_ARGUMENT);
+
+    cmd = SDHCI_MAKE_CMD(opcode,
+        SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX | SDHCI_CMD_DATA);
+    sdhci_writew(host, cmd, SDHCI_COMMAND);
+
+    err = rt_event_recv(&host->event, SDHCI_INT_ERROR | SDHCI_INT_DATA_AVAIL,
+        RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR,
+        sdhci_ms_to_tick(SDHCI_TUNING_TIMEOUT_MS), &event);
+    if (err)
+        return err;
+
+    if (event & SDHCI_INT_ERROR)
+        return -RT_ERROR;
+
+    for (i = 0; i < block_size / sizeof(uint32_t); i++)
+        scratch = sdhci_readl(host, SDHCI_BUFFER);
+    (void)scratch;
+
+    return RT_EOK;
+}
+
+static rt_int32_t sdhci_execute_tuning_cmd(struct rt_mmcsd_host* mmcsd_host, rt_int32_t opcode)
+{
+    struct sdhci_host* host;
+    uint32_t old_int_enable;
+    uint32_t old_signal_enable;
+    uint32_t at_stat;
+    uint64_t tuning_start_ms;
+    uint16_t ctrl2;
+    uint32_t i;
+    rt_err_t ret;
+    rt_bool_t tuning_done;
+
+    RT_ASSERT(mmcsd_host != RT_NULL);
+    RT_ASSERT(mmcsd_host->private_data != RT_NULL);
+
+    host = (struct sdhci_host*)mmcsd_host->private_data;
+
+    if (!host->is_emmc_card || mmcsd_host->io_cfg.timing != MMCSD_TIMING_MMC_HS200)
+        return RT_EOK;
+
+    if (opcode != SEND_TUNING_BLOCK_HS200)
+        return -RT_ERROR;
+
+    old_int_enable = sdhci_readl(host, SDHCI_INT_ENABLE);
+    old_signal_enable = sdhci_readl(host, SDHCI_SIGNAL_ENABLE);
+
+    sdhci_config_tuning_engine(host);
+
+    sdhci_writel(host, old_int_enable | SDHCI_INT_DATA_AVAIL | SDHCI_INT_CMD_MASK |
+        SDHCI_INT_DATA_MASK, SDHCI_INT_ENABLE);
+    sdhci_writel(host, old_signal_enable | SDHCI_INT_DATA_AVAIL | SDHCI_INT_ERROR,
+        SDHCI_SIGNAL_ENABLE);
+
+    ctrl2 = sdhci_readw(host, SDHCI_HOST_CONTROL2);
+    ctrl2 &= ~SDHCI_CTRL_TUNED_CLK;
+    ctrl2 |= SDHCI_CTRL_EXEC_TUNING;
+    sdhci_writew(host, ctrl2, SDHCI_HOST_CONTROL2);
+
+    tuning_start_ms = cpu_ticks_ms();
+    ret = -RT_ERROR;
+    tuning_done = RT_FALSE;
+    for (i = 0; i < SDHCI_TUNING_LOOP_COUNT; i++) {
+        if ((cpu_ticks_ms() - tuning_start_ms) >= SDHCI_TUNING_TOTAL_TIMEOUT_MS) {
+            ret = -RT_ETIMEOUT;
+            break;
+        }
+
+        ret = sdhci_send_tuning_cmd(host, opcode);
+        if (ret)
+            break;
+
+        ctrl2 = sdhci_readw(host, SDHCI_HOST_CONTROL2);
+        if (!(ctrl2 & SDHCI_CTRL_EXEC_TUNING)) {
+            tuning_done = RT_TRUE;
+            if (ctrl2 & SDHCI_CTRL_TUNED_CLK)
+                ret = RT_EOK;
+            else
+                ret = -RT_ERROR;
+            break;
+        }
+    }
+
+    ctrl2 = sdhci_readw(host, SDHCI_HOST_CONTROL2);
+    at_stat = sdhci_readl(host, SDHCI_VENDER_AT_STAT_REG);
+    if (!tuning_done && ret == RT_EOK)
+        ret = -RT_ETIMEOUT;
+
+    if (ret == RT_EOK) {
+        LOG_I("eMMC HS200 tuning ok, loops=%d.", i + 1);
+        sdhci_reset(host, SDHCI_RESET_DATA);
+    } else {
+        sdhci_reset_tuning(host);
+        sdhci_reset(host, SDHCI_RESET_CMD | SDHCI_RESET_DATA);
+        LOG_W("eMMC HS200 tuning failed, err=%d, loops=%d, host_ctrl2=0x%04x, at_stat=0x%08x, err_stat=0x%04x.",
+            ret, i, ctrl2, at_stat, host->error_code);
+    }
+
+    sdhci_writel(host, old_int_enable, SDHCI_INT_ENABLE);
+    sdhci_writel(host, old_signal_enable, SDHCI_SIGNAL_ENABLE);
+    sdhci_writel(host, SDHCI_INT_ALL_MASK, SDHCI_INT_STATUS);
+
+    return ret;
+}
+
 static void kd_mmc_clock_freq_change(struct sdhci_host* host, uint32_t clock)
 {
     uint32_t div, val;
@@ -744,6 +961,46 @@ static void kd_mmc_clock_freq_change(struct sdhci_host* host, uint32_t clock)
         ;
 }
 
+static void kd_mmc_set_timing(struct sdhci_host* host, uint32_t timing)
+{
+    uint16_t ctrl2;
+
+    ctrl2 = sdhci_readw(host, SDHCI_HOST_CONTROL2);
+    ctrl2 &= ~SDHCI_CTRL_UHS_MASK;
+
+    switch (timing) {
+    case MMCSD_TIMING_MMC_HS:
+    case MMCSD_TIMING_SD_HS:
+    case MMCSD_TIMING_UHS_SDR25:
+        ctrl2 |= SDHCI_CTRL_UHS_SDR25;
+        break;
+    case MMCSD_TIMING_UHS_SDR50:
+        ctrl2 |= SDHCI_CTRL_UHS_SDR50;
+        break;
+    case MMCSD_TIMING_MMC_DDR52:
+    case MMCSD_TIMING_UHS_DDR50:
+        ctrl2 |= SDHCI_CTRL_UHS_DDR50;
+        break;
+    case MMCSD_TIMING_MMC_HS200:
+    case MMCSD_TIMING_UHS_SDR104:
+        ctrl2 |= SDHCI_CTRL_UHS_SDR104;
+        break;
+    case MMCSD_TIMING_MMC_HS400:
+        ctrl2 |= SDHCI_CTRL_HS400;
+        break;
+    case MMCSD_TIMING_LEGACY:
+    case MMCSD_TIMING_UHS_SDR12:
+    default:
+        ctrl2 |= SDHCI_CTRL_UHS_SDR12;
+        break;
+    }
+
+    if (host->io_fixed_1v8)
+        ctrl2 |= SDHCI_CTRL_VDD_180;
+
+    sdhci_writew(host, ctrl2, SDHCI_HOST_CONTROL2);
+}
+
 static void kd_set_iocfg(struct rt_mmcsd_host* host, struct rt_mmcsd_io_cfg* io_cfg)
 {
     struct sdhci_host* mmcsd;
@@ -758,9 +1015,17 @@ static void kd_set_iocfg(struct rt_mmcsd_host* host, struct rt_mmcsd_io_cfg* io_
     sdhci_clk = io_cfg->clock;
     bus_width = io_cfg->bus_width;
 
-    LOG_D("%s: sdhci_clk=%d, bus_width:%d\n", __func__, sdhci_clk, bus_width);
+    LOG_D("%s: sdhci_clk=%d, bus_width:%d, timing:%d\n",
+        __func__, sdhci_clk, bus_width, io_cfg->timing);
 
-    kd_mmc_clock_freq_change(mmcsd, sdhci_clk);
+    if (mmcsd->is_emmc_card) {
+        kd_mmc_clock_freq_change(mmcsd, 0);
+        kd_mmc_set_timing(mmcsd, io_cfg->timing);
+        if (sdhci_clk)
+            kd_mmc_clock_freq_change(mmcsd, sdhci_clk);
+    } else {
+        kd_mmc_clock_freq_change(mmcsd, sdhci_clk);
+    }
     ctrl = sdhci_readb(mmcsd, SDHCI_HOST_CONTROL);
     ctrl &= ~(SDHCI_CTRL_4BITBUS | SDHCI_CTRL_8BITBUS);
     if (bus_width == 3)
@@ -788,7 +1053,7 @@ static const struct rt_mmcsd_host_ops ops = {
     kd_set_iocfg,
     RT_NULL,
     kd_enable_sdio_irq,
-    RT_NULL,
+    sdhci_execute_tuning_cmd,
 };
 
 void kd_sdhci0_reset(int value)
@@ -830,12 +1095,12 @@ rt_int32_t kd_sdhci_init(void)
     sdhci_host0->have_phy = 1;
     sdhci_host0->mshc_ctrl_r = 0;
     sdhci_host0->rx_delay_line = 0x0d;
-    sdhci_host0->tx_delay_line = 0xc0;
 #ifdef RT_SDIO0_EMMC
     sdhci_host0->is_emmc_card = 1;
 #else
     sdhci_host0->is_emmc_card = 0;
 #endif
+    sdhci_host0->tx_delay_line = sdhci_host0->is_emmc_card ? 0x8a : 0xc0;
 #ifdef RT_SDIO0_1V8
     sdhci_host0->io_fixed_1v8 = 1;
 #else
@@ -862,9 +1127,20 @@ rt_int32_t kd_sdhci_init(void)
     strncpy(mmcsd_host0->name, "sd0", sizeof(mmcsd_host0->name) - 1);
 
     mmcsd_host0->flags = SDIO0_BUS_WIDTH | MMCSD_MUTBLKWRITE | MMCSD_SUP_HIGHSPEED | MMCSD_SUP_SDIO_IRQ; /* enable 8bit and 4bit support */
+    if (sdhci_host0->is_emmc_card) {
+        mmcsd_host0->flags |= MMCSD_SUP_NONREMOVABLE;
+        if (sdhci_host0->io_fixed_1v8)
+            mmcsd_host0->flags |= MMCSD_SUP_DDR_1V8;
+        else
+            mmcsd_host0->flags |= MMCSD_SUP_DDR_3V3;
+
+        if (sdhci_host0->io_fixed_1v8)
+            mmcsd_host0->flags |= MMCSD_SUP_HS200_1V8;
+
+    }
     mmcsd_host0->valid_ocr = sdhci_host0->io_fixed_1v8 ? VDD_165_195 : VDD_32_33 | VDD_33_34;
 
-    mmcsd_host0->max_seg_size = 512 * 512;
+    mmcsd_host0->max_seg_size = sdhci_host0->is_emmc_card ? (4096 * 512) : (512 * 512);
     mmcsd_host0->max_dma_segs = 1;
     mmcsd_host0->max_blk_size = 512;
     mmcsd_host0->max_blk_count = 4096;
