@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "rthw.h"
 #include "rtdef.h"
 #include "rtthread.h"
 
@@ -37,6 +38,26 @@
 
 #define write32(addr, value) writel(value, (volatile void*)(rt_uint64_t)(addr))
 #define read32(addr)         readl((const volatile void*)(rt_uint64_t)(addr))
+
+static atomic_lock_t g_fpioa_lock;
+
+static inline void drv_fpioa_lock(void)
+{
+    atomic_lock_take(&g_fpioa_lock);
+}
+
+static inline void drv_fpioa_unlock(void)
+{
+    atomic_lock_release(&g_fpioa_lock);
+}
+
+static int drv_fpioa_init(void)
+{
+    atoic_lock_init(&g_fpioa_lock);
+
+    return 0;
+}
+INIT_PREV_EXPORT(drv_fpioa_init);
 
 #pragma pack(1)
 
@@ -350,9 +371,11 @@ static inline int drv_fpioa_set_iomux(int pin, uint32_t value)
         return -1;
     }
 
+    drv_fpioa_lock();
     uint32_t reg_value = read32(&iomux_reg[pin]);
     reg_value          = (reg_value & 0x200) | value;
     write32(&iomux_reg[pin], reg_value);
+    drv_fpioa_unlock();
 
     return 0;
 }
@@ -397,9 +420,11 @@ static inline int drv_fpioa_set_pmu_iomux(int pin, uint32_t value)
 
     data = convert_iomux_to_pmu(value);
 
+    drv_fpioa_lock();
     uint32_t reg_value = read32(&pmu_iomux_reg[pin]);
     reg_value          = (reg_value & 0x200) | data;
     write32(&pmu_iomux_reg[pin], reg_value);
+    drv_fpioa_unlock();
 
     return 0;
 }

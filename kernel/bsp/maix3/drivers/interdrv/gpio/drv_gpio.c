@@ -28,6 +28,7 @@
 #include <stdio.h>
 #include <sys/ioctl.h>
 
+#include <rthw.h>
 #include <rtdef.h>
 #include <rtdevice.h>
 #include <rtthread.h>
@@ -143,6 +144,56 @@ typedef struct _kd_gpio_inst {
 
 static kd_gpio_inst_t _gpio_inst;
 
+#define GPIO_BANK_COUNT 3
+
+#ifdef RT_USING_SMP
+static struct rt_spinlock g_gpio_bank_locks[GPIO_BANK_COUNT];
+#else
+static rt_uint32_t g_gpio_bank_locks[GPIO_BANK_COUNT];
+#endif
+
+static atomic_lock_t g_gpio_pin_state_locks[GPIO_MAX_NUM];
+
+static inline int kd_gpio_pin_bank(rt_base_t pin)
+{
+    if (pin >= 64) {
+        return 2;
+    }
+
+    return (pin >= 32) ? 1 : 0;
+}
+
+static inline rt_base_t kd_gpio_bank_lock(rt_base_t pin)
+{
+#ifdef RT_USING_SMP
+    return rt_spin_lock_irqsave(&g_gpio_bank_locks[kd_gpio_pin_bank(pin)]);
+#else
+    rt_enter_critical();
+    return 0;
+#endif
+}
+
+static inline void kd_gpio_bank_unlock(rt_base_t pin, rt_base_t level)
+{
+#ifdef RT_USING_SMP
+    rt_spin_unlock_irqrestore(&g_gpio_bank_locks[kd_gpio_pin_bank(pin)], level);
+#else
+    (void)pin;
+    (void)level;
+    rt_exit_critical();
+#endif
+}
+
+static inline void kd_gpio_pin_state_lock(rt_base_t pin)
+{
+    atomic_lock_take(&g_gpio_pin_state_locks[pin]);
+}
+
+static inline void kd_gpio_pin_state_unlock(rt_base_t pin)
+{
+    atomic_lock_release(&g_gpio_pin_state_locks[pin]);
+}
+
 rt_err_t kd_pin_mode_get(rt_base_t pin, rt_base_t* mode)
 {
     if (pin < 0 || pin >= GPIO_MAX_NUM) {
@@ -150,12 +201,14 @@ rt_err_t kd_pin_mode_get(rt_base_t pin, rt_base_t* mode)
         return -RT_EINVAL;
     }
 
+    kd_gpio_pin_state_lock(pin);
     *mode = _gpio_inst.mode_table[pin].mode;
+    kd_gpio_pin_state_unlock(pin);
 
     return RT_EOK;
 }
 
-static inline __attribute__((always_inline)) void kd_pin_write_reg(volatile uint32_t* reg, int pin, int val)
+static inline __attribute__((always_inline)) void kd_pin_write_reg_raw(volatile uint32_t* reg, int pin, int val)
 {
     uint32_t reg_val = read32(reg);
     reg_val &= ~BIT(pin);
@@ -163,6 +216,13 @@ static inline __attribute__((always_inline)) void kd_pin_write_reg(volatile uint
         reg_val |= BIT(pin);
     }
     write32(reg, reg_val);
+}
+
+static inline __attribute__((always_inline)) void kd_pin_write_reg(rt_base_t gpio_pin, volatile uint32_t* reg, int pin, int val)
+{
+    rt_base_t level = kd_gpio_bank_lock(gpio_pin);
+    kd_pin_write_reg_raw(reg, pin, val);
+    kd_gpio_bank_unlock(gpio_pin, level);
 }
 
 void kd_pin_set_ddr(rt_base_t pin, int value)
@@ -174,7 +234,7 @@ void kd_pin_set_ddr(rt_base_t pin, int value)
 
     /* Set GPIO direction */
     volatile uint32_t* ddr = &gpio->port[port_idx].ddr;
-    kd_pin_write_reg(ddr, port_pin, value);
+    kd_pin_write_reg(pin, ddr, port_pin, value);
 }
 
 uint32_t kd_pin_get_ddr(rt_base_t pin)
@@ -214,7 +274,7 @@ void kd_pin_set_dr(rt_base_t pin, int value)
 
     /* Set GPIO Ouput Value */
     volatile uint32_t* dr = &gpio->port[port_idx].dr;
-    kd_pin_write_reg(dr, port_pin, value);
+    kd_pin_write_reg(pin, dr, port_pin, value);
 }
 
 rt_err_t kd_pin_mode(rt_base_t pin, rt_base_t mode)
@@ -293,20 +353,30 @@ rt_err_t kd_pin_mode(rt_base_t pin, rt_base_t mode)
         new_cfg.u.bit.io_sel = 0; // Set to GPIO function
     }
     new_cfg.u.bit.st = 1;
+
+    volatile kd_gpio_t* gpio     = _gpio_inst.reg[pin >= 32];
+    uint8_t             port_idx = (pin >= 64);
+    uint8_t             port_pin = pin & 0x1F;
+    volatile uint32_t*  ddr      = &gpio->port[port_idx].ddr;
+    kd_gpio_mode_t*     pin_mode = &_gpio_inst.mode_table[pin];
+
+    kd_gpio_pin_state_lock(pin);
     if (new_cfg.u.value != curr_cfg.u.value) {
         if (0x00 != drv_fpioa_set_pin_cfg(pin, new_cfg.u.value)) {
+            kd_gpio_pin_state_unlock(pin);
             LOG_E("Failed to set pin configuration for pin %d", pin);
             return -RT_EINVAL;
         }
     }
 
-    kd_pin_set_ddr(pin, dir);
-
-    kd_gpio_mode_t* pin_mode = &_gpio_inst.mode_table[pin];
+    rt_base_t level = kd_gpio_bank_lock(pin);
+    kd_pin_write_reg_raw(ddr, port_pin, dir);
+    kd_gpio_bank_unlock(pin, level);
 
     pin_mode->mode  = mode;
     pin_mode->iomux = new_cfg.u.value;
     pin_mode->dir   = dir;
+    kd_gpio_pin_state_unlock(pin);
 
     return RT_EOK;
 }
@@ -319,6 +389,13 @@ rt_err_t kd_pin_write(rt_base_t pin, rt_base_t value)
         return -RT_EINVAL;
     }
 
+    volatile kd_gpio_t* gpio     = _gpio_inst.reg[pin >= 32];
+    uint8_t             port_idx = (pin >= 64);
+    uint8_t             port_pin = pin & 0x1F;
+    volatile uint32_t*  ddr      = &gpio->port[port_idx].ddr;
+    volatile uint32_t*  dr       = &gpio->port[port_idx].dr;
+
+    kd_gpio_pin_state_lock(pin);
     kd_gpio_mode_t* pin_mode = &_gpio_inst.mode_table[pin];
     uint32_t        mode     = pin_mode->mode;
     uint32_t        dir      = pin_mode->dir;
@@ -329,19 +406,27 @@ rt_err_t kd_pin_write(rt_base_t pin, rt_base_t value)
 
             iomux |= BIT(7); // oe = 1
             if (0x00 != drv_fpioa_set_pin_cfg(pin, iomux)) {
+                kd_gpio_pin_state_unlock(pin);
                 LOG_E("Failed to set pin configuration for pin %d", pin);
                 return -RT_EINVAL;
             }
 
-            kd_pin_set_ddr(pin, 1);
+            rt_base_t level = kd_gpio_bank_lock(pin);
+            kd_pin_write_reg_raw(ddr, port_pin, 1);
+            kd_gpio_bank_unlock(pin, level);
             pin_mode->dir = GPIO_OD_DIRECTION_OUTPUT;
+            dir           = GPIO_OD_DIRECTION_OUTPUT;
         }
     } else if (0x00 == dir) {
+        kd_gpio_pin_state_unlock(pin);
         LOG_E("Pin %d is input mode, not write it", pin);
         return -RT_EINVAL;
     }
 
-    kd_pin_set_dr(pin, value);
+    rt_base_t level = kd_gpio_bank_lock(pin);
+    kd_pin_write_reg_raw(dr, port_pin, value);
+    kd_gpio_bank_unlock(pin, level);
+    kd_gpio_pin_state_unlock(pin);
 
     return RT_EOK;
 }
@@ -354,6 +439,12 @@ rt_err_t kd_pin_read(rt_base_t pin)
         return -RT_EINVAL;
     }
 
+    volatile kd_gpio_t* gpio     = _gpio_inst.reg[pin >= 32];
+    uint8_t             port_idx = (pin >= 64);
+    uint8_t             port_pin = pin & 0x1F;
+    volatile uint32_t*  ddr      = &gpio->port[port_idx].ddr;
+
+    kd_gpio_pin_state_lock(pin);
     kd_gpio_mode_t* pin_mode = &_gpio_inst.mode_table[pin];
     uint32_t        mode     = pin_mode->mode;
     uint32_t        dir      = pin_mode->dir;
@@ -364,16 +455,22 @@ rt_err_t kd_pin_read(rt_base_t pin)
 
             iomux &= ~BIT(7); // oe = 0
             if (0x00 != drv_fpioa_set_pin_cfg(pin, iomux)) {
+                kd_gpio_pin_state_unlock(pin);
                 LOG_E("Failed to set pin configuration for pin %d", pin);
                 return -RT_EINVAL;
             }
 
-            kd_pin_set_ddr(pin, 0);
+            rt_base_t level = kd_gpio_bank_lock(pin);
+            kd_pin_write_reg_raw(ddr, port_pin, 0);
+            kd_gpio_bank_unlock(pin, level);
             pin_mode->dir = GPIO_OD_DIRECTION_INPUT;
         }
     }
 
-    return kd_pin_get_dr(pin);
+    uint32_t value = kd_pin_get_dr(pin);
+    kd_gpio_pin_state_unlock(pin);
+
+    return value;
 }
 
 static void kd_pin_irq_handler(int vector, void* param)
@@ -407,7 +504,7 @@ static void kd_pin_irq_handler(int vector, void* param)
         }
 
         // Clear the interrupt status
-        kd_pin_write_reg(&gpio->porta_eoi, port_pin, 1);
+        kd_pin_write_reg(pin, &gpio->porta_eoi, port_pin, 1);
     }
 }
 
@@ -457,31 +554,31 @@ rt_err_t kd_pin_attach_irq(rt_base_t pin, rt_uint32_t mode, void (*hdr)(void* ar
         return -RT_EINVAL;
     }
     // Disable interrupt during configuration
-    kd_pin_write_reg(&gpio->inten, port_pin, 0);
+    kd_pin_write_reg(pin, &gpio->inten, port_pin, 0);
 
     switch (mode) {
     case GPIO_PE_RISING: {
-        kd_pin_write_reg(&gpio->inttype_level, port_pin, 1); // Set to rising edge
-        kd_pin_write_reg(&gpio->int_polarity, port_pin, 1); // Set polarity to high
-        kd_pin_write_reg(&gpio->int_bothedge, port_pin, 0); // Set to both edges
+        kd_pin_write_reg(pin, &gpio->inttype_level, port_pin, 1); // Set to rising edge
+        kd_pin_write_reg(pin, &gpio->int_polarity, port_pin, 1); // Set polarity to high
+        kd_pin_write_reg(pin, &gpio->int_bothedge, port_pin, 0); // Set to both edges
     } break;
     case GPIO_PE_FALLING: {
-        kd_pin_write_reg(&gpio->inttype_level, port_pin, 1); // Set to falling edge
-        kd_pin_write_reg(&gpio->int_polarity, port_pin, 0); // Set polarity to low
-        kd_pin_write_reg(&gpio->int_bothedge, port_pin, 0); // Set to both edges
+        kd_pin_write_reg(pin, &gpio->inttype_level, port_pin, 1); // Set to falling edge
+        kd_pin_write_reg(pin, &gpio->int_polarity, port_pin, 0); // Set polarity to low
+        kd_pin_write_reg(pin, &gpio->int_bothedge, port_pin, 0); // Set to both edges
     } break;
     case GPIO_PE_BOTH: {
-        kd_pin_write_reg(&gpio->int_bothedge, port_pin, 1); // Set to both edges
+        kd_pin_write_reg(pin, &gpio->int_bothedge, port_pin, 1); // Set to both edges
     } break;
     case GPIO_PE_HIGH: {
-        kd_pin_write_reg(&gpio->inttype_level, port_pin, 0); // Set to level high
-        kd_pin_write_reg(&gpio->int_polarity, port_pin, 1); // Set polarity to high
-        kd_pin_write_reg(&gpio->int_bothedge, port_pin, 0); // Set to both edges
+        kd_pin_write_reg(pin, &gpio->inttype_level, port_pin, 0); // Set to level high
+        kd_pin_write_reg(pin, &gpio->int_polarity, port_pin, 1); // Set polarity to high
+        kd_pin_write_reg(pin, &gpio->int_bothedge, port_pin, 0); // Set to both edges
     } break;
     case GPIO_PE_LOW: {
-        kd_pin_write_reg(&gpio->inttype_level, port_pin, 0); // Set to level low
-        kd_pin_write_reg(&gpio->int_polarity, port_pin, 0); // Set polarity to low
-        kd_pin_write_reg(&gpio->int_bothedge, port_pin, 0); // Set to both edges
+        kd_pin_write_reg(pin, &gpio->inttype_level, port_pin, 0); // Set to level low
+        kd_pin_write_reg(pin, &gpio->int_polarity, port_pin, 0); // Set polarity to low
+        kd_pin_write_reg(pin, &gpio->int_bothedge, port_pin, 0); // Set to both edges
     } break;
     default:
         LOG_E("Unsupported IRQ mode %d for pin %d", mode, port_pin);
@@ -540,14 +637,14 @@ rt_err_t kd_pin_irq_enable(rt_base_t pin, rt_uint32_t enabled)
         rt_hw_interrupt_umask(IRQN_GPIO0_INTERRUPT + pin);
 
         // Enable the interrupt
-        kd_pin_write_reg(&gpio->inten, port_pin, 1); // Enable interrupt for the pin
-        kd_pin_write_reg(&gpio->intmask, port_pin, 0); // Unmask the interrupt
+        kd_pin_write_reg(pin, &gpio->inten, port_pin, 1); // Enable interrupt for the pin
+        kd_pin_write_reg(pin, &gpio->intmask, port_pin, 0); // Unmask the interrupt
     } else {
         rt_hw_interrupt_mask(IRQN_GPIO0_INTERRUPT + pin);
 
         // Disable the interrupt
-        kd_pin_write_reg(&gpio->inten, port_pin, 0); // Enable interrupt for the pin
-        kd_pin_write_reg(&gpio->intmask, port_pin, 1); // Mask the interrupt
+        kd_pin_write_reg(pin, &gpio->inten, port_pin, 0); // Enable interrupt for the pin
+        kd_pin_write_reg(pin, &gpio->intmask, port_pin, 1); // Mask the interrupt
     }
 
     return RT_EOK;
@@ -627,7 +724,7 @@ static void kd_pin_irq_debounce_work(struct rt_work* work, void* work_data)
             rt_uint16_t pin = arg.pin;
 
             volatile kd_gpio_t* gpio = _gpio_inst.reg[pin >= 32]; // Get the correct GPIO instance
-            kd_pin_write_reg(&gpio->intmask, pin & 0x1F, 0); // Unmask the interrupt
+            kd_pin_write_reg(pin, &gpio->intmask, pin & 0x1F, 0); // Unmask the interrupt
 
             del_node = 1;
         } else {
@@ -662,7 +759,7 @@ static void kd_pin_irq_to_user_handler(void* arg)
             LOG_E("Invalid GPIO instance for pin %d", pin);
             return;
         }
-        kd_pin_write_reg(&gpio->intmask, port_pin, 1); // Mask the interrupt
+        kd_pin_write_reg(pin, &gpio->intmask, port_pin, 1); // Mask the interrupt
 
         struct kd_gpio_irq_debounce_arg* debounce = &irq->debounce;
         if (0x00 == debounce->runing) {
@@ -939,6 +1036,16 @@ int kd_pin_init(void)
     // Initialize GPIO device
     _gpio_inst.reg[0] = (kd_gpio_t*)reg0;
     _gpio_inst.reg[1] = (kd_gpio_t*)reg1;
+
+#ifdef RT_USING_SMP
+    for (int i = 0; i < GPIO_BANK_COUNT; i++) {
+        rt_spin_lock_init(&g_gpio_bank_locks[i]);
+    }
+#endif
+
+    for (int i = 0; i < GPIO_MAX_NUM; i++) {
+        atoic_lock_init(&g_gpio_pin_state_locks[i]);
+    }
 
     for (int i = 0; i < GPIO_IRQ_MAX_NUM; i++) {
         kd_gpio_irq_t* irq = &_gpio_inst.irq_table[i];

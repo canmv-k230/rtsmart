@@ -114,6 +114,11 @@ static inline void atoic_lock_init(atomic_lock_t *lock)
     __sync_lock_release(lock);
 }
 
+static inline void atomic_lock_init(atomic_lock_t *lock)
+{
+    __sync_lock_release(lock);
+}
+
 static inline void atomic_lock_take(atomic_lock_t *lock)
 {
     while (__sync_lock_test_and_set(lock, 1));
