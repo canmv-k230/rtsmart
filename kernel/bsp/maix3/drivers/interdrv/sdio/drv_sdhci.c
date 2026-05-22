@@ -229,6 +229,7 @@ static void dwcmshc_phy_delay_config(struct sdhci_host* host)
     sdhci_writeb(host, sdclkdl_dc & 0x7f, DWC_MSHC_SDCLKDL_DC);
     sdhci_writeb(host, sdclkdl_cnfg, DWC_MSHC_SDCLKDL_CNFG);
     sdhci_writeb(host, host->rx_delay_line, DWC_MSHC_SMPLDL_CNFG);
+#if 0 // tuning is not stable, need further investigation
     sdhci_writeb(host, 0xc, DWC_MSHC_ATDL_CNFG);
     sdhci_writel(host, sdhci_readl(host, SDHCI_VENDER_AT_CTRL_REG) |
         SDHCI_TUNE_AT_EN | SDHCI_TUNE_SWIN_TH_EN | SDHCI_TUNE_CLK_STOP_EN_MASK |
@@ -237,6 +238,7 @@ static void dwcmshc_phy_delay_config(struct sdhci_host* host)
         (SDHCI_TUNE_SWIN_TH_VAL << SDHCI_TUNE_SWIN_TH_VAL_LSB),
         SDHCI_VENDER_AT_CTRL_REG);
     sdhci_writel(host, 0x0, SDHCI_VENDER_AT_STAT_REG);
+#endif
 }
 
 static int dwcmshc_phy_init(struct sdhci_host* host)
@@ -590,10 +592,14 @@ static rt_err_t sdhci_transfer_blocking(struct sdhci_host* sdhci_host)
 
 static void sdhci_init(struct sdhci_host* host)
 {
+    uint8_t power = SDHCI_POWER_330;
+
     sdhci_reset(host, SDHCI_RESET_ALL);
     sdhci_writeb(host, SDHCI_CTRL_HISPD, SDHCI_HOST_CONTROL);
     sdhci_writeb(host, 0x7, SDHCI_TIMEOUT_CONTROL);
-    sdhci_writeb(host, SDHCI_POWER_ON | SDHCI_POWER_330, SDHCI_POWER_CONTROL);
+    if (host->io_fixed_1v8)
+        power = SDHCI_POWER_180;
+    sdhci_writeb(host, SDHCI_POWER_ON | power, SDHCI_POWER_CONTROL);
     sdhci_writew(host, SDHCI_CLOCK_INT_EN, SDHCI_CLOCK_CONTROL);
     while ((sdhci_readw(host, SDHCI_CLOCK_CONTROL) & SDHCI_CLOCK_INT_STABLE) == 0)
         ;
@@ -1032,6 +1038,12 @@ static void kd_set_iocfg(struct rt_mmcsd_host* host, struct rt_mmcsd_io_cfg* io_
         ctrl |= SDHCI_CTRL_8BITBUS;
     else if (bus_width == 2)
         ctrl |= SDHCI_CTRL_4BITBUS;
+
+    if (sdhci_clk > 26000000)
+        ctrl |= SDHCI_CTRL_HISPD;
+    else
+        ctrl &= ~SDHCI_CTRL_HISPD;
+
     sdhci_writeb(mmcsd, ctrl, SDHCI_HOST_CONTROL);
 }
 
@@ -1100,7 +1112,8 @@ rt_int32_t kd_sdhci_init(void)
 #else
     sdhci_host0->is_emmc_card = 0;
 #endif
-    sdhci_host0->tx_delay_line = sdhci_host0->is_emmc_card ? 0x8a : 0xc0;
+    sdhci_host0->tx_delay_line = 0xb0;
+    // must before sdhci_init, because sdhci_init will reset the controller and clear the delay line settings
 #ifdef RT_SDIO0_1V8
     sdhci_host0->io_fixed_1v8 = 1;
 #else
@@ -1129,6 +1142,7 @@ rt_int32_t kd_sdhci_init(void)
     mmcsd_host0->flags = SDIO0_BUS_WIDTH | MMCSD_MUTBLKWRITE | MMCSD_SUP_HIGHSPEED | MMCSD_SUP_SDIO_IRQ; /* enable 8bit and 4bit support */
     if (sdhci_host0->is_emmc_card) {
         mmcsd_host0->flags |= MMCSD_SUP_NONREMOVABLE;
+#if 0
         if (sdhci_host0->io_fixed_1v8)
             mmcsd_host0->flags |= MMCSD_SUP_DDR_1V8;
         else
@@ -1136,7 +1150,7 @@ rt_int32_t kd_sdhci_init(void)
 
         if (sdhci_host0->io_fixed_1v8)
             mmcsd_host0->flags |= MMCSD_SUP_HS200_1V8;
-
+#endif
     }
     mmcsd_host0->valid_ocr = sdhci_host0->io_fixed_1v8 ? VDD_165_195 : VDD_32_33 | VDD_33_34;
 

@@ -19,6 +19,10 @@
 #endif /* RT_SDIO_DEBUG */
 #include <rtdbg.h>
 
+#define MMC_CMD6_TIMEOUT_MS 500
+
+static rt_err_t mmc_wait_ready(struct rt_mmcsd_card *card, rt_uint32_t timeout_ms);
+
 static const rt_uint32_t tran_unit[] =
 {
     10000, 100000, 1000000, 10000000,
@@ -292,7 +296,11 @@ static int mmc_switch(struct rt_mmcsd_card *card, rt_uint8_t set,
     if (err)
         return err;
 
-    return 0;
+    err = mmc_wait_ready(card, MMC_CMD6_TIMEOUT_MS);
+    if (err)
+        return err;
+
+    return RT_EOK;
 }
 
 static int mmc_send_status(struct rt_mmcsd_card *card, rt_uint32_t *status)
@@ -466,6 +474,7 @@ static int mmc_select_bus_width(struct rt_mmcsd_card *card, rt_uint8_t *ext_csd)
     struct rt_mmcsd_host *host = card->host;
     unsigned idx, bus_width = 0;
     int err = 0, ddr = 0;
+    rt_bool_t wide_bus_selected = RT_FALSE;
 
     if (GET_BITS(card->resp_csd, 122, 4) < 4)
         return 0;
@@ -508,6 +517,7 @@ static int mmc_select_bus_width(struct rt_mmcsd_card *card, rt_uint8_t *ext_csd)
         err = mmc_compare_ext_csds(card, ext_csd, bus_width);
         if (!err)
         {
+            wide_bus_selected = (bus_width != MMCSD_BUS_WIDTH_1) ? RT_TRUE : RT_FALSE;
             break;
         }
         else
@@ -527,6 +537,13 @@ static int mmc_select_bus_width(struct rt_mmcsd_card *card, rt_uint8_t *ext_csd)
                 break;
             }
         }
+    }
+
+    if (!wide_bus_selected && (card->flags & CARD_FLAG_HIGHSPEED_DDR))
+    {
+        card->flags &= ~CARD_FLAG_HIGHSPEED_DDR;
+        card->flags |= CARD_FLAG_HIGHSPEED;
+        card->hs_max_data_rate = 52000000;
     }
 
     if (!err)
@@ -688,8 +705,8 @@ static rt_bool_t mmc_retry_next_speed(struct rt_mmcsd_host *host, const char *st
 {
     if (host->flags & MMCSD_SUP_HS200)
     {
-        mmc_prepare_speed_retry(host, MMCSD_SUP_HS200);
-        LOG_W("eMMC HS200 %s failed, retry with DDR52/HS SDR.", stage);
+        mmc_prepare_speed_retry(host, MMCSD_SUP_HS200 | MMCSD_SUP_HIGHSPEED_DDR);
+        LOG_W("eMMC HS200 %s failed, retry with HS SDR.", stage);
         return RT_TRUE;
     }
 
