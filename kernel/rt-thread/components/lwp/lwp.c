@@ -836,20 +836,16 @@ static int load_elf(int fd, int len, struct rt_lwp *lwp, uint8_t *load_addr, str
             switch (sheader.sh_type)
             {
             case SHT_PROGBITS:
-                if ((sheader.sh_flags & SHF_WRITE) == 0)
-                {
-                    expand_map_range(&user_area[0], (void *)sheader.sh_addr, sheader.sh_size);
-                }
-                else
+            case SHT_NOBITS:
+            default:
+                if ((sheader.sh_flags & SHF_WRITE) != 0)
                 {
                     expand_map_range(&user_area[1], (void *)sheader.sh_addr, sheader.sh_size);
                 }
-                break;
-            case SHT_NOBITS:
-                expand_map_range(&user_area[1], (void *)sheader.sh_addr, sheader.sh_size);
-                break;
-            default:
-                expand_map_range(&user_area[1], (void *)sheader.sh_addr, sheader.sh_size);
+                else
+                {
+                    expand_map_range(&user_area[0], (void *)sheader.sh_addr, sheader.sh_size);
+                }
                 break;
             }
         }
@@ -1109,7 +1105,8 @@ static int load_elf(int fd, int len, struct rt_lwp *lwp, uint8_t *load_addr, str
                 got_start = (void *)((uint8_t *)sheader.sh_addr + load_off);
                 got_size = (size_t)sheader.sh_size;
             }
-            else if (strcmp(p_section_str + sheader.sh_name, ".rel.dyn") == 0)
+            else if ((strcmp(p_section_str + sheader.sh_name, ".rel.dyn") == 0)
+                    || (strcmp(p_section_str + sheader.sh_name, ".rela.dyn") == 0))
             {
                 rel_dyn_start = (void *)((uint8_t *)sheader.sh_addr + load_off);
                 rel_dyn_size = (size_t)sheader.sh_size;

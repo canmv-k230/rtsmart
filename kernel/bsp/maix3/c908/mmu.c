@@ -333,6 +333,7 @@ static int __rt_hw_mmu_map(rt_mmu_info *mmu_info, void *v_addr, void *p_addr, rt
 {
     rt_size_t loop_va = __UMASKVALUE((rt_size_t)v_addr, PAGE_OFFSET_MASK);
     rt_size_t loop_pa = __UMASKVALUE((rt_size_t)p_addr, PAGE_OFFSET_MASK);
+    rt_size_t mapped_pages = 0;
 
     if (!mmu_info)
     {
@@ -343,12 +344,13 @@ static int __rt_hw_mmu_map(rt_mmu_info *mmu_info, void *v_addr, void *p_addr, rt
     {
         if (_mmu_map_one_page(mmu_info, loop_va, loop_pa, attr) != 0)
         {
-            __rt_hw_mmu_unmap(mmu_info, v_addr, npages);
+            __rt_hw_mmu_unmap(mmu_info, v_addr, mapped_pages);
             return -1;
         }
 
         loop_va += PAGE_SIZE;
         loop_pa += PAGE_SIZE;
+        mapped_pages++;
     }
 
     return 0;
@@ -416,6 +418,7 @@ static int __rt_hw_mmu_map_auto(rt_mmu_info *mmu_info,void *v_addr,rt_size_t npa
     rt_size_t *mmu_l1,*mmu_l2,*mmu_l3;
     rt_size_t *ref_cnt;
     rt_size_t i;
+    rt_size_t mapped_pages = 0;
     void *va,*pa;
 
     if(!mmu_info)
@@ -434,10 +437,12 @@ static int __rt_hw_mmu_map_auto(rt_mmu_info *mmu_info,void *v_addr,rt_size_t npa
 
         if(__rt_hw_mmu_map(mmu_info,(void *)loop_va,(void *)loop_pa,1,attr) < 0)
         {
+            rt_pages_free((void *)loop_pa, 0);
             goto err;
         }
 
         loop_va += PAGE_SIZE;
+        mapped_pages++;
     }
 
     return 0;
@@ -445,7 +450,7 @@ static int __rt_hw_mmu_map_auto(rt_mmu_info *mmu_info,void *v_addr,rt_size_t npa
     err:
         va = (void *)__UMASKVALUE((rt_size_t)v_addr,PAGE_OFFSET_MASK);
 
-        for(i = 0;i < npages;i++)
+        for(i = 0;i < mapped_pages;i++)
         {
             pa = rt_hw_mmu_v2p(mmu_info,va);
 
@@ -457,7 +462,7 @@ static int __rt_hw_mmu_map_auto(rt_mmu_info *mmu_info,void *v_addr,rt_size_t npa
             va = (void *)((rt_uint8_t *)va + PAGE_SIZE);
         }
 
-        __rt_hw_mmu_unmap(mmu_info,v_addr,npages);
+        __rt_hw_mmu_unmap(mmu_info,v_addr,mapped_pages);
         return -1;
 }
 

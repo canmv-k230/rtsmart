@@ -32,6 +32,12 @@
 #define PRIORITY_PER_ID                 4
 
 /*
+ * Each interrupt source has a pending bit. Reading pending is side-effect
+ * free; do not use claim register for status dumping.
+ */
+#define PENDING_BASE                    0x1000
+
+/*
  *  Each hart context has a vector of interrupt enable bits associated with it.
  *  There's one bit for each interrupt source.
  */
@@ -51,8 +57,20 @@
 void plic_init(void);
 void plic_enable_irq(int irqno);
 void plic_disable_irq(int irqno);
+void plic_set_priority(int irqno, rt_uint32_t priority);
 // tell PLIC that we've served this IRQ
 void plic_complete(int irq);
 void plic_handle_irq(void);
+
+struct plic_irq_status
+{
+    rt_bool_t present;
+    rt_bool_t enabled;
+    rt_bool_t pending;
+    rt_uint32_t priority;
+    rt_uint32_t threshold;
+};
+
+rt_err_t plic_get_irq_status(int irqno, struct plic_irq_status *status);
 
 #endif

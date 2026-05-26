@@ -36,18 +36,27 @@ struct plic_handler
 rt_inline void plic_toggle(struct plic_handler *handler, int hwirq, int enable);
 struct plic_handler c908_plic_handlers[C908_NR_CPUS];
 
-rt_inline void plic_irq_toggle(int hwirq, int enable)
+rt_inline void *plic_priority_reg(struct plic_handler *handler, int hwirq)
+{
+    return handler->prio + PRIORITY_BASE + hwirq * PRIORITY_PER_ID;
+}
+
+void plic_set_priority(int irqno, rt_uint32_t priority)
 {
     int cpu = 0;
     struct plic_handler *handler = &c908_plic_handlers[cpu];
 
-    /* set priority of interrupt, interrupt 0 is zero. */
-    writel(enable, handler->prio + PRIORITY_BASE + hwirq * PRIORITY_PER_ID);
-
-    if (handler->present)
+    if ((irqno <= 0) || (irqno >= IRQ_MAX_NR))
     {
-        plic_toggle(handler, hwirq, enable);
+        return;
     }
+
+    if ((c908_plic_regs == RT_NULL) || !handler->present)
+    {
+        return;
+    }
+
+    writel(priority, plic_priority_reg(handler, irqno));
 }
 
 void plic_complete(int irqno)
@@ -60,12 +69,89 @@ void plic_complete(int irqno)
 
 void plic_disable_irq(int irqno)
 {
-    plic_irq_toggle(irqno, 0);
+    int cpu = 0;
+    struct plic_handler *handler = &c908_plic_handlers[cpu];
+
+    if ((irqno <= 0) || (irqno >= IRQ_MAX_NR))
+    {
+        return;
+    }
+
+    if (!handler->present)
+    {
+        return;
+    }
+
+    writel(0, plic_priority_reg(handler, irqno));
+    plic_toggle(handler, irqno, 0);
 }
 
 void plic_enable_irq(int irqno)
 {
-    plic_irq_toggle(irqno, 1);
+    int cpu = 0;
+    struct plic_handler *handler = &c908_plic_handlers[cpu];
+    void *prio_reg;
+
+    if ((irqno <= 0) || (irqno >= IRQ_MAX_NR))
+    {
+        return;
+    }
+
+    if (!handler->present)
+    {
+        return;
+    }
+
+    prio_reg = plic_priority_reg(handler, irqno);
+    if (readl(prio_reg) == 0)
+    {
+        writel(1, prio_reg);
+    }
+
+    plic_toggle(handler, irqno, 1);
+}
+
+rt_err_t plic_get_irq_status(int irqno, struct plic_irq_status *status)
+{
+    int cpu = 0;
+    struct plic_handler *handler = &c908_plic_handlers[cpu];
+    uint32_t *enable_reg;
+    uint32_t *pending_reg;
+    uint32_t irq_mask;
+
+    if (status == RT_NULL)
+    {
+        return -RT_EINVAL;
+    }
+
+    rt_memset(status, 0, sizeof(*status));
+
+    if ((irqno <= 0) || (irqno >= IRQ_MAX_NR))
+    {
+        return -RT_EINVAL;
+    }
+
+    if ((c908_plic_regs == RT_NULL) || !handler->present)
+    {
+        return -RT_ERROR;
+    }
+
+    irq_mask = 1U << (irqno % 32);
+    enable_reg = handler->sie + (irqno / 32) * sizeof(uint32_t);
+    if (handler->ip == RT_NULL)
+    {
+        return -RT_ERROR;
+    }
+
+    pending_reg = handler->ip + (irqno / 32) * sizeof(uint32_t);
+
+    status->present = handler->present;
+    status->enabled = (readl(enable_reg) & irq_mask) ? RT_TRUE : RT_FALSE;
+    status->pending = (readl(pending_reg) & irq_mask) ? RT_TRUE : RT_FALSE;
+    status->priority = readl(handler->prio + PRIORITY_BASE + irqno * PRIORITY_PER_ID);
+    status->threshold = readl(handler->sth);
+
+    return RT_EOK;
 }
 
 /*
@@ -171,6 +257,7 @@ void plic_init(void)
         handler->hart_base = c908_plic_regs + CONTEXT_BASE + i * CONTEXT_PER_HART;
         handler->enable_base = c908_plic_regs + ENABLE_BASE + i * ENABLE_PER_HART;
         handler->prio = rt_ioremap_nocache(c908_plic_regs + PRIORITY_BASE, PRIORITY_PER_ID + nr_irqs * PRIORITY_PER_ID);
+        handler->ip = rt_ioremap_nocache(c908_plic_regs + PENDING_BASE, (nr_irqs + 31) / 32 * 4);
         handler->sie = rt_ioremap_nocache(handler->enable_base, (nr_irqs + 31) / 32 * 4);
         handler->sth = rt_ioremap_nocache(handler->hart_base + CONTEXT_THRESHOLD, 4);
         handler->sclaim = rt_ioremap_nocache(handler->hart_base + CONTEXT_CLAIM, 4);

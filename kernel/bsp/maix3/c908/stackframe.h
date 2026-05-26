@@ -151,6 +151,9 @@
     /* push vector frame */
     addi t1, sp, (CTX_GENERAL_REG_NR + CTX_FPU_REG_NR) * REGBYTES
 
+    li      t0, SSTATUS_VS
+    csrs    sstatus, t0
+
     RESTORE_VECTOR t1
 0:
 #endif /* ENABLE_VECTOR */

@@ -25,6 +25,43 @@ struct rt_futex
 
 static struct rt_mutex _futex_lock;
 
+static rt_tick_t futex_timeout_to_tick(const struct timespec *timeout)
+{
+    rt_int64_t second_delta;
+    rt_int64_t nsecond_delta;
+    rt_uint64_t tick;
+    rt_uint64_t tick_max = RT_TICK_MAX / 2U - 1U;
+
+    if (timeout == RT_NULL)
+    {
+        return 0;
+    }
+
+    second_delta = timeout->tv_sec;
+    nsecond_delta = timeout->tv_nsec;
+
+    if (nsecond_delta < 0)
+    {
+        nsecond_delta += NANOSECOND_PER_SECOND;
+        second_delta -= 1;
+    }
+
+    if (second_delta < 0)
+    {
+        return 0;
+    }
+
+    tick = (rt_uint64_t)second_delta * RT_TICK_PER_SECOND;
+    tick += ((rt_uint64_t)nsecond_delta * RT_TICK_PER_SECOND) / NANOSECOND_PER_SECOND;
+
+    if (tick > tick_max)
+    {
+        tick = tick_max;
+    }
+
+    return (rt_tick_t)tick;
+}
+
 static int futex_system_init(void)
 {
     rt_mutex_init(&_futex_lock, "futexList", RT_IPC_FLAG_FIFO);
@@ -124,7 +161,7 @@ int futex_wait(struct rt_futex *futex, int value, const struct timespec *timeout
         /* with timeout */
         if (timeout)
         {
-            rt_int32_t time = clock_time_to_tick(timeout);
+            rt_tick_t time = futex_timeout_to_tick(timeout);
 
             /* start the timer of thread */
             rt_timer_control(&(thread->thread_timer),
