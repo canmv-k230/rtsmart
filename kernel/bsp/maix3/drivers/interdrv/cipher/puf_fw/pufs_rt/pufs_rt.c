@@ -747,7 +747,7 @@ static pufs_status_t otp_unified_range_check(pufs_otp_addr_t addr, uint32_t len)
     return SUCCESS;
 }
 
-/* Little-Endian Data Serialize as Big-Endian */
+/* Preserve the deployed raw byte contract of the leaf PUFS RT/CDE drivers. */
 pufs_status_t pufs_otp_read(uint8_t* outbuf, uint32_t len, pufs_otp_addr_t addr)
 {
     pufs_status_t check;
@@ -758,7 +758,7 @@ pufs_status_t pufs_otp_read(uint8_t* outbuf, uint32_t len, pufs_otp_addr_t addr)
     return pufs_read_cde(outbuf, len, addr - OTP_LEN);
 }
 
-/* Little-Endian Data Serialize as Big-Endian */
+/* Preserve the deployed raw byte contract of the leaf PUFS RT/CDE drivers. */
 pufs_status_t pufs_otp_write(const uint8_t* inbuf, uint32_t len,
     pufs_otp_addr_t addr)
 {
@@ -797,22 +797,46 @@ pufs_status_t pufs_otp_set_lock(pufs_otp_addr_t addr, uint32_t len,
     return rt_cde_write_lock(addr - OTP_LEN, len, lock);
 }
 
-static uint32_t otp_config_word_from_bytes(const uint8_t word_bytes[WORD_SIZE])
+/*
+ * Raw pufs_otp_read()/write() data keeps the existing PUFS byte contract.
+ * For the first two RT config words (0x0000-0x0007), the leaf RT path has
+ * already swapped the PUFS big-endian hardware word into the host buffer, so
+ * the logical config word needs one more byte-order reversal here. Later
+ * config words use the raw buffer bytes directly.
+ */
+static bool otp_config_word_needs_byte_reverse(pufs_otp_addr_t addr)
 {
-    // Parse as Big-Endian to match the underlying OTP read API
-    return ((uint32_t)word_bytes[3]) |
-           ((uint32_t)word_bytes[2] << 8) |
-           ((uint32_t)word_bytes[1] << 16) |
-           ((uint32_t)word_bytes[0] << 24);
+    return addr < 0x0008;
 }
 
-static void otp_config_word_to_bytes(uint8_t word_bytes[WORD_SIZE], uint32_t word)
+static uint32_t otp_config_word_from_bytes(pufs_otp_addr_t addr,
+    const uint8_t word_bytes[WORD_SIZE])
 {
-    // Serialize as Big-Endian to match the underlying OTP write API
-    word_bytes[3] = word & 0xff;
-    word_bytes[2] = (word >> 8) & 0xff;
-    word_bytes[1] = (word >> 16) & 0xff;
-    word_bytes[0] = (word >> 24) & 0xff;
+    uint32_t word;
+
+    if (otp_config_word_needs_byte_reverse(addr)) {
+        return ((uint32_t)word_bytes[0] << 24) |
+               ((uint32_t)word_bytes[1] << 16) |
+               ((uint32_t)word_bytes[2] << 8) |
+               ((uint32_t)word_bytes[3]);
+    }
+
+    memcpy(&word, word_bytes, sizeof(word));
+    return word;
+}
+
+static void otp_config_word_to_bytes(pufs_otp_addr_t addr,
+    uint8_t word_bytes[WORD_SIZE], uint32_t word)
+{
+    if (otp_config_word_needs_byte_reverse(addr)) {
+        word_bytes[0] = (word >> 24) & 0xff;
+        word_bytes[1] = (word >> 16) & 0xff;
+        word_bytes[2] = (word >> 8) & 0xff;
+        word_bytes[3] = word & 0xff;
+        return;
+    }
+
+    memcpy(word_bytes, &word, sizeof(word));
 }
 
 static pufs_status_t otp_update_config_word(pufs_otp_addr_t addr,
@@ -826,7 +850,7 @@ static pufs_status_t otp_update_config_word(pufs_otp_addr_t addr,
     if ((check = pufs_otp_read(word_bytes, sizeof(word_bytes), addr)) != SUCCESS)
         return check;
 
-    raw_word = otp_config_word_from_bytes(word_bytes);
+    raw_word = otp_config_word_from_bytes(addr, word_bytes);
 
     /* Config words are updated by directly setting the documented bit from
      * 0 -> 1 while preserving the rest of the word.
@@ -835,7 +859,7 @@ static pufs_status_t otp_update_config_word(pufs_otp_addr_t addr,
 
     if (updated_raw_word != raw_word)
     {
-        otp_config_word_to_bytes(word_bytes, updated_raw_word);
+        otp_config_word_to_bytes(addr, word_bytes, updated_raw_word);
         check = pufs_otp_write(word_bytes, sizeof(word_bytes), addr);
         if (check != SUCCESS)
             return check;
@@ -916,7 +940,7 @@ pufs_status_t pufs_otp_get_security_config_state(
     if (check != SUCCESS)
         return check;
 
-    raw_word = otp_config_word_from_bytes(word_bytes);
+    raw_word = otp_config_word_from_bytes(OTP_CFG_SPI2AXI_ADDR, word_bytes);
     state->disable_spi2axi = (raw_word & OTP_CFG_DISABLE_SPI2AXI_BIT) ? 1 : 0;
     state->spi2axi_word_lock = pufs_otp_get_lock(OTP_CFG_SPI2AXI_ADDR);
 
@@ -924,7 +948,7 @@ pufs_status_t pufs_otp_get_security_config_state(
     if (check != SUCCESS)
         return check;
 
-    raw_word = otp_config_word_from_bytes(word_bytes);
+    raw_word = otp_config_word_from_bytes(OTP_CFG_JTAG_ADDR, word_bytes);
     state->disable_jtag = (raw_word & OTP_CFG_JTAG_DISABLE_BIT) ? 1 : 0;
     state->jtag_word_lock = pufs_otp_get_lock(OTP_CFG_JTAG_ADDR);
 
@@ -932,7 +956,7 @@ pufs_status_t pufs_otp_get_security_config_state(
     if (check != SUCCESS)
         return check;
 
-    raw_word = otp_config_word_from_bytes(word_bytes);
+    raw_word = otp_config_word_from_bytes(OTP_CFG_BOOT_CTRL_ADDR, word_bytes);
     state->force_secure_boot =
         (raw_word & OTP_CFG_FORCE_SECURE_BOOT_BIT) ? 1 : 0;
     state->disable_isp = (raw_word & OTP_CFG_DISABLE_ISP_BIT) ? 1 : 0;
