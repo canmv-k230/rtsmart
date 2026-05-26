@@ -31,6 +31,8 @@ static volatile uint32_t write_size;
 #define EV_BULK_WRITE_FINISH 0x08
 #define EV_INT_WRITE_FINISH 0x10
 
+RT_WEAK int bank_voltage_check_is_failed(void) { return 0; }
+
 int read_usb(void * ctx, unsigned char * buffer, int maxsize)
 {
     rt_uint32_t re;
@@ -213,16 +215,20 @@ static void mtp_device_init(void)
     extern bool g_fs_mount_data_succ;
     extern bool g_fs_mount_sdcard_succ;
 
-    if(g_fs_mount_sdcard_succ) {
-        mtp_add_storage(mtp_context, "/sdcard", "sdcard", 0, 0, UMTP_STORAGE_READWRITE);
-    }
+    if (bank_voltage_check_is_failed()) {
+        mtp_add_storage(mtp_context, "/tmp", "ERROR_BANK_VOL", 0, 0, UMTP_STORAGE_READWRITE);
+    } else {
+        if(g_fs_mount_sdcard_succ) {
+            mtp_add_storage(mtp_context, "/sdcard", "sdcard", 0, 0, UMTP_STORAGE_READWRITE);
+        }
 
-    if(g_fs_mount_data_succ) {
-        mtp_add_storage(mtp_context, "/data", "data", 0, 0, UMTP_STORAGE_READWRITE);
-    }
+        if(g_fs_mount_data_succ) {
+            mtp_add_storage(mtp_context, "/data", "data", 0, 0, UMTP_STORAGE_READWRITE);
+        }
 
-    if(!g_fs_mount_sdcard_succ && !g_fs_mount_data_succ) {
-        mtp_add_storage(mtp_context, "/tmp", "ERROR", 0, 0, UMTP_STORAGE_READWRITE);
+        if(!g_fs_mount_sdcard_succ && !g_fs_mount_data_succ) {
+            mtp_add_storage(mtp_context, "/tmp", "ERROR", 0, 0, UMTP_STORAGE_READWRITE);
+        }
     }
 
     mtp_event = rt_event_create("mtp", RT_IPC_FLAG_FIFO);

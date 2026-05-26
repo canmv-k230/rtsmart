@@ -34,6 +34,10 @@
 
 #ifdef RT_USING_PUFS
 
+static volatile int g_bank_voltage_check_failed;
+
+int bank_voltage_check_is_failed(void) { return g_bank_voltage_check_failed; }
+
 #include "drv_fpioa.h"
 #include "pufs_rt.h"
 
@@ -156,9 +160,12 @@ static int bank_voltage_check_init(void)
     uint32_t      otp_word;
     uint32_t      uart_sel;
     uint32_t      sdio1_sel;
+    int           check_failed = 0;
     int           required_msc[BANK_GROUP_COUNT];
     const char*   required_source[BANK_GROUP_COUNT];
     pufs_status_t status;
+
+    g_bank_voltage_check_failed = 0;
 
     for (int index = 0; index < BANK_GROUP_COUNT; index++) {
         required_msc[index]    = -1;
@@ -187,16 +194,22 @@ static int bank_voltage_check_init(void)
           (unsigned int)((otp_word & OTP_BOOT_CFG_UART_SEL_MASK) >> OTP_BOOT_CFG_UART_SEL_SHIFT),
           (unsigned int)((otp_word & OTP_BOOT_CFG_SDIO1_SEL_MASK) >> OTP_BOOT_CFG_SDIO1_SEL_SHIFT));
 
-    (void)add_bank_voltage_requirement(BANK1_IO14_25,
-                                       (otp_word & OTP_BOOT_CFG_OSPI_VOL_BIT) ? BANK_VOL_1V8_MSC : BANK_VOL_3V3_MSC, "otp.ospi",
-                                       required_msc, required_source);
+    if (add_bank_voltage_requirement(BANK1_IO14_25,
+                                     (otp_word & OTP_BOOT_CFG_OSPI_VOL_BIT) ? BANK_VOL_1V8_MSC : BANK_VOL_3V3_MSC,
+                                     "otp.ospi", required_msc, required_source)
+        != 0) {
+        check_failed = 1;
+    }
 
     uart_sel = (otp_word & OTP_BOOT_CFG_UART_SEL_MASK) >> OTP_BOOT_CFG_UART_SEL_SHIFT;
     if (uart_sel < (sizeof(g_uart_sel_bank_map) / sizeof(g_uart_sel_bank_map[0]))) {
         LOG_D("otp uart selection %u -> %s", (unsigned int)uart_sel, bank_voltage_group_name(g_uart_sel_bank_map[uart_sel]));
-        (void)add_bank_voltage_requirement(g_uart_sel_bank_map[uart_sel],
-                                           (otp_word & OTP_BOOT_CFG_UART_VOL_BIT) ? BANK_VOL_1V8_MSC : BANK_VOL_3V3_MSC,
-                                           "otp.uart", required_msc, required_source);
+        if (add_bank_voltage_requirement(g_uart_sel_bank_map[uart_sel],
+                                         (otp_word & OTP_BOOT_CFG_UART_VOL_BIT) ? BANK_VOL_1V8_MSC : BANK_VOL_3V3_MSC,
+                                         "otp.uart", required_msc, required_source)
+            != 0) {
+            check_failed = 1;
+        }
     } else {
         LOG_W("invalid otp uart iomux selection %u", (unsigned int)uart_sel);
     }
@@ -205,9 +218,12 @@ static int bank_voltage_check_init(void)
     if (sdio1_sel < (sizeof(g_sdio1_sel_bank_map) / sizeof(g_sdio1_sel_bank_map[0]))) {
         LOG_D("otp sdio1 selection %u -> %s", (unsigned int)sdio1_sel,
               bank_voltage_group_name(g_sdio1_sel_bank_map[sdio1_sel]));
-        (void)add_bank_voltage_requirement(g_sdio1_sel_bank_map[sdio1_sel],
-                                           (otp_word & OTP_BOOT_CFG_SDIO1_VOL_BIT) ? BANK_VOL_1V8_MSC : BANK_VOL_3V3_MSC,
-                                           "otp.sdio1", required_msc, required_source);
+        if (add_bank_voltage_requirement(g_sdio1_sel_bank_map[sdio1_sel],
+                                         (otp_word & OTP_BOOT_CFG_SDIO1_VOL_BIT) ? BANK_VOL_1V8_MSC : BANK_VOL_3V3_MSC,
+                                         "otp.sdio1", required_msc, required_source)
+            != 0) {
+            check_failed = 1;
+        }
     } else {
         LOG_W("invalid otp sdio1 iomux selection %u", (unsigned int)sdio1_sel);
     }
@@ -235,6 +251,12 @@ static int bank_voltage_check_init(void)
         LOG_W("%s is %s%s, otp expects %s (%s)", g_bank_voltage_descs[bank].name,
               is_consistent ? bank_voltage_name(current_msc) : "mixed", is_consistent ? "" : " state",
               bank_voltage_name(required_msc[bank]), required_source[bank]);
+        check_failed = 1;
+    }
+
+    g_bank_voltage_check_failed = check_failed;
+    if (g_bank_voltage_check_failed != 0) {
+        LOG_W("bank voltage check failed");
     }
 
     return 0;
