@@ -24,6 +24,8 @@
  */
 
 #include <stdbool.h>
+#include <limits.h>
+#include <stdlib.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <sys/ioctl.h>
@@ -1112,8 +1114,6 @@ _error1:
 }
 INIT_DEVICE_EXPORT(kd_pin_init);
 
-#define RT_GPIO_ENABLE_BUILTIN_CMD
-
 #if defined(RT_USING_MSH) && defined(RT_GPIO_ENABLE_BUILTIN_CMD) // Enable GPIO command in MSH
 #include <msh.h>
 
@@ -1133,30 +1133,142 @@ static void gpio_irq_demo(void* args)
     last_intr_tick = current_tick;
 }
 
+static int gpio_parse_int_arg(const char* text, const char* arg_name, int* value)
+{
+    char* end = RT_NULL;
+    long  parsed;
+
+    if ((RT_NULL == text) || ('\0' == text[0])) {
+        rt_kprintf("Invalid %s: empty input\n", arg_name);
+        return -RT_EINVAL;
+    }
+
+    parsed = strtol(text, &end, 10);
+    if ((end == text) || ('\0' != *end)) {
+        rt_kprintf("Invalid %s: %s\n", arg_name, text);
+        return -RT_EINVAL;
+    }
+
+    if ((parsed < INT_MIN) || (parsed > INT_MAX)) {
+        rt_kprintf("Invalid %s: out of range (%s)\n", arg_name, text);
+        return -RT_EINVAL;
+    }
+
+    *value = (int)parsed;
+    return RT_EOK;
+}
+
+static void gpio_print_usage(void)
+{
+    rt_kprintf("Usage:\n");
+    rt_kprintf("  gpio mode <pin> <mode>\n");
+    rt_kprintf("  gpio write <pin> <value>\n");
+    rt_kprintf("  gpio read <pin>\n");
+    rt_kprintf("  gpio pulse <pin> <high_ms> <low_ms> [count]\n");
+    rt_kprintf("  gpio irq <pin> <mode>\n");
+    rt_kprintf("  gpio irq_enable <pin>\n");
+    rt_kprintf("  gpio irq_disable <pin>\n");
+    rt_kprintf("\nGPIO output values:\n");
+    rt_kprintf("  0: low\n");
+    rt_kprintf("  1: high\n");
+    rt_kprintf("\nGPIO drive modes:\n");
+    rt_kprintf("  0: output\n");
+    rt_kprintf("  1: input\n");
+    rt_kprintf("  2: input_pullup\n");
+    rt_kprintf("  3: input_pulldown\n");
+    rt_kprintf("  4: output_open_drain\n");
+    rt_kprintf("\nGPIO IRQ modes:\n");
+    rt_kprintf("  0: rising_edge\n");
+    rt_kprintf("  1: falling_edge\n");
+    rt_kprintf("  2: both_edges\n");
+    rt_kprintf("  3: level_high\n");
+    rt_kprintf("  4: level_low\n");
+}
+
+static void gpio_run_pulse(int pin, int high_ms, int low_ms, int count)
+{
+    if (pin < 0 || pin >= GPIO_MAX_NUM) {
+        rt_kprintf("Invalid pin %d\n", pin);
+        return;
+    }
+
+    if (high_ms < 0 || low_ms < 0) {
+        rt_kprintf("Pulse timing must be >= 0 ms\n");
+        return;
+    }
+
+    if (count <= 0) {
+        rt_kprintf("Pulse count must be > 0\n");
+        return;
+    }
+
+    if ((0 == high_ms) && (0 == low_ms)) {
+        rt_kprintf("At least one pulse phase must be > 0 ms\n");
+        return;
+    }
+
+    if (kd_pin_mode(pin, GPIO_DM_OUTPUT) != RT_EOK) {
+        rt_kprintf("Failed to set pin %d to output mode\n", pin);
+        return;
+    }
+
+    if (kd_pin_write(pin, GPIO_PV_LOW) != RT_EOK) {
+        rt_kprintf("Failed to drive pin %d low before pulse test\n", pin);
+        return;
+    }
+
+    rt_kprintf("Pulse test on pin %d: high=%d ms low=%d ms count=%d\n", pin, high_ms, low_ms, count);
+    for (int i = 0; i < count; i++) {
+        if (kd_pin_write(pin, GPIO_PV_HIGH) != RT_EOK) {
+            rt_kprintf("Pulse stopped: failed to drive pin %d high at cycle %d\n", pin, i + 1);
+            break;
+        }
+        if (high_ms > 0) {
+            rt_thread_mdelay(high_ms);
+        }
+
+        if (kd_pin_write(pin, GPIO_PV_LOW) != RT_EOK) {
+            rt_kprintf("Pulse stopped: failed to drive pin %d low at cycle %d\n", pin, i + 1);
+            break;
+        }
+        if (low_ms > 0) {
+            rt_thread_mdelay(low_ms);
+        }
+    }
+}
+
 static void do_gpio(int argc, char** argv)
 {
+    int pin;
+
     if (argc < 3) {
-        rt_kprintf("Usage:\n");
-        rt_kprintf("  gpio mode <pin> <mode>\n");
-        rt_kprintf("  gpio write <pin> <value>\n");
-        rt_kprintf("  gpio read <pin>\n");
-        rt_kprintf("  gpio irq <pin> <mode>\n");
-        rt_kprintf("  gpio irq_enable <pin>\n");
-        rt_kprintf("  gpio irq_disable <pin>\n");
+        gpio_print_usage();
         return;
     }
 
     const char* cmd = argv[1];
-    int         pin = atoi(argv[2]);
+
+    if (gpio_parse_int_arg(argv[2], "pin", &pin) != RT_EOK) {
+        gpio_print_usage();
+        return;
+    }
 
     if (!strcmp(cmd, "mode") && argc == 4) {
-        int mode = atoi(argv[3]);
+        int mode;
+
+        if (gpio_parse_int_arg(argv[3], "mode", &mode) != RT_EOK) {
+            return;
+        }
         if (kd_pin_mode(pin, mode) == RT_EOK)
             rt_kprintf("Set pin %d to mode %d OK\n", pin, mode);
         else
             rt_kprintf("Failed to set mode\n");
     } else if (!strcmp(cmd, "write") && argc == 4) {
-        int value = atoi(argv[3]);
+        int value;
+
+        if (gpio_parse_int_arg(argv[3], "value", &value) != RT_EOK) {
+            return;
+        }
         if (kd_pin_write(pin, value) == RT_EOK)
             rt_kprintf("Wrote %d to pin %d\n", value, pin);
         else
@@ -1167,8 +1279,27 @@ static void do_gpio(int argc, char** argv)
             rt_kprintf("Read from pin %d: %d\n", pin, val);
         else
             rt_kprintf("Read failed\n");
+    } else if (!strcmp(cmd, "pulse") && (argc == 5 || argc == 6)) {
+        int high_ms;
+        int low_ms;
+        int count = 1;
+
+        if (gpio_parse_int_arg(argv[3], "high_ms", &high_ms) != RT_EOK
+            || gpio_parse_int_arg(argv[4], "low_ms", &low_ms) != RT_EOK) {
+            return;
+        }
+
+        if ((argc == 6) && (gpio_parse_int_arg(argv[5], "count", &count) != RT_EOK)) {
+            return;
+        }
+
+        gpio_run_pulse(pin, high_ms, low_ms, count);
     } else if (!strcmp(cmd, "irq") && argc == 4) {
-        int mode = atoi(argv[3]);
+        int mode;
+
+        if (gpio_parse_int_arg(argv[3], "irq_mode", &mode) != RT_EOK) {
+            return;
+        }
         if (kd_pin_attach_irq(pin, mode, gpio_irq_demo, (void*)(long)pin) == RT_EOK && kd_pin_irq_enable(pin, 1) == RT_EOK) {
             rt_kprintf("IRQ attached and enabled on pin %d (mode %d)\n", pin, mode);
         } else {
@@ -1186,6 +1317,7 @@ static void do_gpio(int argc, char** argv)
             rt_kprintf("Failed to disable IRQ on pin %d\n", pin);
     } else {
         rt_kprintf("Invalid command\n");
+        gpio_print_usage();
     }
 }
 
@@ -1194,8 +1326,12 @@ MSH_CMD_EXPORT_ALIAS(do_gpio, gpio,
                      "  mode <pin> <mode>\n"
                      "  write <pin> <value>\n"
                      "  read <pin>\n"
+                     "  pulse <pin> <high_ms> <low_ms> [count]\n"
                      "  irq <pin> <mode>\n"
                      "  irq_enable <pin>\n"
-                     "  irq_disable <pin>");
+                     "  irq_disable <pin>\n"
+                     "  value: 0=low 1=high\n"
+                     "  mode: 0=output 1=input 2=input_pullup 3=input_pulldown 4=output_open_drain\n"
+                     "  irq_mode: 0=rising 1=falling 2=both 3=high 4=low");
 
 #endif // end of RT_USING_MSH

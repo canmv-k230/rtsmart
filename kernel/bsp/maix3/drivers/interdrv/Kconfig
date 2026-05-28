@@ -94,7 +94,19 @@ menu "InterDriver"
         if RT_USING_GPIO
             config RT_GPIO_ENABLE_BUILTIN_CMD
                 bool "Enable gpio test command"
+                depends on RT_USING_MSH
                 default n
+                help
+                    Enable the built-in GPIO MSH test command.
+
+                    Commands provided:
+                    - gpio mode <pin> <mode>
+                    - gpio write <pin> <value>
+                    - gpio read <pin>
+                    - gpio pulse <pin> <high_ms> <low_ms> [count]
+                    - gpio irq <pin> <mode>
+                    - gpio irq_enable <pin>
+                    - gpio irq_disable <pin>
         endif
 
     menuconfig RT_USING_HARDLOCK
