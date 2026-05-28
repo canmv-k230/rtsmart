@@ -53,7 +53,8 @@
 /* Driver constants and register definitions. */
 #define IRQN_WDT1                     (92 + 16)
 #define KD_WDT_FEED_THREAD_STACK_SIZE (1024 * 3)
-#define KD_WDT_FEED_THREAD_TIMESLICE  (50)
+#define KD_WDT_FEED_THREAD_PRIORITY   (25)
+#define KD_WDT_FEED_THREAD_TIMESLICE  (200)
 #define KD_WDT_FEED_IDLE_MS           (30)
 
 #define KD_WDT_DEFAULT_TIMEOUT_SEC (20)
@@ -537,7 +538,7 @@ static void kd_wdt_feeder_entry(void* parameter)
         level = kd_wdt_runtime_lock(inst);
         if (state->running && state->owner_pid == 0) {
             should_feed = RT_TRUE;
-            delay_ms    = (state->timeout_sec * 1000) / 2;
+            delay_ms    = (state->timeout_sec * 1000ULL) / 2;
             if (delay_ms < KD_WDT_FEED_IDLE_MS) {
                 delay_ms = KD_WDT_FEED_IDLE_MS;
             }
@@ -570,7 +571,7 @@ static rt_err_t kd_wdt_runtime_init(struct kd_wdt_inst* inst)
 
     inst->state.feeder_thread
         = rt_thread_create(inst->config->feeder_name, kd_wdt_feeder_entry, inst, KD_WDT_FEED_THREAD_STACK_SIZE,
-                           RT_THREAD_PRIORITY_MAX - 2, KD_WDT_FEED_THREAD_TIMESLICE);
+                           KD_WDT_FEED_THREAD_PRIORITY, KD_WDT_FEED_THREAD_TIMESLICE);
     if (inst->state.feeder_thread == RT_NULL) {
         return -RT_ENOMEM;
     }
