@@ -667,7 +667,7 @@ void handle_user(rt_size_t scause, rt_size_t stval, rt_size_t sepc, struct rt_hw
     /* Also print the legacy addr2line command for convenience. */
     rt_hw_backtrace((uint32_t *)sp->s0_fp, sepc);
 
-    LOG_E("User Fault, killing thread: %s", rt_thread_self()->name);
+    LOG_E("User Fault, killing thread: %s, tid: %d", rt_thread_self()->name, rt_thread_self()->tid);
 
 #if defined (RT_RECOVERY_MPY_AUTO_EXEC_PY)
 if(0x00 == rt_strncmp("micropython", rt_thread_self()->name, sizeof("micropython") - 1)) {
