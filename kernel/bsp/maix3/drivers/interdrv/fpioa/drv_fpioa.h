@@ -33,12 +33,17 @@
 #define BANK_VOL_1V8_MSC 1
 
 #define FPIOA_PIN_MAX_FUNCS    (5)
+#define FPIOA_PIN_FUNC_ALT_NUM (4)
+
+#if !defined(RT_USING_RTC_PMU) && !defined (CONFIG_BOARD_NOT_SUPPORT_HW_RTC)
+#error "RTC PMU is not supported on this board"
+#endif
+
 #ifdef CONFIG_BOARD_NOT_SUPPORT_HW_RTC
 #define FPIOA_PIN_MAX_NUM      (64)
 #else
 #define FPIOA_PIN_MAX_NUM      (64 + 8)
 #endif
-#define FPIOA_PIN_FUNC_ALT_NUM (4)
 
 #ifdef __cplusplus
 extern "C" {

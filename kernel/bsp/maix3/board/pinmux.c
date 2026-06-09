@@ -66,6 +66,8 @@ static int board_get_pin_bank_voltage(int pin)
         return VOL_BANK4_IO50_61;
     case 62 ... 63:
         return VOL_BANK5_IO62_63;
+    case 64 ... 71:
+        return BANK_VOL_1V8_MSC; // fixed to 1.8V.
     default:
         rt_kprintf("Pin %d does not have a defined voltage bank\n", pin);
         return -1;
