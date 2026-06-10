@@ -230,20 +230,31 @@ typedef int (*init_fn_t)(void);
 #define INIT_EXPORT(fn, level)
 #endif
 
+/* Sequence values are sorted lexically by the linker. Use zero-padded
+ * numeric tokens, for example INIT_COMPONENT_EXPORT_SEQ(fn, 010).
+ */
+#define INIT_EXPORT_SEQ(fn, level, seq)   INIT_EXPORT(fn, level "." RT_STRINGIFY(seq))
+
 /* board initial routines will be called in board_init() function */
-#define INIT_BOARD_EXPORT(fn)           INIT_EXPORT(fn, "1")
+#define INIT_BOARD_EXPORT(fn)             INIT_EXPORT(fn, "1")
+#define INIT_BOARD_EXPORT_SEQ(fn, seq)    INIT_EXPORT_SEQ(fn, "1", seq)
 
 /* pre/device/component/env/app initial routines will be called in init_thread */
 /* components pre-initialization (pure software initialization) */
-#define INIT_PREV_EXPORT(fn)            INIT_EXPORT(fn, "2")
+#define INIT_PREV_EXPORT(fn)              INIT_EXPORT(fn, "2")
+#define INIT_PREV_EXPORT_SEQ(fn, seq)     INIT_EXPORT_SEQ(fn, "2", seq)
 /* device initialization */
-#define INIT_DEVICE_EXPORT(fn)          INIT_EXPORT(fn, "3")
+#define INIT_DEVICE_EXPORT(fn)            INIT_EXPORT(fn, "3")
+#define INIT_DEVICE_EXPORT_SEQ(fn, seq)   INIT_EXPORT_SEQ(fn, "3", seq)
 /* components initialization (dfs, lwip, ...) */
-#define INIT_COMPONENT_EXPORT(fn)       INIT_EXPORT(fn, "4")
+#define INIT_COMPONENT_EXPORT(fn)         INIT_EXPORT(fn, "4")
+#define INIT_COMPONENT_EXPORT_SEQ(fn, seq) INIT_EXPORT_SEQ(fn, "4", seq)
 /* environment initialization (mount disk, ...) */
-#define INIT_ENV_EXPORT(fn)             INIT_EXPORT(fn, "5")
+#define INIT_ENV_EXPORT(fn)               INIT_EXPORT(fn, "5")
+#define INIT_ENV_EXPORT_SEQ(fn, seq)      INIT_EXPORT_SEQ(fn, "5", seq)
 /* application initialization (rtgui application etc ...) */
-#define INIT_APP_EXPORT(fn)             INIT_EXPORT(fn, "6")
+#define INIT_APP_EXPORT(fn)               INIT_EXPORT(fn, "6")
+#define INIT_APP_EXPORT_SEQ(fn, seq)      INIT_EXPORT_SEQ(fn, "6", seq)
 
 #if !defined(RT_USING_FINSH)
 /* define these to empty, even if not include finsh.h file */

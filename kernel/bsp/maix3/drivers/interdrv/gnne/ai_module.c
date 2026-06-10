@@ -32,6 +32,9 @@ int ai_module_init(void)
 {
     gnne_device_init();
     ai_2d_device_init();
+
+    return 0;
 }
 
-INIT_COMPONENT_EXPORT(ai_module_init);
+// Make it later than sdk_kernel_init, because it will enable and disable the kpu powerdomain.
+INIT_APP_EXPORT_SEQ(ai_module_init, 1);

@@ -44,16 +44,9 @@ struct gnne_dev_handle {
 
 
 #ifdef  GNNE_LOG_ENABLE
-static int gnne_log(const char *fmt, ...)
-{
-    rt_kprintf(fmt);
-    return 0;
-}
+#define gnne_log(fmt, ...)    rt_kprintf(fmt, ##__VA_ARGS__)
 #else
-static int gnne_log(const char *fmt, ...)
-{
-    return 0;
-}
+#define gnne_log(fmt, ...)
 #endif
 
 #define gnne_info(s...)    do { \
@@ -87,6 +80,7 @@ static hardlock_type g_kpu_lock = HARDLOCK_MAX;
 
 static int gnne_setup_kpu_bandwidth(void)
 {
+#if 0
     volatile char *reg_page;
     volatile rt_uint32_t *reg_kpu_data_set;
     volatile rt_uint32_t *reg_kpu_data_bw;
@@ -103,6 +97,10 @@ static int gnne_setup_kpu_bandwidth(void)
     writel(KPU_DATA_SET_ENABLE, reg_kpu_data_set);
     writel(KPU_DATA_BW_VALUE, reg_kpu_data_bw);
     rt_iounmap((void *)reg_page);
+#else
+    writel(KPU_DATA_SET_ENABLE, (void *)KPU_DATA_SET_REG_ADDR);
+    writel(KPU_DATA_BW_VALUE, (void *)KPU_DATA_BW_REG_ADDR);
+#endif
 
     return RT_EOK;
 }
