@@ -68,6 +68,46 @@ struct usbd_bus g_usbdev_bus[CONFIG_USBDEV_MAX_BUS];
 
 static void usbd_class_event_notify_handler(uint8_t busid, uint8_t event, void *arg);
 
+#define USB_BCD_VERSION_2_01 0x0201U
+
+static uint16_t usbd_get_device_bcdusb(uint8_t busid)
+{
+    const struct usb_device_descriptor *desc = NULL;
+
+#ifdef CONFIG_USBDEV_ADVANCE_DESC
+    desc = (const struct usb_device_descriptor *)g_usbd_core[busid].descriptors->device_descriptor_callback(g_usbd_core[busid].speed);
+#else
+    desc = (const struct usb_device_descriptor *)g_usbd_core[busid].descriptors;
+#endif
+
+    if ((desc == NULL) || (desc->bLength < sizeof(struct usb_device_descriptor)) || (desc->bDescriptorType != USB_DESCRIPTOR_TYPE_DEVICE)) {
+        return 0;
+    }
+
+    return desc->bcdUSB;
+}
+
+static bool usbd_has_bos_descriptor(uint8_t busid)
+{
+#ifdef CONFIG_USBDEV_ADVANCE_DESC
+    return g_usbd_core[busid].descriptors->bos_descriptor != NULL;
+#else
+    return g_usbd_core[busid].bos_desc != NULL;
+#endif
+}
+
+static bool usbd_is_legacy_bos_request(uint8_t busid, struct usb_setup_packet *setup)
+{
+    if ((setup->bmRequestType != (USB_REQUEST_DIR_IN | USB_REQUEST_STANDARD | USB_REQUEST_RECIPIENT_DEVICE)) ||
+        (setup->bRequest != USB_REQUEST_GET_DESCRIPTOR) ||
+        (HI_BYTE(setup->wValue) != USB_DESCRIPTOR_TYPE_BINARY_OBJECT_STORE) ||
+        usbd_has_bos_descriptor(busid)) {
+        return false;
+    }
+
+    return usbd_get_device_bcdusb(busid) < USB_BCD_VERSION_2_01;
+}
+
 static void usbd_print_setup(struct usb_setup_packet *setup)
 {
     USB_LOG_INFO("Setup: "
@@ -905,6 +945,9 @@ static bool usbd_setup_request_handler(uint8_t busid, struct usb_setup_packet *s
             }
 #endif
             if (usbd_standard_request_handler(busid, setup, data, len) < 0) {
+                if (usbd_is_legacy_bos_request(busid, setup)) {
+                    return false;
+                }
                 USB_LOG_ERR("standard request error\r\n");
                 usbd_print_setup(setup);
                 return false;
