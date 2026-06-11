@@ -16,6 +16,37 @@ menu "Components Configuration"
             config CHERRY_USB_SPEED_HS
                 def_bool y
 
+            menuconfig ENABLE_CHERRY_USB_OTG
+                bool "Enable CherryUSB OTG"
+                depends on RT_BOARD_CHIP_K230D
+                default n
+                select ENABLE_CHERRY_USB_DEVICE
+                select ENABLE_CHERRY_USB_HOST
+                help
+                    Enable runtime USB role switching on one USB controller.
+
+                if ENABLE_CHERRY_USB_OTG
+                    choice CHERRY_USB_OTG_USING_DEV
+                        bool "CherryUSB OTG Use Device"
+                        default CHERRY_USB_OTG_USING_DEV0
+
+                        config CHERRY_USB_OTG_USING_DEV0
+                            bool "Using Dev0"
+
+                        config CHERRY_USB_OTG_USING_DEV1
+                            bool "Using Dev1"
+                    endchoice
+
+                    config CHERRY_USB_OTG_USING_DEV
+                        int
+                        default 0 if CHERRY_USB_OTG_USING_DEV0
+                        default 1 if CHERRY_USB_OTG_USING_DEV1
+
+                    config CHERRY_USB_OTG_DEBOUNCE_MS
+                        int "USB OTG ID debounce time (ms)"
+                        default 100
+                endif
+
             menuconfig ENABLE_CHERRY_USB_DEVICE
                 bool "Enable CherryUSB Device"
                 default n

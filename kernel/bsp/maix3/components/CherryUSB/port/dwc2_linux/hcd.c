@@ -22,6 +22,13 @@ __WEAK void usb_hc_low_level_init(struct usbh_bus *bus)
 {
 }
 
+__WEAK void usb_hc_low_level_deinit(struct usbh_bus *bus)
+{
+}
+
+static void dwc2_kill_all_urbs(struct dwc2_hsotg *hsotg);
+static void dwc2_hcd_cleanup_channels(struct dwc2_hsotg *hsotg);
+
 /**
  * dwc2_check_core_endianness() - Returns true if core and AHB have
  * opposite endianness.
@@ -1453,13 +1460,87 @@ static void dwc2_hcd_free(struct dwc2_hsotg *hsotg)
 
     if (hsotg->wq_otg) {
         rt_workqueue_cancel_work_sync(hsotg->wq_otg, &hsotg->wf_otg);
+        rt_workqueue_cancel_work_sync(hsotg->wq_otg, &hsotg->start_work.work);
+        rt_workqueue_cancel_work_sync(hsotg->wq_otg, &hsotg->reset_work.work);
         rt_workqueue_destroy(hsotg->wq_otg);
+        hsotg->wq_otg = NULL;
     }
 
     rt_work_cancel(&hsotg->phy_reset_work);
 
     rt_timer_stop(&hsotg->wkp_timer);
     rt_timer_detach(&hsotg->wkp_timer);
+
+#if DWC2_BH_HANDLE
+    if (hsotg->hi_prio_bh.work_queue) {
+        rt_workqueue_cancel_work_sync(hsotg->hi_prio_bh.work_queue, &hsotg->hi_prio_bh.work);
+        rt_workqueue_destroy(hsotg->hi_prio_bh.work_queue);
+        hsotg->hi_prio_bh.work_queue = NULL;
+    }
+
+    if (hsotg->lo_prio_bh.work_queue) {
+        rt_workqueue_cancel_work_sync(hsotg->lo_prio_bh.work_queue, &hsotg->lo_prio_bh.work);
+        rt_workqueue_destroy(hsotg->lo_prio_bh.work_queue);
+        hsotg->lo_prio_bh.work_queue = NULL;
+    }
+#endif
+}
+
+static void dwc2_hcd_delete_mem_pools(struct dwc2_hsotg *hsotg)
+{
+    if (hsotg->params.host_dma && hsotg->unaligned_cache) {
+        rt_mp_delete_align(hsotg->unaligned_cache);
+        hsotg->unaligned_cache = NULL;
+    }
+
+    if (hsotg->desc_hsisoc_cache) {
+        rt_mp_delete_align(hsotg->desc_hsisoc_cache);
+        hsotg->desc_hsisoc_cache = NULL;
+    }
+
+    if (hsotg->desc_gen_cache) {
+        rt_mp_delete_align(hsotg->desc_gen_cache);
+        hsotg->desc_gen_cache = NULL;
+    }
+
+#if INTERRUPT_MALLOC
+    if (hsotg->bitmap_size_multi_cache) {
+        rt_mp_delete(hsotg->bitmap_size_multi_cache);
+        hsotg->bitmap_size_multi_cache = NULL;
+    }
+
+    if (hsotg->bitmap_size_cache) {
+        rt_mp_delete(hsotg->bitmap_size_cache);
+        hsotg->bitmap_size_cache = NULL;
+    }
+
+    if (hsotg->qtd_cache) {
+        rt_mp_delete(hsotg->qtd_cache);
+        hsotg->qtd_cache = NULL;
+    }
+
+    if (hsotg->qh_cache) {
+        rt_mp_delete(hsotg->qh_cache);
+        hsotg->qh_cache = NULL;
+    }
+
+    if (hsotg->dwc2_urb_iso_cache) {
+        rt_mp_delete(hsotg->dwc2_urb_iso_cache);
+        hsotg->dwc2_urb_iso_cache = NULL;
+    }
+
+    if (hsotg->dwc2_urb_cache) {
+        rt_mp_delete(hsotg->dwc2_urb_cache);
+        hsotg->dwc2_urb_cache = NULL;
+    }
+#endif
+
+#ifdef CONFIG_USB_DWC2_TRACK_MISSED_SOFS
+    rt_free(hsotg->last_frame_num_array);
+    hsotg->last_frame_num_array = NULL;
+    rt_free(hsotg->frame_num_array);
+    hsotg->frame_num_array = NULL;
+#endif
 }
 
 static void dwc2_hcd_release(struct dwc2_hsotg *hsotg)
@@ -1885,6 +1966,9 @@ int usb_hc_init(struct usbh_bus *bus)
     return 0;
 
 error:
+    if (bus->hcd.hcd_priv == hsotg) {
+        bus->hcd.hcd_priv = NULL;
+    }
     rt_free(hsotg);
 #if 0
     if (hsotg->ll_hw_enabled)
@@ -1896,7 +1980,41 @@ error:
 
 int usb_hc_deinit(struct usbh_bus *bus)
 {
-    USB_LOG_WRN("%s %d\n", __func__, __LINE__);
+    struct dwc2_hsotg *hsotg;
+    rt_base_t level;
+
+    if (bus == NULL || bus->hcd.hcd_priv == NULL) {
+        return 0;
+    }
+
+    hsotg = dwc2_hcd_to_hsotg(&bus->hcd);
+
+    usb_hc_low_level_deinit(bus);
+
+    if (!hsotg->hcd_enabled) {
+        USB_LOG_WRN("dwc2 host deinit before hcd enabled, skip urb cleanup\r\n");
+        bus->hcd.hcd_priv = NULL;
+        rt_free(hsotg);
+        return 0;
+    }
+
+    level = rt_spin_lock_irqsave(&hsotg->lock);
+    dwc2_disable_global_interrupts(hsotg);
+    dwc2_disable_host_interrupts(hsotg);
+    dwc2_writel(hsotg, 0, GINTMSK);
+    dwc2_writel(hsotg, 0xffffffff, GINTSTS);
+    dwc2_kill_all_urbs(hsotg);
+    dwc2_hcd_cleanup_channels(hsotg);
+    hsotg->hcd_enabled = 0;
+    rt_spin_unlock_irqrestore(&hsotg->lock, level);
+
+    dwc2_hcd_release(hsotg);
+    dwc2_hcd_delete_mem_pools(hsotg);
+
+    bus->hcd.hcd_priv = NULL;
+    rt_free(hsotg);
+
+    return 0;
 }
 
 int dwc2_hcd_is_b_host(struct dwc2_hsotg *hsotg)

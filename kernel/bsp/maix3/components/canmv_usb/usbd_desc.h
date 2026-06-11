@@ -64,16 +64,21 @@
 extern bool g_usb_device_connected;
 
 extern void canmv_usb_device_cdc_on_connected(void);
+extern void canmv_usb_device_cdc_on_disconnected(void);
 extern void canmv_usb_device_cdc_init(void);
 
 extern void canmv_usb_device_hid_on_connected(void);
+extern void canmv_usb_device_hid_on_disconnected(void);
 extern void canmv_usb_device_hid_init(void);
 
 extern void canmv_usb_device_mtp_init(void);
 
 extern void canmv_usb_device_uvc_on_connected(void);
+extern void canmv_usb_device_uvc_on_disconnected(void);
 extern void canmv_usb_device_uvc_init(void);
 
+extern void board_usb_device_event_handler(uint8_t busid, uint8_t event);
+extern void board_usb_device_register(void);
 extern void board_usb_device_init(void* usb_base);
 
 extern void canmv_usb_device_adb_init(void);

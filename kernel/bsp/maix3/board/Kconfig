@@ -1,5 +1,16 @@
 menu "Board Configuration"
 
+    choice RT_BOARD_CHIP_TYPE
+        bool "Board Chip"
+        default RT_BOARD_CHIP_K230
+
+        config RT_BOARD_CHIP_K230
+            bool "K230"
+
+        config RT_BOARD_CHIP_K230D
+            bool "K230D"
+    endchoice
+
     config RT_USING_MPP
         bool "Use Kendryte MPP"
         default y

@@ -37,8 +37,14 @@ int read_usb(void * ctx, unsigned char * buffer, int maxsize)
 {
     rt_uint32_t re;
 
+    if (!g_usb_device_connected || !usb_device_is_configured(USB_DEVICE_BUS_ID)) {
+        return -1;
+    }
+
     read_size = 0;
-    usbd_ep_start_read(USB_DEVICE_BUS_ID, mtp_ep_data[MTP_OUT_EP_IDX].ep_addr, buffer, maxsize);
+    if (usbd_ep_start_read(USB_DEVICE_BUS_ID, mtp_ep_data[MTP_OUT_EP_IDX].ep_addr, buffer, maxsize) < 0) {
+        return -1;
+    }
     rt_event_recv(mtp_event, EV_BULK_READ_FINISH | EV_DISCONNECT, RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &re);
     if (re & EV_DISCONNECT)
         return -1;
@@ -50,12 +56,20 @@ int write_usb(void * ctx, int channel, unsigned char * buffer, int size)
 {
     rt_uint32_t re;
 
+    if (!g_usb_device_connected || !usb_device_is_configured(USB_DEVICE_BUS_ID)) {
+        return -1;
+    }
+
     if (channel == MTP_IN_EP_IDX) {
         write_size = 0;
-        usbd_ep_start_write(USB_DEVICE_BUS_ID, mtp_ep_data[channel].ep_addr, buffer, size);
+        if (usbd_ep_start_write(USB_DEVICE_BUS_ID, mtp_ep_data[channel].ep_addr, buffer, size) < 0) {
+            return -1;
+        }
         rt_event_recv(mtp_event, EV_BULK_WRITE_FINISH | EV_DISCONNECT, RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &re);
     } else {
-        usbd_ep_start_write(USB_DEVICE_BUS_ID, mtp_ep_data[channel].ep_addr, buffer, size);
+        if (usbd_ep_start_write(USB_DEVICE_BUS_ID, mtp_ep_data[channel].ep_addr, buffer, size) < 0) {
+            return -1;
+        }
         rt_event_recv(mtp_event, EV_INT_WRITE_FINISH | EV_DISCONNECT, RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &re);
     }
     if (re & EV_DISCONNECT)
@@ -139,8 +153,14 @@ static void usbd_mtp_int_in(uint8_t busid, uint8_t ep, uint32_t nbytes)
 
 static void mtp_notify_handler(uint8_t busid, uint8_t event, void *arg)
 {
+    (void)busid;
+    (void)arg;
+
     switch (event) {
         case USBD_EVENT_RESET:
+        case USBD_EVENT_DEINIT:
+            read_size = 0;
+            write_size = 0;
             rt_event_send(mtp_event, EV_DISCONNECT);
             break;
         case USBD_EVENT_CONFIGURED:

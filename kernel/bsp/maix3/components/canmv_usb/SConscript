@@ -7,7 +7,7 @@ src     = []
 
 CPPPATH = [cwd]
 
-if GetDepend(['ENABLE_CHERRY_USB_DEVICE']):
+if GetDepend(['ENABLE_CHERRY_USB_DEVICE']) or GetDepend(['ENABLE_CHERRY_USB_OTG']):
     src += Glob('usbd_desc.c')
 
     if GetDepend(['CHERRY_USB_DEVICE_ENABLE_CLASS_CDC_ACM']):
@@ -21,7 +21,7 @@ if GetDepend(['ENABLE_CHERRY_USB_DEVICE']):
     if GetDepend(['CHERRY_USB_DEVICE_ENABLE_CLASS_ADB']):
         src += Glob('usbd_adb.c')
 
-if GetDepend(['ENABLE_CHERRY_USB_HOST']):
+if GetDepend(['ENABLE_CHERRY_USB_HOST']) or GetDepend(['ENABLE_CHERRY_USB_OTG']):
 
     if GetDepend(['CHERRY_USB_HOST_ENABLE_CLASS_NET_RTL8152']):
         src += Glob('usbh_net_rtl8152.c')

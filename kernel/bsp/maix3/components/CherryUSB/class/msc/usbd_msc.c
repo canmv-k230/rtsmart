@@ -108,6 +108,7 @@ void msc_storage_notify_handler(uint8_t busid, uint8_t event, void *arg)
 #endif
             break;
         case USBD_EVENT_DEINIT:
+            usbd_msc_reset(busid);
 #ifdef CONFIG_USBDEV_MSC_THREAD
             if (g_usbd_msc[busid].usbd_msc_mq) {
                 usb_osal_mq_delete(g_usbd_msc[busid].usbd_msc_mq);

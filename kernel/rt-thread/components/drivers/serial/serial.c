@@ -1203,8 +1203,9 @@ void rt_hw_serial_isr(struct rt_serial_device *serial, int event)
         }
         /* patch for gadget hotplug & usb device disconnect */
         case RT_SERIAL_EVENT_DISCONNECT:
-            serial->config.reserved |= RT_SERIAL_FLAG_DISCONNECT;
-            /* fallthrough */
+            serial->config.reserved = RT_SERIAL_FLAG_DISCONNECT | RT_SERIAL_HOTPLUG_FLAG_MASK;
+            rt_wqueue_wakeup_all(&serial->parent.wait_queue, (void*)POLLERR);
+            break;
         case RT_SERIAL_EVENT_HOTPLUG:
             serial->config.reserved = RT_SERIAL_HOTPLUG_FLAG_MASK;
             rt_wqueue_wakeup_all(&serial->parent.wait_queue, (void*)POLLERR);
@@ -1212,4 +1213,3 @@ void rt_hw_serial_isr(struct rt_serial_device *serial, int event)
 #endif /* RT_SERIAL_USING_DMA */
     }
 }
-

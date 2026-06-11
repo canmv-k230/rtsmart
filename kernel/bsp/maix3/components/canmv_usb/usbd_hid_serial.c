@@ -219,16 +219,31 @@ static void hid_serial_start_read(struct hid_serial_device *hid)
         return;
     }
 
+    if (!g_usb_device_connected || !usb_device_is_configured(hid->busid)) {
+        return;
+    }
+
     usbd_ep_start_read(hid->busid, hid->out_ep, g_usbd_hid_serial_rx_buf, HID_SERIAL_READ_BUFFER_SIZE);
 }
 
 static void hid_serial_complete_tx(struct hid_serial_device *hid)
 {
+    bool serial_tx_ready;
+
+    if (!hid) {
+        return;
+    }
+
+    serial_tx_ready = hid->serial.serial_tx != RT_NULL;
+
     hid->tx_busy = false;
     hid->tx_buf = RT_NULL;
     hid->tx_remaining = 0;
     hid->tx_chunk = 0;
-    rt_hw_serial_isr(&hid->serial, RT_SERIAL_EVENT_TX_DMADONE);
+
+    if (serial_tx_ready) {
+        rt_hw_serial_isr(&hid->serial, RT_SERIAL_EVENT_TX_DMADONE);
+    }
 }
 
 static void hid_serial_start_next_write(struct hid_serial_device *hid)
@@ -236,6 +251,11 @@ static void hid_serial_start_next_write(struct hid_serial_device *hid)
     rt_size_t chunk;
 
     if (!hid || !hid->tx_busy) {
+        return;
+    }
+
+    if (!g_usb_device_connected || !usb_device_is_configured(hid->busid)) {
+        hid_serial_complete_tx(hid);
         return;
     }
 
@@ -376,6 +396,11 @@ static rt_size_t hid_serial_transmit(struct rt_serial_device *serial, rt_uint8_t
         return 0;
     }
 
+    if (!g_usb_device_connected || !usb_device_is_configured(hid->busid)) {
+        hid_serial_complete_tx(hid);
+        return size;
+    }
+
     if (hid->tx_busy) {
         return 0;
     }
@@ -416,7 +441,7 @@ static void usbd_hid_serial_out(uint8_t busid, uint8_t ep, uint32_t nbytes, void
         }
     }
 
-    if (hid && hid->is_open && payload_len > 0) {
+    if (g_usb_device_connected && usb_device_is_configured(busid) && hid && hid->is_open && payload_len > 0) {
         rt_serial_put_rxfifo(&hid->serial, payload, payload_len);
         rt_hw_serial_isr(&hid->serial, RT_SERIAL_EVENT_RX_DMADONE);
     }
@@ -448,17 +473,24 @@ static void usbd_hid_serial_in(uint8_t busid, uint8_t ep, uint32_t nbytes, void 
     hid_serial_start_next_write(hid);
 }
 
+void canmv_usb_device_hid_on_disconnected(void)
+{
+    struct hid_serial_device *hid = &g_usbd_hid_serial;
+
+    hid_serial_complete_tx(hid);
+
+    if (hid->is_open) {
+        rt_hw_serial_isr(&hid->serial, RT_SERIAL_EVENT_DISCONNECT);
+    }
+}
+
 void canmv_usb_device_hid_on_connected(void)
 {
     struct hid_serial_device *hid = &g_usbd_hid_serial;
 
-    hid->tx_busy = false;
-    hid->tx_buf = RT_NULL;
-    hid->tx_remaining = 0;
-    hid->tx_chunk = 0;
+    hid_serial_complete_tx(hid);
 
     if (hid->is_open) {
-        rt_hw_serial_isr(&hid->serial, RT_SERIAL_EVENT_TX_DMADONE);
         rt_hw_serial_isr(&hid->serial, RT_SERIAL_EVENT_HOTPLUG);
     }
 

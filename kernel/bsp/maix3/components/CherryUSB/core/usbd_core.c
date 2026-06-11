@@ -1224,6 +1224,7 @@ int usbd_initialize(uint8_t busid, uint32_t reg_base, void (*event_handler)(uint
 
     bus = &g_usbdev_bus[busid];
     bus->reg_base = reg_base;
+    g_usbd_core[busid].configuration = 0;
 
     g_usbd_core[busid].event_handler = event_handler;
     ret = usb_dc_init(busid);
@@ -1234,7 +1235,7 @@ int usbd_initialize(uint8_t busid, uint32_t reg_base, void (*event_handler)(uint
 
 int usbd_deinitialize(uint8_t busid)
 {
-    g_usbd_core[busid].intf_offset = 0;
+    g_usbd_core[busid].configuration = 0;
     usb_dc_deinit(busid);
     usbd_class_event_notify_handler(busid, USBD_EVENT_DEINIT, NULL);
     g_usbd_core[busid].event_handler(busid, USBD_EVENT_DEINIT);

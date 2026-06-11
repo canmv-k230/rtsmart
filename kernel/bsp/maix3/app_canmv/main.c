@@ -38,16 +38,20 @@
 
 #ifdef ENABLE_CHERRY_USB
 
-#ifdef ENABLE_CHERRY_USB_DEVICE
-#include "usbd_desc.h"
-#endif // ENABLE_CHERRY_USB_DEVICE
+#ifdef ENABLE_CHERRY_USB_OTG
+#include "usbotg_core.h"
+#endif // ENABLE_CHERRY_USB_OTG
 
-#ifdef ENABLE_CHERRY_USB_HOST
+#if defined(ENABLE_CHERRY_USB_DEVICE) || defined(ENABLE_CHERRY_USB_OTG)
+#include "usbd_desc.h"
+#endif // ENABLE_CHERRY_USB_DEVICE || ENABLE_CHERRY_USB_OTG
+
+#if defined(ENABLE_CHERRY_USB_HOST) || defined(ENABLE_CHERRY_USB_OTG)
 #include "usbh_core.h"
 #include "drv_gpio.h"
-#endif // ENABLE_CHERRY_USB_HOST
+#endif // ENABLE_CHERRY_USB_HOST || ENABLE_CHERRY_USB_OTG
 
-#if defined(ENABLE_CHERRY_USB_DEVICE) && defined (ENABLE_CHERRY_USB_HOST)
+#if defined(ENABLE_CHERRY_USB_DEVICE) && defined (ENABLE_CHERRY_USB_HOST) && !defined(ENABLE_CHERRY_USB_OTG)
   #if CHERRY_USB_DEVICE_USING_DEV + CHERRY_USB_HOST_USING_DEV != 1
     #error "Can not set same usb device as device and host"
   #endif
@@ -315,6 +319,11 @@ int main(void) {
   void *usb_base;
   const void *usb_dev_addr[2] = {(void *)0x91500000UL, (void *)0x91540000UL};
 
+#if defined (ENABLE_CHERRY_USB_OTG)
+  usb_base = (void *)rt_ioremap((void *)usb_dev_addr[CHERRY_USB_OTG_USING_DEV], 0x10000);
+  board_usb_device_register();
+  usbotg_initialize(0, (uint32_t)(long)usb_base, board_usb_device_event_handler, USBOTG_MODE_OTG);
+#else
   /* Strange BUG, ​​USB Host must be initialized first */
 #if defined (ENABLE_CHERRY_USB_HOST) && defined (ENABLE_CANMV_USB_HOST)
   usb_base = (void *)rt_ioremap((void *)usb_dev_addr[CHERRY_USB_HOST_USING_DEV], 0x10000);
@@ -335,6 +344,7 @@ int main(void) {
   board_usb_device_init(usb_base);
 #endif // ENABLE_CHERRY_USB_DEVICE
 
+#endif // ENABLE_CHERRY_USB_OTG
 #endif //ENABLE_CHERRY_USB
 
 #if defined CONFIG_BOARD_K230D_CANMV_LABPLUS_AI_CAMERA \

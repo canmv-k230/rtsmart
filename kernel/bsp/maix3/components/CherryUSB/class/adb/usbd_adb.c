@@ -64,6 +64,25 @@ USB_NOCACHE_RAM_SECTION struct adb_packet tx_packet;
 USB_NOCACHE_RAM_SECTION struct adb_packet rx_packet;
 rt_bool_t use_adb_command;
 
+static void adb_reset_state(void)
+{
+    extern void exit_adb_console(void);
+
+    exit_adb_console();
+    adb_client.state = 0;
+    adb_client.common_state = ADB_STATE_READ_MSG;
+    adb_client.write_state = 0;
+    adb_client.writable = false;
+    adb_client.is_open = false;
+    adb_client.localid = 0;
+    adb_client.shell_remoteid = 0;
+    adb_client.file_remoteid = 0;
+
+    if (adb_client.w_sem) {
+        rt_sem_control(adb_client.w_sem, RT_IPC_CMD_RESET, (void *)1);
+    }
+}
+
 static inline uint32_t adb_packet_checksum(struct adb_packet *packet)
 {
     uint32_t sum = 0;
@@ -92,7 +111,9 @@ static void adb_send_msg(struct adb_packet *packet)
     packet->msg.data_crc32 = adb_packet_checksum(packet);
     packet->msg.magic = packet->msg.command ^ 0xffffffff;
 
-    usbd_ep_start_write(0, adb_ep_data[ADB_IN_EP_IDX].ep_addr, (uint8_t *)&packet->msg, sizeof(struct adb_msg));
+    if (usbd_ep_start_write(0, adb_ep_data[ADB_IN_EP_IDX].ep_addr, (uint8_t *)&packet->msg, sizeof(struct adb_msg)) < 0) {
+        adb_reset_state();
+    }
 }
 
 static void adb_send_okay(struct adb_packet *packet, uint32_t localid)
@@ -188,7 +209,9 @@ void usbd_adb_bulk_out(uint8_t busid, uint8_t ep, uint32_t nbytes)
         if (nbytes == 0) {
             /* Zero-Length Packet (ZLP) from USB - ignore and restart read */
             USB_LOG_DBG("[OUT] ZLP received, restarting read\r\n");
-            usbd_ep_start_read(busid, adb_ep_data[ADB_OUT_EP_IDX].ep_addr, (uint8_t *)&rx_packet.msg, sizeof(struct adb_msg));
+            if (usbd_ep_start_read(busid, adb_ep_data[ADB_OUT_EP_IDX].ep_addr, (uint8_t *)&rx_packet.msg, sizeof(struct adb_msg)) < 0) {
+                adb_reset_state();
+            }
             return;
         }
 
@@ -196,8 +219,10 @@ void usbd_adb_bulk_out(uint8_t busid, uint8_t ep, uint32_t nbytes)
             USB_LOG_ERR("invalid adb msg size:%d\r\n", (unsigned int)nbytes);
             /* Recover state machine - restart message read */
             adb_client.common_state = ADB_STATE_READ_MSG;
-            usbd_ep_start_read(busid, adb_ep_data[ADB_OUT_EP_IDX].ep_addr,
-                               (uint8_t *)&rx_packet.msg, sizeof(struct adb_msg));
+            if (usbd_ep_start_read(busid, adb_ep_data[ADB_OUT_EP_IDX].ep_addr,
+                                   (uint8_t *)&rx_packet.msg, sizeof(struct adb_msg)) < 0) {
+                adb_reset_state();
+            }
             return;
         }
 
@@ -210,7 +235,9 @@ void usbd_adb_bulk_out(uint8_t busid, uint8_t ep, uint32_t nbytes)
         if (rx_packet.msg.data_length) {
             /* setup next out ep read transfer */
             adb_client.common_state = ADB_STATE_READ_DATA;
-            usbd_ep_start_read(busid, adb_ep_data[ADB_OUT_EP_IDX].ep_addr, rx_packet.payload, rx_packet.msg.data_length);
+            if (usbd_ep_start_read(busid, adb_ep_data[ADB_OUT_EP_IDX].ep_addr, rx_packet.payload, rx_packet.msg.data_length) < 0) {
+                adb_reset_state();
+            }
         } else {
             if (rx_packet.msg.command == A_CLSE) {
                 adb_client.writable = false;
@@ -220,7 +247,9 @@ void usbd_adb_bulk_out(uint8_t busid, uint8_t ep, uint32_t nbytes)
             }
             adb_client.common_state = ADB_STATE_READ_MSG;
             /* setup first out ep read transfer */
-            usbd_ep_start_read(busid, adb_ep_data[ADB_OUT_EP_IDX].ep_addr, (uint8_t *)&rx_packet.msg, sizeof(struct adb_msg));
+            if (usbd_ep_start_read(busid, adb_ep_data[ADB_OUT_EP_IDX].ep_addr, (uint8_t *)&rx_packet.msg, sizeof(struct adb_msg)) < 0) {
+                adb_reset_state();
+            }
         }
     } else if (adb_client.common_state == ADB_STATE_READ_DATA) {
         switch (rx_packet.msg.command) {
@@ -293,7 +322,9 @@ void usbd_adb_bulk_out(uint8_t busid, uint8_t ep, uint32_t nbytes)
                     } else {
                         /* Buffer full - don't send OKAY, PC will stop sending */
                         adb_client.common_state = ADB_STATE_READ_MSG;
-                        usbd_ep_start_read(busid, adb_ep_data[ADB_OUT_EP_IDX].ep_addr, (uint8_t *)&rx_packet.msg, sizeof(struct adb_msg));
+                        if (usbd_ep_start_read(busid, adb_ep_data[ADB_OUT_EP_IDX].ep_addr, (uint8_t *)&rx_packet.msg, sizeof(struct adb_msg)) < 0) {
+                            adb_reset_state();
+                        }
                     }
                 } else {
                     adb_send_close(&tx_packet, 0, rx_packet.msg.arg0);
@@ -320,7 +351,9 @@ void usbd_adb_bulk_in(uint8_t busid, uint8_t ep, uint32_t nbytes)
     if (adb_client.common_state == ADB_STATE_WRITE_MSG) {
         if (tx_packet.msg.data_length) {
             adb_client.common_state = ADB_STATE_WRITE_DATA;
-            usbd_ep_start_write(busid, adb_ep_data[ADB_IN_EP_IDX].ep_addr, tx_packet.payload, tx_packet.msg.data_length);
+            if (usbd_ep_start_write(busid, adb_ep_data[ADB_IN_EP_IDX].ep_addr, tx_packet.payload, tx_packet.msg.data_length) < 0) {
+                adb_reset_state();
+            }
         } else {
             if (rx_packet.msg.command == A_WRTE) {
                 adb_client.writable = true;
@@ -348,7 +381,9 @@ void usbd_adb_bulk_in(uint8_t busid, uint8_t ep, uint32_t nbytes)
             USB_LOG_DBG("[IN] -> READ_MSG, start_read\r\n");
             adb_client.common_state = ADB_STATE_READ_MSG;
             /* setup first out ep read transfer */
-            usbd_ep_start_read(busid, adb_ep_data[ADB_OUT_EP_IDX].ep_addr, (uint8_t *)&rx_packet.msg, sizeof(struct adb_msg));
+            if (usbd_ep_start_read(busid, adb_ep_data[ADB_OUT_EP_IDX].ep_addr, (uint8_t *)&rx_packet.msg, sizeof(struct adb_msg)) < 0) {
+                adb_reset_state();
+            }
 
             if ((tx_packet.msg.command == A_OKAY) || (tx_packet.msg.command == A_CLSE)) {
                 rt_sem_release(adb_client.w_sem);
@@ -357,11 +392,15 @@ void usbd_adb_bulk_in(uint8_t busid, uint8_t ep, uint32_t nbytes)
     } else if (adb_client.common_state == ADB_STATE_WRITE_DATA) {
         adb_client.common_state = ADB_STATE_READ_MSG;
         /* setup first out ep read transfer */
-        usbd_ep_start_read(busid, adb_ep_data[ADB_OUT_EP_IDX].ep_addr, (uint8_t *)&rx_packet.msg, sizeof(struct adb_msg));
+        if (usbd_ep_start_read(busid, adb_ep_data[ADB_OUT_EP_IDX].ep_addr, (uint8_t *)&rx_packet.msg, sizeof(struct adb_msg)) < 0) {
+            adb_reset_state();
+        }
     } else if (adb_client.write_state == ADB_STATE_AWRITE_MSG) {
         if (tx_packet.msg.data_length) {
             adb_client.write_state = ADB_STATE_AWRITE_DATA;
-            usbd_ep_start_write(busid, adb_ep_data[ADB_IN_EP_IDX].ep_addr, tx_packet.payload, tx_packet.msg.data_length);
+            if (usbd_ep_start_write(busid, adb_ep_data[ADB_IN_EP_IDX].ep_addr, tx_packet.payload, tx_packet.msg.data_length) < 0) {
+                adb_reset_state();
+            }
         } else {
         }
     } else if (adb_client.write_state == ADB_STATE_AWRITE_DATA) {
@@ -387,26 +426,15 @@ void adb_notify_handler(uint8_t busid, uint8_t event, void *arg)
         case USBD_EVENT_INIT:
             break;
         case USBD_EVENT_DEINIT:
-            break;
         case USBD_EVENT_RESET:
-            /* Reset ADB client state when USB bus reset occurs */
-            extern void exit_adb_console(void);
-
-            void exit_adb_console(void);
-            adb_client.state = 0;
-            adb_client.write_state = 0;
-            adb_client.writable = false;
-            adb_client.is_open = false;
-            adb_client.localid = 0;
-            adb_client.shell_remoteid = 0;
-            adb_client.file_remoteid = 0;
-            adb_client.common_state = ADB_STATE_READ_MSG;
-            rt_sem_control(adb_client.w_sem, RT_IPC_CMD_RESET, (void *)1);
+            adb_reset_state();
             break;
         case USBD_EVENT_CONFIGURED:
             adb_client.common_state = ADB_STATE_READ_MSG;
             /* setup first out ep read transfer */
-            usbd_ep_start_read(busid, adb_ep_data[ADB_OUT_EP_IDX].ep_addr, (uint8_t *)&rx_packet.msg, sizeof(struct adb_msg));
+            if (usbd_ep_start_read(busid, adb_ep_data[ADB_OUT_EP_IDX].ep_addr, (uint8_t *)&rx_packet.msg, sizeof(struct adb_msg)) < 0) {
+                adb_reset_state();
+            }
             break;
 
         default:
@@ -493,7 +521,10 @@ int usbd_adb_write(uint32_t localid, const uint8_t *data, uint32_t len)
     packet->msg.magic = packet->msg.command ^ 0xffffffff;
 
     adb_client.write_state = ADB_STATE_AWRITE_MSG;
-    usbd_ep_start_write(0, adb_ep_data[ADB_IN_EP_IDX].ep_addr, (uint8_t *)&packet->msg, sizeof(struct adb_msg));
+    if (usbd_ep_start_write(0, adb_ep_data[ADB_IN_EP_IDX].ep_addr, (uint8_t *)&packet->msg, sizeof(struct adb_msg)) < 0) {
+        adb_reset_state();
+        return -1;
+    }
     return 0;
 }
 

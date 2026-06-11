@@ -821,7 +821,6 @@ static void usbh_hub_thread(void *argument)
 
     struct usbh_bus *bus = (struct usbh_bus *)argument;
 
-    usb_hc_init(bus);
     while (1) {
         ret = usb_osal_mq_recv(bus->hub_mq, (uintptr_t *)&hub, USB_OSAL_WAITING_FOREVER);
         if (ret < 0) {
@@ -839,6 +838,7 @@ void usbh_hub_thread_wakeup(struct usbh_hub *hub)
 int usbh_hub_initialize(struct usbh_bus *bus)
 {
     char thread_name[32] = { 0 };
+    int ret;
 
     bus->hub_mq = usb_osal_mq_create(7);
     if (bus->hub_mq == NULL) {
@@ -846,10 +846,21 @@ int usbh_hub_initialize(struct usbh_bus *bus)
         return -1;
     }
 
+    ret = usb_hc_init(bus);
+    if (ret < 0) {
+        USB_LOG_ERR("Failed to init host controller, ret=%d\r\n", ret);
+        usb_osal_mq_delete(bus->hub_mq);
+        bus->hub_mq = NULL;
+        return ret;
+    }
+
     snprintf(thread_name, 32, "usbh_hub%u", bus->busid);
     bus->hub_thread = usb_osal_thread_create(thread_name, CONFIG_USBHOST_PSC_STACKSIZE, CONFIG_USBHOST_PSC_PRIO, usbh_hub_thread, bus);
     if (bus->hub_thread == NULL) {
         USB_LOG_ERR("Failed to create hub thread\r\n");
+        usb_hc_deinit(bus);
+        usb_osal_mq_delete(bus->hub_mq);
+        bus->hub_mq = NULL;
         return -1;
     }
     return 0;

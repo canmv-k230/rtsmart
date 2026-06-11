@@ -143,10 +143,36 @@ static struct cdc_device *cdc_find_by_intf(uint8_t intf_num)
     return RT_NULL;
 }
 
+static void cdc_reset_link_state(struct cdc_device *cdc)
+{
+    if (!cdc) {
+        return;
+    }
+
+    cdc->cdc_dtr = 0;
+    cdc->last_dtr_state = false;
+    cdc->last_rts_state = false;
+    cdc->send_break_flag = false;
+    cdc->pending_magic_reset = false;
+}
+
+static void cdc_complete_tx(struct cdc_device *cdc)
+{
+    if (!cdc || !cdc->serial.serial_tx) {
+        return;
+    }
+
+    rt_hw_serial_isr(&cdc->serial, RT_SERIAL_EVENT_TX_DMADONE);
+}
+
 static void cdc_start_read(struct cdc_device *cdc)
 {
     if (!cdc) {
         USB_LOG_ERR("%s %d null cdc\n", __func__, __LINE__);
+        return;
+    }
+
+    if (!g_usb_device_connected || !usb_device_is_configured(cdc->busid)) {
         return;
     }
 
@@ -261,7 +287,17 @@ static rt_size_t cdc_transmit(struct rt_serial_device* serial, rt_uint8_t* buf, 
     cdc = (struct cdc_device *)serial->parent.user_data;
 
     if (dir == RT_SERIAL_DMA_TX) {
-        usbd_ep_start_write(cdc->busid, cdc->in_ep, buf, size);
+        int ret;
+
+        if (!g_usb_device_connected || !usb_device_is_configured(cdc->busid) || !cdc->cdc_dtr) {
+            cdc_complete_tx(cdc);
+            return size;
+        }
+
+        ret = usbd_ep_start_write(cdc->busid, cdc->in_ep, buf, size);
+        if (ret < 0) {
+            cdc_complete_tx(cdc);
+        }
         return size;
     }
 
@@ -275,7 +311,7 @@ static void usbd_cdc_acm_bulk_out(uint8_t busid, uint8_t ep, uint32_t nbytes, vo
     (void)busid;
     (void)ep;
 
-    if (cdc && cdc->is_open) {
+    if (g_usb_device_connected && usb_device_is_configured(busid) && cdc && cdc->is_open) {
         rt_serial_put_rxfifo(&cdc->serial, g_usbd_serial_cdc_acm_rx_buf[cdc->port_index], nbytes);
         rt_hw_serial_isr(&cdc->serial, RT_SERIAL_EVENT_RX_DMADONE);
     }
@@ -286,11 +322,15 @@ static void usbd_cdc_acm_bulk_in(uint8_t busid, uint8_t ep, uint32_t nbytes, voi
 {
     struct cdc_device *cdc = (struct cdc_device *)arg;
 
-    if ((nbytes % CDC_MAX_MPS) == 0 && nbytes) {
+    if (!g_usb_device_connected || !usb_device_is_configured(busid)) {
+        cdc_complete_tx(cdc);
+    } else if ((nbytes % CDC_MAX_MPS) == 0 && nbytes) {
         /* send zlp */
-        usbd_ep_start_write(busid, ep, NULL, 0);
+        if (usbd_ep_start_write(busid, ep, NULL, 0) < 0) {
+            cdc_complete_tx(cdc);
+        }
     } else if (cdc) {
-        rt_hw_serial_isr(&cdc->serial, RT_SERIAL_EVENT_TX_DMADONE);
+        cdc_complete_tx(cdc);
     }
 }
 
@@ -316,18 +356,28 @@ void canmv_usb_device_cdc_on_connected(void)
     for (size_t i = 0; i < CANMV_USB_CDC_ACM_COUNT; i++) {
         struct cdc_device *cdc = &g_usbd_serial_cdc_acm[i];
 
-        cdc->cdc_dtr = 0;
-        cdc->last_dtr_state = false;
-        cdc->last_rts_state = false;
-        cdc->send_break_flag = false;
-        cdc->pending_magic_reset = false;
+        cdc_reset_link_state(cdc);
 
         if (cdc->is_open) {
-            rt_hw_serial_isr(&cdc->serial, RT_SERIAL_EVENT_TX_DMADONE);
+            cdc_complete_tx(cdc);
             rt_hw_serial_isr(&cdc->serial, RT_SERIAL_EVENT_HOTPLUG);
         }
 
         cdc_start_read(cdc);
+    }
+}
+
+void canmv_usb_device_cdc_on_disconnected(void)
+{
+    for (size_t i = 0; i < CANMV_USB_CDC_ACM_COUNT; i++) {
+        struct cdc_device *cdc = &g_usbd_serial_cdc_acm[i];
+
+        cdc_reset_link_state(cdc);
+
+        if (cdc->is_open) {
+            cdc_complete_tx(cdc);
+            rt_hw_serial_isr(&cdc->serial, RT_SERIAL_EVENT_DISCONNECT);
+        }
     }
 }
 
@@ -378,6 +428,7 @@ void canmv_usb_device_cdc_init(void)
         cdc->line_coding.bCharFormat = 0;
         cdc->line_coding.bParityType = 0;
         cdc->line_coding.bDataBits = 8;
+        cdc_reset_link_state(cdc);
 
         usbd_add_interface(busid, usbd_cdc_acm_init_intf(busid, &cdc->intf_ctrl));
         usbd_add_interface(busid, usbd_cdc_acm_init_intf(busid, &cdc->intf_data));

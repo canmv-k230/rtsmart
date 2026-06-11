@@ -2,6 +2,7 @@
 # Automatically generated file; DO NOT EDIT.
 # RT-Thread Project Configuration
 #
+CONFIG_RT_BOARD_CHIP_K230D=y
 
 #
 # RT-Thread Kernel

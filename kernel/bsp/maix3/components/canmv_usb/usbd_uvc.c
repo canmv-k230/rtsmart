@@ -561,7 +561,7 @@ static void _usbd_video_thread_entry(void* args)
 
             uint64_t frame_send_time_ms = cpu_ticks_ms();
 
-            if (frame && tx_flag) {
+            if (frame && tx_flag && g_usb_device_connected && usb_device_is_configured(USB_DEVICE_BUS_ID)) {
                 uint8_t* input_data   = (uint8_t*)frame->k_addr;
                 uint32_t input_len    = frame->data_length;
                 uint32_t bytes_sent   = 0;
@@ -580,12 +580,12 @@ static void _usbd_video_thread_entry(void* args)
 
                 // Loop through and send all packets
                 for (uint32_t i = 0; i < total_packets; i++) {
-                    if (!tx_flag) {
+                    if (!tx_flag || !g_usb_device_connected || !usb_device_is_configured(USB_DEVICE_BUS_ID)) {
                         break;
                     }
 
                     // Wait for the previous packet to finish transmission
-                    while (iso_tx_busy && tx_flag) {
+                    while (iso_tx_busy && tx_flag && g_usb_device_connected && usb_device_is_configured(USB_DEVICE_BUS_ID)) {
                         // rt_thread_mdelay(1);
                         asm volatile("wfi");
                     }
@@ -593,7 +593,10 @@ static void _usbd_video_thread_entry(void* args)
                     // Start transmission of the current buffer
                     uint32_t total_packet_size = 12 + bytes_to_copy;
                     iso_tx_busy                = true; // Set busy flag before starting transmission
-                    usbd_ep_start_write(USB_DEVICE_BUS_ID, VIDEO_IN_EP, packet_buffer[buffer_index], total_packet_size);
+                    if (usbd_ep_start_write(USB_DEVICE_BUS_ID, VIDEO_IN_EP, packet_buffer[buffer_index], total_packet_size) < 0) {
+                        iso_tx_busy = false;
+                        break;
+                    }
 
                     // Switch to the other buffer
                     buffer_index = 1 - buffer_index;
@@ -784,6 +787,12 @@ void usbd_video_close(uint8_t busid, uint8_t intf)
 }
 
 void canmv_usb_device_uvc_on_connected(void)
+{
+    tx_flag     = 0;
+    iso_tx_busy = false;
+}
+
+void canmv_usb_device_uvc_on_disconnected(void)
 {
     tx_flag     = 0;
     iso_tx_busy = false;
