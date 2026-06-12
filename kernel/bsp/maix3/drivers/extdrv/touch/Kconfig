@@ -116,11 +116,11 @@ menuconfig RT_USING_TOUCH
 
                 config TOUCH_DEV_INT_EDGE
                     int
-                    default GPIO_PE_RISING if TOUCH_DEV_INT_EDGE_RISING
-                    default GPIO_PE_FALLING if TOUCH_DEV_INT_EDGE_FALLING
-                    default GPIO_PE_BOTH if TOUCH_DEV_INT_EDGE_BOTH
-                    default GPIO_PE_HIGH if TOUCH_DEV_INT_EDGE_HIGH
-                    default GPIO_PE_LOW if TOUCH_DEV_INT_EDGE_LOW
+                    default 0 if TOUCH_DEV_INT_EDGE_RISING
+                    default 1 if TOUCH_DEV_INT_EDGE_FALLING
+                    default 2 if TOUCH_DEV_INT_EDGE_BOTH
+                    default 3 if TOUCH_DEV_INT_EDGE_HIGH
+                    default 4 if TOUCH_DEV_INT_EDGE_LOW
 
                 config TOUCH_DEV_RST_PIN
                     int "Touch Device RST Pin"

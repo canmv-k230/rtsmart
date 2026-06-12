@@ -355,7 +355,7 @@ menu "InterDriver"
 
         if DRV_SYSCTL_BOOT_FORCE_MODE
             choice
-                bool "Forct Sysctl Boot From "
+                bool "Force Sysctl Boot From"
                 default DRV_SYSCTL_BOOT_FORCE_MODE_MODE_SDCARD
 
                 config DRV_SYSCTL_BOOT_FORCE_MODE_MODE_SPI_NOR
