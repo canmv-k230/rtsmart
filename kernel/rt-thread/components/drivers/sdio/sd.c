@@ -421,7 +421,7 @@ rt_err_t mmcsd_send_app_op_cond(struct rt_mmcsd_host *host,
         cmd.arg = ocr;
     cmd.flags = RESP_SPI_R1 | RESP_R3 | CMD_BCR;
 
-    for (i = 100; i; i--) 
+    for (i = 500; i; i--)
     {
         err = mmcsd_send_app_cmd(host, RT_NULL, &cmd, 3);
         if (err)
@@ -445,7 +445,7 @@ rt_err_t mmcsd_send_app_op_cond(struct rt_mmcsd_host *host,
 
         err = -RT_ETIMEOUT;
 
-        mmcsd_delay_ms(10); //delay 10ms
+        mmcsd_delay_ms(5);
     }
 
     if (rocr && !controller_is_spi(host))

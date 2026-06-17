@@ -627,6 +627,7 @@ void mmcsd_detect(void *param)
     struct rt_mmcsd_host *host;
     rt_uint32_t  ocr;
     rt_int32_t  err;
+    rt_bool_t skip_sd_probe;
 
     while (1)
     {
@@ -637,6 +638,12 @@ void mmcsd_detect(void *param)
                 mmcsd_host_lock(host);
                 mmcsd_power_up(host);
                 mmcsd_go_idle(host);
+
+                skip_sd_probe = !controller_is_spi(host) &&
+                                (host->flags & MMCSD_SUP_NONREMOVABLE) &&
+                                (host->flags & MMCSD_BUSWIDTH_8);
+                if (skip_sd_probe)
+                    goto probe_mmc;
 
                 mmcsd_send_if_cond(host, host->valid_ocr);
 
@@ -665,6 +672,7 @@ void mmcsd_detect(void *param)
                 /*
                  * detect mmc card
                  */
+probe_mmc:
                 err = mmc_send_op_cond(host, 0, &ocr);
                 if (!err)
                 {

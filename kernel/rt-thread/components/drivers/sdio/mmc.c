@@ -591,7 +591,7 @@ rt_err_t mmc_send_op_cond(struct rt_mmcsd_host *host,
     cmd.arg = controller_is_spi(host) ? 0 : ocr;
     cmd.flags = RESP_SPI_R1 | RESP_R3 | CMD_BCR;
 
-    for (i = 100; i; i--)
+    for (i = 500; i; i--)
     {
         err = mmcsd_send_cmd(host, &cmd, 3);
         if (err)
@@ -615,7 +615,7 @@ rt_err_t mmc_send_op_cond(struct rt_mmcsd_host *host,
 
         err = -RT_ETIMEOUT;
 
-        mmcsd_delay_ms(10); //delay 10ms
+        mmcsd_delay_ms(5); //delay 5ms
     }
 
     if (rocr && !controller_is_spi(host))
@@ -790,6 +790,13 @@ static rt_int32_t mmcsd_mmc_init_card(struct rt_mmcsd_host *host,
         if (err)
             goto err1;
     }
+
+    /*
+     * The eMMC is now in transfer state. Keep the actual high-speed timing
+     * negotiation below, but avoid reading EXT_CSD at the initial 400 kHz.
+     */
+    if (!controller_is_spi(host) && card->max_data_rate > host->io_cfg.clock)
+        mmcsd_set_clock(host, card->max_data_rate);
 
     /*
     * Fetch and process extended CSD.

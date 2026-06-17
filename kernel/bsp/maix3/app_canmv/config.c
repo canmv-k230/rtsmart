@@ -630,6 +630,7 @@ void excute_sdcard_config(void) {
         continue;
       }
       memcpy(line, p_line_start, line_length);
+      line[line_length] = '\0';
 
       excete_line(line);
 

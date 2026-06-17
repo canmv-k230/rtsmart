@@ -942,19 +942,38 @@ static int drv_touch_register_default(void)
 
     return 0;
 }
+
+static void drv_touch_register_default_entry(void* parameter)
+{
+    (void)parameter;
+
+    drv_touch_register_default();
+}
 #endif
 
 static int drv_touch_init(void)
 {
+    int ret = 0;
+
     if (0x00 != drv_touch_mgmt_init()) {
         LOG_E("touch mgmt init failed");
         return -1;
     }
 
 #if defined(TOUCH_DEFAULT_DEVICE)
-    drv_touch_register_default();
+    rt_thread_t tid = rt_thread_create("touch_init",
+                                       drv_touch_register_default_entry,
+                                       RT_NULL,
+                                       4096,
+                                       RT_THREAD_PRIORITY_MAX - 1,
+                                       20);
+    if (tid) {
+        rt_thread_startup(tid);
+    } else {
+        ret = drv_touch_register_default();
+    }
 #endif
 
-    return 0;
+    return ret;
 }
 INIT_COMPONENT_EXPORT(drv_touch_init);

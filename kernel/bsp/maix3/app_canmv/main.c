@@ -64,6 +64,43 @@ bool g_fs_mount_sdcard_succ = false;
 
 pid_t exec(char *filename, int debug, int argc, char **argv);
 
+#if defined(ENABLE_CHERRY_USB) && !defined(ENABLE_CHERRY_USB_OTG) && defined(ENABLE_CHERRY_USB_HOST) && defined(ENABLE_CANMV_USB_HOST)
+struct usbh_initialize_async_arg {
+  uint8_t busid;
+  uint32_t reg_base;
+};
+
+static struct usbh_initialize_async_arg usbh_initialize_async_args;
+
+static void usbh_initialize_async_entry(void *parameter)
+{
+  struct usbh_initialize_async_arg *arg = (struct usbh_initialize_async_arg *)parameter;
+
+  usbh_initialize(arg->busid, arg->reg_base);
+}
+
+static int usbh_initialize_async(uint8_t busid, uint32_t reg_base)
+{
+  rt_thread_t tid;
+
+  usbh_initialize_async_args.busid = busid;
+  usbh_initialize_async_args.reg_base = reg_base;
+
+  tid = rt_thread_create("usbh_init",
+                         usbh_initialize_async_entry,
+                         &usbh_initialize_async_args,
+                         4096,
+                         RT_THREAD_PRIORITY_MAX - 1,
+                         20);
+  if (tid) {
+    rt_thread_startup(tid);
+    return 0;
+  }
+
+  return usbh_initialize(busid, reg_base);
+}
+#endif
+
 static const struct dfs_mount_tbl* const auto_mount_table[SYSCTL_BOOT_MAX] = {
     (const struct dfs_mount_tbl[]) {
         /* Nor Flash */
@@ -327,7 +364,7 @@ int main(void) {
   /* Strange BUG, ​​USB Host must be initialized first */
 #if defined (ENABLE_CHERRY_USB_HOST) && defined (ENABLE_CANMV_USB_HOST)
   usb_base = (void *)rt_ioremap((void *)usb_dev_addr[CHERRY_USB_HOST_USING_DEV], 0x10000);
-  usbh_initialize(0, (uint32_t)(long)usb_base);
+  usbh_initialize_async(0, (uint32_t)(long)usb_base);
 
 #ifdef CANMV_USB_PWR_PIN
   int usb_host_pin = CANMV_USB_PWR_PIN;

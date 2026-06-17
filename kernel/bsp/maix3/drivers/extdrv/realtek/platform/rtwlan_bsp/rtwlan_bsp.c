@@ -13,6 +13,8 @@
 
 static rt_int32_t realtek_probe(struct rt_mmcsd_card* card);
 static rt_err_t wlan_get_mac(struct rt_wlan_device* wlan, rt_uint8_t mac[]);
+static void realtek_init_do(void);
+static void realtek_init_entry(void* parameter);
 
 struct sdio_func* wifi_sdio_func;
 struct rt_sdio_function* rtt_sdio_func;
@@ -50,7 +52,7 @@ static struct rt_sdio_driver realtek_drv = {
     realtek_id,
 };
 
-int realtek_init(void)
+static void realtek_init_do(void)
 {
     Set_WLAN_Power_On();
 
@@ -76,7 +78,27 @@ int realtek_init(void)
 
     sdio_register_driver(&realtek_drv);
     kd_sdhci_change(REALTEK_SDIO_DEV);
+}
 
+static void realtek_init_entry(void* parameter)
+{
+    (void)parameter;
+
+    realtek_init_do();
+}
+
+int realtek_init(void)
+{
+    rt_thread_t tid;
+
+    tid = rt_thread_create("rtl_init", realtek_init_entry, RT_NULL, 4096,
+                           RT_THREAD_PRIORITY_MAX - 1, 10);
+    if (tid == RT_NULL) {
+        realtek_init_do();
+        return 0;
+    }
+
+    rt_thread_startup(tid);
     return 0;
 }
 INIT_COMPONENT_EXPORT(realtek_init);
