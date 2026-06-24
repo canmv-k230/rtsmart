@@ -209,6 +209,7 @@ config RT_USING_RTC
 
         config RT_USING_SOFT_RTC
             bool "Using software simulation RTC device"
+            depends on !RT_USING_RTC_PMU
             default n
 
         config RTC_SYNC_USING_NTP

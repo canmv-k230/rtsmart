@@ -38,7 +38,16 @@
 #define PMU_INT_DETECT_CLR                      0x54
 #define PMU_INT0_LONG_PRESS_TRIGGER_VAL         0x58
 #define PMU_INT0_LEVEL_DEBOUNCE_VAL             0x64
+#define PMU_INT1_LEVEL_DEBOUNCE_VAL             0x6c
+#define PMU_INT2_LEVEL_DEBOUNCE_VAL             0x70
+#define PMU_INT3_LEVEL_DEBOUNCE_VAL             0x74
 #define PMU_SYSCTRL_REG                         0x78
+#define PMU_IO_CFG_0                            0x80
+#define PMU_IO_CFG_1                            0x84
+#define PMU_IO_CFG_2                            0x88
+#define PMU_IO_CFG_3                            0x8c
+#define PMU_IO_CFG_4                            0x90
+#define PMU_IO_CFG_5                            0x94
 #define PMU_OUT_EVENT_CTRL                      0xa4
 #define PMU_OUT_LOGIC_CTRL                      0xa8
 #define PMU_INT_STATE_REG                       0xac
@@ -54,6 +63,10 @@
 #define PMU_OUT_LOGIC_TO_CTRL_1_LOGIC_AND       BIT(0)
 #define PMU_OUT_LOGIC_TO_CTRL_1_SW_REG          BIT(3)
 #define PMU_ISO_ACCESS_MASK                     BIT(5)
+#define PMU_IO_CFG_PU                           BIT(6)
+#define PMU_IO_CFG_PD                           BIT(5)
+#define PMU_IO_CFG_PULL_MASK                    \
+    (PMU_IO_CFG_PU | PMU_IO_CFG_PD)
 
 #define PMU_CPU_IRQ_MASK                        0x0fffU
 #define PMU_DET_SOURCE_MASK                     0x1fffU
@@ -77,6 +90,11 @@
 #define PMU_DET_KEY_LONG                        BIT(11)
 #define PMU_DET_KEY_SHORT                       BIT(10)
 #define PMU_DET_KEY_EDGE                        BIT(9)
+#define PMU_DET_INT1_1                          BIT(7)
+#define PMU_DET_INT2                            BIT(6)
+#define PMU_DET_INT3                            BIT(5)
+#define PMU_DET_INT4                            BIT(4)
+#define PMU_DET_INT5                            BIT(3)
 #define PMU_DET_RTC_ALARM                       BIT(2)
 #define PMU_DET_RTC_TICK                        BIT(1)
 
@@ -95,7 +113,28 @@
 #define PMU_INT_TRIGGER_MASK                    0x7U
 #define PMU_INT_TRIGGER_TYPE_MASK               0x1U
 #define PMU_INT_TRIGGER_EDGE_MASK               0x2U
+#define PMU_INT_TRIGGER_LEVEL_LOW_MASK          0x4U
+#define PMU_INT1_EDGE_OFFSET                    12U
+#define PMU_INT2_EDGE_OFFSET                    9U
+#define PMU_INT3_EDGE_OFFSET                    6U
+#define PMU_INT4_EDGE_OFFSET                    3U
+#define PMU_INT5_EDGE_OFFSET                    0U
 #define PMU_KEY_EDGE_OFFSET                     16U
+
+#define PMU_WAKEUP_TRIGGER_HIGH_LEVEL           0U
+#define PMU_WAKEUP_TRIGGER_LOW_LEVEL            1U
+#define PMU_WAKEUP_TRIGGER_RISING_EDGE          2U
+#define PMU_WAKEUP_TRIGGER_FALLING_EDGE         3U
+
+#define PMU_WAKEUP_BIAS_KEEP                    0U
+#define PMU_WAKEUP_BIAS_PULL_UP                 1U
+#define PMU_WAKEUP_BIAS_PULL_DOWN               2U
+#define PMU_WAKEUP_BIAS_DISABLE                 3U
+
+#if defined(RT_PMU_SHUTDOWN_WAKEUP) && \
+    !defined(RT_PMU_SHUTDOWN_WAKEUP_BIAS)
+#define RT_PMU_SHUTDOWN_WAKEUP_BIAS             PMU_WAKEUP_BIAS_KEEP
+#endif
 
 #define PMU_INT_STATE_RTC_ALARM_INPUT_MASK      BIT(13)
 #define PMU_RTC_TICK_EN_BIT                     BIT(8)

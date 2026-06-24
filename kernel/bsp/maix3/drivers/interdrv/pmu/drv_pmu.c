@@ -19,6 +19,15 @@ struct pmu_irq_clear_map {
     uint32_t clear;
 };
 
+struct pmu_pad_wakeup_cfg {
+    uint32_t pad;
+    uint32_t io_cfg_reg;
+    uint32_t irq_mask;
+    uint32_t detect_mask;
+    uint32_t type_offset;
+    uint32_t debounce_reg;
+};
+
 static void pmu_irq_handler(int vector, void *param);
 
 static const struct pmu_irq_clear_map g_pmu_irq_clear_map[] = {
@@ -32,6 +41,14 @@ static const struct pmu_irq_clear_map g_pmu_irq_clear_map[] = {
     { PMU_IRQ_INT4, PMU_CLR_INT4 },
     { PMU_IRQ_INT5, PMU_CLR_INT5 },
     { PMU_IRQ_KEY_SHUTDOWN, PMU_CLR_KEY_SHUTDOWN },
+};
+
+static const struct pmu_pad_wakeup_cfg g_pmu_pad_wakeup_cfgs[] = {
+    { 65U, PMU_IO_CFG_1, PMU_IRQ_INT1_1, PMU_DET_INT1_1, PMU_INT1_EDGE_OFFSET, PMU_INT1_LEVEL_DEBOUNCE_VAL },
+    { 66U, PMU_IO_CFG_2, PMU_IRQ_INT2, PMU_DET_INT2, PMU_INT2_EDGE_OFFSET, PMU_INT2_LEVEL_DEBOUNCE_VAL },
+    { 67U, PMU_IO_CFG_3, PMU_IRQ_INT3, PMU_DET_INT3, PMU_INT3_EDGE_OFFSET, PMU_INT3_LEVEL_DEBOUNCE_VAL },
+    { 68U, PMU_IO_CFG_4, PMU_IRQ_INT4, PMU_DET_INT4, PMU_INT4_EDGE_OFFSET, 0U },
+    { 69U, PMU_IO_CFG_5, PMU_IRQ_INT5, PMU_DET_INT5, PMU_INT5_EDGE_OFFSET, 0U },
 };
 
 struct pmu_dev *pmu_get_dev(void)
@@ -233,15 +250,118 @@ static uint32_t pmu_rtc_tick_fallback(struct pmu_dev *pmu, uint32_t status)
     return PMU_IRQ_RTC_TICK;
 }
 
+static const struct pmu_pad_wakeup_cfg *pmu_get_shutdown_wakeup_pad(void)
+{
+#ifdef RT_PMU_SHUTDOWN_WAKEUP
+    rt_size_t index;
+
+    for (index = 0; index < sizeof(g_pmu_pad_wakeup_cfgs) /
+                   sizeof(g_pmu_pad_wakeup_cfgs[0]); index++) {
+        if (g_pmu_pad_wakeup_cfgs[index].pad ==
+            RT_PMU_SHUTDOWN_WAKEUP_PAD)
+            return &g_pmu_pad_wakeup_cfgs[index];
+    }
+#endif
+
+    return RT_NULL;
+}
+
+#ifdef RT_PMU_SHUTDOWN_WAKEUP
+static uint32_t pmu_shutdown_wakeup_type_bits(void)
+{
+    switch (RT_PMU_SHUTDOWN_WAKEUP_TRIGGER) {
+    case PMU_WAKEUP_TRIGGER_LOW_LEVEL:
+        return PMU_INT_TRIGGER_LEVEL_LOW_MASK;
+    case PMU_WAKEUP_TRIGGER_RISING_EDGE:
+        return PMU_INT_TRIGGER_TYPE_MASK;
+    case PMU_WAKEUP_TRIGGER_FALLING_EDGE:
+        return PMU_INT_TRIGGER_TYPE_MASK | PMU_INT_TRIGGER_EDGE_MASK;
+    case PMU_WAKEUP_TRIGGER_HIGH_LEVEL:
+    default:
+        return 0U;
+    }
+}
+
+static uint32_t pmu_shutdown_wakeup_bias_bits(bool *update)
+{
+    *update = true;
+
+    switch (RT_PMU_SHUTDOWN_WAKEUP_BIAS) {
+    case PMU_WAKEUP_BIAS_PULL_UP:
+        return PMU_IO_CFG_PU;
+    case PMU_WAKEUP_BIAS_PULL_DOWN:
+        return PMU_IO_CFG_PD;
+    case PMU_WAKEUP_BIAS_DISABLE:
+        return 0U;
+    case PMU_WAKEUP_BIAS_KEEP:
+    default:
+        *update = false;
+        return 0U;
+    }
+}
+
+static void pmu_configure_shutdown_wakeup_bias(
+    struct pmu_dev *pmu,
+    const struct pmu_pad_wakeup_cfg *cfg)
+{
+    uint32_t value;
+    uint32_t bias;
+    bool update;
+
+    bias = pmu_shutdown_wakeup_bias_bits(&update);
+    if (!update)
+        return;
+
+    value = pmu_readl(pmu, cfg->io_cfg_reg);
+    value &= ~PMU_IO_CFG_PULL_MASK;
+    value |= bias;
+    pmu_writel(pmu, value, cfg->io_cfg_reg);
+}
+#endif
+
+static void pmu_configure_shutdown_wakeup_pad(
+    struct pmu_dev *pmu,
+    const struct pmu_pad_wakeup_cfg *cfg)
+{
+#ifdef RT_PMU_SHUTDOWN_WAKEUP
+    uint32_t value;
+
+    if (cfg == RT_NULL)
+        return;
+
+    pmu_configure_shutdown_wakeup_bias(pmu, cfg);
+
+    value = pmu_readl(pmu, PMU_INT_DETECT_TYP);
+    value &= ~(PMU_INT_TRIGGER_MASK << cfg->type_offset);
+    value |= pmu_shutdown_wakeup_type_bits() << cfg->type_offset;
+    pmu_writel(pmu, value, PMU_INT_DETECT_TYP);
+
+    if (cfg->debounce_reg != 0U) {
+        pmu_writel(pmu, RT_PMU_SHUTDOWN_WAKEUP_DEBOUNCE_TICKS,
+               cfg->debounce_reg);
+    }
+#else
+    (void)pmu;
+    (void)cfg;
+#endif
+}
+
 static void pmu_prepare_wakeup_sources(struct pmu_dev *pmu)
 {
+    const struct pmu_pad_wakeup_cfg *pad_wakeup;
     rt_base_t level;
     uint32_t output_mask;
     uint32_t detect_mask;
     uint32_t value;
 
+    pad_wakeup = pmu_get_shutdown_wakeup_pad();
+
     output_mask = PMU_IRQ_KEY_LONG;
     detect_mask = PMU_DET_KEY_LONG;
+    if (pad_wakeup != RT_NULL) {
+        output_mask |= pad_wakeup->irq_mask;
+        detect_mask |= pad_wakeup->detect_mask;
+    }
 
     if (pmu->cycle.shutting_down) {
         output_mask |= PMU_IRQ_RTC_ALARM;
@@ -249,6 +369,7 @@ static void pmu_prepare_wakeup_sources(struct pmu_dev *pmu)
     }
 
     level = rt_hw_interrupt_disable();
+    pmu_configure_shutdown_wakeup_pad(pmu, pad_wakeup);
 
     value = pmu_readl(pmu, PMU_INT0_TO_CTL_REGISTER);
     value &= ~PMU_CPU_IRQ_MASK;

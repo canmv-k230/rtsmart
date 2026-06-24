@@ -281,6 +281,104 @@ menu "InterDriver"
                 Software long-press shutdown time in seconds while the
                 system is running. This does not change the PMU hardware
                 wakeup long-press threshold after poweroff.
+
+        menuconfig RT_PMU_SHUTDOWN_WAKEUP
+            bool "PMU shutdown wakeup"
+            default n
+            help
+                Enable an extra PMU input PAD as a wakeup source after
+                shutdown. PAD64 is reserved for the power-key long-press path.
+
+        if RT_PMU_SHUTDOWN_WAKEUP
+            choice
+                bool "PMU shutdown wakeup PAD"
+                default RT_PMU_SHUTDOWN_WAKEUP_PAD68
+
+                config RT_PMU_SHUTDOWN_WAKEUP_PAD65
+                    bool "PAD65"
+
+                config RT_PMU_SHUTDOWN_WAKEUP_PAD66
+                    bool "PAD66"
+
+                config RT_PMU_SHUTDOWN_WAKEUP_PAD67
+                    bool "PAD67"
+
+                config RT_PMU_SHUTDOWN_WAKEUP_PAD68
+                    bool "PAD68"
+
+                config RT_PMU_SHUTDOWN_WAKEUP_PAD69
+                    bool "PAD69"
+            endchoice
+
+            config RT_PMU_SHUTDOWN_WAKEUP_PAD
+                int
+                default 65 if RT_PMU_SHUTDOWN_WAKEUP_PAD65
+                default 66 if RT_PMU_SHUTDOWN_WAKEUP_PAD66
+                default 67 if RT_PMU_SHUTDOWN_WAKEUP_PAD67
+                default 68 if RT_PMU_SHUTDOWN_WAKEUP_PAD68
+                default 69 if RT_PMU_SHUTDOWN_WAKEUP_PAD69
+
+            choice
+                bool "PMU shutdown wakeup trigger type"
+                default RT_PMU_SHUTDOWN_WAKEUP_RISING_EDGE
+
+                config RT_PMU_SHUTDOWN_WAKEUP_HIGH_LEVEL
+                    bool "High level"
+
+                config RT_PMU_SHUTDOWN_WAKEUP_LOW_LEVEL
+                    bool "Low level"
+
+                config RT_PMU_SHUTDOWN_WAKEUP_RISING_EDGE
+                    bool "Rising edge"
+
+                config RT_PMU_SHUTDOWN_WAKEUP_FALLING_EDGE
+                    bool "Falling edge"
+            endchoice
+
+            config RT_PMU_SHUTDOWN_WAKEUP_TRIGGER
+                int
+                default 0 if RT_PMU_SHUTDOWN_WAKEUP_HIGH_LEVEL
+                default 1 if RT_PMU_SHUTDOWN_WAKEUP_LOW_LEVEL
+                default 2 if RT_PMU_SHUTDOWN_WAKEUP_RISING_EDGE
+                default 3 if RT_PMU_SHUTDOWN_WAKEUP_FALLING_EDGE
+
+            choice
+                bool "PMU shutdown wakeup PAD pull bias"
+                default RT_PMU_SHUTDOWN_WAKEUP_BIAS_KEEP
+                help
+                    Select how the driver updates the PMU_IO_CFG pull-up and
+                    pull-down bits for the selected wakeup PAD before shutdown.
+                    Keep current preserves the existing PMU_IO_CFG state.
+
+                config RT_PMU_SHUTDOWN_WAKEUP_BIAS_KEEP
+                    bool "Keep current PMU_IO_CFG pull setting"
+
+                config RT_PMU_SHUTDOWN_WAKEUP_BIAS_PULL_UP
+                    bool "Pull up"
+
+                config RT_PMU_SHUTDOWN_WAKEUP_BIAS_PULL_DOWN
+                    bool "Pull down"
+
+                config RT_PMU_SHUTDOWN_WAKEUP_BIAS_DISABLE
+                    bool "Disable pull up/down"
+            endchoice
+
+            config RT_PMU_SHUTDOWN_WAKEUP_BIAS
+                int
+                default 0 if RT_PMU_SHUTDOWN_WAKEUP_BIAS_KEEP
+                default 1 if RT_PMU_SHUTDOWN_WAKEUP_BIAS_PULL_UP
+                default 2 if RT_PMU_SHUTDOWN_WAKEUP_BIAS_PULL_DOWN
+                default 3 if RT_PMU_SHUTDOWN_WAKEUP_BIAS_DISABLE
+
+            config RT_PMU_SHUTDOWN_WAKEUP_DEBOUNCE_TICKS
+                int "PMU shutdown wakeup debounce ticks" if RT_PMU_SHUTDOWN_WAKEUP_PAD65 || RT_PMU_SHUTDOWN_WAKEUP_PAD66 || RT_PMU_SHUTDOWN_WAKEUP_PAD67
+                default 256
+                range 0 4095
+                help
+                    Debounce time in 32 KHz PMU clock cycles for PAD65-PAD67
+                    edge/level wakeup detection. PAD68 and PAD69 do not have
+                    debounce registers in the PMU TRM.
+        endif
     endif
 
     menuconfig RT_USING_SDIO
