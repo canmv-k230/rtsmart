@@ -119,6 +119,17 @@ static void usbd_print_setup(struct usb_setup_packet *setup)
                  setup->wLength);
 }
 
+static void usbd_print_setup_err(struct usb_setup_packet *setup)
+{
+    USB_LOG_ERR("Setup: "
+                "bmRequestType 0x%02x, bRequest 0x%02x, wValue 0x%04x, wIndex 0x%04x, wLength 0x%04x\r\n",
+                setup->bmRequestType,
+                setup->bRequest,
+                setup->wValue,
+                setup->wIndex,
+                setup->wLength);
+}
+
 static bool is_device_configured(uint8_t busid)
 {
     return (g_usbd_core[busid].configuration != 0);
@@ -252,6 +263,20 @@ static bool usbd_get_descriptor(uint8_t busid, uint16_t type_index, uint8_t **da
             desc_len = g_usbd_core[busid].descriptors->bos_descriptor->string_len;
             break;
 
+        case USB_DESCRIPTOR_TYPE_DEBUG:
+            /* The host requests a Debug Descriptor (USB 3.0 feature) which this
+             * device does not support. Return a minimal debug descriptor header
+             * (bLength=4, bDescriptorType=0x0A, bcdDebug=0x0000) to indicate
+             * no debug capability.
+             */
+            USB_LOG_DBG("Debug descriptor not supported, returning minimal header\r\n");
+            (*data)[0] = 4;                    /* bLength */
+            (*data)[1] = USB_DESCRIPTOR_TYPE_DEBUG; /* bDescriptorType */
+            (*data)[2] = 0x00;                 /* bcdDebug low byte */
+            (*data)[3] = 0x00;                 /* bcdDebug high byte - version 0.00 = no debug */
+            *len = 4;
+            return true;
+
         default:
             found = false;
             break;
@@ -301,6 +326,19 @@ static bool usbd_get_descriptor(uint8_t busid, uint16_t type_index, uint8_t **da
         //*data = g_usbd_core[busid].bos_desc->string;
         usb_memcpy(*data, (uint8_t *)g_usbd_core[busid].bos_desc->string, g_usbd_core[busid].bos_desc->string_len);
         *len = g_usbd_core[busid].bos_desc->string_len;
+        return true;
+    } else if (type == USB_DESCRIPTOR_TYPE_DEBUG) {
+        /* The host requests a Debug Descriptor (USB 3.0 feature) which this
+         * device does not support. Return a minimal debug descriptor header
+         * (bLength=4, bDescriptorType=0x0A, bcdDebug=0x0000) to indicate
+         * no debug capability.
+         */
+        USB_LOG_DBG("Debug descriptor not supported, returning minimal header\r\n");
+        (*data)[0] = 4;                    /* bLength */
+        (*data)[1] = USB_DESCRIPTOR_TYPE_DEBUG; /* bDescriptorType */
+        (*data)[2] = 0x00;                 /* bcdDebug low byte */
+        (*data)[3] = 0x00;                 /* bcdDebug high byte - version 0.00 = no debug */
+        *len = 4;
         return true;
     }
     /*
@@ -730,6 +768,8 @@ static int usbd_standard_request_handler(uint8_t busid, struct usb_setup_packet 
     switch (setup->bmRequestType & USB_REQUEST_RECIPIENT_MASK) {
         case USB_REQUEST_RECIPIENT_DEVICE:
             if (usbd_std_device_req_handler(busid, setup, data, len) == false) {
+                USB_LOG_ERR("std dev req error: bRequest=0x%02x wValue=0x%04x wIndex=0x%04x\r\n",
+                            setup->bRequest, setup->wValue, setup->wIndex);
                 rc = -1;
             }
 
@@ -737,6 +777,8 @@ static int usbd_standard_request_handler(uint8_t busid, struct usb_setup_packet 
 
         case USB_REQUEST_RECIPIENT_INTERFACE:
             if (usbd_std_interface_req_handler(busid, setup, data, len) == false) {
+                USB_LOG_ERR("std iface req error: bRequest=0x%02x wValue=0x%04x wIndex=0x%04x (not configured=%d)\r\n",
+                            setup->bRequest, setup->wValue, setup->wIndex, !is_device_configured(busid));
                 rc = -1;
             }
 
@@ -744,12 +786,15 @@ static int usbd_standard_request_handler(uint8_t busid, struct usb_setup_packet 
 
         case USB_REQUEST_RECIPIENT_ENDPOINT:
             if (usbd_std_endpoint_req_handler(busid, setup, data, len) == false) {
+                USB_LOG_ERR("std ep req error: bRequest=0x%02x wValue=0x%04x wIndex=0x%04x (not configured=%d)\r\n",
+                            setup->bRequest, setup->wValue, setup->wIndex, !is_device_configured(busid));
                 rc = -1;
             }
 
             break;
 
         default:
+            USB_LOG_ERR("std req unknown recipient: bmRequestType=0x%02x\r\n", setup->bmRequestType);
             rc = -1;
             break;
     }
@@ -948,22 +993,40 @@ static bool usbd_setup_request_handler(uint8_t busid, struct usb_setup_packet *s
                 if (usbd_is_legacy_bos_request(busid, setup)) {
                     return false;
                 }
-                USB_LOG_ERR("standard request error\r\n");
-                usbd_print_setup(setup);
+                USB_LOG_ERR("standard request error: "
+                            "bmRequestType=0x%02x bRequest=0x%02x wValue=0x%04x wIndex=0x%04x wLength=%d\r\n",
+                            setup->bmRequestType,
+                            setup->bRequest,
+                            setup->wValue,
+                            setup->wIndex,
+                            setup->wLength);
+                usbd_print_setup_err(setup);
                 return false;
             }
             break;
         case USB_REQUEST_CLASS:
             if (usbd_class_request_handler(busid, setup, data, len) < 0) {
-                USB_LOG_ERR("class request error\r\n");
-                usbd_print_setup(setup);
+                USB_LOG_ERR("class request error: "
+                            "bmRequestType=0x%02x bRequest=0x%02x wValue=0x%04x wIndex=0x%04x wLength=%d\r\n",
+                            setup->bmRequestType,
+                            setup->bRequest,
+                            setup->wValue,
+                            setup->wIndex,
+                            setup->wLength);
+                usbd_print_setup_err(setup);
                 return false;
             }
             break;
         case USB_REQUEST_VENDOR:
             if (usbd_vendor_request_handler(busid, setup, data, len) < 0) {
-                USB_LOG_ERR("vendor request error\r\n");
-                usbd_print_setup(setup);
+                USB_LOG_ERR("vendor request error: "
+                            "bmRequestType=0x%02x bRequest=0x%02x wValue=0x%04x wIndex=0x%04x wLength=%d\r\n",
+                            setup->bmRequestType,
+                            setup->bRequest,
+                            setup->wValue,
+                            setup->wIndex,
+                            setup->wLength);
+                usbd_print_setup_err(setup);
                 return false;
             }
             break;
