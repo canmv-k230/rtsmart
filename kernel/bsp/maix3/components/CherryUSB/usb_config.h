@@ -41,14 +41,27 @@
 
 #define CONFIG_USBDEV_MAX_BUS 1 // for now, bus num must be 1 except hpm ip
 
+/* DWC2 device DFIFO policy (sizes in 32-bit words).
+ *
+ * RX and the EP0 TX FIFO have a static minimum reserved here. Every other
+ * IN-endpoint TX FIFO is sized from its own type/MPS and allocated on demand
+ * when the endpoint is opened (released when closed), so the layout fits
+ * whatever composite configuration (CDC / HID / MTP / ADB / UVC, single or dual
+ * CDC) is built, without a per-index size table to keep in sync.
+ *
+ * After the minimums, any spare DFIFO is shared out by the weights below so the
+ * controller RAM is fully used. The split is by endpoint *type*, so the policy
+ * applies uniformly to every configuration: bulk/iso FIFOs and the shared RX
+ * FIFO grow (they gain throughput from extra depth), while interrupt FIFOs keep
+ * just their minimum (weight 0). Raise BULK/ISO to favour IN throughput, or RX
+ * to favour OUT throughput (e.g. host->device MTP writes). */
 #define CONFIG_USB_DWC2_RXALL_FIFO_SIZE (2048 / 4)
-#define CONFIG_USB_DWC2_TX0_FIFO_SIZE (256 / 4)
-#define CONFIG_USB_DWC2_TX1_FIFO_SIZE (2048 / 4)
-#define CONFIG_USB_DWC2_TX2_FIFO_SIZE (256 / 4)
-#define CONFIG_USB_DWC2_TX3_FIFO_SIZE (2048 / 4)
-#define CONFIG_USB_DWC2_TX4_FIFO_SIZE (256 / 4)
-#define CONFIG_USB_DWC2_TX5_FIFO_SIZE (2048 / 4)
-#define CONFIG_USB_DWC2_TX6_FIFO_SIZE (256 / 4)
+#define CONFIG_USB_DWC2_TX0_FIFO_SIZE   (256 / 4)
+
+#define CONFIG_USB_DWC2_FIFO_WEIGHT_RX   4
+#define CONFIG_USB_DWC2_FIFO_WEIGHT_BULK 4
+#define CONFIG_USB_DWC2_FIFO_WEIGHT_ISO  4
+#define CONFIG_USB_DWC2_FIFO_WEIGHT_INT  0
 
 /* Ep0 max transfer buffer, specially for receiving data from ep0 out */
 #define CONFIG_USBDEV_REQUEST_BUFFER_LEN 256

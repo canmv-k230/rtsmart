@@ -60,37 +60,27 @@
 #define CONFIG_USB_DWC2_TX0_FIFO_SIZE (64 / 4)
 #endif
 
-#ifndef CONFIG_USB_DWC2_TX1_FIFO_SIZE
-#define CONFIG_USB_DWC2_TX1_FIFO_SIZE (512 / 4)
+/* Relative weights used to share the spare DFIFO words across the active
+ * endpoints (and the shared RX FIFO). Bulk/iso endpoints and RX gain real
+ * throughput from extra depth; interrupt endpoints never need more than one
+ * packet, so their default weight is 0. These are deliberately type-based so
+ * the policy applies uniformly to every configuration (cdc/hid/mtp/adb/uvc,
+ * single or dual). Override in usb_config.h to bias a particular workload. */
+#ifndef CONFIG_USB_DWC2_FIFO_WEIGHT_RX
+#define CONFIG_USB_DWC2_FIFO_WEIGHT_RX 4U
+#endif
+#ifndef CONFIG_USB_DWC2_FIFO_WEIGHT_BULK
+#define CONFIG_USB_DWC2_FIFO_WEIGHT_BULK 4U
+#endif
+#ifndef CONFIG_USB_DWC2_FIFO_WEIGHT_ISO
+#define CONFIG_USB_DWC2_FIFO_WEIGHT_ISO 4U
+#endif
+#ifndef CONFIG_USB_DWC2_FIFO_WEIGHT_INT
+#define CONFIG_USB_DWC2_FIFO_WEIGHT_INT 0U
 #endif
 
-#ifndef CONFIG_USB_DWC2_TX2_FIFO_SIZE
-#define CONFIG_USB_DWC2_TX2_FIFO_SIZE (512 / 4)
-#endif
-
-#ifndef CONFIG_USB_DWC2_TX3_FIFO_SIZE
-#define CONFIG_USB_DWC2_TX3_FIFO_SIZE (512 / 4)
-#endif
-
-#ifndef CONFIG_USB_DWC2_TX4_FIFO_SIZE
-#define CONFIG_USB_DWC2_TX4_FIFO_SIZE (512 / 4)
-#endif
-
-#ifndef CONFIG_USB_DWC2_TX5_FIFO_SIZE
-#define CONFIG_USB_DWC2_TX5_FIFO_SIZE (512 / 4)
-#endif
-
-#ifndef CONFIG_USB_DWC2_TX6_FIFO_SIZE
-#define CONFIG_USB_DWC2_TX6_FIFO_SIZE (0 / 4)
-#endif
-
-#ifndef CONFIG_USB_DWC2_TX7_FIFO_SIZE
-#define CONFIG_USB_DWC2_TX7_FIFO_SIZE (0 / 4)
-#endif
-
-#ifndef CONFIG_USB_DWC2_TX8_FIFO_SIZE
-#define CONFIG_USB_DWC2_TX8_FIFO_SIZE (0 / 4)
-#endif
+#define DWC2_DEVICE_TX_FIFO_COUNT 16U
+#define DWC2_MIN_TX_FIFO_WORDS    16U
 
 #define USBD_BASE (long)(g_usbdev_bus[0].reg_base)
 
@@ -119,6 +109,16 @@ USB_NOCACHE_RAM_SECTION struct dwc2_udc {
     USB_MEM_ALIGNX struct dwc2_ep_state in_ep[CONFIG_USBDEV_EP_NUM];  /*!< IN endpoint parameters*/
     struct dwc2_ep_state out_ep[CONFIG_USBDEV_EP_NUM]; /*!< OUT endpoint parameters */
 } g_dwc2_udc;
+
+/* Total device DFIFO depth (32-bit words), read from GHWCFG3 at init. */
+static uint32_t g_dwc2_dfifo_depth;
+
+/* TX FIFO words currently reserved for each IN endpoint (index 0 == EP0).
+ * A value of 0 means "not allocated". The shared RX FIFO and EP0 TX FIFO are
+ * reserved once at init; every other IN endpoint is allocated on demand when
+ * it is opened and released when it is closed, so the DFIFO only ever holds
+ * the endpoints of the configuration that is actually active. */
+static uint16_t g_dwc2_in_fifo_words[CONFIG_USBDEV_EP_NUM];
 
 #define __io_bw()   __asm__ __volatile__ ("fence w,o" : : : "memory");
 
@@ -287,40 +287,183 @@ static void dwc2_set_turnaroundtime(uint32_t hclk, uint8_t speed)
     USB_OTG_GLB->GUSBCFG |= (uint32_t)((UsbTrd << USB_OTG_GUSBCFG_TRDT_Pos) & USB_OTG_GUSBCFG_TRDT);
 }
 
-static void dwc2_set_txfifo(uint8_t fifo, uint16_t size)
+/* Words needed by one IN endpoint, derived from its transfer type and the
+ * payload it must hold per (micro)frame. Bulk and isochronous endpoints are
+ * double buffered so the controller can load the next packet while the current
+ * one is still draining onto the bus; interrupt endpoints only ever need to
+ * hold a single packet. The result is clamped to the controller's 16-word
+ * minimum. mult is the transactions-per-(micro)frame count (1 for the common
+ * case, 2/3 for high-bandwidth HS iso/interrupt endpoints). */
+static uint16_t dwc2_required_txfifo_words(uint8_t ep_type, uint16_t mps, uint8_t mult)
 {
-    uint8_t i;
-    uint32_t Tx_Offset;
-    uint32_t Tx_Size;
+    uint32_t words = (((uint32_t)mps * (uint32_t)mult) + 3U) / 4U;
 
-    /*  TXn min size = 16 words. (n  : Transmit FIFO index)
-      When a TxFIFO is not used, the Configuration should be as follows:
-          case 1 :  n > m    and Txn is not used    (n,m  : Transmit FIFO indexes)
-         --> Txm can use the space allocated for Txn.
-         case2  :  n < m    and Txn is not used    (n,m  : Transmit FIFO indexes)
-         --> Txn should be configured with the minimum space of 16 words
-     The FIFO is used optimally when used TxFIFOs are allocated in the top
-         of the FIFO.Ex: use EP1 and EP2 as IN instead of EP1 and EP3 as IN ones.
-     When DMA is used 3n * FIFO locations should be reserved for internal DMA registers */
-
-    Tx_Offset = USB_OTG_GLB->GRXFSIZ;
-
-    if (fifo == 0U) {
-        USB_OTG_GLB->DIEPTXF0_HNPTXFSIZ = ((uint32_t)size << 16) | Tx_Offset;
-        Tx_Size = USB_OTG_GLB->DIEPTXF0_HNPTXFSIZ;
-    } else {
-        Tx_Offset += (USB_OTG_GLB->DIEPTXF0_HNPTXFSIZ) >> 16;
-        for (i = 0U; i < (fifo - 1U); i++) {
-            Tx_Offset += (USB_OTG_GLB->DIEPTXF[i] >> 16);
-        }
-
-        /* Multiply Tx_Size by 2 to get higher performance */
-        USB_OTG_GLB->DIEPTXF[fifo - 1U] = ((uint32_t)size << 16) | Tx_Offset;
-
-        Tx_Size = USB_OTG_GLB->DIEPTXF[fifo - 1U];
+    switch (ep_type) {
+        case USB_ENDPOINT_TYPE_BULK:
+        case USB_ENDPOINT_TYPE_ISOCHRONOUS:
+            words *= 2U;
+            break;
+        default:
+            break;
     }
 
-    USB_LOG_INFO("fifo-%02d size:%04d %08x\n", fifo, size, Tx_Size);
+    if (words < DWC2_MIN_TX_FIFO_WORDS) {
+        words = DWC2_MIN_TX_FIFO_WORDS;
+    }
+
+    return (uint16_t)words;
+}
+
+/* Per-endpoint share of the spare DFIFO, by transfer type. Type-based so the
+ * same policy fits every configuration without a per-endpoint table. */
+static uint32_t dwc2_fifo_weight(uint8_t ep_type)
+{
+    switch (ep_type) {
+        case USB_ENDPOINT_TYPE_BULK:
+            return CONFIG_USB_DWC2_FIFO_WEIGHT_BULK;
+        case USB_ENDPOINT_TYPE_ISOCHRONOUS:
+            return CONFIG_USB_DWC2_FIFO_WEIGHT_ISO;
+        case USB_ENDPOINT_TYPE_INTERRUPT:
+            return CONFIG_USB_DWC2_FIFO_WEIGHT_INT;
+        default:
+            return 0U;
+    }
+}
+
+/* Lay out the shared RX FIFO and every IN-endpoint TX FIFO. This is re-run
+ * whenever an endpoint is opened or closed, so closing an endpoint reclaims its
+ * space for the next one.
+ *
+ * g_dwc2_in_fifo_words[] holds only the *minimum* each endpoint needs. Whatever
+ * DFIFO is left after the minimums is shared out by weight (see
+ * dwc2_fifo_weight() and CONFIG_USB_DWC2_FIFO_WEIGHT_RX) so the controller RAM
+ * is fully used: bulk/iso TX FIFOs and the shared RX FIFO grow, while interrupt
+ * FIFOs (weight 0 by default) keep just their minimum. RX absorbs the rounding
+ * remainder, so the layout always ends exactly at the DFIFO depth.
+ *
+ * Re-packing only happens on open/close (configuration changes), never during
+ * steady-state transfers, and endpoints are opened in ascending index order,
+ * so a FIFO that is actively in use is never relocated underneath traffic.
+ *
+ * Returns -1 (without committing an overflowing layout) if the minimum set
+ * does not fit in the controller DFIFO. */
+static int dwc2_repack_txfifos(void)
+{
+    uint32_t rx_base = CONFIG_USB_DWC2_RXALL_FIFO_SIZE;
+    uint32_t base = rx_base + g_dwc2_in_fifo_words[0];
+    uint32_t rx_weight = 0U;
+    uint8_t top = 0U;
+
+    /* The shared RX FIFO only competes for the surplus when it actually carries
+     * bulk/iso OUT data; if every OUT endpoint is control/interrupt (e.g. UVC,
+     * which has only the ISO IN stream) its minimum is plenty and the spare
+     * words should go to the IN FIFOs instead. If nothing benefits from depth
+     * at all (a pure interrupt config), rx_weight stays 0 and RX simply absorbs
+     * the whole surplus below, so the DFIFO is still fully used. */
+    for (uint8_t i = 1U; i < CONFIG_USBDEV_EP_NUM; i++) {
+        uint8_t t = g_dwc2_udc.out_ep[i].ep_type;
+        if ((t == USB_ENDPOINT_TYPE_BULK) || (t == USB_ENDPOINT_TYPE_ISOCHRONOUS)) {
+            rx_weight = CONFIG_USB_DWC2_FIFO_WEIGHT_RX;
+            break;
+        }
+    }
+
+    uint32_t weight_total = rx_weight;
+
+    /* Highest index in use. */
+    for (uint8_t i = 1U; i < CONFIG_USBDEV_EP_NUM; i++) {
+        if (g_dwc2_in_fifo_words[i] != 0U) {
+            top = i;
+        }
+    }
+
+    /* Sum the minimums (real endpoints + the 16-word floor reserved for any
+     * unused FIFO that sits below the top one) and the distribution weights. */
+    for (uint8_t i = 1U; i <= top; i++) {
+        if (g_dwc2_in_fifo_words[i] == 0U) {
+            base += DWC2_MIN_TX_FIFO_WORDS;
+            continue;
+        }
+        base += g_dwc2_in_fifo_words[i];
+        weight_total += dwc2_fifo_weight(g_dwc2_udc.in_ep[i].ep_type);
+    }
+
+    uint32_t surplus = (base < g_dwc2_dfifo_depth) ? (g_dwc2_dfifo_depth - base) : 0U;
+
+    /* Pre-compute the TX share so RX can take the remainder (keeps the total
+     * exactly at the DFIFO depth despite integer rounding). */
+    uint32_t tx_bonus_total = 0U;
+    if ((surplus != 0U) && (weight_total != 0U)) {
+        for (uint8_t i = 1U; i <= top; i++) {
+            if (g_dwc2_in_fifo_words[i] == 0U) {
+                continue;
+            }
+            tx_bonus_total += (uint32_t)(((uint64_t)surplus * dwc2_fifo_weight(g_dwc2_udc.in_ep[i].ep_type)) / weight_total);
+        }
+    }
+
+    uint32_t rx_size = rx_base + (surplus - tx_bonus_total);
+
+    USB_OTG_GLB->GRXFSIZ = rx_size;
+
+    uint32_t offset = rx_size;
+    USB_OTG_GLB->DIEPTXF0_HNPTXFSIZ = ((uint32_t)g_dwc2_in_fifo_words[0] << 16) | offset;
+    offset += g_dwc2_in_fifo_words[0];
+
+    for (uint8_t i = 1U; i < CONFIG_USBDEV_EP_NUM; i++) {
+        uint32_t words = g_dwc2_in_fifo_words[i];
+
+        if ((words == 0U) && (i < top)) {
+            words = DWC2_MIN_TX_FIFO_WORDS;
+        }
+        if (words == 0U) {
+            USB_OTG_GLB->DIEPTXF[i - 1U] = 0U;
+            continue;
+        }
+
+        if ((surplus != 0U) && (weight_total != 0U) && (g_dwc2_in_fifo_words[i] != 0U)) {
+            words += (uint32_t)(((uint64_t)surplus * dwc2_fifo_weight(g_dwc2_udc.in_ep[i].ep_type)) / weight_total);
+        }
+
+        USB_OTG_GLB->DIEPTXF[i - 1U] = ((uint32_t)words << 16) | offset;
+        offset += words;
+    }
+
+    if (offset > g_dwc2_dfifo_depth) {
+        return -1;
+    }
+
+    return 0;
+}
+
+/* Dump the active TX/RX FIFO layout straight from the controller registers,
+ * so the printed sizes reflect the minimum + distributed surplus actually in
+ * effect. Offsets/sizes are in 32-bit words (bytes shown for convenience). */
+static void dwc2_dump_fifo_config(void)
+{
+    uint32_t rx = USB_OTG_GLB->GRXFSIZ & 0xFFFFU;
+    uint32_t reg = USB_OTG_GLB->DIEPTXF0_HNPTXFSIZ;
+    uint32_t off = reg & 0xFFFFU;
+    uint32_t size = (reg >> 16) & 0xFFFFU;
+    uint32_t total = rx;
+
+    USB_LOG_INFO("==== dwc2 fifo map (dfifo depth %u words) ====\r\n", g_dwc2_dfifo_depth);
+    USB_LOG_INFO(" rx       off:%-5u size:%-5u (%u bytes)\r\n", 0U, rx, rx * 4U);
+    USB_LOG_INFO(" ep0  in  off:%-5u size:%-5u (%u bytes)\r\n", off, size, size * 4U);
+    total += size;
+
+    for (uint8_t i = 1U; i < CONFIG_USBDEV_EP_NUM; i++) {
+        reg = USB_OTG_GLB->DIEPTXF[i - 1U];
+        off = reg & 0xFFFFU;
+        size = (reg >> 16) & 0xFFFFU;
+        if (size == 0U) {
+            continue;
+        }
+        USB_LOG_INFO(" ep%-2u in  off:%-5u size:%-5u (%u bytes)\r\n", i, off, size, size * 4U);
+        total += size;
+    }
+
+    USB_LOG_INFO("==== dwc2 fifo used %u/%u words ====\r\n", total, g_dwc2_dfifo_depth);
 }
 
 static uint8_t dwc2_get_devspeed(void)
@@ -509,7 +652,7 @@ int usb_dc_init(uint8_t busid)
     uint8_t hsphy_type;
     uint8_t dma_support;
     uint8_t endpoints;
-    uint32_t fifo_num;
+    uint32_t dfifo_depth;
 
     usb_memset(&g_dwc2_udc, 0, sizeof(struct dwc2_udc));
 
@@ -538,6 +681,7 @@ int usb_dc_init(uint8_t busid)
     hsphy_type = ((USB_OTG_GLB->GHWCFG2 & (0x03 << 6)) >> 6);
     dma_support = ((USB_OTG_GLB->GHWCFG2 & (0x03 << 3)) >> 3);
     endpoints = ((USB_OTG_GLB->GHWCFG2 & (0x0f << 10)) >> 10) + 1;
+    dfifo_depth = (USB_OTG_GLB->GHWCFG3 >> 16);
 
     USB_LOG_INFO("========== dwc2 udc params ==========\r\n");
     USB_LOG_INFO("CID:%08x\r\n", USB_OTG_GLB->CID);
@@ -548,11 +692,17 @@ int usb_dc_init(uint8_t busid)
     USB_LOG_INFO("GHWCFG4:%08x\r\n", USB_OTG_GLB->GHWCFG4);
 
     USB_LOG_INFO("dwc2 fsphy type:%d, hsphy type:%d, dma support:%d\r\n", fsphy_type, hsphy_type, dma_support);
-    USB_LOG_INFO("dwc2 has %d endpoints and dfifo depth(32-bit words) is %d, default config: %d endpoints\r\n", endpoints, (USB_OTG_GLB->GHWCFG3 >> 16), CONFIG_USBDEV_EP_NUM);
+    USB_LOG_INFO("dwc2 has %d endpoints and dfifo depth(32-bit words) is %d, default config: %d endpoints\r\n", endpoints, dfifo_depth, CONFIG_USBDEV_EP_NUM);
     USB_LOG_INFO("=================================\r\n");
 
     if (endpoints < CONFIG_USBDEV_EP_NUM) {
         USB_LOG_ERR("dwc2 has less endpoints than config, please check\r\n");
+        while (1) {
+        }
+    }
+
+    if (CONFIG_USBDEV_EP_NUM > DWC2_DEVICE_TX_FIFO_COUNT) {
+        USB_LOG_ERR("dwc2 device fifo config supports up to %u endpoint indexes, please check\r\n", DWC2_DEVICE_TX_FIFO_COUNT);
         while (1) {
         }
     }
@@ -626,44 +776,25 @@ int usb_dc_init(uint8_t busid)
     USB_OTG_GLB->GINTMSK |= USB_OTG_GINTMSK_SOFM;
 #endif
 
-    USB_OTG_GLB->GRXFSIZ = (CONFIG_USB_DWC2_RXALL_FIFO_SIZE);
+    g_dwc2_dfifo_depth = dfifo_depth;
 
-    dwc2_set_txfifo(0, CONFIG_USB_DWC2_TX0_FIFO_SIZE);
-    dwc2_set_txfifo(1, CONFIG_USB_DWC2_TX1_FIFO_SIZE);
-    dwc2_set_txfifo(2, CONFIG_USB_DWC2_TX2_FIFO_SIZE);
-    dwc2_set_txfifo(3, CONFIG_USB_DWC2_TX3_FIFO_SIZE);
+    /* Reserve the shared RX FIFO minimum and the EP0 TX FIFO up front. Every
+     * other IN-endpoint TX FIFO is allocated dynamically in usbd_ep_open() from
+     * the endpoint's type/MPS, and any spare DFIFO is shared out by weight in
+     * dwc2_repack_txfifos(), so the layout always matches the active config. */
+    usb_memset(g_dwc2_in_fifo_words, 0, sizeof(g_dwc2_in_fifo_words));
+    g_dwc2_in_fifo_words[0] = CONFIG_USB_DWC2_TX0_FIFO_SIZE;
 
-    fifo_num = CONFIG_USB_DWC2_RXALL_FIFO_SIZE;
-    fifo_num += CONFIG_USB_DWC2_TX0_FIFO_SIZE;
-    fifo_num += CONFIG_USB_DWC2_TX1_FIFO_SIZE;
-    fifo_num += CONFIG_USB_DWC2_TX2_FIFO_SIZE;
-    fifo_num += CONFIG_USB_DWC2_TX3_FIFO_SIZE;
-#if CONFIG_USBDEV_EP_NUM > 4
-    dwc2_set_txfifo(4, CONFIG_USB_DWC2_TX4_FIFO_SIZE);
-    fifo_num += CONFIG_USB_DWC2_TX4_FIFO_SIZE;
-#endif
-#if CONFIG_USBDEV_EP_NUM > 5
-    dwc2_set_txfifo(5, CONFIG_USB_DWC2_TX5_FIFO_SIZE);
-    fifo_num += CONFIG_USB_DWC2_TX5_FIFO_SIZE;
-#endif
-#if CONFIG_USBDEV_EP_NUM > 6
-    dwc2_set_txfifo(6, CONFIG_USB_DWC2_TX6_FIFO_SIZE);
-    fifo_num += CONFIG_USB_DWC2_TX6_FIFO_SIZE;
-#endif
-#if CONFIG_USBDEV_EP_NUM > 7
-    dwc2_set_txfifo(7, CONFIG_USB_DWC2_TX7_FIFO_SIZE);
-    fifo_num += CONFIG_USB_DWC2_TX7_FIFO_SIZE;
-#endif
-#if CONFIG_USBDEV_EP_NUM > 8
-    dwc2_set_txfifo(8, CONFIG_USB_DWC2_TX8_FIFO_SIZE);
-    fifo_num += CONFIG_USB_DWC2_TX8_FIFO_SIZE;
-#endif
-
-    if (fifo_num > (USB_OTG_GLB->GHWCFG3 >> 16)) {
-        USB_LOG_ERR("Your fifo config is overflow, please check\r\n");
+    if ((CONFIG_USB_DWC2_RXALL_FIFO_SIZE + CONFIG_USB_DWC2_TX0_FIFO_SIZE) > dfifo_depth) {
+        USB_LOG_ERR("dwc2 rx+ep0 fifo needs %u words but controller has only %u words\r\n",
+                    (uint32_t)(CONFIG_USB_DWC2_RXALL_FIFO_SIZE + CONFIG_USB_DWC2_TX0_FIFO_SIZE), dfifo_depth);
         while (1) {
         }
     }
+
+    dwc2_repack_txfifos();
+    USB_LOG_INFO("dwc2 dfifo depth %u words, rx min:%u ep0-tx:%u, per-ep tx allocated on open\r\n",
+                 dfifo_depth, (uint32_t)CONFIG_USB_DWC2_RXALL_FIFO_SIZE, (uint32_t)CONFIG_USB_DWC2_TX0_FIFO_SIZE);
 
     ret = dwc2_flush_txfifo(0x10U);
     ret = dwc2_flush_rxfifo();
@@ -748,20 +879,36 @@ int usbd_ep_open(uint8_t busid, const struct usb_endpoint_descriptor *ep)
                                               USB_OTG_DIEPCTL_SD0PID_SEVNFRM |
                                               USB_OTG_DOEPCTL_USBAEP;
         }
+
+        /* A bulk/iso OUT endpoint changes how much of the surplus RX deserves,
+         * so re-pack here too (regardless of whether OUT or IN opened first). */
+        if (ep_idx != 0) {
+            (void)dwc2_repack_txfifos();
+            dwc2_dump_fifo_config();
+        }
     } else {
-        uint16_t fifo_size;
-        if (ep_idx == 0) {
-            fifo_size = (USB_OTG_GLB->DIEPTXF0_HNPTXFSIZ >> 16);
-        } else {
-            fifo_size = (USB_OTG_GLB->DIEPTXF[ep_idx - 1U] >> 16);
+        uint16_t mps = USB_GET_MAXPACKETSIZE(ep->wMaxPacketSize);
+        uint8_t ep_type = USB_GET_ENDPOINT_TYPE(ep->bmAttributes);
+
+        /* Record type/mps first: dwc2_repack_txfifos() weights the spare DFIFO
+         * by endpoint type, so it must see this endpoint's type before it runs. */
+        g_dwc2_udc.in_ep[ep_idx].ep_mps = mps;
+        g_dwc2_udc.in_ep[ep_idx].ep_type = ep_type;
+
+        if (ep_idx != 0) {
+            /* bits[12:11] of wMaxPacketSize carry the additional transactions
+             * per microframe for high-bandwidth HS iso/interrupt endpoints. */
+            uint8_t mult = 1U + (uint8_t)((ep->wMaxPacketSize >> 11) & 0x03U);
+
+            g_dwc2_in_fifo_words[ep_idx] = dwc2_required_txfifo_words(ep_type, mps, mult);
+            if (dwc2_repack_txfifos() != 0) {
+                g_dwc2_in_fifo_words[ep_idx] = 0U;
+                (void)dwc2_repack_txfifos();
+                USB_LOG_ERR("Ep addr %02x tx fifo alloc overflow\r\n", ep->bEndpointAddress);
+                return -2;
+            }
+            dwc2_dump_fifo_config();
         }
-        if ((fifo_size * 4) < USB_GET_MAXPACKETSIZE(ep->wMaxPacketSize)) {
-            USB_LOG_ERR("Ep addr %02x fifo overflow\r\n", ep->bEndpointAddress);
-            return -2;
-        }
-        
-        g_dwc2_udc.in_ep[ep_idx].ep_mps = USB_GET_MAXPACKETSIZE(ep->wMaxPacketSize);
-        g_dwc2_udc.in_ep[ep_idx].ep_type = USB_GET_ENDPOINT_TYPE(ep->bmAttributes);
 
         USB_OTG_DEV->DAINTMSK |= USB_OTG_DAINTMSK_IEPM & (uint32_t)(1UL << ep_idx);
 
@@ -801,6 +948,12 @@ int usbd_ep_close(uint8_t busid, const uint8_t ep)
         USB_OTG_DEV->DEACHMSK &= ~(USB_OTG_DAINTMSK_OEPM & ((uint32_t)(1UL << (ep_idx & 0x07)) << 16));
         USB_OTG_DEV->DAINTMSK &= ~(USB_OTG_DAINTMSK_OEPM & ((uint32_t)(1UL << (ep_idx & 0x07)) << 16));
         USB_OTG_OUTEP(ep_idx)->DOEPCTL = 0;
+
+        /* Drop this OUT endpoint's contribution to the RX weight and re-pack. */
+        if (ep_idx != 0U) {
+            g_dwc2_udc.out_ep[ep_idx].ep_type = USB_ENDPOINT_TYPE_CONTROL;
+            (void)dwc2_repack_txfifos();
+        }
     } else {
         if (USB_OTG_INEP(ep_idx)->DIEPCTL & USB_OTG_DIEPCTL_EPENA) {
             USB_OTG_INEP(ep_idx)->DIEPCTL |= USB_OTG_DIEPCTL_SNAK;
@@ -821,6 +974,12 @@ int usbd_ep_close(uint8_t busid, const uint8_t ep)
         USB_OTG_DEV->DEACHMSK &= ~(USB_OTG_DAINTMSK_IEPM & (uint32_t)(1UL << (ep_idx & 0x07)));
         USB_OTG_DEV->DAINTMSK &= ~(USB_OTG_DAINTMSK_IEPM & (uint32_t)(1UL << (ep_idx & 0x07)));
         USB_OTG_INEP(ep_idx)->DIEPCTL = 0;
+
+        /* Release this endpoint's TX FIFO so the space can be reused. */
+        if (ep_idx != 0U) {
+            g_dwc2_in_fifo_words[ep_idx] = 0U;
+            (void)dwc2_repack_txfifos();
+        }
     }
     return 0;
 }
@@ -1184,6 +1343,14 @@ check_setup:
             USB_OTG_DEV->DIEPMSK = USB_OTG_DIEPMSK_XFRCM;
 
             usb_memset(&g_dwc2_udc, 0, sizeof(struct dwc2_udc));
+
+            /* Drop all per-endpoint TX FIFO reservations (keep RX + EP0); they
+             * are re-allocated as the host re-opens endpoints on enumeration. */
+            for (uint8_t i = 1U; i < CONFIG_USBDEV_EP_NUM; i++) {
+                g_dwc2_in_fifo_words[i] = 0U;
+            }
+            (void)dwc2_repack_txfifos();
+
             usbd_event_reset_handler(0);
             /* Start reading setup */
             dwc2_ep0_start_read_setup((uint8_t *)&g_dwc2_udc.setup);
