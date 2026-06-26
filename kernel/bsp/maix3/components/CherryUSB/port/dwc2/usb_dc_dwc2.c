@@ -987,12 +987,29 @@ int usbd_ep_close(uint8_t busid, const uint8_t ep)
 int usbd_ep_set_stall(uint8_t busid, const uint8_t ep)
 {
     uint8_t ep_idx = USB_EP_GET_IDX(ep);
+    volatile uint32_t count = 0U;
 
     if (USB_EP_DIR_IS_OUT(ep)) {
         if (((USB_OTG_OUTEP(ep_idx)->DOEPCTL & USB_OTG_DOEPCTL_EPENA) == 0U) && (ep_idx != 0U)) {
             USB_OTG_OUTEP(ep_idx)->DOEPCTL &= ~(USB_OTG_DOEPCTL_EPDIS);
         }
         USB_OTG_OUTEP(ep_idx)->DOEPCTL |= USB_OTG_DOEPCTL_STALL;
+    } else if ((ep_idx != 0U) && (USB_OTG_INEP(ep_idx)->DIEPCTL & USB_OTG_DIEPCTL_EPENA)) {
+        /* The IN endpoint is still enabled: quiesce it (SNAK -> EPDIS, wait for
+         * the disable to take effect) before stalling, then drop whatever is
+         * left in its TX FIFO so no stale data is sent once the stall clears.
+         * The wait is bounded so a yanked cable (no EPDISD) cannot hang here. */
+        USB_OTG_INEP(ep_idx)->DIEPCTL |= USB_OTG_DIEPCTL_SNAK;
+        USB_OTG_INEP(ep_idx)->DIEPCTL |= (USB_OTG_DIEPCTL_STALL | USB_OTG_DIEPCTL_EPDIS);
+
+        do {
+            if (++count > 50000U) {
+                break;
+            }
+        } while ((USB_OTG_INEP(ep_idx)->DIEPINT & USB_OTG_DIEPINT_EPDISD) != USB_OTG_DIEPINT_EPDISD);
+
+        USB_OTG_INEP(ep_idx)->DIEPINT |= USB_OTG_DIEPINT_EPDISD;
+        dwc2_flush_txfifo(ep_idx);
     } else {
         if (((USB_OTG_INEP(ep_idx)->DIEPCTL & USB_OTG_DIEPCTL_EPENA) == 0U) && (ep_idx != 0U)) {
             USB_OTG_INEP(ep_idx)->DIEPCTL &= ~(USB_OTG_DIEPCTL_EPDIS);
@@ -1022,6 +1039,11 @@ int usbd_ep_clear_stall(uint8_t busid, const uint8_t ep)
         if ((g_dwc2_udc.in_ep[ep_idx].ep_type == USB_ENDPOINT_TYPE_INTERRUPT) ||
             (g_dwc2_udc.in_ep[ep_idx].ep_type == USB_ENDPOINT_TYPE_BULK)) {
             USB_OTG_INEP(ep_idx)->DIEPCTL |= USB_OTG_DIEPCTL_SD0PID_SEVNFRM; /* DATA0 */
+        }
+        /* Discard anything queued before the halt so the endpoint restarts
+         * clean from DATA0 instead of replaying stale data. */
+        if (ep_idx != 0U) {
+            dwc2_flush_txfifo(ep_idx);
         }
     }
     return 0;
