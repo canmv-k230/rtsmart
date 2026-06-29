@@ -816,7 +816,7 @@ int sys_poll(struct pollfd *fds, nfds_t nfds, int timeout)
     {
         for (i = 0; i < nfds; i++)
         {
-            dfs2musl_events(&kfds->revents);
+            dfs2musl_events(&kfds[i].revents);
         }
         lwp_put_to_user(fds, kfds, nfds * sizeof *kfds);
     }
@@ -827,7 +827,7 @@ int sys_poll(struct pollfd *fds, nfds_t nfds, int timeout)
 #ifdef RT_USING_MUSL
     for (i = 0; i < nfds; i++)
     {
-        musl2dfs_events(&fds->events);
+        musl2dfs_events(&fds[i].events);
     }
 #endif /* RT_USING_MUSL */
     if (!lwp_user_accessable((void *)fds, nfds * sizeof *fds))
@@ -840,7 +840,7 @@ int sys_poll(struct pollfd *fds, nfds_t nfds, int timeout)
     {
         for (i = 0; i < nfds; i++)
         {
-            dfs2musl_events(&fds->revents);
+            dfs2musl_events(&fds[i].revents);
         }
     }
 #endif /* RT_USING_MUSL */

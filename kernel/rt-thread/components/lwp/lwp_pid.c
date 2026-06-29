@@ -373,6 +373,28 @@ void lwp_free(struct rt_lwp* lwp)
         lwp->args = RT_NULL;
     }
 
+    if (lwp->tty != RT_NULL)
+    {
+        struct rt_lwp *old_lwp = RT_NULL;
+
+        if (lwp->session == -1)
+        {
+            struct termios *old_stdin_termios = get_old_termios();
+            tcsetattr(1, 0, old_stdin_termios);
+        }
+
+        level = rt_hw_interrupt_disable();
+        rt_spin_lock(&lwp->tty->spinlock);
+        old_lwp = tty_pop(&lwp->tty->head, RT_NULL);
+        rt_spin_unlock(&lwp->tty->spinlock);
+        if (lwp->tty->foreground == lwp)
+        {
+            lwp->tty->foreground = old_lwp;
+            lwp->tty = RT_NULL;
+        }
+        rt_hw_interrupt_enable(level);
+    }
+
     if (lwp->fdt.fds != RT_NULL)
     {
         /* auto clean fds */
@@ -442,26 +464,6 @@ void lwp_free(struct rt_lwp* lwp)
     rt_hw_interrupt_enable(level);
     /* for parent */
     {
-        struct termios *old_stdin_termios = get_old_termios();
-        struct rt_lwp *old_lwp = NULL;
-
-        if (lwp->session == -1 && lwp->tty != RT_NULL)
-        {
-            tcsetattr(1, 0, old_stdin_termios);
-        }
-        level = rt_hw_interrupt_disable();
-        if (lwp->tty != RT_NULL)
-        {
-            rt_spin_lock(&lwp->tty->spinlock);
-            old_lwp = tty_pop(&lwp->tty->head, RT_NULL);
-            rt_spin_unlock(&lwp->tty->spinlock);
-            if (lwp->tty->foreground == lwp)
-            {
-                lwp->tty->foreground = old_lwp;
-                lwp->tty = RT_NULL;
-            }
-        }
-
         if (lwp->parent)
         {
             struct rt_thread *thread;
