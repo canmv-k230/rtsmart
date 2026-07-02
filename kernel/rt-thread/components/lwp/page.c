@@ -400,6 +400,13 @@ void rt_page_init(rt_region_t reg)
         reg.start += (mnr << ARCH_PAGE_SHIFT);
         page_addr = (void*)reg.start;
         page_nr = (reg.end - reg.start) >> ARCH_PAGE_SHIFT;
+
+        /* Stale descriptors can look like free buddies before being inserted. */
+        rt_memset(page_start, 0, page_nr * sizeof(struct page));
+        for (size_t page_idx = 0; page_idx < page_nr; page_idx++)
+        {
+            page_start[page_idx].size_bits = ARCH_ADDRESS_WIDTH_BITS;
+        }
     }
 
     LOG_D("align 0x%08x 0x%08x\n", reg.start, reg.end);
