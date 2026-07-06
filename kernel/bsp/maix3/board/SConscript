@@ -7,7 +7,7 @@ src     = Glob('*.c')
 path = [cwd]
 CPPDEFINES = []
 
-if GetDepend(['RT_BOARD_ENABLE_PINMUX']) and GetDepend(['CONFIG_BOARD']):
+if GetDepend(['CONFIG_BOARD']) and (GetDepend(['RT_BOARD_ENABLE_PINMUX']) or GetDepend(['RT_BOARD_ENABLE_PIN_INIT_SEQUENCE'])):
     board = GetConfigValue('CONFIG_BOARD').strip('"')
 
     path += [cwd + '/configs/' + board]

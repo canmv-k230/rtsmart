@@ -27,16 +27,31 @@
 
 #include "rtconfig.h"
 #include "rtdebug.h"
+#include "rtdef.h"
 #include "rtthread.h"
 
 #include "drv_fpioa.h"
 #include "drv_gpio.h"
+
+static int pin_output(int pin, int val);
 
 /* if func is FUNC_MAX, use cfg, else use func default */
 typedef struct _board_pinmux_cfg_t {
     fpioa_func_t      func; /* function */
     fpioa_iomux_cfg_t cfg; /* pinmux configuration */
 } board_pinmux_cfg_t;
+
+
+#define PINMUX_CFG(_sel, _msc, _ie, _oe, _pu, _pd, _ds, _st) \
+    { \
+        .func = FUNC_MAX, \
+        .cfg = { .u.bit = { .st = (_st), .ds = (_ds), .pd = (_pd), .pu = (_pu), .oe = (_oe), .ie = (_ie), .msc = (_msc), .io_sel = (_sel) } } \
+    }
+
+#define PMU_GPIO(_func) \
+    { \
+        .func = (_func), .cfg = { .u.value = 0 } \
+    }
 
 #define STRINGIFY(x) #x
 #define TOSTRING(x)  STRINGIFY(x)
@@ -128,12 +143,22 @@ int board_pinmux_init(void)
     return 0;
 }
 
+static int pin_output(int pin, int val)
+{
+    int ret = 0;
+
+    ret += kd_pin_mode(pin, GPIO_DM_OUTPUT);
+    ret += kd_pin_write(pin, val);
+
+    return ret;
+}
+
+#ifdef RT_BOARD_ENABLE_PIN_INIT_SEQUENCE
 static int _board_specific_pin_init_sequence_wrap()
 {
-    kd_pin_init();
-
     board_specific_pin_init_sequence();
 
     return 0;
 }
-INIT_PREV_EXPORT(_board_specific_pin_init_sequence_wrap);
+INIT_DEVICE_EXPORT_SEQ(_board_specific_pin_init_sequence_wrap, 1); // after kd_pin_init
+#endif

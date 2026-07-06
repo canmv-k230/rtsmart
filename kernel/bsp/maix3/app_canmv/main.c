@@ -298,29 +298,9 @@ static void auto_exec_trusted_preload(const char *cmd_line)
   rt_free(cmd_copy);
 }
 
-static void apply_pin_config(void)
-{
-#ifdef CONFIG_BOARD_K230_CANMV_LCKFB
-    kd_pin_mode(62, GPIO_DM_OUTPUT);
-    kd_pin_write(62, GPIO_PV_LOW);
-#elif defined(CONFIG_BOARD_K230D_CANMV_LUSHANPI_LITE)
-    //LED_R
-    kd_pin_mode(65, GPIO_DM_OUTPUT);
-    kd_pin_write(65, GPIO_PV_LOW);
-	// LED_G
-    kd_pin_mode(66, GPIO_DM_OUTPUT);
-    kd_pin_write(66, GPIO_PV_LOW);
-	// LED_B
-    kd_pin_mode(71, GPIO_DM_OUTPUT);
-    kd_pin_write(71, GPIO_PV_LOW);
-#endif
-}
-
 int main(void) {
   sysctl_pwr_off(SYSCTL_PD_CPU0);
   sysctl_pwr_off(SYSCTL_PD_DPU);
-
-  apply_pin_config();
 
   rt_kprintf("\n#############SDK VERSION######################################\n");
   rt_kprintf("SDK   : %s\n", SDK_VERSION_);

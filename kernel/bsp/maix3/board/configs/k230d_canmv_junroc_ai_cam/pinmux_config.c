@@ -26,7 +26,7 @@
 #include "drv_fpioa.h"
 
 #define VOL_BANK_IO0_1     BANK_VOL_1V8_MSC
-#define VOL_BANK0_IO2_13   BANK_VOL_3V3_MSC
+#define VOL_BANK0_IO2_13   BANK_VOL_1V8_MSC
 #define VOL_BANK1_IO14_25  BANK_VOL_3V3_MSC
 #define VOL_BANK2_IO26_37  BANK_VOL_3V3_MSC
 #define VOL_BANK3_IO38_49  BANK_VOL_3V3_MSC
@@ -36,21 +36,21 @@
 /* clang-format off */
 const board_pinmux_cfg_t board_pinmux_cfg[FPIOA_PIN_MAX_NUM] = {
     /* BOOT IO */
-    [0 ] = PINMUX_CFG(0, VOL_BANK_IO0_1, 1, 0, 0, 0, 0, 0), // GPIO0
-    [1 ] = PINMUX_CFG(0, VOL_BANK_IO0_1, 1, 0, 0, 0, 0, 0), // GPIO1
+    [0 ] = PINMUX_CFG(1, VOL_BANK_IO0_1, 1, 0, 0, 0, 0, 1), // BOOT0
+    [1 ] = PINMUX_CFG(1, VOL_BANK_IO0_1, 1, 0, 0, 0, 0, 1), // BOOT1
 
     /* BANK0 */
     [2 ] = PINMUX_CFG(0, VOL_BANK0_IO2_13, 0, 0, 0, 0, 0, 0), // GPIO2
-    [3 ] = PINMUX_CFG(3, VOL_BANK0_IO2_13, 0, 1, 0, 0, 7, 1), // UART1_TXD
-    [4 ] = PINMUX_CFG(3, VOL_BANK0_IO2_13, 1, 0, 0, 0, 7, 1), // UART1_RXD
-    [5 ] = PINMUX_CFG(3, VOL_BANK0_IO2_13, 0, 1, 0, 0, 7, 1), // UART2_TXD
-    [6 ] = PINMUX_CFG(3, VOL_BANK0_IO2_13, 1, 0, 0, 0, 7, 1), // UART2_RXD
-    [7 ] = PINMUX_CFG(0, VOL_BANK0_IO2_13, 1, 0, 1, 0, 7, 1), // GPIO7
-    [8 ] = PINMUX_CFG(0, VOL_BANK0_IO2_13, 0, 1, 1, 0, 7, 1), // GPIO8
+    [3 ] = PINMUX_CFG(0, VOL_BANK0_IO2_13, 0, 0, 0, 0, 0, 0), // GPIO3
+    [4 ] = PINMUX_CFG(0, VOL_BANK0_IO2_13, 0, 0, 0, 0, 0, 0), // GPIO4
+    [5 ] = PINMUX_CFG(0, VOL_BANK0_IO2_13, 0, 0, 0, 0, 0, 0), // GPIO5
+    [6 ] = PINMUX_CFG(0, VOL_BANK0_IO2_13, 0, 0, 0, 0, 0, 0), // GPIO6
+    [7 ] = PINMUX_CFG(2, VOL_BANK0_IO2_13, 1, 1, 0, 0, 7, 1), // IIC4_SCL
+    [8 ] = PINMUX_CFG(2, VOL_BANK0_IO2_13, 1, 1, 0, 0, 7, 1), // IIC4_SDA
     [9 ] = PINMUX_CFG(0, 0, 0, 0, 0, 0, 7, 1), // GPIO9
-    [10] = PINMUX_CFG(0, VOL_BANK0_IO2_13, 1, 0, 1, 0, 4, 1), // GPIO10
-    [11] = PINMUX_CFG(0, VOL_BANK0_IO2_13, 1, 0, 1, 0, 4, 1), // GPIO11
-    [12] = PINMUX_CFG(0, VOL_BANK0_IO2_13, 1, 0, 1, 0, 4, 1), // GPIO12
+    [10] = PINMUX_CFG(0, VOL_BANK0_IO2_13, 0, 1, 0, 1, 4, 1), // GPIO10
+    [11] = PINMUX_CFG(0, VOL_BANK0_IO2_13, 0, 0, 0, 0, 0, 0), // GPIO11
+    [12] = PINMUX_CFG(0, VOL_BANK0_IO2_13, 0, 0, 0, 0, 0, 0), // GPIO12
     [13] = PINMUX_CFG(1, VOL_BANK0_IO2_13, 0, 1, 0, 1, 4, 1), // M_CLK1
 
     /* BANK1 */
@@ -58,42 +58,42 @@ const board_pinmux_cfg_t board_pinmux_cfg[FPIOA_PIN_MAX_NUM] = {
     [15] = PINMUX_CFG(0, VOL_BANK1_IO14_25, 0, 0, 0, 0, 0, 0), // GPIO15
     [16] = PINMUX_CFG(0, VOL_BANK1_IO14_25, 0, 0, 0, 0, 0, 0), // GPIO16
     [17] = PINMUX_CFG(0, VOL_BANK1_IO14_25, 0, 0, 0, 0, 0, 0), // GPIO17
-    [18] = PINMUX_CFG(0, VOL_BANK1_IO14_25, 0, 0, 0, 0, 0, 0), // GPIO18
+    [18] = PINMUX_CFG(0, VOL_BANK1_IO14_25, 1, 1, 0, 0, 7, 1), // GPIO18
     [19] = PINMUX_CFG(0, VOL_BANK1_IO14_25, 0, 0, 0, 0, 0, 0), // GPIO19
     [20] = PINMUX_CFG(0, VOL_BANK1_IO14_25, 0, 0, 0, 0, 0, 0), // GPIO20
     [21] = PINMUX_CFG(0, VOL_BANK1_IO14_25, 0, 0, 0, 0, 0, 0), // GPIO21
-    [22] = PINMUX_CFG(0, VOL_BANK1_IO14_25, 0, 0, 0, 0, 0, 0), // GPIO22
-    [23] = PINMUX_CFG(0, VOL_BANK1_IO14_25, 0, 0, 0, 0, 0, 0), // GPIO23
-    [24] = PINMUX_CFG(0, VOL_BANK1_IO14_25, 0, 0, 0, 0, 0, 0), // GPIO24
-    [25] = PINMUX_CFG(0, VOL_BANK1_IO14_25, 0, 0, 0, 0, 0, 0), // GPIO25
+    [22] = PINMUX_CFG(0, VOL_BANK1_IO14_25, 1, 1, 0, 0, 7, 1), // GPIO22
+    [23] = PINMUX_CFG(0, VOL_BANK1_IO14_25, 1, 1, 0, 0, 7, 1), // GPIO23
+    [24] = PINMUX_CFG(0, VOL_BANK1_IO14_25, 1, 1, 0, 0, 7, 1), // GPIO24
+    [25] = PINMUX_CFG(0, VOL_BANK1_IO14_25, 1, 1, 0, 0, 7, 1), // GPIO25
 
     /* BANK2 */
-    [26] = PINMUX_CFG(0, VOL_BANK2_IO26_37, 0, 0, 0, 0, 0, 0), // GPIO26
-    [27] = PINMUX_CFG(0, VOL_BANK2_IO26_37, 0, 0, 0, 0, 0, 0), // GPIO27
-    [28] = PINMUX_CFG(0, VOL_BANK2_IO26_37, 0, 0, 0, 0, 0, 0), // GPIO28
-    [29] = PINMUX_CFG(0, VOL_BANK2_IO26_37, 0, 0, 0, 0, 0, 0), // GPIO29
-    [30] = PINMUX_CFG(0, VOL_BANK2_IO26_37, 0, 0, 0, 0, 0, 0), // GPIO30
-    [31] = PINMUX_CFG(0, VOL_BANK2_IO26_37, 0, 0, 0, 0, 0, 0), // GPIO31
+    [26] = PINMUX_CFG(1, VOL_BANK2_IO26_37, 0, 1, 0, 0, 7, 0), // MMC1_CLK
+    [27] = PINMUX_CFG(1, VOL_BANK2_IO26_37, 1, 1, 1, 0, 7, 1), // MMC1_CMD
+    [28] = PINMUX_CFG(1, VOL_BANK2_IO26_37, 1, 1, 1, 0, 7, 1), // MMC1_D0
+    [29] = PINMUX_CFG(1, VOL_BANK2_IO26_37, 1, 1, 1, 0, 7, 1), // MMC1_D1
+    [30] = PINMUX_CFG(1, VOL_BANK2_IO26_37, 1, 1, 1, 0, 7, 1), // MMC1_D2
+    [31] = PINMUX_CFG(1, VOL_BANK2_IO26_37, 1, 1, 1, 0, 7, 1), // MMC1_D3
     [32] = PINMUX_CFG(0, VOL_BANK2_IO26_37, 0, 0, 0, 0, 0, 0), // GPIO32
     [33] = PINMUX_CFG(0, VOL_BANK2_IO26_37, 0, 0, 0, 0, 0, 0), // GPIO33
     [34] = PINMUX_CFG(0, VOL_BANK2_IO26_37, 0, 0, 0, 0, 0, 0), // GPIO34
     [35] = PINMUX_CFG(0, VOL_BANK2_IO26_37, 0, 0, 0, 0, 0, 0), // GPIO35
-    [36] = PINMUX_CFG(0, VOL_BANK2_IO26_37, 0, 1, 1, 0, 7, 1), // GPIO36
-    [37] = PINMUX_CFG(0, VOL_BANK2_IO26_37, 0, 1, 1, 0, 7, 1), // GPIO37
+    [36] = PINMUX_CFG(1, VOL_BANK2_IO26_37, 1, 1, 0, 0, 7, 1), // IIC3_SCL
+    [37] = PINMUX_CFG(1, VOL_BANK2_IO26_37, 1, 1, 0, 0, 7, 1), // IIC3_SDA
 
     /* BANK3 */
-    [38] = PINMUX_CFG(1, VOL_BANK3_IO38_49, 0, 1, 0, 0, 7, 1), // UART0_TXD
-    [39] = PINMUX_CFG(1, VOL_BANK3_IO38_49, 1, 0, 0, 0, 7, 1), // UART0_RXD
+    [38] = PINMUX_CFG(1, VOL_BANK3_IO38_49, 0, 1, 0, 0, 7, 0), // UART0_TXD
+    [39] = PINMUX_CFG(1, VOL_BANK3_IO38_49, 1, 0, 0, 0, 0, 1), // UART0_RXD
     [40] = PINMUX_CFG(0, VOL_BANK3_IO38_49, 0, 0, 0, 0, 0, 0), // GPIO40
     [41] = PINMUX_CFG(0, VOL_BANK3_IO38_49, 0, 0, 0, 0, 0, 0), // GPIO41
     [42] = PINMUX_CFG(0, 0, 0, 0, 0, 0, 7, 1), // GPIO42
     [43] = PINMUX_CFG(0, 0, 0, 0, 0, 0, 7, 1), // GPIO43
-    [44] = PINMUX_CFG(0, VOL_BANK3_IO38_49, 0, 0, 0, 0, 0, 0), // GPIO44
-    [45] = PINMUX_CFG(0, VOL_BANK3_IO38_49, 0, 0, 0, 0, 0, 0), // GPIO45
+    [44] = PINMUX_CFG(1, VOL_BANK3_IO38_49, 0, 1, 0, 0, 7, 0), // UART2_TXD
+    [45] = PINMUX_CFG(1, VOL_BANK3_IO38_49, 1, 0, 0, 0, 0, 1), // UART2_RXD
     [46] = PINMUX_CFG(0, 0, 0, 0, 0, 0, 7, 1), // GPIO46
     [47] = PINMUX_CFG(0, 0, 0, 0, 0, 0, 7, 1), // GPIO47
-    [48] = PINMUX_CFG(3, VOL_BANK3_IO38_49, 1, 1, 1, 0, 7, 1), // IIC0_SCL
-    [49] = PINMUX_CFG(3, VOL_BANK3_IO38_49, 1, 1, 1, 0, 7, 1), // IIC0_SDA
+    [48] = PINMUX_CFG(0, VOL_BANK3_IO38_49, 0, 0, 0, 0, 0, 0), // GPIO48
+    [49] = PINMUX_CFG(0, VOL_BANK3_IO38_49, 0, 0, 0, 0, 0, 0), // GPIO49
 
     /* BANK4 */
     [50] = PINMUX_CFG(0, VOL_BANK4_IO50_61, 0, 0, 0, 0, 7, 1), // GPIO50
@@ -110,7 +110,7 @@ const board_pinmux_cfg_t board_pinmux_cfg[FPIOA_PIN_MAX_NUM] = {
     [61] = PINMUX_CFG(0, VOL_BANK4_IO50_61, 0, 0, 0, 0, 0, 0), // GPIO61
 
     /* BANK5 */
-    [62] = PINMUX_CFG(0, VOL_BANK5_IO62_63, 0, 1, 1, 0, 7, 1), // GPIO62
+    [62] = PINMUX_CFG(0, VOL_BANK5_IO62_63, 0, 0, 0, 0, 0, 0), // GPIO62
     [63] = PINMUX_CFG(0, VOL_BANK5_IO62_63, 0, 0, 0, 0, 0, 0), // GPIO63
 
 #if FPIOA_PIN_MAX_NUM > 64
