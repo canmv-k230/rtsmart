@@ -115,6 +115,12 @@
 static struct sdhci_host* sdhci_host0;
 static struct sdhci_host* sdhci_host1;
 
+#if defined(SDIO0_BUS_WIDTH_8BIT)
+#define SDIO0_BUS_WIDTH_FLAGS (MMCSD_BUSWIDTH_4 | MMCSD_BUSWIDTH_8)
+#else
+#define SDIO0_BUS_WIDTH_FLAGS MMCSD_BUSWIDTH_4
+#endif
+
 static inline void sdhci_writel(struct sdhci_host* host, uint32_t val, int reg)
 {
     writel(val, (void*)host->mapbase + reg);
@@ -1139,7 +1145,7 @@ rt_int32_t kd_sdhci_init(void)
 
     strncpy(mmcsd_host0->name, "sd0", sizeof(mmcsd_host0->name) - 1);
 
-    mmcsd_host0->flags = SDIO0_BUS_WIDTH | MMCSD_MUTBLKWRITE | MMCSD_SUP_HIGHSPEED | MMCSD_SUP_SDIO_IRQ; /* enable 8bit and 4bit support */
+    mmcsd_host0->flags = SDIO0_BUS_WIDTH_FLAGS | MMCSD_MUTBLKWRITE | MMCSD_SUP_HIGHSPEED | MMCSD_SUP_SDIO_IRQ; /* enable 8bit and 4bit support */
     if (sdhci_host0->is_emmc_card) {
         mmcsd_host0->flags |= MMCSD_SUP_NONREMOVABLE;
 #if 0
