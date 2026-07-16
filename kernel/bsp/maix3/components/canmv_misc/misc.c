@@ -8,6 +8,7 @@
 
 #include <rtthread.h>
 #include <dfs_file.h>
+#include <dfs_fs.h>
 #include <lwp_user_mm.h>
 
 #include "board.h"
@@ -157,6 +158,14 @@ static int misc_close(struct dfs_fd *file) { return 0; }
 #define MISC_DEV_CMD_UNREGISTER_TOUCH_DEVICE  _IOWR('M', 0x11, void *)
 #define MISC_DEV_CMD_GET_MMZ_ZONE_INFO        _IOWR('M', 0x12, void *)
 #define MISC_DEV_CMD_GET_KERNEL_BUILD_INFO    _IOWR('M', 0x13, void *)
+#define MISC_DEV_CMD_MKFS                     _IOWR('M', 0x14, void *)
+
+#define MISC_MKFS_MOUNT_PATH                  "/data"
+#define MISC_MKFS_MOUNT_PATH_LEN              32
+
+struct misc_mkfs_args {
+  char mount_path[MISC_MKFS_MOUNT_PATH_LEN];
+};
 
 struct meminfo_t {
   size_t total_size;
@@ -364,6 +373,48 @@ static int misc_delete_soft_i2c_device(void *args) {
 
   return -1;
 #endif // RT_USING_SOFT_I2C
+}
+
+static int misc_mkfs(void *args) {
+  struct misc_mkfs_args mkfs_args;
+  struct dfs_filesystem *fs;
+  int result;
+
+  if ((args == RT_NULL) ||
+      (sizeof(mkfs_args) != lwp_get_from_user(&mkfs_args, args, sizeof(mkfs_args)))) {
+    return -EFAULT;
+  }
+
+  if ((mkfs_args.mount_path[0] == '\0') ||
+      (memchr(mkfs_args.mount_path, '\0', sizeof(mkfs_args.mount_path)) == RT_NULL)) {
+    return -EINVAL;
+  }
+
+  if (rt_strcmp(mkfs_args.mount_path, MISC_MKFS_MOUNT_PATH) != 0) {
+    return -EINVAL;
+  }
+
+  fs = dfs_filesystem_lookup(mkfs_args.mount_path);
+  if ((fs == RT_NULL) || (fs->path == RT_NULL) ||
+      (rt_strcmp(fs->path, MISC_MKFS_MOUNT_PATH) != 0) ||
+      (fs->ops == RT_NULL) || (fs->ops->name == RT_NULL) ||
+      (fs->dev_id == RT_NULL)) {
+    return -ENODEV;
+  }
+
+  /* dfs_mkfs returns -1 for some failures and reports the detail via errno. */
+  rt_set_errno(-EINVAL);
+  result = dfs_mkfs(fs->ops->name, fs->dev_id->parent.name);
+  if (result == -1) {
+    result = rt_get_errno();
+    if (result > 0) {
+      result = -result;
+    } else if (result == 0) {
+      result = -EIO;
+    }
+  }
+
+  return result;
 }
 
 static int misc_get_local_time(void *args) {
@@ -728,6 +779,10 @@ static const struct misc_dev_handle misc_handles[] = {
   {
     .cmd = MISC_DEV_CMD_GET_KERNEL_BUILD_INFO,
     .func = misc_get_kernel_build_info,
+  },
+  {
+    .cmd = MISC_DEV_CMD_MKFS,
+    .func = misc_mkfs,
   },
 
 };
