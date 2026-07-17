@@ -144,6 +144,10 @@ static void mnt_mount_table(void)
     int err                     = 0;
     int fd                      = -1;
     int mkfs_for_data_partition = 0;
+#if defined(CONFIG_RT_AUTO_RESIZE_PARTITION)
+    bool format_data_partition  = false;
+    bool auto_mkfs_marker       = false;
+#endif
 
     sysctl_boot_mode_e          boot_mode;
     const struct dfs_mount_tbl* mnt_tbl = NULL;
@@ -175,23 +179,35 @@ static void mnt_mount_table(void)
 #if defined(CONFIG_RT_AUTO_RESIZE_PARTITION)
                 if (0 <= (fd = open("/bin/auto_mkfs_data", O_RDONLY))) {
                     close(fd);
-                    unlink("/bin/auto_mkfs_data");
-                    fd = 0x1234;
+                    auto_mkfs_marker = true;
+                    format_data_partition = true;
                 }
 
-                if ((0x1234 == fd) && (0x00 == mkfs_for_data_partition)) {
+#if defined(CONFIG_RT_AUTO_RESIZE_PARTITION_ALWAYS)
+                format_data_partition = true;
+#endif
+
+                if (format_data_partition && (0x00 == mkfs_for_data_partition)) {
                     mkfs_for_data_partition = 1;
 
                     rt_kprintf("\033[31mStart format partition[2] to fat, it will took a long time, DO NOT POWEROFF "
                                "THE BOARD, PLEASE WAIT IT DONE\033[0m\n");
-                    dfs_mkfs("elm", mnt_tbl->device_name);
-                    rt_kprintf("\n\n\033[32mformat done.\033[0m\n");
-
-                    mnt_tbl--;
+                    int mkfs_ret = dfs_mkfs("elm", mnt_tbl->device_name);
+                    if (RT_EOK == mkfs_ret) {
+                        if (auto_mkfs_marker &&
+                            (0 != unlink("/bin/auto_mkfs_data"))) {
+                            rt_kprintf("remove /bin/auto_mkfs_data failed\n");
+                        }
+                        rt_kprintf("\n\n\033[32mformat done.\033[0m\n");
+                        mnt_tbl--;
+                    } else {
+                        rt_kprintf("\n\n\033[31mformat failed (%d), errno %d.\033[0m\n",
+                                   mkfs_ret, errno);
+                    }
                 }
 #endif
 
-                if ((-19) == err) {
+                if ((-19) == err && !format_data_partition) {
                     rt_kprintf("Please format the partition[2] to FAT32.\nRefer to "
                                "https://support.microsoft.com/zh-cn/windows/"
                                "%E5%88%9B%E5%BB%BA%E5%92%8C%E6%A0%BC%E5%BC%8F%E5%8C%96%E7%A1%AC%E7%9B%98%E5%88%86%E5%"

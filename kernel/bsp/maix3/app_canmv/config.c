@@ -20,31 +20,38 @@
 
 struct config_handler {
   uint32_t command; // const char *command;
-  void (*handler)(char *value);
+  int (*handler)(char *value);
 };
 
 /* 0: success, -1: failed */
 /* if successed, user should close(fd), and rt_free(buffer) to release resources
  */
-static int read_config_file(int *fd, char **buffer, size_t *buffer_size) {
+static int read_config_file(int *fd, char **buffer, size_t *buffer_size,
+                            int open_flags) {
   int _fd = 0;
+  off_t file_size = 0;
   size_t _buffer_size = 0;
   char *_buffer = NULL;
 
-  _fd = open(RT_SMART_CONFIG_FILE_PATH, O_RDWR);
+  _fd = open(RT_SMART_CONFIG_FILE_PATH, open_flags);
   if (0 > _fd) {
     goto _failed;
   }
 
-  _buffer_size = lseek(_fd, 0, SEEK_END);
-  lseek(_fd, 0, SEEK_SET);
-
-  if (0x00 == _buffer_size) {
+  file_size = lseek(_fd, 0, SEEK_END);
+  if (0 >= file_size || 0 > lseek(_fd, 0, SEEK_SET)) {
     close(_fd);
     goto _failed;
   }
 
-  if (NULL == (_buffer = rt_malloc(_buffer_size))) {
+  _buffer_size = (size_t)file_size;
+
+  if (SIZE_MAX == _buffer_size) {
+    close(_fd);
+    goto _failed;
+  }
+
+  if (NULL == (_buffer = rt_malloc(_buffer_size + 1))) {
     close(_fd);
     goto _failed;
   }
@@ -52,9 +59,11 @@ static int read_config_file(int *fd, char **buffer, size_t *buffer_size) {
   if (_buffer_size != read(_fd, _buffer, _buffer_size)) {
     rt_kprintf("read config.txt failed\n");
     close(_fd);
-    rt_free(buffer);
+    rt_free(_buffer);
     goto _failed;
   }
+
+  _buffer[_buffer_size] = '\0';
 
   *fd = _fd;
   *buffer = _buffer;
@@ -165,6 +174,10 @@ static bool is_power_of_two_u32(uint32_t value) {
 // MBR ////////////////////////////////////////////////////////////////////////
 #define DPT_ADDRESS 0x1be /* device partition offset in Boot Sector */
 #define DPT_ITEM_SIZE 16  /* partition item size */
+#define MBR_SIGNATURE_OFFSET 510
+#define MBR_SIGNATURE_0 0x55
+#define MBR_SIGNATURE_1 0xaa
+#define GPT_PROTECTIVE_PARTITION_TYPE 0xee
 
 struct partition_entry {
   u_int8_t active;
@@ -176,6 +189,17 @@ struct partition_entry {
   u_int32_t lba_sector;
   u_int32_t lba_len;
 };
+
+static bool is_gpt_protective_mbr(const uint8_t *buffer) {
+  for (uint32_t i = 0; i < 4; i++) {
+    if (GPT_PROTECTIVE_PARTITION_TYPE ==
+        buffer[DPT_ADDRESS + i * DPT_ITEM_SIZE + 4]) {
+      return true;
+    }
+  }
+
+  return false;
+}
 
 #define CONFIG_RT_AUTO_RESIZE_PARTITION_NR (CONFIG_RT_PARTITION_NUMBER - 1)
 
@@ -192,6 +216,7 @@ static int mmc_mbr_part_create_new(struct mmcsd_blk_device *blk_dev,
   uint64_t sector_count = 0;
   uint64_t total_sector_count = 0;
   uint64_t start_lba = 0;
+  uint64_t partition_sector_count = 0;
 
   struct dfs_partition part, prev_part;
   struct partition_entry part_entry;
@@ -211,6 +236,17 @@ static int mmc_mbr_part_create_new(struct mmcsd_blk_device *blk_dev,
 
   if (0x01 != rt_device_read(dev_sd, 0, buffer, 1)) {
     rt_kprintf("%s read sector failed.\n", __func__);
+    goto _exit;
+  }
+
+  if ((MBR_SIGNATURE_0 != buffer[MBR_SIGNATURE_OFFSET]) ||
+      (MBR_SIGNATURE_1 != buffer[MBR_SIGNATURE_OFFSET + 1])) {
+    rt_kprintf("%s invalid MBR signature.\n", __func__);
+    goto _exit;
+  }
+
+  if (is_gpt_protective_mbr(buffer)) {
+    rt_kprintf("%s GPT partition table is not supported.\n", __func__);
     goto _exit;
   }
 
@@ -239,9 +275,12 @@ static int mmc_mbr_part_create_new(struct mmcsd_blk_device *blk_dev,
     }
     part_entry.lba_sector = (uint32_t)start_lba;
 
-    /* we suppose user not use sdcard bigger than 128GiB, so no need to limit
-     * the lba_len  */
-    part_entry.lba_len = (uint32_t)(sector_count - start_lba);
+    partition_sector_count = sector_count - start_lba;
+    if (UINT32_MAX < partition_sector_count) {
+      rt_kprintf("%s partition is too large for MBR.\n", __func__);
+      goto _exit;
+    }
+    part_entry.lba_len = (uint32_t)partition_sector_count;
 
     rt_memcpy(buffer + DPT_ADDRESS +
                   CONFIG_RT_AUTO_RESIZE_PARTITION_NR * DPT_ITEM_SIZE,
@@ -437,15 +476,18 @@ static inline __attribute__((always_inline)) void disable_auto_resize(void) {
   char *file_buffer = NULL;
   size_t file_buffer_size = 0;
 
-  if ((0x00 == read_config_file(&fd, &file_buffer, &file_buffer_size)) &&
+  if ((0x00 == read_config_file(&fd, &file_buffer, &file_buffer_size,
+                                O_RDWR)) &&
       (0 <= fd) && (NULL != file_buffer)) {
     /* change auto_resize to n */
-    int offset_auto_resize = 0;
     char *p_auto_resize = rt_strstr(file_buffer, "auto_resize=");
     if (p_auto_resize) {
-      lseek(fd, p_auto_resize - file_buffer + sizeof("auto_resize=") - 1,
-            SEEK_SET);
-      write(fd, "n", 1);
+      off_t offset_auto_resize =
+          p_auto_resize - file_buffer + sizeof("auto_resize=") - 1;
+      if ((0 > lseek(fd, offset_auto_resize, SEEK_SET)) ||
+          (1 != write(fd, "n", 1))) {
+        rt_kprintf("%s, update config file failed\n", __func__);
+      }
       close(fd);
 
     } else {
@@ -460,11 +502,14 @@ static inline __attribute__((always_inline)) void disable_auto_resize(void) {
   }
 }
 
-static void execute_auto_resize(char *value) {
-  int ret = 0;
+static int execute_auto_resize(char *value) {
+  int ret = -1;
   int fd = -1;
   char enable = 0;
   uint32_t sector_size = SECTOR_SIZE;
+#if !defined(CONFIG_RT_AUTO_RESIZE_PARTITION_ALWAYS)
+  bool data_marker_created = false;
+#endif
 
   char dev_name[16];
   rt_device_t dev_sd = NULL;
@@ -478,7 +523,7 @@ static void execute_auto_resize(char *value) {
 
   if (0x01 != sscanf(value, "%c", &enable)) {
     rt_kprintf("%s parse value failed.\n", __func__);
-    return;
+    return -1;
   }
 
   if ('y' != enable) {
@@ -489,7 +534,7 @@ static void execute_auto_resize(char *value) {
       fd = -1;
     }
 
-    return;
+    return 0;
   }
 
   if(SYSCTL_BOOT_EMMC == boot_mode) {
@@ -497,10 +542,8 @@ static void execute_auto_resize(char *value) {
   } else if(SYSCTL_BOOT_SDCARD == boot_mode) {
     mmc_dev = 1;
   } else {
-    return;
+    return -1;
   }
-
-  disable_auto_resize();
 
   rt_snprintf(dev_name, sizeof(dev_name), "sd%d", mmc_dev);
   if (NULL == (dev_sd = rt_device_find(dev_name))) {
@@ -515,14 +558,15 @@ static void execute_auto_resize(char *value) {
 
   blk_dev = rt_container_of(dev_sd, struct mmcsd_blk_device, dev);
   if (NULL == blk_dev) {
+    ret = -1;
     goto _exit;
   }
 
   sector_size = get_block_sector_size(dev_sd);
   rt_kprintf("%s using sector size: %u\n", __func__, sector_size);
-  if (!is_power_of_two_u32(sector_size)) {
+  if ((SECTOR_SIZE != sector_size) || !is_power_of_two_u32(sector_size)) {
     rt_kprintf("%s invalid sector size: %u\n", __func__, sector_size);
-    RT_ASSERT(is_power_of_two_u32(sector_size));
+    ret = -1;
     goto _exit;
   }
 
@@ -541,13 +585,28 @@ static void execute_auto_resize(char *value) {
 
   if (0x00 == ret) {
     rt_device_close(dev_sd);
+    dev_sd = NULL;
 
-    /* create /bin/auto_mkfs */
+    /* Persist the pending format across the reboot needed to rescan MBR. */
     if (0 > (fd = open("/bin/auto_mkfs_data", O_CREAT | O_WRONLY))) {
       rt_kprintf("%s, create /bin/auto_mkfs_data failed\n", __func__);
     } else {
       close(fd);
+#if !defined(CONFIG_RT_AUTO_RESIZE_PARTITION_ALWAYS)
+      data_marker_created = true;
+#endif
     }
+
+#if !defined(CONFIG_RT_AUTO_RESIZE_PARTITION_ALWAYS)
+    if (!data_marker_created) {
+      rt_kprintf("%s, partition created but format marker was not saved\n",
+                 __func__);
+      ret = -1;
+      goto _exit;
+    }
+
+    disable_auto_resize();
+#endif
 
     /* reboot */
     rt_kprintf("reboot...\n");
@@ -560,10 +619,12 @@ _exit:
   if (dev_sd) {
     rt_device_close(dev_sd);
   }
+  return ret;
 }
 #else
-static void execute_auto_resize(char *value) {
+static int execute_auto_resize(char *value) {
   rt_kprintf("not support reisze partition.\n");
+  return -1;
 }
 #endif
 
@@ -574,7 +635,8 @@ static const struct config_handler hanlders[] = {
     },
 };
 
-static inline __attribute__((always_inline)) void excete_line(char *line) {
+static inline __attribute__((always_inline)) void excete_line(
+    char *line, bool skip_auto_resize) {
   uint32_t hash_command;
 
   char *p_command = line;
@@ -591,16 +653,34 @@ static inline __attribute__((always_inline)) void excete_line(char *line) {
 
   for (size_t i = 0; i < sizeof(hanlders) / sizeof(hanlders[0]); i++) {
     if (hash_command == hanlders[i].command) {
-      hanlders[i].handler(p_value);
+      if (skip_auto_resize && (0x277A782F == hash_command)) {
+        break;
+      }
+      int handler_ret = hanlders[i].handler(p_value);
+      if (0 > handler_ret) {
+        rt_kprintf("config command failed (%d)\n", handler_ret);
+      }
       break;
     }
   }
 }
 
 void excute_sdcard_config(void) {
+  bool skip_auto_resize = false;
+
+#if defined(CONFIG_RT_AUTO_RESIZE_PARTITION_ALWAYS)
+  if (!g_fs_mount_data_succ) {
+    int auto_resize_ret = execute_auto_resize("y");
+    if (0 > auto_resize_ret) {
+      rt_kprintf("auto resize data partition failed (%d)\n", auto_resize_ret);
+    }
+  }
+  skip_auto_resize = true;
+#endif
+
   int fd = -1;
   size_t length = 0;
-  int line_length = 0;
+  size_t line_length = 0;
 
   char *buffer = NULL;
   char *buffer_end = NULL;
@@ -609,7 +689,7 @@ void excute_sdcard_config(void) {
 
   char line[LINE_MAX_SIZE];
 
-  if (0x00 == read_config_file(&fd, &buffer, &length)) {
+  if (0x00 == read_config_file(&fd, &buffer, &length, O_RDONLY)) {
     close(fd);
 
     buffer_end = buffer + length;
@@ -618,26 +698,38 @@ void excute_sdcard_config(void) {
     while (p_line_start < buffer_end) {
       p_line_end = rt_strstr(p_line_start, "\n");
       if (NULL == p_line_end) {
-        break;
+        p_line_end = buffer_end;
       }
-      line_length = p_line_end - p_line_start;
-      if (0x00 == line_length) {
-        break;
-      }
-      if (LINE_MAX_SIZE <= line_length) {
+      line_length = (size_t)(p_line_end - p_line_start);
+      if (sizeof(line) <= line_length) {
         rt_kprintf("parse config, line data too long\n");
-        p_line_start = p_line_end;
+        if (p_line_end == buffer_end) {
+          break;
+        }
+        p_line_start = p_line_end + 1;
         continue;
       }
-      memcpy(line, p_line_start, line_length);
-      line[line_length] = '\0';
 
-      excete_line(line);
+      if (0x00 != line_length) {
+        memcpy(line, p_line_start, line_length);
+        line[line_length] = '\0';
 
-      p_line_start = p_line_end;
+        if ((0x00 != line_length) && ('\r' == line[line_length - 1])) {
+          line[--line_length] = '\0';
+        }
+
+        excete_line(line, skip_auto_resize);
+      }
+
+      if (p_line_end == buffer_end) {
+        break;
+      }
+      p_line_start = p_line_end + 1;
     }
   } else {
+#if !defined(CONFIG_RT_AUTO_RESIZE_PARTITION_ALWAYS)
     rt_kprintf("open %s failed\n", RT_SMART_CONFIG_FILE_PATH);
+#endif
   }
 
   if (buffer) {

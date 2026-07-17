@@ -1,10 +1,13 @@
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #define LINE_MAX_SIZE       (64)
 
 #define RT_SMART_CONFIG_FILE_PATH  "/bin/config.txt"
+
+extern bool g_fs_mount_data_succ;
 
 static inline __attribute__((always_inline)) uint32_t shash(const char *s) {
   uint32_t v = 5381;
