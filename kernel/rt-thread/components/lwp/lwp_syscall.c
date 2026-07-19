@@ -4185,15 +4185,14 @@ int sys_getrlimit(unsigned int resource, unsigned long rlim[2])
     switch (resource)
     {
     case RLIMIT_NOFILE:
-        {
-            struct dfs_fdtable *fdt = dfs_fdtable_get();
-
-            dfs_fd_lock();
-            rlim[0] = fdt->maxfd;
-            dfs_fd_unlock();
-            rlim[1] = DFS_FD_MAX;
-            ret = 0;
-        }
+        /*
+         * RLIMIT_NOFILE is the fd-number ceiling plus one, not the current
+         * fdtable capacity. The table starts at 8 entries and grows up to
+         * DFS_FD_MAX. RT-Smart has no per-process setrlimit support.
+         */
+        rlim[0] = DFS_FD_MAX;
+        rlim[1] = DFS_FD_MAX;
+        ret = 0;
         break;
     default:
         return -EINVAL;
