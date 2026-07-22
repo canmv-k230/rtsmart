@@ -692,7 +692,7 @@ static rt_err_t _usbd_video_dev_close(rt_device_t dev)
     rt_mutex_release(&inst->mutex);
 
     for (int i = 0; i < count; i++) {
-        lwp_munmap(addresses_to_unmap[i]);
+        lwp_unmap_user(lwp_self(), addresses_to_unmap[i]);
     }
 
     rt_mutex_take(&inst->mutex, RT_WAITING_FOREVER);

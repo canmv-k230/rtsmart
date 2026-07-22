@@ -30,44 +30,182 @@ struct rt_pmutex
     struct lwp_avl_struct node;
     struct rt_object *custom_obj;
     rt_uint8_t type; /* pmutex type */
+    rt_uint8_t destroying;
+    rt_uint32_t operation_count;
 };
 
 static struct rt_mutex _pmutex_lock;
+#ifdef RT_USING_SMP
+static struct rt_spinlock _pmutex_tree_lock;
+#else
+static rt_spinlock_t _pmutex_tree_lock;
+#endif
 
 static int pmutex_system_init(void)
 {
     rt_mutex_init(&_pmutex_lock, "pmtxLock", RT_IPC_FLAG_FIFO);
+    rt_spin_lock_init(&_pmutex_tree_lock);
     return 0;
 }
 INIT_PREV_EXPORT(pmutex_system_init);
 
+static void pmutex_release(struct rt_pmutex *pmutex)
+{
+    if (pmutex->type == PMUTEX_NORMAL)
+    {
+        rt_sem_delete(pmutex->lock.ksem);
+    }
+    else
+    {
+        rt_mutex_delete(pmutex->lock.kmutex);
+    }
+
+    rt_free(pmutex);
+}
+
+static void pmutex_tree_insert(struct rt_pmutex *pmutex)
+{
+    rt_base_t level = rt_spin_lock_irqsave(&_pmutex_tree_lock);
+
+    lwp_avl_insert(&pmutex->node, (struct lwp_avl_struct **)pmutex->node.data);
+    rt_spin_unlock_irqrestore(&_pmutex_tree_lock, level);
+}
+
+static void pmutex_tree_remove(struct rt_pmutex *pmutex)
+{
+    rt_base_t level = rt_spin_lock_irqsave(&_pmutex_tree_lock);
+
+    if (pmutex->node.data != RT_NULL)
+    {
+        lwp_avl_remove(&pmutex->node, (struct lwp_avl_struct **)pmutex->node.data);
+        pmutex->node.data = RT_NULL;
+    }
+    rt_spin_unlock_irqrestore(&_pmutex_tree_lock, level);
+}
+
+static int pmutex_exists(void *umutex, struct rt_lwp *lwp)
+{
+    struct lwp_avl_struct *node;
+    int exists = 0;
+    rt_base_t level;
+
+    if (!lwp)
+    {
+        return 0;
+    }
+
+    level = rt_spin_lock_irqsave(&_pmutex_tree_lock);
+    node = lwp_avl_find((avl_key_t)umutex, lwp->pmutex_search_head);
+    if (node)
+    {
+        struct rt_pmutex *pmutex = rt_container_of(node, struct rt_pmutex, node);
+
+        exists = !pmutex->destroying;
+    }
+    rt_spin_unlock_irqrestore(&_pmutex_tree_lock, level);
+    return exists;
+}
+
+static struct rt_pmutex *pmutex_get(void *umutex, struct rt_lwp *lwp,
+                                    rt_uint32_t *active_operations)
+{
+    struct rt_pmutex *pmutex = RT_NULL;
+    struct lwp_avl_struct *node;
+    rt_base_t level;
+
+    if (!lwp)
+    {
+        return RT_NULL;
+    }
+
+    level = rt_spin_lock_irqsave(&_pmutex_tree_lock);
+    node = lwp_avl_find((avl_key_t)umutex, lwp->pmutex_search_head);
+    if (node)
+    {
+        pmutex = rt_container_of(node, struct rt_pmutex, node);
+        if (pmutex->destroying)
+        {
+            pmutex = RT_NULL;
+        }
+        else
+        {
+            if (active_operations)
+            {
+                *active_operations = pmutex->operation_count;
+            }
+            pmutex->operation_count++;
+        }
+    }
+    rt_spin_unlock_irqrestore(&_pmutex_tree_lock, level);
+    return pmutex;
+}
+
+static void pmutex_put(struct rt_pmutex *pmutex)
+{
+    int release = 0;
+    rt_base_t level = rt_spin_lock_irqsave(&_pmutex_tree_lock);
+
+    RT_ASSERT(pmutex->operation_count > 0);
+    pmutex->operation_count--;
+    if (pmutex->destroying && pmutex->operation_count == 0)
+    {
+        release = 1;
+    }
+    rt_spin_unlock_irqrestore(&_pmutex_tree_lock, level);
+
+    if (release)
+    {
+        pmutex_release(pmutex);
+    }
+}
+
+static int pmutex_is_locked(struct rt_pmutex *pmutex)
+{
+    int locked;
+    rt_base_t level = rt_hw_interrupt_disable();
+
+    if (pmutex->type == PMUTEX_NORMAL)
+    {
+        locked = pmutex->lock.ksem->value == 0;
+    }
+    else if (pmutex->type == PMUTEX_RECURSIVE || pmutex->type == PMUTEX_ERRORCHECK)
+    {
+        locked = pmutex->lock.kmutex->owner != RT_NULL;
+    }
+    else
+    {
+        locked = 1;
+    }
+
+    rt_hw_interrupt_enable(level);
+    return locked;
+}
+
 static rt_err_t pmutex_destory(void *data)
 {
-    rt_err_t ret = -1;
-    rt_base_t level = 0;
+    int release = 0;
+    rt_base_t level;
     struct rt_pmutex *pmutex = (struct rt_pmutex *)data;
 
     if (pmutex)
     {
-        level = rt_hw_interrupt_disable();
-        /* remove pmutex from pmutext avl */
-        lwp_avl_remove(&pmutex->node, (struct lwp_avl_struct **)pmutex->node.data);
-        rt_hw_interrupt_enable(level);
-
-        if (pmutex->type == PMUTEX_NORMAL)
+        level = rt_spin_lock_irqsave(&_pmutex_tree_lock);
+        if (pmutex->node.data != RT_NULL)
         {
-            rt_sem_delete(pmutex->lock.ksem);
+            lwp_avl_remove(&pmutex->node,
+                           (struct lwp_avl_struct **)pmutex->node.data);
+            pmutex->node.data = RT_NULL;
         }
-        else
-        {
-            rt_mutex_delete(pmutex->lock.kmutex);
-        }
+        pmutex->destroying = 1;
+        release = pmutex->operation_count == 0;
+        rt_spin_unlock_irqrestore(&_pmutex_tree_lock, level);
 
-        /* release object */
-        rt_free(pmutex);
-        ret = 0;
+        if (release)
+        {
+            pmutex_release(pmutex);
+        }
     }
-    return ret;
+    return pmutex ? RT_EOK : -RT_ERROR;
 }
 
 static struct rt_pmutex* pmutex_create(void *umutex, struct rt_lwp *lwp)
@@ -94,6 +232,9 @@ static struct rt_pmutex* pmutex_create(void *umutex, struct rt_lwp *lwp)
     {
         return RT_NULL;
     }
+    pmutex->type = type;
+    pmutex->destroying = 0;
+    pmutex->operation_count = 0;
 
     if (type == PMUTEX_NORMAL)
     {
@@ -129,26 +270,11 @@ static struct rt_pmutex* pmutex_create(void *umutex, struct rt_lwp *lwp)
         return RT_NULL;
     }
     pmutex->node.avl_key = (avl_key_t)umutex;
-    pmutex->node.data = &lwp->address_search_head;
+    pmutex->node.data = &lwp->pmutex_search_head;
     pmutex->custom_obj = obj;
-    pmutex->type = type;
 
     /* insert into pmutex head */
-    lwp_avl_insert(&pmutex->node, &lwp->address_search_head);
-    return pmutex;
-}
-
-static struct rt_pmutex* pmutex_get(void *umutex, struct rt_lwp *lwp)
-{
-    struct rt_pmutex *pmutex = RT_NULL;
-    struct lwp_avl_struct *node = RT_NULL;
-
-    node = lwp_avl_find((avl_key_t)umutex, lwp->address_search_head);
-    if (!node)
-    {
-        return RT_NULL;
-    }
-    pmutex = rt_container_of(node, struct rt_pmutex, node);
+    pmutex_tree_insert(pmutex);
     return pmutex;
 }
 
@@ -173,8 +299,7 @@ static int _pthread_mutex_init(void *umutex)
     }
 
     lwp = lwp_self();
-    pmutex = pmutex_get(umutex, lwp);
-    if (pmutex == RT_NULL)
+    if (!pmutex_exists(umutex, lwp))
     {
         /* create a pmutex according to this umutex */
         pmutex = pmutex_create(umutex, lwp);
@@ -186,29 +311,15 @@ static int _pthread_mutex_init(void *umutex)
         }
         if (lwp_user_object_add(lwp, pmutex->custom_obj) != 0)
         {
+            pmutex_tree_remove(pmutex);
             rt_custom_object_destroy(pmutex->custom_obj);
             rt_mutex_release(&_pmutex_lock);
             rt_set_errno(ENOMEM);
             return -ENOMEM;
         }
     }
-    else
-    {
-        rt_base_t level = rt_hw_interrupt_disable();
-
-        if (pmutex->type == PMUTEX_NORMAL)
-        {
-            pmutex->lock.ksem->value = 1;
-        }
-        else
-        {
-            pmutex->lock.kmutex->owner    = RT_NULL;
-            pmutex->lock.kmutex->priority = 0xFF;
-            pmutex->lock.kmutex->hold     = 0;
-            pmutex->lock.kmutex->ceiling_priority = 0xFF;
-        }
-        rt_hw_interrupt_enable(level);
-    }
+    /* The lock path can race with another first-use initialization. Keep an
+     * existing kernel lock intact instead of resetting a live mutex. */
 
     rt_mutex_release(&_pmutex_lock);
 
@@ -220,6 +331,7 @@ static int _pthread_mutex_lock_timeout(void *umutex, struct timespec *timeout)
     struct rt_lwp *lwp = RT_NULL;
     struct rt_pmutex *pmutex = RT_NULL;
     rt_err_t lock_ret = 0;
+    int ret = 0;
     rt_int32_t time = RT_WAITING_FOREVER;
     register rt_base_t temp;
 
@@ -241,14 +353,13 @@ static int _pthread_mutex_lock_timeout(void *umutex, struct timespec *timeout)
     }
 
     lwp = lwp_self();
-    pmutex = pmutex_get(umutex, lwp);
+    pmutex = pmutex_get(umutex, lwp, RT_NULL);
     if (pmutex == RT_NULL)
     {
         rt_mutex_release(&_pmutex_lock);
         rt_set_errno(EINVAL);
         return -ENOMEM;  /* umutex not recored in kernel */
     }
-
     rt_mutex_release(&_pmutex_lock);
 
     switch (pmutex->type)
@@ -265,13 +376,17 @@ static int _pthread_mutex_lock_timeout(void *umutex, struct timespec *timeout)
         {
             /* enable interrupt */
             rt_hw_interrupt_enable(temp);
-            return -EDEADLK;
+            rt_set_errno(EDEADLK);
+            ret = -EDEADLK;
+            goto out;
         }
         lock_ret = rt_mutex_take_interruptible(pmutex->lock.kmutex, time);
         rt_hw_interrupt_enable(temp);
         break;
     default: /* unknown type */
-        return -EINVAL;
+        rt_set_errno(EINVAL);
+        ret = -EINVAL;
+        goto out;
     }
 
     if (lock_ret != RT_EOK)
@@ -281,26 +396,28 @@ static int _pthread_mutex_lock_timeout(void *umutex, struct timespec *timeout)
             if (time == 0) /* timeout is 0, means try lock failed */
             {
                 rt_set_errno(EBUSY);
-                return -EBUSY;
+                ret = -EBUSY;
             }
             else
             {
                 rt_set_errno(ETIMEDOUT);
-                return -ETIMEDOUT;
+                ret = -ETIMEDOUT;
             }
         }
         else if (lock_ret == -RT_EINTR)
         {
             rt_set_errno(EINTR);
-            return -EINTR;
+            ret = -EINTR;
         }
         else
         {
             rt_set_errno(EAGAIN);
-            return -EAGAIN;
+            ret = -EAGAIN;
         }
     }
-    return 0;
+out:
+    pmutex_put(pmutex);
+    return ret;
 }
 
 static int _pthread_mutex_unlock(void *umutex)
@@ -308,6 +425,8 @@ static int _pthread_mutex_unlock(void *umutex)
     struct rt_lwp *lwp = RT_NULL;
     struct rt_pmutex *pmutex = RT_NULL;
     rt_err_t lock_ret = 0;
+    int ret = 0;
+    rt_base_t level;
 
     lock_ret = rt_mutex_take_interruptible(&_pmutex_lock, RT_WAITING_FOREVER);
     if (lock_ret != RT_EOK)
@@ -317,49 +436,54 @@ static int _pthread_mutex_unlock(void *umutex)
     }
 
     lwp = lwp_self();
-    pmutex = pmutex_get(umutex, lwp);
+    pmutex = pmutex_get(umutex, lwp, RT_NULL);
     if (pmutex == RT_NULL)
     {
         rt_mutex_release(&_pmutex_lock);
         rt_set_errno(EPERM);
         return -EPERM;//unlock static mutex of unlock state
     }
-
     rt_mutex_release(&_pmutex_lock);
 
     switch (pmutex->type)
     {
     case PMUTEX_NORMAL:
+        level = rt_hw_interrupt_disable();
         if(pmutex->lock.ksem->value >=1)
         {
+            rt_hw_interrupt_enable(level);
             rt_set_errno(EPERM);
-            return -EPERM;//unlock dynamic mutex of unlock state
+            ret = -EPERM;
+            goto out;
         }
-        else
-        {
-            lock_ret = rt_sem_release(pmutex->lock.ksem);
-        }
+        rt_hw_interrupt_enable(level);
+        lock_ret = rt_sem_release(pmutex->lock.ksem);
         break;
     case PMUTEX_RECURSIVE:
     case PMUTEX_ERRORCHECK:
         lock_ret = rt_mutex_release(pmutex->lock.kmutex);
         break;
     default: /* unknown type */
-        return -EINVAL;
+        rt_set_errno(EINVAL);
+        ret = -EINVAL;
+        goto out;
     }
 
     if (lock_ret != RT_EOK)
     {
         rt_set_errno(EPERM);
-        return -EPERM;
+        ret = -EPERM;
     }
-    return 0;
+out:
+    pmutex_put(pmutex);
+    return ret;
 }
 
 static int _pthread_mutex_destroy(void *umutex)
 {
     struct rt_lwp *lwp = RT_NULL;
     struct rt_pmutex *pmutex = RT_NULL;
+    rt_uint32_t active_operations;
     rt_err_t lock_ret = 0;
 
     lock_ret = rt_mutex_take_interruptible(&_pmutex_lock, RT_WAITING_FOREVER);
@@ -370,7 +494,7 @@ static int _pthread_mutex_destroy(void *umutex)
     }
 
     lwp = lwp_self();
-    pmutex = pmutex_get(umutex, lwp);
+    pmutex = pmutex_get(umutex, lwp, &active_operations);
     if (pmutex == RT_NULL)
     {
         rt_mutex_release(&_pmutex_lock);
@@ -378,8 +502,25 @@ static int _pthread_mutex_destroy(void *umutex)
         return -EINVAL;
     }
 
-    lwp_user_object_delete(lwp, pmutex->custom_obj);
+    if (active_operations != 0 || pmutex_is_locked(pmutex))
+    {
+        pmutex_put(pmutex);
+        rt_mutex_release(&_pmutex_lock);
+        rt_set_errno(EBUSY);
+        return -EBUSY;
+    }
+
+    pmutex_tree_remove(pmutex);
+    lock_ret = lwp_user_object_delete(lwp, pmutex->custom_obj);
+
+    pmutex_put(pmutex);
     rt_mutex_release(&_pmutex_lock);
+
+    if (lock_ret != RT_EOK)
+    {
+        rt_set_errno(EINVAL);
+        return -EINVAL;
+    }
 
     return 0;
 }
@@ -415,5 +556,8 @@ int sys_pmutex(void *umutex, int op, void *arg)
             rt_set_errno(EINVAL);
             break;
     }
-    return ret;
+
+    /* PMUTEX is the userspace pthread interface, whose operations return
+     * positive errno values rather than the kernel's raw negative errno. */
+    return ret < 0 ? -ret : ret;
 }

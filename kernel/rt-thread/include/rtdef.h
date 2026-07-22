@@ -562,6 +562,8 @@ enum
 #define RT_THREAD_SUSPEND_UNINTERRUPTIBLE    (RT_THREAD_SUSPEND_MASK | RT_SIGNAL_COMMON_WAKEUP_MASK | RT_SIGNAL_KILL_WAKEUP_MASK) /**< Suspend with uninterruptable 0x7 */
 #define RT_THREAD_STAT_MASK                  0x07
 
+#define RT_THREAD_FLAG_CLEANUP_OWNS_TCB       0x01                /**< cleanup callback may release the thread control block */
+
 #define RT_THREAD_STAT_YIELD            0x08                /**< indicate whether remaining_tick has been reloaded since last schedule */
 #define RT_THREAD_STAT_YIELD_MASK       RT_THREAD_STAT_YIELD
 

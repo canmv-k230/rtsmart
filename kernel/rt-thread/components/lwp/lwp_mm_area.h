@@ -37,6 +37,7 @@ struct rt_mm_area_struct
     size_t addr;
     size_t size;
     int type;
+    size_t unmap_all_addr;
 };
 
 int lwp_map_area_insert(struct lwp_avl_struct **avl_tree, size_t addr, size_t size, int ma_type);

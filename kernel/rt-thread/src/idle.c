@@ -197,6 +197,7 @@ static void rt_defunct_execute(void)
     {
         rt_base_t lock;
         rt_thread_t thread;
+        rt_bool_t cleanup_owns_tcb;
         void (*cleanup)(struct rt_thread *tid);
 
 #ifdef RT_USING_MODULE
@@ -233,13 +234,38 @@ static void rt_defunct_execute(void)
             break;
         }
 #endif
-        /* invoke thread cleanup */
         cleanup = thread->cleanup;
+        cleanup_owns_tcb = (cleanup != RT_NULL) &&
+            ((thread->flags & RT_THREAD_FLAG_CLEANUP_OWNS_TCB) != 0);
+
+        /*
+         * A marked cleanup callback owns a manually allocated thread control
+         * block and can release it. Prepare that thread before the callback;
+         * unmarked cleanup callbacks retain the established reaper ordering.
+         */
+        if (cleanup_owns_tcb)
+        {
+#ifdef RT_USING_SIGNALS
+            rt_thread_free_sig(thread);
+#endif
+            if (rt_object_is_systemobject((rt_object_t)thread) == RT_TRUE)
+            {
+                rt_object_detach((rt_object_t)thread);
+            }
+        }
+
         if (cleanup != RT_NULL)
         {
             rt_hw_interrupt_enable(lock);
             cleanup(thread);
             lock = rt_hw_interrupt_disable();
+        }
+
+        if (cleanup_owns_tcb)
+        {
+            /* The callback may have released thread. Do not dereference it. */
+            rt_hw_interrupt_enable(lock);
+            continue;
         }
 
 #ifdef RT_USING_SIGNALS

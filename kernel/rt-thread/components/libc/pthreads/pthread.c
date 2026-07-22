@@ -99,23 +99,35 @@ void _pthread_data_destroy(pthread_t pth)
 
         /* delete joinable semaphore */
         if (ptd->joinable_sem != RT_NULL)
+        {
             rt_sem_delete(ptd->joinable_sem);
+            ptd->joinable_sem = RT_NULL;
+        }
 
         /* release thread resource */
-        if (ptd->attr.stackaddr == RT_NULL && ptd->tid->stack_addr != RT_NULL)
+        if (ptd->tid != RT_NULL)
         {
-            /* release thread allocated stack */
-            rt_free(ptd->tid->stack_addr);
-        }
-        /* clean stack addr pointer */
-        ptd->tid->stack_addr = RT_NULL;
+            if (ptd->attr.stackaddr == RT_NULL && ptd->tid->stack_addr != RT_NULL)
+            {
+                /* release thread allocated stack */
+                rt_free(ptd->tid->stack_addr);
+            }
+            /* clean stack addr pointer before releasing the thread object */
+            ptd->tid->stack_addr = RT_NULL;
 
-        /*
-        * if this thread create the local thread data,
-        * delete it
-        */
-        if (ptd->tls != RT_NULL) rt_free(ptd->tls);
-        rt_free(ptd->tid);
+            /*
+            * if this thread create the local thread data,
+            * delete it
+            */
+            rt_free(ptd->tid);
+            ptd->tid = RT_NULL;
+        }
+
+        if (ptd->tls != RT_NULL)
+        {
+            rt_free(ptd->tls);
+            ptd->tls = RT_NULL;
+        }
 
         /* clean magic */
         ptd->magic = 0x0;
@@ -277,6 +289,7 @@ int pthread_create(pthread_t            *pid,
 
     /* set pthread cleanup function and ptd data */
     ptd->tid->cleanup = _pthread_cleanup;
+    ptd->tid->flags |= RT_THREAD_FLAG_CLEANUP_OWNS_TCB;
     ptd->tid->user_data = (rt_ubase_t)ptd;
 
     /* start thread */
@@ -687,4 +700,3 @@ int pthread_cancel(pthread_t thread)
     return 0;
 }
 RTM_EXPORT(pthread_cancel);
-

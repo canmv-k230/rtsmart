@@ -116,7 +116,8 @@ struct rt_lwp
     struct rt_wqueue wait_queue; /*for console */
     struct tty_struct *tty; /* NULL if no tty */
 
-    struct lwp_avl_struct *address_search_head; /* for addressed object fast rearch */
+    struct lwp_avl_struct *address_search_head; /* for futex addressed object fast search */
+    struct lwp_avl_struct *pmutex_search_head; /* for pmutex addressed object fast search */
     char working_directory[DFS_PATH_MAX];
     int debug;
     uint32_t bak_first_ins;

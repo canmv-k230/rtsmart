@@ -169,9 +169,10 @@ static rt_err_t _rt_thread_init(struct rt_thread *thread,
     thread->remaining_tick = tick;
     thread->run_tick       = 0;
 
-    /* error and flags */
+    /* error, state and flags */
     thread->error = RT_EOK;
     thread->stat  = RT_THREAD_INIT;
+    thread->flags = 0;
 
 #ifdef RT_USING_SMP
     /* not bind on any cpu */

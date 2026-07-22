@@ -1210,7 +1210,7 @@ void *sys_mmap2(void *addr, size_t length, int prot,
 
 int sys_munmap(void *addr, size_t length)
 {
-    return lwp_munmap(addr);
+    return lwp_munmap(addr, length);
 }
 
 void *sys_mremap(void *old_address, size_t old_size,

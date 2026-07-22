@@ -76,31 +76,97 @@ static void lwp_avl_rebalance(struct lwp_avl_struct ***nodeplaces_ptr, int count
     }
 }
 
+static int lwp_avl_find_nodeplace(struct lwp_avl_struct **nodeplace,
+                                  struct lwp_avl_struct *target,
+                                  struct lwp_avl_struct ***stack,
+                                  uint32_t *stack_count)
+{
+    struct lwp_avl_struct **search_stack[avl_maxheight + 1];
+    rt_uint8_t search_state[avl_maxheight + 1];
+    int depth = 0;
+
+    search_stack[0] = nodeplace;
+    search_state[0] = 0;
+    while (depth >= 0)
+    {
+        struct lwp_avl_struct *node = *search_stack[depth];
+        struct lwp_avl_struct **next;
+
+        if (node == AVL_EMPTY)
+        {
+            depth--;
+            continue;
+        }
+
+        if (search_state[depth] == 0)
+        {
+            if (node == target)
+            {
+                int i;
+
+                *stack_count = depth + 1;
+                for (i = 0; i <= depth; i++)
+                {
+                    stack[i] = search_stack[i];
+                }
+                return 1;
+            }
+
+            if (target->avl_key < node->avl_key)
+            {
+                search_state[depth] = 3;
+                next = &node->avl_left;
+            }
+            else if (target->avl_key > node->avl_key)
+            {
+                search_state[depth] = 3;
+                next = &node->avl_right;
+            }
+            else
+            {
+                search_state[depth] = 1;
+                next = &node->avl_left;
+            }
+        }
+        else if (search_state[depth] == 1)
+        {
+            search_state[depth] = 2;
+            next = &node->avl_right;
+        }
+        else
+        {
+            depth--;
+            continue;
+        }
+
+        if (depth + 1 >= avl_maxheight && *next != AVL_EMPTY)
+        {
+            return 0;
+        }
+        depth++;
+        search_stack[depth] = next;
+        search_state[depth] = 0;
+    }
+    return 0;
+}
+
 void lwp_avl_remove(struct lwp_avl_struct *node_to_delete, struct lwp_avl_struct **ptree)
 {
-    avl_key_t key = node_to_delete->avl_key;
     struct lwp_avl_struct **nodeplace = ptree;
     struct lwp_avl_struct **stack[avl_maxheight];
     uint32_t stack_count = 0;
     struct lwp_avl_struct ***stack_ptr = &stack[0]; /* = &stack[stackcount] */
     struct lwp_avl_struct **nodeplace_to_delete;
-    for (;;)
-    {
-        struct lwp_avl_struct *node = *nodeplace;
-        if (node == AVL_EMPTY)
-        {
-            return;
-        }
 
-        *stack_ptr++ = nodeplace;
-        stack_count++;
-        if (key == node->avl_key)
-            break;
-        if (key < node->avl_key)
-            nodeplace = &node->avl_left;
-        else
-            nodeplace = &node->avl_right;
+    if (!node_to_delete || !ptree ||
+        !lwp_avl_find_nodeplace(nodeplace, node_to_delete, stack, &stack_count))
+    {
+        return;
     }
+
+    stack_ptr = &stack[stack_count];
+    nodeplace = *(stack_ptr - 1);
+    node_to_delete = *nodeplace;
     nodeplace_to_delete = nodeplace;
     if (node_to_delete->avl_left == AVL_EMPTY)
     {
@@ -224,4 +290,3 @@ RT_WEAK struct lwp_avl_struct* lwp_map_find_first(struct lwp_avl_struct* ptree)
     }
     return ptree;
 }
-

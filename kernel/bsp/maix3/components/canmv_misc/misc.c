@@ -211,7 +211,10 @@ static int misc_get_heap_info(void *args) {
 
         _total += mh->pool_size;
         _free += mh->available_size;
-        _used += mh->max_used_size;
+        /* Report current allocation, not the historical high-water mark. */
+        if (mh->pool_size >= mh->available_size) {
+          _used += mh->pool_size - mh->available_size;
+        }
       }
     }
   } while (next != (rt_list_t *)RT_NULL);

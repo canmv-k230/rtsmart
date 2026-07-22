@@ -28,14 +28,7 @@ extern "C" {
         if (!(dst) || !(src)) {                                                                                                \
             __ret = -2;                                                                                                        \
         } else {                                                                                                               \
-            if ((lwp_self() != NULL) && lwp_user_accessable((src), sizeof(type))) {                                            \
-                if (sizeof(type) != lwp_get_from_user((dst), (src), sizeof(type))) {                                           \
-                    rt_kprintf("get from user failed, type %s\n", #type);                                                      \
-                    __ret = -1;                                                                                                \
-                }                                                                                                              \
-            } else {                                                                                                           \
-                memcpy((dst), (src), sizeof(type));                                                                            \
-            }                                                                                                                  \
+            __ret = lwp_get_from_user_ex((dst), (src), sizeof(type));                                                         \
         }                                                                                                                      \
         __ret;                                                                                                                 \
     })
@@ -46,14 +39,7 @@ extern "C" {
         if (!(dst) || !(src)) {                                                                                                \
             __ret = -2;                                                                                                        \
         } else {                                                                                                               \
-            if ((lwp_self() != NULL) && lwp_user_accessable((dst), sizeof(type))) {                                            \
-                if (sizeof(type) != lwp_put_to_user((dst), (src), sizeof(type))) {                                             \
-                    rt_kprintf("put to user failed, type %s\n", #type);                                                        \
-                    __ret = -1;                                                                                                \
-                }                                                                                                              \
-            } else {                                                                                                           \
-                memcpy((dst), (src), sizeof(type));                                                                            \
-            }                                                                                                                  \
+            __ret = lwp_put_to_user_ex((dst), (src), sizeof(type));                                                           \
         }                                                                                                                      \
         __ret;                                                                                                                 \
     })
@@ -72,7 +58,7 @@ int lwp_unmap_user_type(struct rt_lwp *lwp, void *va);
 
 rt_base_t lwp_brk(void *addr);
 void* lwp_mmap2(void *addr, size_t length, int prot, int flags, int fd, off_t pgoffset);
-int lwp_munmap(void *addr);
+int lwp_munmap(void *addr, size_t length);
 
 size_t lwp_get_from_user(void *dst, void *src, size_t size);
 size_t lwp_put_to_user(void *dst, void *src, size_t size);
