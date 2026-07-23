@@ -24,6 +24,7 @@
  */
 
 mtp_size send_file_data( mtp_ctx * ctx, fs_entry * entry,mtp_offset offset, mtp_size maxsize );
+uint32_t mtp_sync_folder(mtp_ctx * ctx, uint32_t storageid, uint32_t parent_handle);
 int delete_tree(mtp_ctx * ctx,uint32_t handle);
 
 int umount_store(mtp_ctx * ctx, int store_index, int update_flag);

@@ -582,9 +582,6 @@ static WCHAR LfnBuf[_MAX_LFN+1];	/* LFN enabled with static working buffer */
 static const BYTE ExCvt[] = _EXCVT;	/* Upper conversion table for SBCS extended characters */
 #endif
 
-extern unsigned char dfs_fs_change;
-
-
 
 
 /*--------------------------------------------------------------------------
@@ -3287,7 +3284,6 @@ FRESULT f_open (
 #else
 					res = dir_register(&dj);
 #endif
-					dfs_fs_change = 1;
 				}
 				mode |= FA_CREATE_ALWAYS;		/* File is created */
 			}
@@ -3730,7 +3726,6 @@ FRESULT f_sync (
 					fp->flag &= (BYTE)~FA_MODIFIED;
 				}
 			}
-			dfs_fs_change = 1;
 		}
 	}
 
@@ -4639,7 +4634,6 @@ FRESULT f_mkdir (
 					fs->wflag = 1;
 				}
 				if (res == FR_OK) res = sync_fs(fs);
-				if (res == FR_OK) dfs_fs_change = 1;
 			} else {
 				remove_chain(&dj.obj, dcl, 0);		/* Could not register, remove cluster chain */
 			}
@@ -6076,4 +6070,3 @@ int elm_get_vol(FATFS *fat)
 	return -1;
 }
 #endif
-

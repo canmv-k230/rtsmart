@@ -34,5 +34,6 @@ int build_objectinfo_dataset(mtp_ctx * ctx, void * buffer, int maxsize,fs_entry 
 int build_event_dataset(mtp_ctx * ctx, void * buffer, int maxsize, uint32_t event, uint32_t session, uint32_t transaction, int nbparams, uint32_t * parameters);
 
 void set_default_date(struct tm * date);
+void mtp_format_entry_date(uint32_t timestamp, uint16_t fat_date, uint16_t fat_time, char * timestr, int maxsize);
 
 #endif

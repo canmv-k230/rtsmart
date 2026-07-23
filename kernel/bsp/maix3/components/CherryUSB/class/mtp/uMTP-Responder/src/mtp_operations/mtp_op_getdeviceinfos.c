@@ -39,7 +39,7 @@
 
 uint32_t mtp_op_GetDeviceInfos(mtp_ctx * ctx,MTP_PACKET_HEADER * mtp_packet_hdr, int * size,uint32_t * ret_params, int * ret_params_size)
 {
-	int sz,tmp_sz;
+	int sz,tmp_sz,transfer_status;
 
 	// Note : From the MTP specification this operation can be used without first 
 	// opening an MTP session by sending an OpenSession command !
@@ -60,9 +60,9 @@ uint32_t mtp_op_GetDeviceInfos(mtp_ctx * ctx,MTP_PACKET_HEADER * mtp_packet_hdr,
 	PRINT_DEBUG("MTP_OPERATION_GET_DEVICE_INFO response (%d Bytes):", sz);
 	PRINT_DEBUG_BUF(ctx->wrbuffer, sz);
 
-	write_usb(ctx->usb_ctx,EP_DESCRIPTOR_IN,ctx->wrbuffer, sz);
-
-	check_and_send_USB_ZLP(ctx , sz );
+	transfer_status = mtp_send_data_response(ctx, sz);
+	if( transfer_status < 0 )
+		return transfer_status == -2 ? MTP_RESPONSE_NO_RESPONSE : MTP_RESPONSE_GENERAL_ERROR;
 
 	*size = sz;
 

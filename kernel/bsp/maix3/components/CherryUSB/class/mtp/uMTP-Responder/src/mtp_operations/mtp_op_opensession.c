@@ -39,6 +39,7 @@ uint32_t mtp_op_OpenSession(mtp_ctx * ctx,MTP_PACKET_HEADER * mtp_packet_hdr, in
 {
 	int i;
 	uint32_t id;
+	fs_handles_db * db;
 
 	id = peek(mtp_packet_hdr, sizeof(MTP_PACKET_HEADER), 4); // Get param 1
 
@@ -50,31 +51,37 @@ uint32_t mtp_op_OpenSession(mtp_ctx * ctx,MTP_PACKET_HEADER * mtp_packet_hdr, in
 	if(ctx->fs_db)
 	{
 		ret_params[0] = ctx->session_id;
-		*ret_params_size = 1;
+		*ret_params_size = sizeof(uint32_t);
 		return MTP_RESPONSE_SESSION_ALREADY_OPEN;
 	}
 
-	ctx->session_id = id;
-
-	ctx->fs_db = init_fs_db(ctx);
-	if( !ctx->fs_db )
+	db = init_fs_db(ctx);
+	if( !db )
 	{
 		PRINT_DEBUG("Open session - init fs db failure");
 		return MTP_RESPONSE_GENERAL_ERROR;
 	}
 
-	i = 0;
-	while( (i < MAX_STORAGE_NB) && ctx->storages[i].root_path)
+	if( pthread_mutex_lock( &ctx->inotify_mutex ) )
 	{
-		if( pthread_mutex_lock( &ctx->inotify_mutex ) )
-			return MTP_RESPONSE_GENERAL_ERROR;
-
-		alloc_root_entry(ctx->fs_db, ctx->storages[i].storage_id);
-
-		pthread_mutex_unlock( &ctx->inotify_mutex );
-
-		i++;
+		deinit_fs_db(db);
+		return MTP_RESPONSE_GENERAL_ERROR;
 	}
+
+	for(i = 0; (i < MAX_STORAGE_NB) && ctx->storages[i].root_path; i++)
+	{
+		if( !alloc_root_entry(db, ctx->storages[i].storage_id) )
+		{
+			pthread_mutex_unlock( &ctx->inotify_mutex );
+			deinit_fs_db(db);
+			return MTP_RESPONSE_GENERAL_ERROR;
+		}
+	}
+
+	ctx->session_id = id;
+	ctx->fs_db = db;
+	mtp_fs_db_session_begin(ctx);
+	pthread_mutex_unlock( &ctx->inotify_mutex );
 
 	PRINT_DEBUG("Open session - ID 0x%.8x",ctx->session_id);
 

@@ -764,8 +764,11 @@ int dfs_elm_getdents(struct dfs_fd *file, struct dirent *dirp, uint32_t count)
             d->d_type = DT_REG;
         }
 
-#ifndef MTP_USE_FILE_STAT_OPERATION
+#if !defined(MTP_USE_FILE_STAT_OPERATION) && !defined(CONFIG_MTP_USE_FILE_STAT_OPERATION)
         d->fsize = fno.fsize;
+        d->fdate = fno.fdate;
+        d->ftime = fno.ftime;
+        d->d_info_flags = DFS_DIRENT_INFO_METADATA_VALID;
 #endif
         d->d_namlen = (rt_uint8_t)rt_strlen(fn);
         d->d_reclen = (rt_uint16_t)sizeof(struct dirent);

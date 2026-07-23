@@ -58,5 +58,7 @@ int build_device_properties_dataset(mtp_ctx * ctx,void * buffer, int maxsize,uin
 int build_DevicePropValue_dataset(mtp_ctx * ctx,void * buffer, int maxsize,uint32_t prop_code);
 
 int build_objectproplist_dataset(mtp_ctx * ctx, void * buffer, int maxsize,fs_entry * entry, uint32_t handle,uint32_t format_id, uint32_t prop_code, uint32_t prop_group_code, uint32_t depth);
+int build_objectproplist_entry(mtp_ctx * ctx, void * buffer, int maxsize, fs_entry * entry, uint32_t prop_code, int * numberofelements);
+int objectproplist_property_supported(uint32_t prop_code);
 
 #endif

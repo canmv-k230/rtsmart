@@ -74,13 +74,19 @@ struct statfs
     size_t f_bfree;   /* free blocks in file system */
 };
 
+#define DFS_DIRENT_INFO_METADATA_VALID 0x00000001U
+
 struct dirent
 {
     uint8_t d_type;           /* The type of the file */
     uint8_t d_namlen;         /* The length of the not including the terminating null file name */
     uint16_t d_reclen;        /* length of this record */
-#ifndef MTP_USE_FILE_STAT_OPERATION
+#if !defined(MTP_USE_FILE_STAT_OPERATION) && !defined(CONFIG_MTP_USE_FILE_STAT_OPERATION)
     uint32_t fsize;           /* file size */
+    uint32_t mtime;           /* filesystem modification time, when available */
+    uint16_t fdate;           /* FAT modification date */
+    uint16_t ftime;           /* FAT modification time */
+    uint32_t d_info_flags;    /* DFS_DIRENT_INFO_* values */
 #endif
     char d_name[DFS_PATH_MAX];   /* The null-terminated file name */
 };

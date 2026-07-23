@@ -40,7 +40,7 @@
 
 uint32_t mtp_op_GetStorageInfo(mtp_ctx * ctx,MTP_PACKET_HEADER * mtp_packet_hdr, int * size,uint32_t * ret_params, int * ret_params_size)
 {
-	int ofs,tmp_ofs;
+	int ofs,tmp_ofs,transfer_status;
 	uint32_t storageid;
 
 	if(!ctx->fs_db)
@@ -65,9 +65,9 @@ uint32_t mtp_op_GetStorageInfo(mtp_ctx * ctx,MTP_PACKET_HEADER * mtp_packet_hdr,
 		PRINT_DEBUG("MTP_OPERATION_GET_STORAGE_INFO response (%d Bytes):",ofs);
 		PRINT_DEBUG_BUF(ctx->wrbuffer, ofs);
 
-		write_usb(ctx->usb_ctx,EP_DESCRIPTOR_IN,ctx->wrbuffer,ofs);
-
-		check_and_send_USB_ZLP(ctx , ofs );
+		transfer_status = mtp_send_data_response(ctx, ofs);
+		if( transfer_status < 0 )
+			return transfer_status == -2 ? MTP_RESPONSE_NO_RESPONSE : MTP_RESPONSE_GENERAL_ERROR;
 
 		*size = ofs;
 
@@ -81,4 +81,3 @@ uint32_t mtp_op_GetStorageInfo(mtp_ctx * ctx,MTP_PACKET_HEADER * mtp_packet_hdr,
 error:
 	return MTP_RESPONSE_GENERAL_ERROR;
 }
-

@@ -50,6 +50,47 @@ void set_default_date(struct tm * date)
 {
 	memset(date, 0, sizeof(struct tm));
 	date->tm_year = 110;
+	date->tm_mday = 1;
+}
+
+void mtp_format_entry_date(uint32_t timestamp, uint16_t fat_date, uint16_t fat_time, char * timestr, int maxsize)
+{
+	time_t time_value;
+	struct tm local_time;
+	int year;
+	int month;
+	int day;
+	int hour;
+	int minute;
+	int second;
+
+	if( !timestr || (maxsize <= 0) )
+		return;
+
+	if( fat_date )
+	{
+		day = fat_date & 0x1f;
+		month = (fat_date >> 5) & 0x0f;
+		year = ((fat_date >> 9) & 0x7f) + 1980;
+		second = (fat_time & 0x1f) * 2;
+		minute = (fat_time >> 5) & 0x3f;
+		hour = (fat_time >> 11) & 0x1f;
+		if( day && (day <= 31) && month && (month <= 12) &&
+			(hour <= 23) && (minute <= 59) && (second <= 59) )
+		{
+			snprintf(timestr, maxsize, "%.4d%.2d%.2dT%.2d%.2d%.2d", year, month, day, hour, minute, second);
+			return;
+		}
+	}
+
+	set_default_date(&local_time);
+	if( timestamp )
+	{
+		time_value = (time_t)timestamp;
+		localtime_r(&time_value, &local_time);
+	}
+
+	snprintf(timestr, maxsize, "%.4d%.2d%.2dT%.2d%.2d%.2d", 1900 + local_time.tm_year, local_time.tm_mon + 1, local_time.tm_mday, local_time.tm_hour, local_time.tm_min, local_time.tm_sec);
 }
 
 int build_deviceinfo_dataset(mtp_ctx * ctx, void * buffer, int maxsize)
@@ -175,29 +216,11 @@ int build_storageinfo_dataset(mtp_ctx * ctx,void * buffer, int maxsize,uint32_t 
 
 int build_objectinfo_dataset(mtp_ctx * ctx, void * buffer, int maxsize,fs_entry * entry)
 {
-	struct stat64 entrystat;
-	time_t t;
-	struct tm lt;
-	int ofs,ret;
-	char * path;
+	int ofs;
 	char timestr[32];
 
+	(void)ctx;
 	ofs = 0;
-
-	ret = -1;
-	path = build_full_path(ctx->fs_db, mtp_get_storage_root(ctx, entry->storage_id), entry);
-
-	if(path)
-	{
-		ret = stat64(path, &entrystat);
-	}
-
-	if(ret)
-	{
-		if(path)
-			free(path);
-		return 0;
-	}
 
 	ofs = poke32(buffer, ofs, maxsize, entry->storage_id);                                       // StorageID  (NR)
 	if(entry->flags & ENTRY_IS_DIR)
@@ -205,8 +228,6 @@ int build_objectinfo_dataset(mtp_ctx * ctx, void * buffer, int maxsize,fs_entry 
 	else
 		ofs = poke16(buffer, ofs, maxsize, MTP_FORMAT_UNDEFINED);                                // ObjectFormat Code
 	ofs = poke16(buffer, ofs, maxsize, 0x0000);                                                  // Protection Status (NR)
-
-	entry->size = entrystat.st_size;
 
 	ofs = poke32(buffer, ofs, maxsize, entry->size);                                             // Object Compressed Size
 	ofs = poke16(buffer, ofs, maxsize, 0x0000);                                                  // Thumb Format (NR)
@@ -227,26 +248,12 @@ int build_objectinfo_dataset(mtp_ctx * ctx, void * buffer, int maxsize,fs_entry 
 	ofs = poke32(buffer, ofs, maxsize, 0x00000000);                                              // Sequence Number (NR)
 	ofs = poke_string(buffer, ofs, maxsize, entry->name);                                         // Filename
 
-	// Date Created (NR) "YYYYMMDDThhmmss.s"
-	set_default_date(&lt);
-	t = entrystat.st_mtime;
-	localtime_r(&t, &lt);
-	snprintf(timestr,sizeof(timestr),"%.4d%.2d%.2dT%.2d%.2d%.2d",1900 + lt.tm_year, lt.tm_mon + 1, lt.tm_mday, lt.tm_hour, lt.tm_min, lt.tm_sec);
+	// Date Created and Date Modified (NR) "YYYYMMDDThhmmss.s"
+	mtp_format_entry_date(entry->date, entry->fat_date, entry->fat_time, timestr, sizeof(timestr));
 	ofs = poke_string(buffer, ofs, maxsize, timestr);
-
-	// Date Modified (NR) "YYYYMMDDThhmmss.s"
-	set_default_date(&lt);
-	t = entrystat.st_mtime;
-	localtime_r(&t, &lt);
-	snprintf(timestr,sizeof(timestr),"%.4d%.2d%.2dT%.2d%.2d%.2d",1900 + lt.tm_year, lt.tm_mon + 1, lt.tm_mday, lt.tm_hour, lt.tm_min, lt.tm_sec);
 	ofs = poke_string(buffer, ofs, maxsize, timestr);
 
 	ofs = poke08(buffer, ofs, maxsize, 0x00);      // Keywords (NR)
-
-	if(path)
-	{
-		free(path);
-	}
 	return ofs;
 }
 

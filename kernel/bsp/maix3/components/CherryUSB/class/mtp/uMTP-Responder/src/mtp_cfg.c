@@ -58,6 +58,10 @@ enum
 	USBMAXRDBUFFERSIZE_CMD,
 	USBMAXWRBUFFERSIZE_CMD,
 	READBUFFERSIZE_CMD,
+	FSDBCACHEBUCKETS_CMD,
+	FSDBPOOLSIZE_CMD,
+	FSDBSCANCACHE_CMD,
+	FSDIRREADBUFFERSIZE_CMD,
 
 	USB_DEV_PATH_CMD,
 	USB_EPIN_PATH_CMD,
@@ -451,7 +455,33 @@ static int get_hex_param(mtp_ctx * context, char * line,int cmd)
 			break;
 
 			case READBUFFERSIZE_CMD:
-				context->read_file_buffer_size = param_value;
+				if( param_value && !(param_value & (param_value - 1)) )
+				{
+					context->read_file_buffer_size = param_value;
+				}
+				else
+				{
+					PRINT_MSG("Read file buffer size must be a non-zero power of two !\n");
+				}
+			break;
+
+			case FSDBCACHEBUCKETS_CMD:
+				if( param_value <= UINT32_MAX )
+				{
+					context->fs_db_cache_buckets = (uint32_t)param_value;
+				}
+				else
+				{
+					PRINT_MSG("Bad file-handle cache bucket count !\n");
+				}
+			break;
+
+			case FSDBSCANCACHE_CMD:
+				context->fs_db_scan_cache = param_value ? 1 : 0;
+			break;
+
+			case FSDIRREADBUFFERSIZE_CMD:
+				context->fs_dir_read_buffer_size = (uint32_t)param_value;
 			break;
 
 			case WAIT_CONNECTION:
@@ -471,6 +501,37 @@ static int get_hex_param(mtp_ctx * context, char * line,int cmd)
 			break;
 
 		}
+	}
+
+	return 0;
+}
+
+static int get_uint_param(mtp_ctx * context, char * line,int cmd)
+{
+	int i;
+	char * end;
+	char tmp_txt[MAX_CFG_STRING_SIZE];
+	unsigned long param_value;
+
+	i = get_param(line, 1, tmp_txt);
+	if( i < 0 )
+		return 0;
+
+	param_value = strtoul(tmp_txt, &end, 0);
+	if( (end == tmp_txt) || *end || (param_value > UINT32_MAX) )
+	{
+		PRINT_MSG("Bad unsigned integer value !\n");
+		return 0;
+	}
+
+	switch(cmd)
+	{
+		case FSDBPOOLSIZE_CMD:
+			context->fs_db_pool_size = (uint32_t)param_value;
+		break;
+
+		default:
+		break;
 	}
 
 	return 0;
@@ -566,6 +627,10 @@ kw_list kwlist[] =
 	{"usb_max_rd_buffer_size", get_hex_param,   USBMAXRDBUFFERSIZE_CMD},
 	{"usb_max_wr_buffer_size", get_hex_param,   USBMAXWRBUFFERSIZE_CMD},
 	{"read_buffer_cache_size", get_hex_param,   READBUFFERSIZE_CMD},
+	{"fs_db_cache_buckets",    get_hex_param,   FSDBCACHEBUCKETS_CMD},
+	{"fs_db_pool_size",         get_uint_param,  FSDBPOOLSIZE_CMD},
+	{"fs_db_scan_cache",       get_hex_param,   FSDBSCANCACHE_CMD},
+	{"fs_dir_read_buffer_size",get_hex_param,   FSDIRREADBUFFERSIZE_CMD},
 
 	{"usb_functionfs_mode",    get_hex_param,   USBFUNCTIONFSMODE_CMD},
 
@@ -660,6 +725,10 @@ int mtp_load_config_file(mtp_ctx * context, const char * conffile)
 	context->default_uid = -1;
 
 	context->no_inotify = 0;
+	context->fs_db_cache_buckets = CONFIG_FS_DB_CACHE_BUCKETS;
+	context->fs_db_pool_size = MTP_FS_DB_POOL_SIZE;
+	context->fs_db_scan_cache = CONFIG_FS_DB_SCAN_CACHE;
+	context->fs_dir_read_buffer_size = CONFIG_MTP_DIR_READ_BUFFER_SIZE;
 
 	f = fopen(conffile, "r");
 	if(f)
@@ -686,6 +755,10 @@ int mtp_load_config_file(mtp_ctx * context, const char * conffile)
 	PRINT_DEBUG("USB Max write buffer size : 0x%X bytes",context->usb_wr_buffer_max_size);
 	PRINT_DEBUG("USB Max read buffer size : 0x%X bytes",context->usb_rd_buffer_max_size);
 	PRINT_DEBUG("Read file buffer size : 0x%X bytes",context->read_file_buffer_size);
+	PRINT_DEBUG("File-handle cache buckets : %u",context->fs_db_cache_buckets);
+	PRINT_DEBUG("File-handle database pool : %u bytes",context->fs_db_pool_size);
+	PRINT_DEBUG("Directory scan cache : %s",context->fs_db_scan_cache ? "enabled" : "disabled");
+	PRINT_DEBUG("Directory scan buffer size : %u bytes",context->fs_dir_read_buffer_size);
 
 	PRINT_DEBUG("Manufacturer string : %s",context->usb_cfg.usb_string_manufacturer);
 	PRINT_DEBUG("Product string : %s",context->usb_cfg.usb_string_product);

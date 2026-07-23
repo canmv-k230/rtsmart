@@ -31,7 +31,9 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <string.h>
 #include <sys/stat.h>
+#include <errno.h>
 
 #include "logs_out.h"
 
@@ -42,16 +44,52 @@
 
 #include "usb_gadget_fct.h"
 
+static void mtp_clear_send_object_state(mtp_ctx * ctx)
+{
+	ctx->SendObjInfoHandle = 0xFFFFFFFFU;
+	ctx->SendObjInfoSize = 0;
+	ctx->SendObjInfoOffset = 0;
+	ctx->pending_data_operation = 0;
+	ctx->pending_data_transaction_id = 0;
+}
+
+static int mtp_write_file_data(int file, const unsigned char * data, mtp_size size)
+{
+	ssize_t written;
+
+	while(size > 0)
+	{
+		written = write(file, data, size);
+		if( written < 0 && errno == EINTR )
+			continue;
+		if( written <= 0 )
+			return -1;
+
+		data += written;
+		size -= written;
+	}
+
+	return 0;
+}
+
 uint32_t mtp_op_SendObject(mtp_ctx * ctx,MTP_PACKET_HEADER * mtp_packet_hdr, int * size,uint32_t * ret_params, int * ret_params_size)
 {
 	uint32_t response_code;
 	fs_entry * entry;
-	unsigned char * tmp_ptr;
+	const unsigned char * data;
 	char * full_path;
 	int file;
-	int sz;
+	int received_size;
+	int request_size;
 	int transfer_failed;
+	int transport_failed;
+	int cancelled;
+	int is_partial;
+	int transfer_limit;
+	filefoundinfo fileinfo;
 	mtp_size expected_size;
+	mtp_size remaining_size;
+	mtp_size entry_size;
 
 	if(!ctx->fs_db)
 		return MTP_RESPONSE_SESSION_NOT_OPEN;
@@ -60,190 +98,217 @@ uint32_t mtp_op_SendObject(mtp_ctx * ctx,MTP_PACKET_HEADER * mtp_packet_hdr, int
 		return MTP_RESPONSE_GENERAL_ERROR;
 
 	response_code = MTP_RESPONSE_GENERAL_ERROR;
+	is_partial = mtp_packet_hdr->code == MTP_OPERATION_SEND_PARTIAL_OBJECT;
 
-	if( mtp_packet_hdr->code == MTP_OPERATION_SEND_PARTIAL_OBJECT && mtp_packet_hdr->operation == MTP_CONTAINER_TYPE_COMMAND )
+	if( mtp_packet_hdr->operation == MTP_CONTAINER_TYPE_COMMAND )
 	{
-		ctx->SendObjInfoHandle = peek(mtp_packet_hdr, sizeof(MTP_PACKET_HEADER), 4);         // Get param 1 - Object handle
-		ctx->SendObjInfoOffset = peek64(mtp_packet_hdr, sizeof(MTP_PACKET_HEADER) + 4, 8);   // Get param 2 - Offset in bytes
-		ctx->SendObjInfoSize = peek(mtp_packet_hdr, sizeof(MTP_PACKET_HEADER) + 12, 4);      // Get param 3 - Max size in bytes
+		if( ctx->pending_data_operation )
+		{
+			response_code = MTP_RESPONSE_DEVICE_BUSY;
+			goto out;
+		}
+
+		if( is_partial )
+		{
+			if( ctx->SendObjInfoHandle != 0xFFFFFFFFU )
+			{
+				response_code = MTP_RESPONSE_DEVICE_BUSY;
+				goto out;
+			}
+
+			ctx->SendObjInfoHandle = peek(mtp_packet_hdr, sizeof(MTP_PACKET_HEADER), 4);
+			ctx->SendObjInfoOffset = peek64(mtp_packet_hdr, sizeof(MTP_PACKET_HEADER) + 4, 8);
+			ctx->SendObjInfoSize = peek(mtp_packet_hdr, sizeof(MTP_PACKET_HEADER) + 12, 4);
+			if( ctx->SendObjInfoSize > (UINT32_MAX - (uint32_t)sizeof(MTP_PACKET_HEADER)) )
+			{
+				response_code = MTP_RESPONSE_OBJECT_TOO_LARGE;
+				mtp_clear_send_object_state(ctx);
+				goto out;
+			}
+		}
+
+		if( ctx->SendObjInfoHandle == 0xFFFFFFFFU )
+		{
+			response_code = MTP_RESPONSE_INVALID_OBJECT_HANDLE;
+			mtp_clear_send_object_state(ctx);
+			goto out;
+		}
+
+		if( check_handle_access(ctx, NULL, ctx->SendObjInfoHandle, 1, &response_code) )
+		{
+			mtp_clear_send_object_state(ctx);
+			goto out;
+		}
+
+		if( is_partial )
+		{
+			entry = get_entry_by_handle(ctx->fs_db, ctx->SendObjInfoHandle);
+			if( !entry || (entry->edit_session_id != ctx->session_id) )
+			{
+				response_code = MTP_RESPONSE_ACCESS_DENIED;
+				mtp_clear_send_object_state(ctx);
+				goto out;
+			}
+		}
+
+		ctx->pending_data_operation = mtp_packet_hdr->code;
+		ctx->pending_data_transaction_id = mtp_packet_hdr->tx_id;
+		response_code = MTP_RESPONSE_NO_RESPONSE;
+		goto out;
 	}
 
-	if( ctx->SendObjInfoHandle != 0xFFFFFFFF )
+	if( (mtp_packet_hdr->operation != MTP_CONTAINER_TYPE_DATA) || (ctx->pending_data_operation != mtp_packet_hdr->code) || (ctx->pending_data_transaction_id != mtp_packet_hdr->tx_id) || (ctx->SendObjInfoHandle == 0xFFFFFFFFU) )
 	{
-		switch(mtp_packet_hdr->operation)
+		response_code = MTP_RESPONSE_INVALID_PARAMETER;
+		goto out;
+	}
+
+	expected_size = ctx->SendObjInfoSize;
+	if( (mtp_packet_hdr->length != (uint32_t)(sizeof(MTP_PACKET_HEADER) + expected_size)) || (*size < (int)sizeof(MTP_PACKET_HEADER)) || (*size > (int)mtp_packet_hdr->length) )
+	{
+		response_code = MTP_RESPONSE_INVALID_PARAMETER;
+		mtp_clear_send_object_state(ctx);
+		goto out;
+	}
+
+	entry = get_entry_by_handle(ctx->fs_db, ctx->SendObjInfoHandle);
+	if( !entry )
+	{
+		response_code = MTP_RESPONSE_INVALID_OBJECT_HANDLE;
+		mtp_clear_send_object_state(ctx);
+		goto out;
+	}
+	if( check_handle_access(ctx, entry, 0, 1, &response_code) )
+	{
+		mtp_clear_send_object_state(ctx);
+		goto out;
+	}
+	if( is_partial && (entry->edit_session_id != ctx->session_id) )
+	{
+		response_code = MTP_RESPONSE_ACCESS_DENIED;
+		mtp_clear_send_object_state(ctx);
+		goto out;
+	}
+
+	full_path = build_full_path(ctx->fs_db, mtp_get_storage_root(ctx, entry->storage_id), entry);
+	if( !full_path )
+	{
+		mtp_clear_send_object_state(ctx);
+		goto out;
+	}
+
+	file = -1;
+	if( !set_storage_giduid(ctx, entry->storage_id) )
+	{
+		if( is_partial )
+			file = open(full_path, O_RDWR | O_LARGEFILE);
+		else
+			file = open(full_path, O_WRONLY | O_TRUNC | O_LARGEFILE);
+	}
+	restore_giduid(ctx);
+	if( file == -1 )
+	{
+		free(full_path);
+		mtp_clear_send_object_state(ctx);
+		goto out;
+	}
+
+	transfer_failed = 0;
+	transport_failed = 0;
+	cancelled = ctx->cancel_req ? 1 : 0;
+	transfer_limit = mtp_get_usb_bulk_transfer_limit(ctx);
+	if( transfer_limit > ctx->usb_rd_buffer_max_size )
+		transfer_limit = ctx->usb_rd_buffer_max_size;
+	if( transfer_limit <= 0 )
+		transfer_failed = 1;
+	if( lseek64(file, ctx->SendObjInfoOffset, SEEK_SET) < 0 )
+		transfer_failed = 1;
+
+	received_size = *size - (int)sizeof(MTP_PACKET_HEADER);
+	remaining_size = expected_size - received_size;
+	if( (received_size < 0) || (remaining_size < 0) )
+		transfer_failed = 1;
+
+	ctx->transferring_file_data = 1;
+	if( !transfer_failed && !cancelled && received_size > 0 )
+	{
+		data = (const unsigned char *)mtp_packet_hdr + sizeof(MTP_PACKET_HEADER);
+		if( mtp_write_file_data(file, data, received_size) )
+			transfer_failed = 1;
+	}
+
+	while( !transfer_failed && !transport_failed && !cancelled && (remaining_size > 0) )
+	{
+		request_size = remaining_size > transfer_limit ? transfer_limit : (int)remaining_size;
+		if( request_size <= 0 )
 		{
-			case MTP_CONTAINER_TYPE_DATA:
-				entry = get_entry_by_handle(ctx->fs_db, ctx->SendObjInfoHandle);
-				if(entry)
-				{
-					expected_size = ctx->SendObjInfoSize;
-					response_code = MTP_RESPONSE_GENERAL_ERROR;
-
-					if( check_handle_access( ctx, entry, 0x00000000, 1, &response_code) )
-					{
-						pthread_mutex_unlock( &ctx->inotify_mutex );
-
-						return response_code;
-					}
-
-					if( (mtp_packet_hdr->code == MTP_OPERATION_SEND_PARTIAL_OBJECT) && (entry->edit_session_id != ctx->session_id) )
-					{
-						pthread_mutex_unlock( &ctx->inotify_mutex );
-
-						return MTP_RESPONSE_ACCESS_DENIED;
-					}
-
-					full_path = build_full_path(ctx->fs_db, mtp_get_storage_root(ctx, entry->storage_id), entry);
-					if(full_path)
-					{
-						file = -1;
-
-						if(!set_storage_giduid(ctx, entry->storage_id))
-						{
-							if( mtp_packet_hdr->code == MTP_OPERATION_SEND_PARTIAL_OBJECT )
-								file = open(full_path,O_RDWR | O_LARGEFILE);
-							else
-								file = open(full_path,O_CREAT|O_WRONLY|O_TRUNC| O_LARGEFILE, S_IRUSR|S_IWUSR);
-						}
-
-						restore_giduid(ctx);
-
-						if( file != -1 )
-						{
-							if( mtp_packet_hdr->code != MTP_OPERATION_SEND_PARTIAL_OBJECT && expected_size > 0 )
-							{
-								ftruncate(file, expected_size);
-							}
-							transfer_failed = 0;
-							ctx->transferring_file_data = 1;
-
-							lseek64(file, ctx->SendObjInfoOffset, SEEK_SET);
-
-							sz = *size - sizeof(MTP_PACKET_HEADER);
-							tmp_ptr = ((unsigned char*)mtp_packet_hdr) ;
-							tmp_ptr += sizeof(MTP_PACKET_HEADER);
-
-							if(sz > 0)
-							{
-								if( write(file, tmp_ptr, sz) != sz)
-								{
-									transfer_failed = 1;
-									goto transfer_end;
-								}
-
-								ctx->SendObjInfoSize -= sz;
-							}
-
-							tmp_ptr = ctx->rdbuffer2;
-							if( sz == ( ctx->usb_rd_buffer_max_size - sizeof(MTP_PACKET_HEADER) ) )
-							{
-								sz = ctx->usb_rd_buffer_max_size;
-							}
-
-							if( mtp_packet_hdr->code == MTP_OPERATION_SEND_PARTIAL_OBJECT && ctx->SendObjInfoSize )
-							{
-								sz = ctx->usb_rd_buffer_max_size;
-							}
-
-							while( ( sz == ctx->usb_rd_buffer_max_size ) && ( !ctx->cancel_req ) && ( sz >= 0 ) )
-							{
-								sz = read_usb(ctx->usb_ctx, ctx->rdbuffer2, ctx->usb_rd_buffer_max_size);
-
-								if( sz >= 0 )
-								{
-									if( write(file, tmp_ptr, sz) != sz)
-									{
-										transfer_failed = 1;
-										goto transfer_end;
-									}
-
-									ctx->SendObjInfoSize -= sz;
-								}
-								else
-								{
-									transfer_failed = 1;
-								}
-							};
-
-						transfer_end:
-							entry->size = lseek64(file, 0, SEEK_END);
-
-							ctx->transferring_file_data = 0;
-
-							close(file);
-
-							if( transfer_failed || (sz < 0) )
-							{
-								response_code = MTP_RESPONSE_NO_RESPONSE;
-								free( full_path );
-								pthread_mutex_unlock( &ctx->inotify_mutex );
-								return response_code;
-							}
-
-							if(ctx->usb_cfg.val_umask >= 0)
-								chmod(full_path, 0777 & (~ctx->usb_cfg.val_umask));
-
-							if(ctx->cancel_req)
-							{
-								ctx->cancel_req = 0;
-
-								free( full_path );
-
-								pthread_mutex_unlock( &ctx->inotify_mutex );
-
-								return MTP_RESPONSE_NO_RESPONSE;
-							}
-
-							response_code = MTP_RESPONSE_OK;
-						}
-
-						free( full_path );
-					}
-				}
-				else
-				{
-					response_code = MTP_RESPONSE_INVALID_OBJECT_HANDLE;
-				}
-			break;
-			case MTP_CONTAINER_TYPE_COMMAND:
-				PRINT_DEBUG("SEND_OBJECT : Handle 0x%.8x, Offset 0x%"SIZEHEX", Size 0x%"SIZEHEX,ctx->SendObjInfoHandle,ctx->SendObjInfoOffset,ctx->SendObjInfoSize);
-
-				if( check_handle_access( ctx, NULL, ctx->SendObjInfoHandle, 1, &response_code) )
-				{
-					pthread_mutex_unlock( &ctx->inotify_mutex );
-
-					return response_code;
-				}
-
-				if( mtp_packet_hdr->code == MTP_OPERATION_SEND_PARTIAL_OBJECT )
-				{
-					entry = get_entry_by_handle(ctx->fs_db, ctx->SendObjInfoHandle);
-					if( !entry || (entry->edit_session_id != ctx->session_id) )
-					{
-						pthread_mutex_unlock( &ctx->inotify_mutex );
-
-						return MTP_RESPONSE_ACCESS_DENIED;
-					}
-				}
-
-				// no response to send, wait for the data...
-				response_code = MTP_RESPONSE_NO_RESPONSE;
-			break;
-			default:
+			transfer_failed = 1;
 			break;
 		}
+
+		received_size = read_usb(ctx->usb_ctx, ctx->rdbuffer2, request_size);
+		if( received_size == -2 )
+		{
+			cancelled = 1;
+			break;
+		}
+		if( (received_size <= 0) || (received_size > request_size) )
+		{
+			transport_failed = 1;
+			break;
+		}
+		if( mtp_write_file_data(file, ctx->rdbuffer2, received_size) )
+		{
+			transfer_failed = 1;
+			break;
+		}
+
+		remaining_size -= received_size;
+		if( received_size < request_size && remaining_size )
+			transport_failed = 1;
+		if( ctx->cancel_req )
+			cancelled = 1;
 	}
+
+	entry_size = lseek64(file, 0, SEEK_END);
+	if( entry_size >= 0 )
+		entry->size = entry_size;
 	else
-	{
-		PRINT_WARN("MTP_OPERATION_SEND_OBJECT ! : Invalid Handle (0x%.8X)", ctx->SendObjInfoHandle);
+		transfer_failed = 1;
+	ctx->transferring_file_data = 0;
+	close(file);
+	fs_invalidate_scan_cache(ctx->fs_db);
 
-		response_code = MTP_RESPONSE_INVALID_OBJECT_HANDLE;
-	}
+	if( !is_partial && !transfer_failed && !transport_failed && !cancelled && (remaining_size == 0) && (ctx->usb_cfg.val_umask >= 0) )
+		chmod(full_path, 0777 & (~ctx->usb_cfg.val_umask));
 
-	if( pthread_mutex_unlock( &ctx->inotify_mutex ) )
+	memset(&fileinfo, 0, sizeof(fileinfo));
+	if( !set_storage_giduid(ctx, entry->storage_id) )
 	{
-		response_code = MTP_RESPONSE_GENERAL_ERROR;
+		if( fs_entry_stat(full_path, &fileinfo) )
+		{
+			entry->size = fileinfo.size;
+			entry->date = fileinfo.date;
+			entry->fat_date = fileinfo.fat_date;
+			entry->fat_time = fileinfo.fat_time;
+		}
 	}
+	restore_giduid(ctx);
+
+	free(full_path);
+
+	if( cancelled || ctx->cancel_req || transport_failed )
+		response_code = MTP_RESPONSE_NO_RESPONSE;
+	else if( transfer_failed || remaining_size )
+		response_code = MTP_RESPONSE_INCOMPLETE_TRANSFER;
+	else
+		response_code = MTP_RESPONSE_OK;
+
+	mtp_clear_send_object_state(ctx);
+
+out:
+	if( pthread_mutex_unlock(&ctx->inotify_mutex) )
+		return MTP_RESPONSE_GENERAL_ERROR;
 
 	return response_code;
 }

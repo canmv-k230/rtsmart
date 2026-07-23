@@ -46,19 +46,36 @@ uint32_t mtp_op_SetObjectPropValue(mtp_ctx * ctx,MTP_PACKET_HEADER * mtp_packet_
 	switch(mtp_packet_hdr->operation)
 	{
 		case MTP_CONTAINER_TYPE_COMMAND:
+			if( pthread_mutex_lock( &ctx->inotify_mutex ) )
+				return MTP_RESPONSE_GENERAL_ERROR;
+
+			if( ctx->pending_data_operation )
+			{
+				pthread_mutex_unlock( &ctx->inotify_mutex );
+				return MTP_RESPONSE_DEVICE_BUSY;
+			}
 
 			ctx->SetObjectPropValue_Handle = peek(mtp_packet_hdr, sizeof(MTP_PACKET_HEADER), 4);  // Get param 1 - handle
 			ctx->SetObjectPropValue_PropCode = peek(mtp_packet_hdr, sizeof(MTP_PACKET_HEADER) + 4, 4); // Get param 2 - PropCode
+			ctx->pending_data_operation = mtp_packet_hdr->code;
+			ctx->pending_data_transaction_id = mtp_packet_hdr->tx_id;
 
 			// no response to send, wait for the data...
 			response_code = MTP_RESPONSE_NO_RESPONSE;
+			pthread_mutex_unlock( &ctx->inotify_mutex );
 		break;
 
 		case MTP_CONTAINER_TYPE_DATA:
+			if( pthread_mutex_lock( &ctx->inotify_mutex ) )
+				return MTP_RESPONSE_GENERAL_ERROR;
 
 			response_code = setObjectPropValue(ctx, mtp_packet_hdr, ctx->SetObjectPropValue_Handle, ctx->SetObjectPropValue_PropCode);
 
 			ctx->SetObjectPropValue_Handle = 0xFFFFFFFF;
+			ctx->SetObjectPropValue_PropCode = 0;
+			ctx->pending_data_operation = 0;
+			ctx->pending_data_transaction_id = 0;
+			pthread_mutex_unlock( &ctx->inotify_mutex );
 		break;
 
 		default:

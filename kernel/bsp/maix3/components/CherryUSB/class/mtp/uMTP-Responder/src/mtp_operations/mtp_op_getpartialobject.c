@@ -45,7 +45,7 @@ uint32_t mtp_op_GetPartialObject(mtp_ctx * ctx,MTP_PACKET_HEADER * mtp_packet_hd
 	fs_entry * entry;
 	mtp_size actualsize;
 	mtp_offset offset;
-	int maxsize;
+	uint32_t maxsize;
 
 	if(!ctx->fs_db)
 		return MTP_RESPONSE_SESSION_NOT_OPEN;
@@ -95,11 +95,13 @@ uint32_t mtp_op_GetPartialObject(mtp_ctx * ctx,MTP_PACKET_HEADER * mtp_packet_hd
 				pthread_mutex_unlock( &ctx->inotify_mutex );
 				return MTP_RESPONSE_NO_RESPONSE;
 			}
+			response_code = MTP_RESPONSE_INCOMPLETE_TRANSFER;
 		}
 
 		*size = sz;
 
-		response_code = MTP_RESPONSE_OK;
+		if( actualsize >= 0 )
+			response_code = MTP_RESPONSE_OK;
 	}
 	else
 	{

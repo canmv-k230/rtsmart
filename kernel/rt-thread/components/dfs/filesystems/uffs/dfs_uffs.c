@@ -352,7 +352,7 @@ static int dfs_uffs_open(struct dfs_fd *file)
     /* save this pointer, it will be used when calling read(), write(),
      * flush(), seek(), and will be free when calling close()*/
 
-    file->fnode->data = (void *)fd;
+    file->fnode->data = (void *)(rt_ubase_t)fd;
     file->pos  = uffs_seek(fd, 0, USEEK_CUR);
     file->fnode->size = uffs_seek(fd, 0, USEEK_END);
     uffs_seek(fd, file->pos, USEEK_SET);
@@ -385,7 +385,7 @@ static int dfs_uffs_close(struct dfs_fd *file)
         return 0;
     }
     /* regular file operations */
-    fd = (int)(file->fnode->data);
+    fd = (int)(rt_ubase_t)file->fnode->data;
 
     if (uffs_close(fd) == 0)
         return 0;
@@ -403,7 +403,7 @@ static int dfs_uffs_read(struct dfs_fd *file, void *buf, size_t len)
     int fd;
     int char_read;
 
-    fd = (int)(file->fnode->data);
+    fd = (int)(rt_ubase_t)file->fnode->data;
     char_read = uffs_read(fd, buf, len);
     if (char_read < 0)
         return uffs_result_to_dfs(uffs_get_error());
@@ -420,7 +420,7 @@ static int dfs_uffs_write(struct dfs_fd *file,
     int fd;
     int char_write;
 
-    fd = (int)(file->fnode->data);
+    fd = (int)(rt_ubase_t)file->fnode->data;
 
     char_write = uffs_write(fd, buf, len);
     if (char_write < 0)
@@ -436,7 +436,7 @@ static int dfs_uffs_flush(struct dfs_fd *file)
     int fd;
     int result;
 
-    fd = (int)(file->fnode->data);
+    fd = (int)(rt_ubase_t)file->fnode->data;
 
     result = uffs_flush(fd);
     if (result < 0)
@@ -476,7 +476,7 @@ static int dfs_uffs_seek(struct dfs_fd *file,
     }
     else if (file->fnode->type == FT_REGULAR)
     {
-        result = uffs_seek((int)(file->fnode->data), offset, USEEK_SET);
+        result = uffs_seek((int)(rt_ubase_t)file->fnode->data, offset, USEEK_SET);
         if (result >= 0)
             return offset;
     }
@@ -491,7 +491,9 @@ static int dfs_uffs_getdents(
     uint32_t count)
 {
     rt_uint32_t index;
+#if !defined(MTP_USE_FILE_STAT_OPERATION) && !defined(CONFIG_MTP_USE_FILE_STAT_OPERATION)
     char *file_path;
+#endif
     struct dirent *d;
     uffs_DIR *dir;
     struct uffs_dirent *uffs_d;
@@ -499,53 +501,47 @@ static int dfs_uffs_getdents(
     dir = (uffs_DIR *)(file->fnode->data);
     RT_ASSERT(dir != RT_NULL);
 
-    /* round count, count is always 1 */
+    /* Limit the result to complete DFS directory entries. */
     count = (count / sizeof(struct dirent)) * sizeof(struct dirent);
     if (count == 0) return -EINVAL;
 
-    /* allocate file name */
+#if !defined(MTP_USE_FILE_STAT_OPERATION) && !defined(CONFIG_MTP_USE_FILE_STAT_OPERATION)
     file_path = rt_malloc(FILE_PATH_MAX);
     if (file_path == RT_NULL)
         return -ENOMEM;
+#endif
 
     index = 0;
-    /* usually, the while loop should only be looped only once! */
     while (1)
     {
-        struct uffs_stat s;
-
         d = dirp + index;
 
         uffs_d = uffs_readdir(dir);
         if (uffs_d == RT_NULL)
+            break;
+
+        d->d_type = (uffs_d->d_type & FILE_ATTR_DIR) ? DT_DIR : DT_REG;
+
+#if !defined(MTP_USE_FILE_STAT_OPERATION) && !defined(CONFIG_MTP_USE_FILE_STAT_OPERATION)
         {
-            rt_free(file_path);
-            return (uffs_result_to_dfs(uffs_get_error()));
+            struct uffs_stat s;
+
+            d->d_info_flags = 0;
+            if (file->fnode->path[0] == '/' && file->fnode->path[1] != 0)
+                rt_snprintf(file_path, FILE_PATH_MAX, "%s/%s", file->fnode->path, uffs_d->d_name);
+            else
+                rt_strncpy(file_path, uffs_d->d_name, FILE_PATH_MAX);
+
+            if (uffs_stat(file_path, &s) == 0)
+            {
+                d->fsize = (rt_uint32_t)s.st_size;
+                d->mtime = (rt_uint32_t)s.st_mtime;
+                d->d_info_flags = DFS_DIRENT_INFO_METADATA_VALID;
+            }
         }
+#endif
 
-        if (file->fnode->path[0] == '/' && !(file->fnode->path[1] == 0))
-            rt_snprintf(file_path, FILE_PATH_MAX, "%s/%s", file->fnode->path, uffs_d->d_name);
-        else
-            rt_strncpy(file_path, uffs_d->d_name, FILE_PATH_MAX);
-
-        uffs_stat(file_path, &s);
-        switch (s.st_mode & US_IFMT)  /* file type mark */
-        {
-        case US_IFREG: /* directory */
-            d->d_type = DT_REG;
-            break;
-        case US_IFDIR: /* regular file */
-            d->d_type = DT_DIR;
-            break;
-        case US_IFLNK: /* symbolic link */
-        case US_IREAD: /* read permission */
-        case US_IWRITE:/* write permission */
-        default:
-            d->d_type = DT_UNKNOWN;
-            break;
-        }
-
-        /* write the rest args of struct dirent* dirp  */
+        /* Write the remaining DFS directory entry fields. */
         d->d_namlen = rt_strlen(uffs_d->d_name);
         d->d_reclen = (rt_uint16_t)sizeof(struct dirent);
         rt_strncpy(d->d_name, uffs_d->d_name, rt_strlen(uffs_d->d_name) + 1);
@@ -555,11 +551,12 @@ static int dfs_uffs_getdents(
             break;
     }
 
-    /* free file name buf */
+#if !defined(MTP_USE_FILE_STAT_OPERATION) && !defined(CONFIG_MTP_USE_FILE_STAT_OPERATION)
     rt_free(file_path);
+#endif
 
     if (index == 0)
-        return uffs_result_to_dfs(uffs_get_error());
+        return 0;
 
     file->pos += index * sizeof(struct dirent);
 
@@ -676,4 +673,3 @@ int dfs_uffs_init(void)
     return -RT_ERROR;
 }
 INIT_COMPONENT_EXPORT(dfs_uffs_init);
-

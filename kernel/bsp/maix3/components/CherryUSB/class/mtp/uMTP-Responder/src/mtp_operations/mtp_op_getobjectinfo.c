@@ -42,7 +42,7 @@ uint32_t mtp_op_GetObjectInfo(mtp_ctx * ctx,MTP_PACKET_HEADER * mtp_packet_hdr, 
 {
 	uint32_t handle;
 	uint32_t response_code;
-	int sz,tmp_sz;
+	int sz,tmp_sz,transfer_status;
 	fs_entry * entry;
 
 	if(!ctx->fs_db)
@@ -71,9 +71,12 @@ uint32_t mtp_op_GetObjectInfo(mtp_ctx * ctx,MTP_PACKET_HEADER * mtp_packet_hdr, 
 		PRINT_DEBUG("MTP_OPERATION_GET_OBJECT_INFO response (%d Bytes):",sz);
 		PRINT_DEBUG_BUF(ctx->wrbuffer, sz);
 
-		write_usb(ctx->usb_ctx,EP_DESCRIPTOR_IN,ctx->wrbuffer,sz);
-
-		check_and_send_USB_ZLP(ctx , sz );
+		transfer_status = mtp_send_data_response(ctx, sz);
+		if( transfer_status < 0 )
+		{
+			pthread_mutex_unlock( &ctx->inotify_mutex );
+			return transfer_status == -2 ? MTP_RESPONSE_NO_RESPONSE : MTP_RESPONSE_GENERAL_ERROR;
+		}
 
 		*size = sz;
 

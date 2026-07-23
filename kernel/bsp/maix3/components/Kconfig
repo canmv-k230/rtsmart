@@ -91,9 +91,80 @@ menu "Components Configuration"
                                 select CHERRY_USB_DEVICE_ENABLE_CLASS_MSC
 
                                 if CHERRY_USB_DEVICE_ENABLE_CLASS_MTP
+                                    config MTP_READ_FILE_BUFFER_SIZE
+                                        int "MTP file read buffer size (bytes)"
+                                        default 524288
+                                        help
+                                          Size of the buffer used while reading an object from storage.
+                                          The value should be a power of two.
+
+                                    config MTP_MAX_TX_USB_BUFFER_SIZE
+                                        int "MTP USB transmit buffer size (bytes)"
+                                        default 262144
+                                        help
+                                          Maximum MTP bulk-in transfer buffer size. The value should be a
+                                          multiple of the USB bulk packet size and smaller than the file
+                                          read buffer size.
+
+                                    config MTP_MAX_RX_USB_BUFFER_SIZE
+                                        int "MTP USB receive buffer size (bytes)"
+                                        default 262144
+                                        help
+                                          Maximum MTP bulk-out transfer buffer size. The value should be a
+                                          multiple of the USB bulk packet size.
+
                                     config MTP_USE_FILE_STAT_OPERATION
-                                    bool "Use file stat in uMTP-Responder"
-                                    default n
+                                        bool "Use file stat in uMTP-Responder"
+                                        default n
+                                        help
+                                          Use stat() while scanning MTP storage directories to obtain each
+                                          entry's type, size, and modification time. Enable this when the
+                                          filesystem metadata is unreliable or needs to be revalidated.
+
+                                          When disabled, uMTP uses directory-entry metadata from
+                                          filesystems that mark it valid and falls back to stat() for
+                                          other filesystems. Enabling it forces a stat() call per entry
+                                          and can make large folder listings slower.
+
+                                    config MTP_FS_DB_CACHE_BUCKETS
+                                        int "MTP file-handle cache buckets"
+                                        default 16384
+                                        help
+                                          Number of buckets used by the MTP file-handle lookup cache.
+                                          Set to 0 to disable the cache and use list lookup.
+
+                                    config MTP_FS_DB_POOL_SIZE
+                                        int "MTP database cache buffer size (bytes)"
+                                        default 262144
+                                        help
+                                          Reserve one contiguous buffer for uMTP-Responder object records
+                                          and file names. This avoids per-file heap allocations during the
+                                          first directory scan and reduces heap fragmentation.
+
+                                          Set this to 0 to use the heap for every entry. When the buffer is
+                                          exhausted, the responder falls back to heap allocation, so the
+                                          setting limits the optimization rather than the number of files.
+                                          The runtime mtp.conf setting fs_db_pool_size can override it.
+
+                                    config MTP_FS_DB_SCAN_CACHE
+                                        bool "Cache completed MTP directory scans"
+                                        default y
+                                        help
+                                          Reuse completed directory scans between MTP requests. Disable this
+                                          when storage contents change outside the MTP responder frequently.
+
+                                    config MTP_FS_DB_SCAN_CACHE_VALUE
+                                        int
+                                        default 1 if MTP_FS_DB_SCAN_CACHE
+                                        default 0
+
+                                    config MTP_DIR_READ_BUFFER_SIZE
+                                        int "MTP directory read buffer size (bytes)"
+                                        default 8192
+                                        help
+                                          Buffer size used for DFS getdents() directory scans. Set to 0 to
+                                          use the readdir() fallback. Nonzero values should be large enough
+                                          for at least one directory entry.
                                 endif
                             menuconfig CHERRY_USB_DEVICE_ENABLE_CLASS_UVC
                                 bool "Enable UVC"

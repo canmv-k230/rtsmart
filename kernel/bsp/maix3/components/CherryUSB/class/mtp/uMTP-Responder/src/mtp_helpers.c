@@ -53,7 +53,7 @@ int poke32(void * buffer, int index, int maxsize,uint32_t data)
 	if(index < 0)
 		return index;
 
-	if(index + 4 >= maxsize)
+	if(index + 4 > maxsize)
 	{
 #ifdef DEBUG
 		PRINT_DEBUG("poke32 : buffer overrun operation attempt ! index : %d, maxise : %d",index,maxsize);
@@ -80,7 +80,7 @@ int poke16(void * buffer, int index, int maxsize, uint16_t data)
 	if(index < 0)
 		return index;
 
-	if(index + 2 >= maxsize)
+	if(index + 2 > maxsize)
 	{
 #ifdef DEBUG
 		PRINT_DEBUG("poke16 : buffer overrun operation attempt ! index : %d, maxise : %d",index,maxsize);
@@ -103,7 +103,7 @@ int poke08(void * buffer, int index, int maxsize, uint8_t data)
 	if(index < 0)
 		return index;
 
-	if(index + 1 >= maxsize)
+	if(index + 1 > maxsize)
 	{
 #ifdef DEBUG
 		PRINT_DEBUG("poke08 : buffer overrun operation attempt ! index : %d, maxise : %d",index,maxsize);
@@ -168,7 +168,7 @@ int poke_string(void * buffer, int index, int maxsize, const char *str)
 
 	ptr = ((unsigned char *)buffer);
 
-	if( index + 1 >= maxsize )
+	if( index + 1 > maxsize )
 	{
 #ifdef DEBUG
 		PRINT_DEBUG("poke_string : buffer overrun operation attempt ! index : %d, maxise : %d",index,maxsize);
@@ -212,7 +212,7 @@ int poke_array(void * buffer, int index, int maxsize, int size, int elementsize,
 	if(index < 0)
 		return index;
 
-	if( index + (size + (prefixed*4)) >= maxsize )
+	if( index + (size + (prefixed*4)) > maxsize )
 	{
 #ifdef DEBUG
 		PRINT_DEBUG("poke_array : buffer overrun operation attempt ! prefixed : %d, index : %d, maxise : %d",prefixed,index,maxsize);

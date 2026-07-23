@@ -40,12 +40,25 @@ uint32_t mtp_op_CloseSession(mtp_ctx * ctx,MTP_PACKET_HEADER * mtp_packet_hdr, i
 	if(!ctx->fs_db)
 		return MTP_RESPONSE_SESSION_NOT_OPEN;
 
-	clear_edit_locks(ctx->fs_db);
+	if( pthread_mutex_lock(&ctx->inotify_mutex) )
+		return MTP_RESPONSE_GENERAL_ERROR;
 
+	mtp_fs_db_session_end(ctx);
+	clear_edit_locks(ctx->fs_db);
+	fs_invalidate_scan_cache(ctx->fs_db);
 	deinit_fs_db(ctx->fs_db);
 
 	ctx->fs_db = 0;
 	ctx->session_id = 0;
+	ctx->SendObjInfoHandle = 0xFFFFFFFFU;
+	ctx->SendObjInfoSize = 0;
+	ctx->SendObjInfoOffset = 0;
+	ctx->SetObjectPropValue_Handle = 0xFFFFFFFFU;
+	ctx->SetObjectPropValue_PropCode = 0;
+	ctx->pending_data_operation = 0;
+	ctx->pending_data_transaction_id = 0;
+	if( pthread_mutex_unlock(&ctx->inotify_mutex) )
+		return MTP_RESPONSE_GENERAL_ERROR;
 
 	return MTP_RESPONSE_OK;
 }

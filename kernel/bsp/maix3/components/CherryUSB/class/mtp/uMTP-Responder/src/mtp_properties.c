@@ -27,6 +27,7 @@
 
 #include <inttypes.h>
 #include <pthread.h>
+#include <limits.h>
 #include <string.h>
 #include <stdio.h>
 #include <sys/types.h>
@@ -448,16 +449,33 @@ int build_properties_supported_dataset(mtp_ctx * ctx,void * buffer, int maxsize,
 	return ofs;
 }
 
+static int mtp_property_filename_is_valid(const char * filename)
+{
+	if( !filename[0] || !strcmp(filename, ".") || !strcmp(filename, "..") )
+		return 0;
+
+	if( strchr(filename, '/') || strchr(filename, '\\') )
+		return 0;
+
+	return 1;
+}
+
 int setObjectPropValue(mtp_ctx * ctx,MTP_PACKET_HEADER * mtp_packet_hdr, uint32_t handle,uint32_t prop_code)
 {
 	fs_entry * entry;
+	fs_entry * existing_entry;
 	char * path;
 	char * path2;
-	char * old_filename;
-	char tmpstr[256+1];
+	char old_filename[FS_HANDLE_MAX_FILENAME_SIZE + 1];
+	char tmpstr[FS_HANDLE_MAX_FILENAME_SIZE + 1];
+	uint16_t unicode_str[FS_HANDLE_MAX_FILENAME_SIZE + 1];
+	filefoundinfo fileinfo;
+	struct stat target_stat;
 	unsigned int stringlen;
 	uint32_t response_code;
+	int payload_size;
 	int ret;
+	int i;
 
 	PRINT_DEBUG("setObjectPropValue : (Handle : 0x%.8X - Prop code : 0x%.4X )", handle, prop_code);
 
@@ -473,46 +491,58 @@ int setObjectPropValue(mtp_ctx * ctx,MTP_PACKET_HEADER * mtp_packet_hdr, uint32_
 				if( check_handle_access( ctx, entry, 0x00000000, 1, &response_code) )
 					return response_code;
 
+				if( mtp_packet_hdr->length < (sizeof(MTP_PACKET_HEADER) + 1) )
+					return MTP_RESPONSE_INVALID_OBJECT_PROP_VALUE;
+
+				payload_size = (int)mtp_packet_hdr->length - (int)sizeof(MTP_PACKET_HEADER);
+				stringlen = peek(mtp_packet_hdr, sizeof(MTP_PACKET_HEADER), 1);
+				if( !stringlen || (stringlen > FS_HANDLE_MAX_FILENAME_SIZE) || ((1 + (int)(stringlen * sizeof(uint16_t))) > payload_size) )
+					return MTP_RESPONSE_INVALID_OBJECT_PROP_VALUE;
+
+				memset(unicode_str, 0, sizeof(unicode_str));
+				for(i = 0; i < (int)stringlen; i++)
+					unicode_str[i] = peek(mtp_packet_hdr, sizeof(MTP_PACKET_HEADER) + 1 + (i * (int)sizeof(uint16_t)), 2);
+				if( unicode_str[stringlen - 1] != 0 )
+					return MTP_RESPONSE_INVALID_OBJECT_PROP_VALUE;
+				for(i = 0; i < (int)stringlen - 1; i++)
+				{
+					if( unicode_str[i] == 0 )
+						return MTP_RESPONSE_INVALID_OBJECT_PROP_VALUE;
+				}
+
+				memset(tmpstr, 0, sizeof(tmpstr));
+				if( unicode2charstring(tmpstr, unicode_str, sizeof(tmpstr)) || !mtp_property_filename_is_valid(tmpstr) )
+					return MTP_RESPONSE_INVALID_OBJECT_PROP_VALUE;
+
+				memset(&fileinfo, 0, sizeof(fileinfo));
+				strncpy(fileinfo.filename, tmpstr, FS_HANDLE_MAX_FILENAME_SIZE);
+				fileinfo.filename[FS_HANDLE_MAX_FILENAME_SIZE] = 0;
+				existing_entry = search_entry(ctx->fs_db, &fileinfo, entry->parent, entry->storage_id);
+				if( existing_entry && (existing_entry != entry) )
+					return MTP_RESPONSE_ACCESS_DENIED;
+
 				path = build_full_path(ctx->fs_db, mtp_get_storage_root(ctx, entry->storage_id), entry);
 				if(!path)
 					return MTP_RESPONSE_GENERAL_ERROR;
 
-				memset(tmpstr,0,sizeof(tmpstr));
-
-				stringlen = peek(mtp_packet_hdr, sizeof(MTP_PACKET_HEADER), 1);
-
-				if( stringlen > sizeof(tmpstr))
-					stringlen = sizeof(tmpstr);
-
-				unicode2charstring(tmpstr, (uint16_t *) ((char*)(mtp_packet_hdr) + sizeof(MTP_PACKET_HEADER) + 1), sizeof(tmpstr));
-				tmpstr[ sizeof(tmpstr) - 1 ] = 0;
-
-				old_filename = entry->name;
-
-				entry->name = malloc(strlen(tmpstr)+1);
-				if( entry->name )
-				{
-					strcpy(entry->name,tmpstr);
-				}
-				else
-				{
-					entry->name = old_filename;
-					return MTP_RESPONSE_GENERAL_ERROR;
-				}
+				strncpy(old_filename, entry->name, FS_HANDLE_MAX_FILENAME_SIZE);
+				old_filename[FS_HANDLE_MAX_FILENAME_SIZE] = '\0';
+				strncpy(entry->name, tmpstr, FS_HANDLE_MAX_FILENAME_SIZE);
+				entry->name[FS_HANDLE_MAX_FILENAME_SIZE] = '\0';
 
 				path2 = build_full_path(ctx->fs_db, mtp_get_storage_root(ctx, entry->storage_id), entry);
 				if(!path2)
 				{
-					if( old_filename )
-					{
-						if(entry->name)
-							free(entry->name);
-
-						entry->name = old_filename;
-					}
-
+					strcpy(entry->name, old_filename);
 					free(path);
 					return MTP_RESPONSE_GENERAL_ERROR;
+				}
+				if( strcmp(path, path2) && !stat(path2, &target_stat) )
+				{
+					strcpy(entry->name, old_filename);
+					free(path);
+					free(path2);
+					return MTP_RESPONSE_ACCESS_DENIED;
 				}
 
 				ret = -1;
@@ -527,13 +557,7 @@ int setObjectPropValue(mtp_ctx * ctx,MTP_PACKET_HEADER * mtp_packet_hdr, uint32_
 				{
 					PRINT_ERROR("setObjectPropValue : Can't rename %s to %s", path, path2);
 
-					if( old_filename )
-					{
-						if(entry->name)
-							free(entry->name);
-
-						entry->name = old_filename;
-					}
+					strcpy(entry->name, old_filename);
 
 					free(path);
 					free(path2);
@@ -542,6 +566,8 @@ int setObjectPropValue(mtp_ctx * ctx,MTP_PACKET_HEADER * mtp_packet_hdr, uint32_
 
 				free(path);
 				free(path2);
+				fs_rebuild_entry_cache(ctx->fs_db);
+				fs_invalidate_scan_cache(ctx->fs_db);
 				return MTP_RESPONSE_OK;
 			break;
 
@@ -625,7 +651,7 @@ int build_ObjectPropValue_dataset(mtp_ctx * ctx,void * buffer, int maxsize,uint3
 
 			case MTP_PROPERTY_DATE_CREATED:
 			case MTP_PROPERTY_DATE_MODIFIED:
-				snprintf(timestr,sizeof(timestr),"%.4d%.2d%.2dT%.2d%.2d%.2d",1900 + 110, 1, 2, 10, 11,12);
+				mtp_format_entry_date(entry->date, entry->fat_date, entry->fat_time, timestr, sizeof(timestr));
 				ofs = poke_string(buffer, ofs, maxsize, timestr);
 			break;
 
@@ -673,162 +699,268 @@ int build_DevicePropValue_dataset(mtp_ctx * ctx,void * buffer, int maxsize,uint3
 	return ofs;
 }
 
-int objectproplist_element(mtp_ctx * ctx, void * buffer, int * ofs, int maxsize, uint16_t prop_code, uint32_t handle, void * data,uint32_t prop_code_param)
+static const uint16_t objectproplist_props[] =
 {
+	MTP_PROPERTY_STORAGE_ID,
+	MTP_PROPERTY_OBJECT_FORMAT,
+	MTP_PROPERTY_ASSOCIATION_TYPE,
+	MTP_PROPERTY_PROTECTION_STATUS,
+	MTP_PROPERTY_OBJECT_SIZE,
+	MTP_PROPERTY_OBJECT_FILE_NAME,
+	MTP_PROPERTY_DATE_MODIFIED,
+	MTP_PROPERTY_PARENT_OBJECT,
+	MTP_PROPERTY_PERSISTENT_UID,
+	MTP_PROPERTY_NAME,
+	MTP_PROPERTY_DISPLAY_NAME,
+	MTP_PROPERTY_DATE_CREATED,
+	0xFFFF
+};
+
+static int objectproplist_string_size(const char * str)
+{
+	char unicode[512];
+	int length;
+
+	if( !str || !str[0] )
+		return 1;
+
+	length = char2unicodestring(unicode, 0, sizeof(unicode), (char *)str, 255);
+	if( (length < 0) || (length > ((INT_MAX - 1) / 2)) )
+		return -1;
+
+	return 1 + (length * 2);
+}
+
+static int objectproplist_append_element(void * buffer, int ofs, int maxsize, uint32_t handle, uint16_t prop_code, uint16_t data_type, const void * data)
+{
+	const uint32_t * words;
+	const uint64_t * qword;
+	int value_size;
 	int i;
-	uint64_t tmp_data[2];
-	void * tmp_ptr;
 
-	if( !ofs )
-		return 0;
-
-	tmp_data[0] = 0;
-	tmp_data[1] = 0;
-
-	if( data )
-		tmp_ptr = data;
-	else
-		tmp_ptr = (void*)&tmp_data;
-
-	if( (prop_code != prop_code_param) && (prop_code_param != 0xFFFFFFFF) )
+	if( !buffer )
 	{
-		return 0;
-	}
-
-	i = 0;
-	while(properties[i].prop_code != 0xFFFF && properties[i].prop_code != prop_code)
-	{
-		i++;
-	}
-
-	if( properties[i].prop_code == prop_code )
-	{
-		*ofs = poke32(buffer, *ofs, maxsize, handle);
-		*ofs = poke16(buffer, *ofs, maxsize, properties[i].prop_code);
-		*ofs = poke16(buffer, *ofs, maxsize, properties[i].data_type);
-		switch(properties[i].data_type)
+		switch(data_type)
 		{
 			case MTP_TYPE_STR:
-				*ofs = poke_string(buffer, *ofs, maxsize, (char*)tmp_ptr);
+				value_size = objectproplist_string_size(data ? (const char *)data : "");
 			break;
-			case MTP_TYPE_UINT8:
-				*ofs = poke08(buffer, *ofs, maxsize, *((uint8_t*)tmp_ptr));
-			break;
+
 			case MTP_TYPE_UINT16:
-				*ofs = poke16(buffer, *ofs, maxsize, *((uint16_t*)tmp_ptr));
+				value_size = 2;
 			break;
+
 			case MTP_TYPE_UINT32:
-				*ofs = poke32(buffer, *ofs, maxsize, *((uint32_t*)tmp_ptr));
+				value_size = 4;
 			break;
+
 			case MTP_TYPE_UINT64:
-				*ofs = poke32(buffer, *ofs, maxsize, *((uint64_t*)tmp_ptr) & 0xFFFFFFFF);
-				*ofs = poke32(buffer, *ofs, maxsize, *((uint64_t*)tmp_ptr) >> 32);
+				value_size = 8;
 			break;
+
 			case MTP_TYPE_UINT128:
-				for(i=0;i<4;i++)
-				{
-					*ofs = poke32(buffer, *ofs, maxsize, *((uint32_t*)tmp_ptr)+i);
-				}
+				value_size = 16;
 			break;
+
 			default:
-				PRINT_ERROR("objectproplist_element : Unsupported data type : 0x%.4X", properties[i].data_type );
-			break;
+				return -1;
 		}
 
+		if( (value_size < 0) || (ofs > (INT_MAX - 8 - value_size)) )
+			return -1;
+		return ofs + 8 + value_size;
+	}
+
+	ofs = poke32(buffer, ofs, maxsize, handle);
+	ofs = poke16(buffer, ofs, maxsize, prop_code);
+	ofs = poke16(buffer, ofs, maxsize, data_type);
+	if( ofs < 0 )
+		return -1;
+
+	switch(data_type)
+	{
+		case MTP_TYPE_STR:
+			return poke_string(buffer, ofs, maxsize, data ? (const char *)data : "");
+
+		case MTP_TYPE_UINT16:
+			return poke16(buffer, ofs, maxsize, data ? *((const uint16_t *)data) : 0);
+
+		case MTP_TYPE_UINT32:
+			return poke32(buffer, ofs, maxsize, data ? *((const uint32_t *)data) : 0);
+
+		case MTP_TYPE_UINT64:
+			qword = (const uint64_t *)data;
+			ofs = poke32(buffer, ofs, maxsize, qword ? (uint32_t)(*qword) : 0);
+			return poke32(buffer, ofs, maxsize, qword ? (uint32_t)(*qword >> 32) : 0);
+
+		case MTP_TYPE_UINT128:
+			words = (const uint32_t *)data;
+			for(i = 0; i < 4; i++)
+			{
+				ofs = poke32(buffer, ofs, maxsize, words ? words[i] : 0);
+				if( ofs < 0 )
+					return -1;
+			}
+			return ofs;
+
+		default:
+			return -1;
+	}
+}
+
+static int objectproplist_append_property(void * buffer, int * ofs, int maxsize, fs_entry * entry, uint16_t prop_code, uint32_t requested_prop, const char * date_string, int * numberofelements)
+{
+	uint16_t format;
+	uint16_t association_type;
+	uint16_t protection_status;
+	uint32_t persistent_uid[4];
+	int next_ofs;
+
+	if( (requested_prop != 0xFFFFFFFFU) && (requested_prop != prop_code) )
+		return 0;
+
+	format = (entry->flags & ENTRY_IS_DIR) ? MTP_FORMAT_ASSOCIATION : MTP_FORMAT_UNDEFINED;
+	association_type = (entry->flags & ENTRY_IS_DIR) ? MTP_ASSOCIATION_TYPE_GENERIC_FOLDER : 0;
+	protection_status = 0;
+	persistent_uid[0] = entry->handle;
+	persistent_uid[1] = entry->parent;
+	persistent_uid[2] = entry->storage_id;
+	persistent_uid[3] = 0;
+
+	switch(prop_code)
+	{
+		case MTP_PROPERTY_STORAGE_ID:
+			next_ofs = objectproplist_append_element(buffer, *ofs, maxsize, entry->handle, prop_code, MTP_TYPE_UINT32, &entry->storage_id);
+		break;
+
+		case MTP_PROPERTY_OBJECT_FORMAT:
+			next_ofs = objectproplist_append_element(buffer, *ofs, maxsize, entry->handle, prop_code, MTP_TYPE_UINT16, &format);
+		break;
+
+		case MTP_PROPERTY_PROTECTION_STATUS:
+			next_ofs = objectproplist_append_element(buffer, *ofs, maxsize, entry->handle, prop_code, MTP_TYPE_UINT16, &protection_status);
+		break;
+
+		case MTP_PROPERTY_OBJECT_SIZE:
+			next_ofs = objectproplist_append_element(buffer, *ofs, maxsize, entry->handle, prop_code, MTP_TYPE_UINT64, &entry->size);
+		break;
+
+		case MTP_PROPERTY_ASSOCIATION_TYPE:
+			next_ofs = objectproplist_append_element(buffer, *ofs, maxsize, entry->handle, prop_code, MTP_TYPE_UINT16, &association_type);
+		break;
+
+		case MTP_PROPERTY_OBJECT_FILE_NAME:
+		case MTP_PROPERTY_NAME:
+			next_ofs = objectproplist_append_element(buffer, *ofs, maxsize, entry->handle, prop_code, MTP_TYPE_STR, entry->name);
+		break;
+
+		case MTP_PROPERTY_DISPLAY_NAME:
+			next_ofs = objectproplist_append_element(buffer, *ofs, maxsize, entry->handle, prop_code, MTP_TYPE_STR, "");
+		break;
+
+		case MTP_PROPERTY_DATE_CREATED:
+		case MTP_PROPERTY_DATE_MODIFIED:
+			next_ofs = objectproplist_append_element(buffer, *ofs, maxsize, entry->handle, prop_code, MTP_TYPE_STR, date_string ? date_string : "20100101T000000");
+		break;
+
+		case MTP_PROPERTY_PARENT_OBJECT:
+			next_ofs = objectproplist_append_element(buffer, *ofs, maxsize, entry->handle, prop_code, MTP_TYPE_UINT32, &entry->parent);
+		break;
+
+		case MTP_PROPERTY_PERSISTENT_UID:
+			next_ofs = objectproplist_append_element(buffer, *ofs, maxsize, entry->handle, prop_code, MTP_TYPE_UINT128, persistent_uid);
+		break;
+
+		default:
+			return 0;
+	}
+
+	if( next_ofs < 0 )
+		return -1;
+
+	*ofs = next_ofs;
+	(*numberofelements)++;
+	return 0;
+}
+
+int objectproplist_property_supported(uint32_t prop_code)
+{
+	int i;
+
+	if( prop_code == MTP_PROPERTY_ASSOCIATION_TYPE )
 		return 1;
+
+	for(i = 0; objectproplist_props[i] != 0xFFFF; i++)
+	{
+		if( objectproplist_props[i] == prop_code )
+			return 1;
 	}
 
 	return 0;
 }
 
+int build_objectproplist_entry(mtp_ctx * ctx, void * buffer, int maxsize, fs_entry * entry, uint32_t prop_code, int * numberofelements)
+{
+	int i;
+	int ofs;
+	int elements;
+	char timestr[32];
+	const char * date_string;
+
+	(void)ctx;
+	if( !entry || !numberofelements )
+		return -1;
+
+	ofs = 0;
+	elements = 0;
+	date_string = NULL;
+	if( buffer && ((prop_code == 0xFFFFFFFFU) ||
+		(prop_code == MTP_PROPERTY_DATE_CREATED) ||
+		(prop_code == MTP_PROPERTY_DATE_MODIFIED)) )
+	{
+		mtp_format_entry_date(entry->date, entry->fat_date, entry->fat_time, timestr, sizeof(timestr));
+		date_string = timestr;
+	}
+	if( prop_code == 0xFFFFFFFFU )
+	{
+		for(i = 0; objectproplist_props[i] != 0xFFFF; i++)
+		{
+			if( objectproplist_append_property(buffer, &ofs, maxsize, entry, objectproplist_props[i], prop_code, date_string, &elements) )
+				return -1;
+		}
+	}
+	else if( objectproplist_append_property(buffer, &ofs, maxsize, entry, (uint16_t)prop_code, prop_code, date_string, &elements) )
+	{
+		return -1;
+	}
+
+	*numberofelements = elements;
+	return ofs;
+}
+
 int build_objectproplist_dataset(mtp_ctx * ctx, void * buffer, int maxsize,fs_entry * entry, uint32_t handle,uint32_t format_id, uint32_t prop_code, uint32_t prop_group_code, uint32_t depth)
 {
-	struct stat64 entrystat;
-	time_t t;
-	struct tm lt;
-	int ofs,ret,numberofelements;
-	char * path;
-	char timestr[32];
-	// tmp_dword : 2 dword to fix the static analysis error with the MTP_TYPE_UINT64 case.
-	// Probably a false positive alert
-	// but some codes was added to check possible second word corruption
-	uint32_t tmp_dword[2];
-	uint32_t tmp_dword_array[4];
+	int ofs;
+	int numberofelements;
+	int entry_size;
 
-	tmp_dword[1] = 0xDEADBEEF;  // Canary
+	(void)handle;
+	(void)format_id;
+	(void)prop_group_code;
+	(void)depth;
+	if( !buffer || (maxsize <= (int)sizeof(uint32_t)) )
+		return -1;
 
-	ret = -1;
-	path = build_full_path(ctx->fs_db, mtp_get_storage_root(ctx, entry->storage_id), entry);
+	ofs = poke32(buffer, 0, maxsize, 0);
+	if( ofs < 0 )
+		return -1;
 
-	if(path)
-	{
-		ret = stat64(path, &entrystat);
-	}
+	entry_size = build_objectproplist_entry(ctx, (unsigned char *)buffer + ofs, maxsize - ofs, entry, prop_code, &numberofelements);
+	if( entry_size < 0 )
+		return -1;
 
-	if(ret)
-	{
-		if(path)
-			free(path);
-		return 0;
-	}
+	if( poke32(buffer, 0, maxsize, numberofelements) < 0 )
+		return -1;
 
-	/* update the file size infomation */
-	entry->size = entrystat.st_size;
-
-	numberofelements = 0;
-
-	ofs = poke32(buffer, 0, maxsize, numberofelements);   // Number of elements
-
-	numberofelements += objectproplist_element(ctx, buffer, &ofs, maxsize, MTP_PROPERTY_STORAGE_ID, handle, &entry->storage_id,prop_code);
-
-	if(entry->flags & ENTRY_IS_DIR)
-		tmp_dword[0] = MTP_FORMAT_ASSOCIATION;
-	else
-		tmp_dword[0] = MTP_FORMAT_UNDEFINED;
-
-	numberofelements += objectproplist_element(ctx, buffer, &ofs, maxsize, MTP_PROPERTY_OBJECT_FORMAT, handle, &tmp_dword[0],prop_code);
-
-	if(entry->flags & ENTRY_IS_DIR)
-		tmp_dword[0] = MTP_ASSOCIATION_TYPE_GENERIC_FOLDER;
-	else
-		tmp_dword[0] = 0x0000;
-
-	numberofelements += objectproplist_element(ctx, buffer, &ofs, maxsize, MTP_PROPERTY_ASSOCIATION_TYPE, handle, &tmp_dword[0],prop_code);
-	numberofelements += objectproplist_element(ctx, buffer, &ofs, maxsize, MTP_PROPERTY_PARENT_OBJECT, handle, &entry->parent,prop_code);
-	numberofelements += objectproplist_element(ctx, buffer, &ofs, maxsize, MTP_PROPERTY_OBJECT_SIZE, handle, &entry->size,prop_code);
-
-	tmp_dword[0] = 0x0000;
-	numberofelements += objectproplist_element(ctx, buffer, &ofs, maxsize, MTP_PROPERTY_PROTECTION_STATUS, handle, &tmp_dword[0],prop_code);
-
-	numberofelements += objectproplist_element(ctx, buffer, &ofs, maxsize, MTP_PROPERTY_OBJECT_FILE_NAME, handle, entry->name,prop_code);
-	numberofelements += objectproplist_element(ctx, buffer, &ofs, maxsize, MTP_PROPERTY_NAME, handle, entry->name,prop_code);
-	numberofelements += objectproplist_element(ctx, buffer, &ofs, maxsize, MTP_PROPERTY_DISPLAY_NAME, handle, 0,prop_code);
-
-	// Date Created (NR) "YYYYMMDDThhmmss.s"
-	set_default_date(&lt);
-	t = entrystat.st_mtime;
-	localtime_r(&t, &lt);
-	snprintf(timestr,sizeof(timestr),"%.4d%.2d%.2dT%.2d%.2d%.2d",1900 + lt.tm_year, lt.tm_mon + 1, lt.tm_mday, lt.tm_hour, lt.tm_min, lt.tm_sec);
-	numberofelements += objectproplist_element(ctx, buffer, &ofs, maxsize, MTP_PROPERTY_DATE_CREATED, handle, &timestr,prop_code);
-
-	// Date Modified (NR) "YYYYMMDDThhmmss.s"
-	set_default_date(&lt);
-	t = entrystat.st_mtime;
-	localtime_r(&t, &lt);
-	snprintf(timestr,sizeof(timestr),"%.4d%.2d%.2dT%.2d%.2d%.2d",1900 + lt.tm_year, lt.tm_mon + 1, lt.tm_mday, lt.tm_hour, lt.tm_min, lt.tm_sec);
-	numberofelements += objectproplist_element(ctx, buffer, &ofs, maxsize, MTP_PROPERTY_DATE_MODIFIED, handle, &timestr,prop_code);
-
-	tmp_dword_array[0] = entry->handle;
-	tmp_dword_array[1] = entry->parent;
-	tmp_dword_array[2] = entry->storage_id;
-	tmp_dword_array[3] = 0x00000000;
-	numberofelements += objectproplist_element(ctx, buffer, &ofs, maxsize, MTP_PROPERTY_PERSISTENT_UID, handle, &tmp_dword_array,prop_code);
-
-	poke32(buffer, 0, maxsize, numberofelements);   // Number of elements
-
-	if( tmp_dword[1] != 0xDEADBEEF )
-	{
-		PRINT_ERROR("build_objectproplist_dataset : second dword modified ! Please report ! (0x%.8X)", tmp_dword[1] );
-	}
-	return ofs;
+	return ofs + entry_size;
 }

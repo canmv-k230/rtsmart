@@ -39,7 +39,7 @@
 
 uint32_t mtp_op_GetStorageIDs(mtp_ctx * ctx,MTP_PACKET_HEADER * mtp_packet_hdr, int * size,uint32_t * ret_params, int * ret_params_size)
 {
-	int ofs,i,cnt;
+	int ofs,i,cnt,transfer_status;
 
 	if(!ctx->fs_db)
 		return MTP_RESPONSE_SESSION_NOT_OPEN;
@@ -71,9 +71,9 @@ uint32_t mtp_op_GetStorageIDs(mtp_ctx * ctx,MTP_PACKET_HEADER * mtp_packet_hdr, 
 	PRINT_DEBUG("MTP_OPERATION_GET_STORAGE_IDS response (%d Bytes):",ofs);
 	PRINT_DEBUG_BUF(ctx->wrbuffer, ofs);
 
-	write_usb(ctx->usb_ctx,EP_DESCRIPTOR_IN,ctx->wrbuffer,ofs);
-
-	check_and_send_USB_ZLP(ctx , ofs );
+	transfer_status = mtp_send_data_response(ctx, ofs);
+	if( transfer_status < 0 )
+		return transfer_status == -2 ? MTP_RESPONSE_NO_RESPONSE : MTP_RESPONSE_GENERAL_ERROR;
 
 	*size = ofs;
 

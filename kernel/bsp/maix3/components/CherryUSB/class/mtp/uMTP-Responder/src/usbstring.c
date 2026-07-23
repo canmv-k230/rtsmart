@@ -227,7 +227,7 @@ int char2unicodestring(char * unicodestr, int index, int maxsize, char * str, in
 		unicode = utf2unicode((unsigned char*)str, &ofs);
 		str = str + ofs;
 
-		if(index + 2 >= maxsize)
+		if(index + 2 > maxsize)
 			return -1;
 
 		unicodestr[index++] = unicode & 0xFF;

@@ -43,13 +43,13 @@ uint32_t mtp_op_GetDevicePropDesc(mtp_ctx * ctx,MTP_PACKET_HEADER * mtp_packet_h
 {
 	uint32_t property_id;
 	uint32_t response_code;
-	int sz,tmp_sz;
+	int sz,tmp_sz,transfer_status;
 
 	if(!ctx->fs_db)
 		return MTP_RESPONSE_SESSION_NOT_OPEN;
 
 	if( pthread_mutex_lock( &ctx->inotify_mutex ) )
-		goto error;
+		return MTP_RESPONSE_GENERAL_ERROR;
 
 	property_id = peek(mtp_packet_hdr, sizeof(MTP_PACKET_HEADER), 4);  // Get param 1 - property id
 
@@ -71,9 +71,12 @@ uint32_t mtp_op_GetDevicePropDesc(mtp_ctx * ctx,MTP_PACKET_HEADER * mtp_packet_h
 		PRINT_DEBUG("MTP_OPERATION_GET_DEVICE_PROP_DESC response (%d Bytes):",sz);
 		PRINT_DEBUG_BUF(ctx->wrbuffer, sz);
 
-		write_usb(ctx->usb_ctx,EP_DESCRIPTOR_IN,ctx->wrbuffer,sz);
-
-		check_and_send_USB_ZLP(ctx , sz );
+		transfer_status = mtp_send_data_response(ctx, sz);
+		if( transfer_status < 0 )
+		{
+			pthread_mutex_unlock( &ctx->inotify_mutex );
+			return transfer_status == -2 ? MTP_RESPONSE_NO_RESPONSE : MTP_RESPONSE_GENERAL_ERROR;
+		}
 
 		*size = sz;
 

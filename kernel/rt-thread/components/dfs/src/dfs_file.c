@@ -26,12 +26,9 @@ struct dfs_fnode_mgr
 
 static struct dfs_fnode_mgr dfs_fm;
 
-unsigned char dfs_fs_change;
-
 #if defined (CHERRY_USB_DEVICE_ENABLE_CLASS_MTP)
-#define mtp_ctx void
 #include "inotify.h"
-extern const struct dfs_filesystem_ops dfs_elm;
+#define DFS_F_MTP_DIRTY 0x10000000U
 #endif
 
 void dfs_fm_lock(void)
@@ -143,6 +140,7 @@ int dfs_file_open(struct dfs_fd *fd, const char *path, int flags)
     struct dfs_filesystem *fs;
     char *fullpath;
     int result;
+    int fnode_locked = 1;
     struct dfs_fnode *fnode = NULL;
     rt_list_t *hash_head;
 
@@ -166,10 +164,6 @@ int dfs_file_open(struct dfs_fd *fd, const char *path, int flags)
 
     dfs_fm_lock();
 
-#if defined (CHERRY_USB_DEVICE_ENABLE_CLASS_MTP)
-    dfs_fs_change = 0;
-#endif // CHERRY_USB_DEVICE_ENABLE_CLASS_MTP
-
     /* fnode find */
     fnode = dfs_fnode_find(fullpath, &hash_head);
     if (fnode)
@@ -178,7 +172,9 @@ int dfs_file_open(struct dfs_fd *fd, const char *path, int flags)
         fd->pos   = 0;
         fd->fnode = fnode;
         dfs_fm_unlock();
+        fnode_locked = 0;
         rt_free(fullpath); /* release path */
+        fullpath = NULL;
     }
     else
     {
@@ -248,6 +244,14 @@ int dfs_file_open(struct dfs_fd *fd, const char *path, int flags)
 
     if ((result = fnode->fops->open(fd)) < 0)
     {
+        LOG_D("%s open failed", path);
+
+        if (!fnode_locked)
+        {
+            dfs_fm_lock();
+            fnode_locked = 1;
+        }
+
         fnode->ref_count--;
         if (fnode->ref_count == 0)
         {
@@ -259,12 +263,13 @@ int dfs_file_open(struct dfs_fd *fd, const char *path, int flags)
                 rt_free(fnode->fullpath);
             }
             rt_free(fnode->path);
-            fd->fnode = NULL;
             rt_free(fnode);
         }
 
-        dfs_fm_unlock();
-        LOG_D("%s open failed", fullpath);
+        fd->fnode = NULL;
+
+        if (fnode_locked)
+            dfs_fm_unlock();
 
         return result;
     }
@@ -277,14 +282,20 @@ int dfs_file_open(struct dfs_fd *fd, const char *path, int flags)
     }
 
 #if defined (CHERRY_USB_DEVICE_ENABLE_CLASS_MTP)
-    if (dfs_fs_change)
+    if (flags & O_TRUNC)
+    {
+        notify_type = NTY_FILE_CHG;
+        notify_path = rt_strdup(fnode->fullpath);
+    }
+    else if (flags & O_CREAT)
     {
         notify_type = NTY_FILE_ADD;
-        notify_path = rt_strdup(fullpath);
+        notify_path = rt_strdup(fnode->fullpath);
     }
 #endif // CHERRY_USB_DEVICE_ENABLE_CLASS_MTP
 
-    dfs_fm_unlock();
+    if (fnode_locked)
+        dfs_fm_unlock();
 
 #if defined (CHERRY_USB_DEVICE_ENABLE_CLASS_MTP)
     if (notify_type && notify_path)
@@ -324,10 +335,6 @@ int dfs_file_close(struct dfs_fd *fd)
     {
         dfs_fm_lock();
 
-#if defined (CHERRY_USB_DEVICE_ENABLE_CLASS_MTP)
-        dfs_fs_change = 0;
-#endif // CHERRY_USB_DEVICE_ENABLE_CLASS_MTP
-
         fnode = fd->fnode;
 
         if (fnode->ref_count <= 0)
@@ -349,10 +356,11 @@ int dfs_file_close(struct dfs_fd *fd)
         }
 
 #if defined (CHERRY_USB_DEVICE_ENABLE_CLASS_MTP)
-        if (dfs_fs_change)
+        if (fd->flags & DFS_F_MTP_DIRTY)
         {
             notify_type = NTY_FILE_CHG;
-            notify_path = rt_strdup(fd->fnode->fullpath);
+            notify_path = rt_strdup(fnode->fullpath);
+            fd->flags &= ~DFS_F_MTP_DIRTY;
         }
 #endif // CHERRY_USB_DEVICE_ENABLE_CLASS_MTP
 
@@ -481,6 +489,13 @@ int dfs_file_getdents(struct dfs_fd *fd, struct dirent *dirp, size_t nbytes)
         return -EINVAL;
     }
 
+    if (dirp == NULL)
+    {
+        return -EINVAL;
+    }
+
+    rt_memset(dirp, 0, nbytes);
+
     if (fd->fnode->fops->getdents != NULL)
     {
         return fd->fnode->fops->getdents(fd, dirp, nbytes);
@@ -539,7 +554,7 @@ int dfs_file_unlink(const char *path)
 
 __exit:
 #if defined (CHERRY_USB_DEVICE_ENABLE_CLASS_MTP)
-    if (result == 0 && fs->ops == &dfs_elm)
+    if (result == 0)
         inotify_handler_filechange(NTY_FILE_RM, fullpath);
 #endif // CHERRY_USB_DEVICE_ENABLE_CLASS_MTP
 
@@ -558,6 +573,8 @@ __exit:
  */
 int dfs_file_write(struct dfs_fd *fd, const void *buf, size_t len)
 {
+    int result;
+
     if (fd == NULL)
     {
         return -EINVAL;
@@ -568,7 +585,14 @@ int dfs_file_write(struct dfs_fd *fd, const void *buf, size_t len)
         return -ENOSYS;
     }
 
-    return fd->fnode->fops->write(fd, buf, len);
+    result = fd->fnode->fops->write(fd, buf, len);
+
+#if defined (CHERRY_USB_DEVICE_ENABLE_CLASS_MTP)
+    if ((result > 0) && (fd->fnode->type == FT_REGULAR))
+        fd->flags |= DFS_F_MTP_DIRTY;
+#endif // CHERRY_USB_DEVICE_ENABLE_CLASS_MTP
+
+    return result;
 }
 
 /**
@@ -580,34 +604,25 @@ int dfs_file_write(struct dfs_fd *fd, const void *buf, size_t len)
  */
 int dfs_file_flush(struct dfs_fd *fd)
 {
+    int result;
+
     if (fd == NULL)
         return -EINVAL;
 
     if (fd->fnode->fops->flush == NULL)
         return -ENOSYS;
 
+    result = fd->fnode->fops->flush(fd);
+
 #if defined (CHERRY_USB_DEVICE_ENABLE_CLASS_MTP)
-    if (fd->fnode->fs->ops == &dfs_elm) {
-        char *notify_path = RT_NULL;
-
-        dfs_fm_lock();
-        dfs_fs_change = 0;
-        int ret = fd->fnode->fops->flush(fd);
-        if (dfs_fs_change)
-            notify_path = rt_strdup(fd->fnode->fullpath);
-        dfs_fm_unlock();
-
-        if (notify_path)
-        {
-            inotify_handler_filechange(NTY_FILE_CHG, notify_path);
-            rt_free(notify_path);
-        }
-
-        return ret;
+    if ((result == 0) && (fd->flags & DFS_F_MTP_DIRTY))
+    {
+        fd->flags &= ~DFS_F_MTP_DIRTY;
+        inotify_handler_filechange(NTY_FILE_CHG, fd->fnode->fullpath);
     }
 #endif // CHERRY_USB_DEVICE_ENABLE_CLASS_MTP
 
-    return fd->fnode->fops->flush(fd);
+    return result;
 }
 
 /**
@@ -745,6 +760,12 @@ int dfs_file_rename(const char *oldpath, const char *newpath)
     oldfs = dfs_filesystem_lookup(oldfullpath);
     newfs = dfs_filesystem_lookup(newfullpath);
 
+    if ((oldfs == NULL) || (newfs == NULL))
+    {
+        result = -ENOENT;
+        goto __exit;
+    }
+
     if (oldfs == newfs)
     {
         if (oldfs->ops->rename == NULL)
@@ -769,7 +790,7 @@ int dfs_file_rename(const char *oldpath, const char *newpath)
 
 __exit:
 #if defined (CHERRY_USB_DEVICE_ENABLE_CLASS_MTP)
-    if (result == 0 && newfs->ops == &dfs_elm) {
+    if (result == 0) {
         inotify_handler_filechange(NTY_FILE_RM, oldfullpath);
         inotify_handler_filechange(NTY_FILE_ADD, newfullpath);
     }
@@ -812,7 +833,12 @@ int dfs_file_ftruncate(struct dfs_fd *fd, off_t length)
 
     /* update current size */
     if (result == 0)
+    {
         fd->fnode->size = length;
+#if defined (CHERRY_USB_DEVICE_ENABLE_CLASS_MTP)
+        inotify_handler_filechange(NTY_FILE_CHG, fd->fnode->fullpath);
+#endif // CHERRY_USB_DEVICE_ENABLE_CLASS_MTP
+    }
 
     return result;
 }
@@ -1178,4 +1204,3 @@ FINSH_FUNCTION_EXPORT(copy, copy file or dir)
 
 #endif
 /* @} */
-

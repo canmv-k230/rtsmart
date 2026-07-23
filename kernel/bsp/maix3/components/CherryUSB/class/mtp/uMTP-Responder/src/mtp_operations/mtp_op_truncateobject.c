@@ -29,6 +29,7 @@
 #include <pthread.h>
 #include <inttypes.h>
 #include <errno.h>
+#include <stdlib.h>
 
 #include "logs_out.h"
 
@@ -78,12 +79,15 @@ uint32_t mtp_op_TruncateObject(mtp_ctx * ctx,MTP_PACKET_HEADER * mtp_packet_hdr,
 			PRINT_DEBUG("Truncate file at 0x%"SIZEHEX" Bytes",offset);
 			if( !truncate64(full_path, offset) )
 			{
+				entry->size = offset;
+				fs_invalidate_scan_cache(ctx->fs_db);
 				response_code = MTP_RESPONSE_OK;
 			}
 			else
 			{
 				response_code = posix_to_mtp_errcode(errno);
 			}
+			free(full_path);
 		}
 	}
 	else

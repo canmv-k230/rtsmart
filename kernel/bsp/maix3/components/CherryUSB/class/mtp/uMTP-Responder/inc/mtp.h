@@ -29,6 +29,10 @@
 #define MAX_STORAGE_NB 4
 #define MAX_CFG_STRING_SIZE 128
 
+/* DWC2 bulk endpoint transfer limits. */
+#define MTP_USB_BULK_MAX_PACKET_COUNT   1023U
+#define MTP_USB_BULK_MAX_TRANSFER_SIZE  0x7FFFFU
+
 #pragma pack(1)
 
 typedef struct _MTP_PACKET_HEADER
@@ -43,6 +47,14 @@ typedef struct _MTP_PACKET_HEADER
 
 #include "fs_handles_db.h"
 #include "rtthread.h"
+
+#ifndef MTP_FS_DB_POOL_SIZE
+#ifdef CONFIG_MTP_FS_DB_POOL_SIZE
+#define MTP_FS_DB_POOL_SIZE CONFIG_MTP_FS_DB_POOL_SIZE
+#else
+#define MTP_FS_DB_POOL_SIZE CONFIG_FS_DB_POOL_SIZE
+#endif
+#endif
 
 #define pthread_mutex_t struct rt_mutex
 
@@ -105,6 +117,13 @@ typedef struct mtp_ctx_
 
 	unsigned char * read_file_buffer;
 	int read_file_buffer_size;
+	uint32_t fs_db_cache_buckets;
+	uint32_t fs_db_pool_size;
+	uint32_t fs_dir_read_buffer_size;
+	int fs_db_scan_cache;
+	volatile uint32_t fs_db_change_generation;
+	volatile uint32_t fs_db_session_generation;
+	uint32_t fs_db_session_counter;
 
 	uint32_t *temp_array;
 
@@ -138,7 +157,13 @@ typedef struct mtp_ctx_
 	int default_gid;
 
 	volatile int cancel_req;
+	volatile int cancel_status_pending;
+	volatile int reset_req;
 	volatile int transferring_file_data;
+	volatile int transaction_active;
+	volatile uint32_t active_transaction_id;
+	uint16_t pending_data_operation;
+	uint32_t pending_data_transaction_id;
 }mtp_ctx;
 
 mtp_ctx * mtp_init_responder();
@@ -165,9 +190,14 @@ void clear_edit_locks(fs_handles_db * db);
 int mtp_push_event(mtp_ctx * ctx, uint32_t event, int nbparams, uint32_t * parameters );
 
 void mtp_deinit_responder(mtp_ctx * ctx);
+uint32_t mtp_fs_db_session_begin(mtp_ctx * ctx);
+void mtp_fs_db_session_end(mtp_ctx * ctx);
+uint32_t mtp_fs_db_session_get(mtp_ctx * ctx);
 
 int build_response(mtp_ctx * ctx, uint32_t tx_id, uint16_t type, uint16_t status, void * buffer, int maxsize, void * datain,int size);
 int check_and_send_USB_ZLP(mtp_ctx * ctx , int size);
+int mtp_get_usb_bulk_transfer_limit(mtp_ctx * ctx);
+int mtp_send_data_response(mtp_ctx * ctx, int size);
 int parse_incomming_dataset(mtp_ctx * ctx,void * datain,int size,uint32_t * newhandle, uint32_t parent_handle, uint32_t storage_id);
 
 #define APP_VERSION "v1.6.6"
