@@ -103,6 +103,12 @@ ret_to_user_exit:
  */
 arch_signal_quit:
     call lwp_signal_restore
+    bnez a0, 1f
+    li a0, -1
+    call sys_exit
+0:
+    j 0b
+1:
     call arch_get_usp_from_uctx
     // return value is user sp
     mv sp, a0

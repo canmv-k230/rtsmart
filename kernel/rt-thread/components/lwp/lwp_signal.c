@@ -15,6 +15,10 @@
 #include "lwp_arch.h"
 #include "signal.h"
 
+#define DBG_TAG "LWP.signal"
+#define DBG_LVL DBG_WARNING
+#include <rtdbg.h>
+
 rt_inline void lwp_sigaddset(lwp_sigset_t *set, int _sig)
 {
     unsigned long sig = _sig - 1;
@@ -223,7 +227,7 @@ struct rt_user_context *lwp_signal_restore(void)
 {
     rt_base_t level;
     struct rt_thread *thread;
-    struct rt_user_context *ctx;
+    struct rt_user_context *ctx = RT_NULL;
 
     level = rt_hw_interrupt_disable();
     thread = rt_thread_self();
@@ -234,6 +238,12 @@ struct rt_user_context *lwp_signal_restore(void)
         thread->signal_mask = thread->signal_mask_bak[thread->signal_in_process];
     }
     rt_hw_interrupt_enable(level);
+
+    if (ctx == RT_NULL)
+    {
+        LOG_E("invalid sigreturn from thread %s: no active signal context", thread->name);
+    }
+
     return ctx;
 }
 
