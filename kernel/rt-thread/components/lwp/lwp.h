@@ -206,8 +206,10 @@ struct __pthread {
 #endif
 
 /* for futex op */
-#define FUTEX_WAIT  0
-#define FUTEX_WAKE  1
+#define FUTEX_WAIT          0
+#define FUTEX_WAKE          1
+#define FUTEX_REQUEUE       3
+#define FUTEX_PRIVATE_FLAG  128
 
 /* for pmutex op */
 #define PMUTEX_INIT    0

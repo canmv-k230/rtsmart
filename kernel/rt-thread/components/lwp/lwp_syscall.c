@@ -406,7 +406,6 @@ void sys_exit(int value)
     tid = rt_thread_self();
     lwp = (struct rt_lwp *)tid->lwp;
 
-    level = rt_hw_interrupt_disable();
 #ifdef ARCH_MM_MMU
     if (tid->clear_child_tid)
     {
@@ -417,6 +416,10 @@ void sys_exit(int value)
         lwp_put_to_user(clear_child_tid, &t, sizeof t);
         sys_futex(clear_child_tid, FUTEX_WAKE, 1, RT_NULL, RT_NULL, 0);
     }
+#endif
+
+    level = rt_hw_interrupt_disable();
+#ifdef ARCH_MM_MMU
     main_thread = rt_list_entry(lwp->t_grp.prev, struct rt_thread, sibling);
     if (main_thread == tid)
     {
@@ -1656,6 +1659,7 @@ long _sys_clone(void *arg[])
             self->init_tick);
     if (!thread)
     {
+        SET_ERRNO(ENOMEM);
         goto fail;
     }
 
@@ -4420,22 +4424,22 @@ int sys_sched_getparam(pid_t pid, void *param)
 
 int sys_sched_get_priority_max(int policy)
 {
-    if(policy < 0)
+    if (policy != SCHED_OTHER && policy != SCHED_FIFO && policy != SCHED_RR)
     {
         rt_set_errno(EINVAL);
         return -rt_get_errno();
     }
-    return RT_THREAD_PRIORITY_MAX;
+    return policy == SCHED_OTHER ? 0 : RT_THREAD_PRIORITY_MAX - 1;
 }
 
 int sys_sched_get_priority_min(int policy)
 {
-    if(policy < 0)
+    if (policy != SCHED_OTHER && policy != SCHED_FIFO && policy != SCHED_RR)
     {
         rt_set_errno(EINVAL);
         return -rt_get_errno();
     }
-    return 0;
+    return policy == SCHED_OTHER ? 0 : 1;
 }
 
 int sys_sched_setscheduler(int tid, int policy, void *param)
@@ -4446,6 +4450,18 @@ int sys_sched_setscheduler(int tid, int policy, void *param)
     if (!lwp_user_accessable(param, sizeof(struct sched_param)))
     {
         return -EFAULT;
+    }
+    if (!thread)
+    {
+        return -ESRCH;
+    }
+    if ((policy != SCHED_OTHER && policy != SCHED_FIFO && policy != SCHED_RR) ||
+        (policy == SCHED_OTHER && sched_param->sched_priority != 0) ||
+        (policy != SCHED_OTHER &&
+         (sched_param->sched_priority < 1 ||
+          sched_param->sched_priority >= RT_THREAD_PRIORITY_MAX)))
+    {
+        return -EINVAL;
     }
     return rt_thread_control(thread, RT_THREAD_CTRL_CHANGE_PRIORITY, (void *)&sched_param->sched_priority);
 }

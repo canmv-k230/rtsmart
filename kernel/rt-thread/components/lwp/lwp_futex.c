@@ -52,7 +52,12 @@ static rt_tick_t futex_timeout_to_tick(const struct timespec *timeout)
     }
 
     tick = (rt_uint64_t)second_delta * RT_TICK_PER_SECOND;
-    tick += ((rt_uint64_t)nsecond_delta * RT_TICK_PER_SECOND) / NANOSECOND_PER_SECOND;
+    if (nsecond_delta > 0)
+    {
+        /* A relative futex timeout must not expire before its deadline. */
+        tick += ((rt_uint64_t)nsecond_delta * RT_TICK_PER_SECOND
+                 + NANOSECOND_PER_SECOND - 1) / NANOSECOND_PER_SECOND;
+    }
 
     if (tick > tick_max)
     {
@@ -152,7 +157,7 @@ int futex_wait(struct rt_futex *futex, int value, const struct timespec *timeout
             rt_mutex_release(&_futex_lock);
             rt_hw_interrupt_enable(level);
             rt_set_errno(EINTR);
-            return ret;
+            return -EINTR;
         }
 
         /* add into waiting thread list */
@@ -176,19 +181,35 @@ int futex_wait(struct rt_futex *futex, int value, const struct timespec *timeout
         rt_schedule();
 
         ret = thread->error;
-        /* check errno */
+        if (ret == -RT_ETIMEOUT)
+        {
+            rt_set_errno(ETIMEDOUT);
+            ret = -ETIMEDOUT;
+        }
+        else if (ret == -RT_EINTR)
+        {
+            rt_set_errno(EINTR);
+            ret = -EINTR;
+        }
+        else if (ret != RT_EOK)
+        {
+            rt_set_errno(EAGAIN);
+            ret = -EAGAIN;
+        }
     }
     else
     {
         rt_mutex_release(&_futex_lock);
+        ret = -EAGAIN;
         rt_set_errno(EAGAIN);
     }
 
     return ret;
 }
 
-void futex_wake(struct rt_futex *futex, int number)
+int futex_wake(struct rt_futex *futex, int number)
 {
+    int woken = 0;
     rt_base_t level = rt_hw_interrupt_disable();
     while (!rt_list_isempty(&(futex->waiting_thread)) && number)
     {
@@ -201,6 +222,7 @@ void futex_wake(struct rt_futex *futex, int number)
         thread->error = RT_EOK;
         /* resume the suspended thread */
         rt_thread_resume(thread);
+        woken++;
 
         number--;
     }
@@ -208,7 +230,12 @@ void futex_wake(struct rt_futex *futex, int number)
     rt_hw_interrupt_enable(level);
 
     /* do schedule */
-    rt_schedule();
+    if (woken)
+    {
+        rt_schedule();
+    }
+
+    return woken;
 }
 
 int sys_futex(int *uaddr, int op, int val, const struct timespec *timeout,
@@ -216,38 +243,67 @@ int sys_futex(int *uaddr, int op, int val, const struct timespec *timeout,
 {
     struct rt_lwp *lwp = RT_NULL;
     struct rt_futex *futex = RT_NULL;
+    int command = op & ~FUTEX_PRIVATE_FLAG;
     int ret = 0;
     rt_err_t lock_ret = 0;
 
     if (!lwp_user_accessable(uaddr, sizeof(int)))
     {
         rt_set_errno(EINVAL);
-        return -RT_EINVAL;
+        return -EINVAL;
     }
 
-    /** 
-     * if (op & (FUTEX_WAKE|FUTEX_FD|FUTEX_WAKE_BITSET|FUTEX_TRYLOCK_PI|FUTEX_UNLOCK_PI)) was TRUE
-     * `timeout` should be ignored by implementation, according to POSIX futex(2) manual.
-     * since only FUTEX_WAKE is implemented in rt-smart, only FUTEX_WAKE was omitted currently
-     */
-    if (timeout && !(op & (FUTEX_WAKE)))
+    if (command == FUTEX_WAIT && timeout)
     {
         if (!lwp_user_accessable((void *)timeout, sizeof(struct timespec)))
         {
             rt_set_errno(EINVAL);
-            return -RT_EINVAL;
+            return -EINVAL;
+        }
+        if (timeout->tv_sec < 0 || timeout->tv_nsec < 0 ||
+            timeout->tv_nsec >= NANOSECOND_PER_SECOND)
+        {
+            rt_set_errno(EINVAL);
+            return -EINVAL;
+        }
+    }
+    else if (command == FUTEX_REQUEUE)
+    {
+        /*
+         * musl uses (wake_count, requeue_count) == (0, 1) to hand a private
+         * condition-variable barrier to its mutex. RT-Smart mutexes wait on
+         * pmutex objects, so that one barrier waiter must be woken directly.
+         * Reject all other forms instead of pretending to provide the Linux
+         * FUTEX_REQUEUE ABI without moving waiters to uaddr2.
+         */
+        if (!(op & FUTEX_PRIVATE_FLAG) ||
+            val != 0 || (rt_base_t)timeout != 1)
+        {
+            rt_set_errno(ENOSYS);
+            return -ENOSYS;
+        }
+        if (uaddr2 == uaddr)
+        {
+            rt_set_errno(EINVAL);
+            return -EINVAL;
+        }
+        if (!lwp_user_accessable(uaddr2, sizeof(int)))
+        {
+            rt_set_errno(EFAULT);
+            return -EFAULT;
         }
     }
     lock_ret = rt_mutex_take_interruptible(&_futex_lock, RT_WAITING_FOREVER);
     if (lock_ret != RT_EOK)
     {
-        rt_set_errno(EAGAIN);
-        return -RT_EINTR;
+        rt_set_errno(EINTR);
+        return -EINTR;
     }
 
     lwp = lwp_self();
     futex = futex_get(uaddr, lwp);
-    if (futex == RT_NULL)
+
+    if (command == FUTEX_WAIT && futex == RT_NULL)
     {
         /* create a futex according to this uaddr */
         futex = futex_create(uaddr, lwp);
@@ -255,18 +311,18 @@ int sys_futex(int *uaddr, int op, int val, const struct timespec *timeout,
         {
             rt_mutex_release(&_futex_lock);
             rt_set_errno(ENOMEM);
-            return -RT_ENOMEM;
+            return -ENOMEM;
         }
         if (lwp_user_object_add(lwp, futex->custom_obj) != 0)
         {
             rt_custom_object_destroy(futex->custom_obj);
             rt_mutex_release(&_futex_lock);
             rt_set_errno(ENOMEM);
-            return -RT_ENOMEM;
+            return -ENOMEM;
         }
     }
 
-    switch (op)
+    switch (command)
     {
     case FUTEX_WAIT:
         ret = futex_wait(futex, val, timeout);
@@ -274,8 +330,27 @@ int sys_futex(int *uaddr, int op, int val, const struct timespec *timeout,
         break;
 
     case FUTEX_WAKE:
-        futex_wake(futex, val);
-        /* _futex_lock is released by futex_wake */
+        if (futex == RT_NULL)
+        {
+            rt_mutex_release(&_futex_lock);
+        }
+        else
+        {
+            ret = futex_wake(futex, val);
+            /* _futex_lock is released by futex_wake */
+        }
+        break;
+
+    case FUTEX_REQUEUE:
+        if (futex == RT_NULL)
+        {
+            rt_mutex_release(&_futex_lock);
+        }
+        else
+        {
+            ret = futex_wake(futex, 1);
+            /* _futex_lock is released by futex_wake */
+        }
         break;
 
     default:
