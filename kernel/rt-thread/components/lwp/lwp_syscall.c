@@ -4429,7 +4429,12 @@ int sys_sched_get_priority_max(int policy)
         rt_set_errno(EINVAL);
         return -rt_get_errno();
     }
-    return policy == SCHED_OTHER ? 0 : RT_THREAD_PRIORITY_MAX - 1;
+
+    /*
+     * Keep the native RT-Smart priority range for existing userspace that
+     * creates explicitly scheduled SCHED_OTHER threads with non-zero priority.
+     */
+    return RT_THREAD_PRIORITY_MAX - 1;
 }
 
 int sys_sched_get_priority_min(int policy)
@@ -4439,7 +4444,7 @@ int sys_sched_get_priority_min(int policy)
         rt_set_errno(EINVAL);
         return -rt_get_errno();
     }
-    return policy == SCHED_OTHER ? 0 : 1;
+    return 0;
 }
 
 int sys_sched_setscheduler(int tid, int policy, void *param)
@@ -4456,10 +4461,8 @@ int sys_sched_setscheduler(int tid, int policy, void *param)
         return -ESRCH;
     }
     if ((policy != SCHED_OTHER && policy != SCHED_FIFO && policy != SCHED_RR) ||
-        (policy == SCHED_OTHER && sched_param->sched_priority != 0) ||
-        (policy != SCHED_OTHER &&
-         (sched_param->sched_priority < 1 ||
-          sched_param->sched_priority >= RT_THREAD_PRIORITY_MAX)))
+        sched_param->sched_priority < 0 ||
+        sched_param->sched_priority >= RT_THREAD_PRIORITY_MAX)
     {
         return -EINVAL;
     }
