@@ -72,7 +72,8 @@ do {                                                                            
 
 #define SAL_NETDEV_IS_UP(netdev)                                                  \
 do {                                                                              \
-    if (!netdev_is_up(netdev)) {                                                  \
+    if ((netdev) == RT_NULL || !netdev_is_up(netdev)) {                           \
+        rt_set_errno(-ENETDOWN);                                                   \
         return -1;                                                                \
     }                                                                             \
 }while(0)                                                                         \
@@ -623,7 +624,6 @@ int sal_accept(int socket, struct sockaddr *addr, socklen_t *addrlen)
     new_socket = pf->skt_ops->accept((int)(size_t)sock->user_data, addr, addrlen);
     if (new_socket != -1)
     {
-        int retval;
         int new_sal_socket;
         struct sal_socket *new_sock;
 
@@ -636,18 +636,13 @@ int sal_accept(int socket, struct sockaddr *addr, socklen_t *addrlen)
             return -1;
         }
 
-        retval = socket_init(sock->domain, sock->type, sock->protocol, &new_sock);
-        if (retval < 0)
-        {
-            pf->skt_ops->closesocket(new_socket);
-            rt_memset(new_sock, 0x00, sizeof(struct sal_socket));
-            /* socket init failed, delete socket */
-            socket_delete(new_sal_socket);
-            LOG_E("New socket registered failed, return error %d.", retval);
-            return -1;
-        }
-
-        /* socket structure user_data used to store the acquired new socket */
+        /* An accepted socket belongs to the listener's interface. Re-selecting
+         * the current default interface is incorrect when several lwIP netifs
+         * (STA, AP, and LAN) are active at the same time. */
+        new_sock->domain = sock->domain;
+        new_sock->type = sock->type;
+        new_sock->protocol = sock->protocol;
+        new_sock->netdev = sock->netdev;
         new_sock->user_data = (void *)(size_t)new_socket;
 
         return new_sal_socket;
@@ -693,6 +688,7 @@ int sal_bind(int socket, const struct sockaddr *name, socklen_t namelen)
         new_netdev = netdev_get_by_ipaddr(&input_ipaddr);
         if (new_netdev == RT_NULL)
         {
+            rt_set_errno(-EADDRNOTAVAIL);
             return -1;
         }
 
@@ -705,17 +701,20 @@ int sal_bind(int socket, const struct sockaddr *name, socklen_t namelen)
         {
             int new_socket = -1;
 
-            /* protocol family is different, close old socket and create new socket by input ip address */
-            local_pf->skt_ops->closesocket(socket);
-
             new_socket = input_pf->skt_ops->socket(input_pf->family, sock->type, sock->protocol);
             if (new_socket < 0)
             {
                 return -1;
             }
-            sock->netdev = new_netdev;
+
+            /* protocol family is different, replace the underlying socket */
+            local_pf->skt_ops->closesocket((int)(size_t)sock->user_data);
             sock->user_data = (void *)(size_t)new_socket;
         }
+
+        /* Explicit binding selects this netdev even when multiple interfaces
+         * use the same lwIP protocol family. */
+        sock->netdev = new_netdev;
     }
 
     /* check and get protocol families by the network interface device */
@@ -1227,4 +1226,3 @@ void sal_freeaddrinfo(struct addrinfo *ai)
         }
     }
 }
-

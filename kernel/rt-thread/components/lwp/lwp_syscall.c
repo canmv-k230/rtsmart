@@ -2862,6 +2862,7 @@ int sys_accept(int socket, struct musl_sockaddr *addr, socklen_t *addrlen)
 
 int sys_bind(int socket, const struct musl_sockaddr *name, socklen_t namelen)
 {
+    int ret;
     struct sockaddr sa;
     struct musl_sockaddr kname;
 
@@ -2881,7 +2882,8 @@ int sys_bind(int socket, const struct musl_sockaddr *name, socklen_t namelen)
 
     sockaddr_tolwip(&kname, &sa);
 
-    return bind(socket, &sa, namelen);
+    ret = bind(socket, &sa, namelen);
+    return (ret < 0 ? GET_ERRNO() : ret);
 }
 
 int sys_shutdown(int socket, int how)

@@ -57,6 +57,7 @@ struct sk_buff {
 //----- ------------------------------------------------------------------
 int rltk_wlan_init(int idx_wlan, rtw_mode_t mode);				//return 0: success. -1:fail
 void rltk_wlan_deinit(void);
+void rltk_wlan_deinit_idx(int idx_wlan);
 void rltk_wlan_deinit_fastly(void);
 int rltk_wlan_start(int idx_wlan);
 void rltk_wlan_statistic(unsigned char idx);
@@ -68,6 +69,7 @@ int rltk_wlan_rf_off(void);
 int rltk_wlan_check_bus(void);
 int rltk_wlan_wireless_mode(unsigned char mode);
 int rltk_wlan_get_wireless_mode(unsigned char *pmode);
+int rltk_set_tx_power_percentage(unsigned char power_percentage_idx);
 int rltk_wlan_set_wps_phase(unsigned char is_trigger_wps);
 int rtw_ps_enable(int enable);
 int rltk_wlan_is_connected_to_ap(void);

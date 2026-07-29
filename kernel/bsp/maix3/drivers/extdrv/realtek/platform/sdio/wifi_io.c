@@ -34,21 +34,41 @@ static int rtt_sdio_disable_func(struct sdio_func* func)
 static void rtt_sdio_irq_handler(struct rt_sdio_function* rt_func)
 {
     struct sdio_func* func = sdio_get_drvdata(rt_func);
-    wifi_irq_handler(func);
+    void (*handler)(struct sdio_func*) = wifi_irq_handler;
+
+    if (handler != NULL)
+        handler(func);
 }
 
 static int rtt_sdio_claim_irq(struct sdio_func* func, void (*handler)(struct sdio_func*))
 {
+    int ret;
+
+    if (rtt_sdio_func == NULL || handler == NULL)
+        return -RT_EINVAL;
+
     wifi_irq_handler = handler;
-    int ret = sdio_attach_irq(rtt_sdio_func, rtt_sdio_irq_handler);
+    ret = sdio_attach_irq(rtt_sdio_func, rtt_sdio_irq_handler);
+    if (ret != RT_EOK) {
+        wifi_irq_handler = NULL;
+        return ret;
+    }
+
     rtt_sdio_func->card->host->ops->enable_sdio_irq(rtt_sdio_func->card->host, 1);
-    return ret;
+    return RT_EOK;
 }
 
 static int rtt_sdio_release_irq(struct sdio_func* func)
 {
+    int ret;
+
+    if (rtt_sdio_func == NULL)
+        return -RT_EINVAL;
+
+    ret = sdio_detach_irq(rtt_sdio_func);
     wifi_irq_handler = NULL;
-    return sdio_detach_irq(rtt_sdio_func);
+
+    return ret;
 }
 
 static void rtt_sdio_claim_host(struct sdio_func* func)
@@ -68,7 +88,7 @@ static unsigned char rtt_sdio_readb(struct sdio_func* func, unsigned int addr, i
 
 static unsigned short rtt_sdio_readw(struct sdio_func* func, unsigned int addr, int* err_ret)
 {
-    unsigned short data;
+    unsigned short data = 0;
     int ret = sdio_io_rw_extended_block(rtt_sdio_func, 0, addr, 1, (rt_uint8_t*)&data, sizeof(unsigned short));
     if (err_ret)
         *err_ret = ret;
@@ -77,7 +97,7 @@ static unsigned short rtt_sdio_readw(struct sdio_func* func, unsigned int addr, 
 
 static unsigned int rtt_sdio_readl(struct sdio_func* func, unsigned int addr, int* err_ret)
 {
-    unsigned int data;
+    unsigned int data = 0;
     int ret = sdio_io_rw_extended_block(rtt_sdio_func, 0, addr, 1, (rt_uint8_t*)&data, sizeof(unsigned int));
     if (err_ret)
         *err_ret = ret;

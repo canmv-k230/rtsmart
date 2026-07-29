@@ -360,18 +360,18 @@ static rt_err_t rt_wlan_lwip_protocol_recv(struct rt_wlan_device *wlan, void *bu
 static rt_err_t rt_wlan_lwip_protocol_send(rt_device_t device, struct pbuf *p)
 {
     struct rt_wlan_device *wlan = ((struct eth_device *)device)->parent.user_data;
+    rt_err_t ret;
 
     LOG_D("F:%s L:%d run", __FUNCTION__, __LINE__);
 
     if (wlan == RT_NULL)
     {
-        return RT_EOK;
+        return -RT_ERROR;
     }
 
 #ifdef RT_WLAN_PROT_LWIP_PBUF_FORCE
     {
-        rt_wlan_prot_transfer_dev(wlan, p, p->tot_len);
-        return RT_EOK;
+        return rt_wlan_prot_transfer_dev(wlan, p, p->tot_len);
     }
 #else
     {
@@ -381,9 +381,9 @@ static rt_err_t rt_wlan_lwip_protocol_send(rt_device_t device, struct pbuf *p)
         if (p->len == p->tot_len)
         {
             frame = (rt_uint8_t *)p->payload;
-            rt_wlan_prot_transfer_dev(wlan, frame, p->tot_len);
+            ret = rt_wlan_prot_transfer_dev(wlan, frame, p->tot_len);
             LOG_D("F:%s L:%d run len:%d", __FUNCTION__, __LINE__, p->tot_len);
-            return RT_EOK;
+            return ret;
         }
         frame = rt_malloc(p->tot_len);
         if (frame == RT_NULL)
@@ -394,10 +394,10 @@ static rt_err_t rt_wlan_lwip_protocol_send(rt_device_t device, struct pbuf *p)
         /*copy pbuf -> data dat*/
         pbuf_copy_partial(p, frame, p->tot_len, 0);
         /* send data */
-        rt_wlan_prot_transfer_dev(wlan, frame, p->tot_len);
+        ret = rt_wlan_prot_transfer_dev(wlan, frame, p->tot_len);
         LOG_D("F:%s L:%d run len:%d", __FUNCTION__, __LINE__, p->tot_len);
         rt_free(frame);
-        return RT_EOK;
+        return ret;
     }
 #endif
 }

@@ -16,6 +16,8 @@
 #ifndef __NET_STACK_INTF_H__
 #define __NET_STACK_INTF_H__
 
+#include <stdint.h>
+
 #ifdef	__cplusplus
 extern "C" {
 #endif
@@ -32,7 +34,7 @@ struct netif;
 #include "ethernetif.h" 
 #else
 struct eth_drv_sg {
-    unsigned int	buf;
+    uintptr_t       buf;
     unsigned int 	len;
 };
 #endif

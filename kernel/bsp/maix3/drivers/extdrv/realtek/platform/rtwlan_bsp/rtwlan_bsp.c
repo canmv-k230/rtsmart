@@ -1,4 +1,5 @@
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -8,6 +9,7 @@
 #include "drv_gpio.h"
 #include "card.h"
 #include "wifi/wifi_conf.h"
+#include "wifi/wifi_util.h"
 #include "net_stack_intf.h"
 #include "customer_rtos_service.h"
 
@@ -15,10 +17,13 @@ static rt_int32_t realtek_probe(struct rt_mmcsd_card* card);
 static rt_err_t wlan_get_mac(struct rt_wlan_device* wlan, rt_uint8_t mac[]);
 static void realtek_init_do(void);
 static void realtek_init_entry(void* parameter);
+static void wlan_log_tx_power(const char* ifname);
 
 struct sdio_func* wifi_sdio_func;
 struct rt_sdio_function* rtt_sdio_func;
 static struct rt_wlan_device wlan_sta, wlan_ap;
+static rt_bool_t wlan_sta_registered;
+static rt_bool_t wlan_ap_registered;
 
 void Set_WLAN_Power_On(void)
 {
@@ -30,6 +35,44 @@ void Set_WLAN_Power_Off(void)
 
 static rt_int32_t realtek_remove(struct rt_mmcsd_card* card)
 {
+    rt_int32_t ret = RT_EOK;
+    rt_int32_t err;
+
+    (void)card;
+
+    if (wifi_sdio_func != NULL) {
+        err = wifi_off();
+        if (err < 0)
+            return -RT_EIO;
+    }
+
+    if (wlan_ap_registered) {
+        if (wlan_ap.mode != RT_WLAN_NONE)
+            rt_wlan_set_mode(RT_WLAN_DEVICE_AP_NAME, RT_WLAN_NONE);
+        rt_device_unregister(&wlan_ap.device);
+        wlan_ap_registered = RT_FALSE;
+    }
+
+    if (wlan_sta_registered) {
+        if (wlan_sta.mode != RT_WLAN_NONE)
+            rt_wlan_set_mode(RT_WLAN_DEVICE_STA_NAME, RT_WLAN_NONE);
+        rt_device_unregister(&wlan_sta.device);
+        wlan_sta_registered = RT_FALSE;
+    }
+
+    if (rtt_sdio_func != NULL) {
+        sdio_set_drvdata(rtt_sdio_func, NULL);
+        err = sdio_disable_func(rtt_sdio_func);
+        if (err != RT_EOK && ret == RT_EOK)
+            ret = err;
+    }
+
+    rt_free(wifi_sdio_func);
+    wifi_sdio_func = NULL;
+    rtt_sdio_func = NULL;
+    Set_WLAN_Power_Off();
+
+    return ret;
 }
 
 #define PRODUCT_RTL8189FTV (0xf179)
@@ -54,6 +97,8 @@ static struct rt_sdio_driver realtek_drv = {
 
 static void realtek_init_do(void)
 {
+    rt_int32_t ret;
+
     Set_WLAN_Power_On();
 
 #if defined (REALTEK_SDIO_DEV0)
@@ -76,7 +121,12 @@ static void realtek_init_do(void)
     #endif
 #endif
 
-    sdio_register_driver(&realtek_drv);
+    ret = sdio_register_driver(&realtek_drv);
+    if (ret != RT_EOK && ret != -RT_EEMPTY) {
+        rt_kprintf("Realtek Wi-Fi: SDIO driver registration failed\n");
+        Set_WLAN_Power_Off();
+        return;
+    }
     kd_sdhci_change(REALTEK_SDIO_DEV);
 }
 
@@ -114,9 +164,13 @@ void wlan_event_indication(rtw_event_indicate_t event, char* buf, int buf_len)
         buff.data = &wlan_info;
         buff.len = sizeof(struct rt_wlan_info);
         if (event == WIFI_EVENT_STA_ASSOC) {
+            if (buf == NULL || buf_len < 10 + sizeof(wlan_info.bssid))
+                return;
             memcpy(wlan_info.bssid, buf + 10, sizeof(wlan_info.bssid));
             rt_wlan_dev_indicate_event_handle(&wlan_ap, RT_WLAN_DEV_EVT_AP_ASSOCIATED, &buff);
         } else {
+            if (buf == NULL || buf_len < sizeof(wlan_info.bssid))
+                return;
             memcpy(wlan_info.bssid, buf, sizeof(wlan_info.bssid));
             rt_wlan_dev_indicate_event_handle(&wlan_ap, RT_WLAN_DEV_EVT_AP_DISASSOCIATED, &buff);
         }
@@ -128,7 +182,7 @@ void ethernetif_recv(int idx, int total_len)
     struct eth_drv_sg sg_list;
     void *buffer = NULL;
 
-    if (!rltk_wlan_running(idx))
+    if ((idx != 0 && idx != 1) || total_len <= 0 || !rltk_wlan_running(idx))
         return;
 
     buffer = rt_malloc(total_len);
@@ -137,11 +191,12 @@ void ethernetif_recv(int idx, int total_len)
         return;
     }
 
-    sg_list.buf = (unsigned int)(uintptr_t)buffer;
+    sg_list.buf = (uintptr_t)buffer;
     sg_list.len = total_len;
 
     rltk_wlan_recv(idx, &sg_list, 1);
-    rt_wlan_dev_report_data(idx == 0 ? &wlan_sta : &wlan_ap, (void*)(uint64_t)sg_list.buf, total_len);
+    rt_wlan_dev_report_data(idx == 0 ? &wlan_sta : &wlan_ap,
+                            (void*)sg_list.buf, total_len);
 
     rt_free(buffer);
 }
@@ -209,6 +264,8 @@ static rt_err_t wlan_join(struct rt_wlan_device* wlan, struct rt_sta_info* sta_i
 
     ret = wifi_connect(sta_info->ssid.val, sta_info->security, sta_info->key.val,
         sta_info->ssid.len, sta_info->key.len, 0, NULL);
+    if (ret == RTW_SUCCESS)
+        wlan_log_tx_power(WLAN0_NAME);
 out:
     rt_wlan_dev_indicate_event_handle(&wlan_sta, ret ? RT_WLAN_DEV_EVT_CONNECT_FAIL :
         RT_WLAN_DEV_EVT_CONNECT, NULL);
@@ -222,23 +279,35 @@ static rt_err_t wlan_softap(struct rt_wlan_device* wlan, struct rt_ap_info* ap_i
     uint8_t mac[ETH_ALEN];
     struct rt_wlan_buff buff = {NULL, 0};
 
-    wifi_off();
-    rt_thread_mdelay(20);
-    if (wifi_on(RTW_MODE_STA_AP) < 0) {
-        rt_kprintf("%s: STA+AP start failed\n", __func__);
+    if (!wifi_is_up(RTW_STA_INTERFACE)) {
+        rt_kprintf("%s: STA interface is not running\n", __func__);
         ret = -RT_EIO;
         goto out;
     }
 
+    if (!wifi_is_up(RTW_AP_INTERFACE)) {
+        /* WLAN0 is kept for STA; add WLAN1 without restarting the driver. */
+        if (wifi_on_coAP(RTW_MODE_STA_AP) < 0) {
+            rt_kprintf("%s: AP interface start failed\n", __func__);
+            ret = -RT_EIO;
+            goto out;
+        }
+    }
+
     ret = wifi_start_ap(ap_info->ssid.val, ap_info->security, ap_info->key.val,
                         ap_info->ssid.len, ap_info->key.len, ap_info->channel);
+    if (ret == RTW_SUCCESS)
+        wlan_log_tx_power(WLAN1_NAME);
 
-    wlan_get_mac(&wlan_ap, mac);
-    buff.data = mac;
-    buff.len = ETH_ALEN;
+    if (ret == RTW_SUCCESS && wlan_get_mac(&wlan_ap, mac) == RT_EOK) {
+        buff.data = mac;
+        buff.len = ETH_ALEN;
+    }
 
 out:
-    rt_wlan_dev_indicate_event_handle(&wlan_ap, ret < 0 ? RT_WLAN_DEV_EVT_AP_STOP : RT_WLAN_DEV_EVT_AP_START, &buff);
+    rt_wlan_dev_indicate_event_handle(&wlan_ap,
+        ret == RTW_SUCCESS ? RT_WLAN_DEV_EVT_AP_START : RT_WLAN_DEV_EVT_AP_STOP,
+        buff.data != NULL ? &buff : NULL);
 
     return ret;
 }
@@ -257,15 +326,14 @@ static rt_err_t wlan_disconnect(struct rt_wlan_device* wlan)
 static rt_err_t wlan_ap_stop(struct rt_wlan_device* wlan)
 {
     if (wifi_is_up(RTW_AP_INTERFACE)) {
-        wifi_off();
-        rt_thread_mdelay(20);
-        if (wifi_on(RTW_MODE_STA) < 0) {
-            rt_kprintf("%s: STA start failed\n", __func__);
+        if (wifi_off_coAP() < 0) {
+            rt_kprintf("%s: AP interface stop failed\n", __func__);
+            return -RT_EIO;
         }
     }
 
     rt_wlan_dev_indicate_event_handle(&wlan_ap, RT_WLAN_DEV_EVT_AP_STOP, NULL);
-    return 0;
+    return RT_EOK;
 }
 
 static rt_err_t wlan_ap_deauth(struct rt_wlan_device* wlan, rt_uint8_t mac[])
@@ -285,6 +353,35 @@ static int wlan_get_rssi(struct rt_wlan_device* wlan)
     wifi_get_rssi(&rssi);
 
     return rssi;
+}
+
+static void wlan_log_tx_power(const char* ifname)
+{
+    uint8_t poweridx[20];
+    uint8_t min[3] = {UINT8_MAX, UINT8_MAX, UINT8_MAX};
+    uint8_t max[3] = {0, 0, 0};
+    static const uint8_t first[3] = {0, 4, 12};
+    static const uint8_t end[3] = {4, 12, 20};
+    int group;
+    int i;
+
+    if (wext_get_tx_power(ifname, poweridx) < 0) {
+        rt_kprintf("Realtek Wi-Fi RF %s: unable to read TX power indices\n", ifname);
+        return;
+    }
+
+    for (group = 0; group < 3; group++) {
+        for (i = first[group]; i < end[group]; i++) {
+            if (poweridx[i] < min[group])
+                min[group] = poweridx[i];
+            if (poweridx[i] > max[group])
+                max[group] = poweridx[i];
+        }
+    }
+
+    rt_kprintf("Realtek Wi-Fi RF %s: TX scale 100%%, calibrated indices "
+               "CCK %u-%u, OFDM %u-%u, MCS %u-%u\n",
+               ifname, min[0], max[0], min[1], max[1], min[2], max[2]);
 }
 
 static rt_err_t wlan_set_powersave(struct rt_wlan_device* wlan, int level)
@@ -341,31 +438,49 @@ static rt_err_t wlan_get_mac(struct rt_wlan_device* wlan, rt_uint8_t mac[])
 {
     char addr[32];
 
-    wifi_get_mac_address(addr);
-    sscanf(addr, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx", mac, mac + 1, mac + 2, mac + 3, mac + 4, mac + 5);
+    if (mac == NULL || wifi_get_mac_address(addr) != RTW_SUCCESS)
+        return -RT_EIO;
+
+    if (sscanf(addr, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx", mac, mac + 1,
+               mac + 2, mac + 3, mac + 4, mac + 5) != ETH_ALEN)
+        return -RT_EIO;
+
     if (wlan == &wlan_ap)
         mac[5] = mac[5] + 1;
 
-    return 0;
+    return RT_EOK;
 }
 
 static int wlan_recv(struct rt_wlan_device* wlan, void* buff, int len)
 {
+    (void)wlan;
+    (void)buff;
+    (void)len;
+
+    return -RT_ENOSYS;
 }
 
 static int wlan_send(struct rt_wlan_device* wlan, void* buff, int len)
 {
     struct eth_drv_sg sg_list;
-    int idx = wlan == &wlan_sta ? 0 : 1;
+    int idx;
 
+    if (wlan == &wlan_sta)
+        idx = 0;
+    else if (wlan == &wlan_ap)
+        idx = 1;
+    else
+        return -RT_EINVAL;
+
+    if (buff == NULL || len <= 0)
+        return -RT_EINVAL;
     if (!rltk_wlan_running(idx))
-        return -1;
+        return -RT_EIO;
 
-    sg_list.buf = (unsigned int)(uintptr_t)buff;
+    sg_list.buf = (uintptr_t)buff;
     sg_list.len = len;
 
-    rltk_wlan_send(idx, &sg_list, 1, len);
-    return 0;
+    return rltk_wlan_send(idx, &sg_list, 1, len) == 0 ? RT_EOK : -RT_EIO;
 }
 
 static int wlan_send_raw_frame(struct rt_wlan_device* wlan, void* buff, int len)
@@ -402,14 +517,28 @@ static const struct rt_wlan_dev_ops ops = {
 
 static rt_int32_t realtek_probe(struct rt_mmcsd_card* card)
 {
-    wifi_sdio_func = rt_malloc(sizeof(struct sdio_func));
+    rt_int32_t ret;
+
+    if (card == NULL || card->sdio_function[0] == NULL ||
+        card->sdio_function[1] == NULL)
+        return -RT_EINVAL;
+    if (wifi_sdio_func != NULL || rtt_sdio_func != NULL)
+        return -RT_EBUSY;
+
+    wifi_sdio_func = rt_calloc(1, sizeof(struct sdio_func));
     if (wifi_sdio_func == NULL)
-        return -ENOMEM;
+        return -RT_ENOMEM;
 
     rtt_sdio_func = card->sdio_function[1];
     sdio_set_drvdata(rtt_sdio_func, wifi_sdio_func);
-    sdio_enable_func(rtt_sdio_func);
-    sdio_set_block_size(rtt_sdio_func, 512);
+
+    ret = sdio_enable_func(rtt_sdio_func);
+    if (ret != RT_EOK)
+        goto fail;
+
+    ret = sdio_set_block_size(rtt_sdio_func, 512);
+    if (ret != RT_EOK)
+        goto fail_disable_sdio;
 
     wifi_sdio_func->max_blksize = rtt_sdio_func->max_blk_size;
     wifi_sdio_func->cur_blksize = rtt_sdio_func->cur_blk_size;
@@ -422,13 +551,53 @@ static rt_int32_t realtek_probe(struct rt_mmcsd_card* card)
     if (wifi_on(RTW_MODE_STA) < 0) {
         rt_kprintf("%s init error\n", (PRODUCT_RTL8189FTV == wifi_sdio_func->device) ?
                    "rtl8189FTV": "rtl8733BS");
-        return -1;
+        ret = -RT_EIO;
+        goto fail_disable_sdio;
     }
 
-    rt_wlan_dev_register(&wlan_sta, RT_WLAN_DEVICE_STA_NAME, &ops, 0, NULL);
-    rt_wlan_dev_register(&wlan_ap, RT_WLAN_DEVICE_AP_NAME, &ops, 0, NULL);
-    rt_wlan_set_mode(RT_WLAN_DEVICE_STA_NAME, RT_WLAN_STATION);
-    rt_wlan_set_mode(RT_WLAN_DEVICE_AP_NAME, RT_WLAN_AP);
+    ret = rt_wlan_dev_register(&wlan_sta, RT_WLAN_DEVICE_STA_NAME, &ops, 0, NULL);
+    if (ret != RT_EOK)
+        goto fail_wifi;
+    wlan_sta_registered = RT_TRUE;
 
-    return 0;
+    ret = rt_wlan_dev_register(&wlan_ap, RT_WLAN_DEVICE_AP_NAME, &ops, 0, NULL);
+    if (ret != RT_EOK)
+        goto fail_wifi;
+    wlan_ap_registered = RT_TRUE;
+
+    ret = rt_wlan_set_mode(RT_WLAN_DEVICE_STA_NAME, RT_WLAN_STATION);
+    if (ret != RT_EOK)
+        goto fail_wifi;
+
+    ret = rt_wlan_set_mode(RT_WLAN_DEVICE_AP_NAME, RT_WLAN_AP);
+    if (ret != RT_EOK)
+        goto fail_wifi;
+
+    return RT_EOK;
+
+fail_wifi:
+    if (wifi_off() < 0) {
+        rt_kprintf("Realtek Wi-Fi: cleanup failed after probe error %d\n", ret);
+        return -RT_EIO;
+    }
+    if (wlan_ap_registered) {
+        if (wlan_ap.mode != RT_WLAN_NONE)
+            rt_wlan_set_mode(RT_WLAN_DEVICE_AP_NAME, RT_WLAN_NONE);
+        rt_device_unregister(&wlan_ap.device);
+        wlan_ap_registered = RT_FALSE;
+    }
+    if (wlan_sta_registered) {
+        if (wlan_sta.mode != RT_WLAN_NONE)
+            rt_wlan_set_mode(RT_WLAN_DEVICE_STA_NAME, RT_WLAN_NONE);
+        rt_device_unregister(&wlan_sta.device);
+        wlan_sta_registered = RT_FALSE;
+    }
+fail_disable_sdio:
+    sdio_disable_func(rtt_sdio_func);
+fail:
+    sdio_set_drvdata(rtt_sdio_func, NULL);
+    rt_free(wifi_sdio_func);
+    wifi_sdio_func = NULL;
+    rtt_sdio_func = NULL;
+    return ret;
 }

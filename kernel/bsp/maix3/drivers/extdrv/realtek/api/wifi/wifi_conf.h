@@ -400,6 +400,7 @@ _WEAK void wifi_set_mib(void);
  * @return  If the function succeeds, the return value is 0.
  */
 //----------------------------------------------------------------------------//
+
 _WEAK void wifi_set_country_code(void);
 
 /**
@@ -431,6 +432,14 @@ int wifi_rf_off(void);
 int wifi_on(rtw_mode_t mode);
 
 /**
+ * @brief  Enable the AP interface while keeping the STA interface running.
+ * @param[in]  mode: Must select concurrent STA+AP mode.
+ * @return  RTW_SUCCESS if the AP interface was initialized successfully.
+ * @return  RTW_ERROR otherwise.
+ */
+int wifi_on_coAP(rtw_mode_t mode);
+
+/**
  * @brief  Disable Wi-Fi.
  *  
  * @param  None
@@ -438,6 +447,13 @@ int wifi_on(rtw_mode_t mode);
  * @return  RTW_ERROR: otherwise.
  */
 int wifi_off(void);
+
+/**
+ * @brief  Disable the AP interface while keeping the STA interface running.
+ * @return  RTW_SUCCESS if the AP interface was deinitialized successfully.
+ * @return  RTW_ERROR otherwise.
+ */
+int wifi_off_coAP(void);
 
 /**
  * Turn off the Wi-Fi device
@@ -1052,4 +1068,3 @@ unsigned char wifi_read_byte(int idx, unsigned short addr, unsigned short cnts, 
 #endif // __WIFI_API_H
 
 //----------------------------------------------------------------------------//
-

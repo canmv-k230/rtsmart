@@ -723,12 +723,19 @@ int wext_get_tx_power(const char *ifname, __u8 *poweridx)
 	__u8 *para = NULL;
 	int cmd_len = sizeof("get_tx_power");
 
+	if (ifname == NULL || poweridx == NULL)
+		return -1;
+
 	memset(&iwr, 0, sizeof(iwr));
 	//Tx power size : 20 Bytes
 	//CCK 1M,2M,5.5M,11M : 4 Bytes
 	//OFDM 6M, 9M, 12M, 18M, 24M, 36M 48M, 54M : 8 Bytes
 	//MCS 0~7 : 8 Bytes
 	para = rtw_malloc(cmd_len + 20);
+	if (para == NULL)
+		return -1;
+
+	memset(para, 0, cmd_len + 20);
 	snprintf((char*)para, cmd_len, "get_tx_power");
 
 	iwr.u.data.pointer = para;
@@ -736,9 +743,10 @@ int wext_get_tx_power(const char *ifname, __u8 *poweridx)
 	if (iw_ioctl(ifname, SIOCDEVPRIVATE, &iwr) < 0) {
 		DBG_INFO("wext_get_tx_power():ioctl[SIOCDEVPRIVATE] error");
 		ret = -1;
+	} else {
+		memcpy(poweridx,(__u8 *)(iwr.u.data.pointer),20);
 	}
 
-	memcpy(poweridx,(__u8 *)(iwr.u.data.pointer),20);
 	rtw_free(para);
 	return ret;
 }

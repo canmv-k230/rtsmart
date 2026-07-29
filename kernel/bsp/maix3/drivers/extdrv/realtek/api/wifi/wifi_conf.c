@@ -1096,15 +1096,20 @@ int wifi_on_coAP(rtw_mode_t mode)
 
 	DBG_INFO("Initializing WIFI WLAN1...");
 		ret = rltk_wlan_init(devnum, mode);
-		if(ret <0)
+		if(ret <0) {
+			wifi_mode = RTW_MODE_STA;
 			return ret;
+		}
 		device_mutex_lock(RT_DEV_LOCK_WLAN);
 		ret = rltk_wlan_start(devnum);
 		if(ret == 0) _wifi_is_on = 1;
 		device_mutex_unlock(RT_DEV_LOCK_WLAN);
 		if(ret <0){
 			DBG_INFO("ERROR: Start WIFI WLAN 1 Failed!");
-			rltk_wlan_deinit();
+			device_mutex_lock(RT_DEV_LOCK_WLAN);
+			rltk_wlan_deinit_idx(WLAN1_IDX);
+			device_mutex_unlock(RT_DEV_LOCK_WLAN);
+			wifi_mode = RTW_MODE_STA;
 			return ret;
 		}
 	while(1) {
@@ -1116,11 +1121,20 @@ int wifi_on_coAP(rtw_mode_t mode)
 
 		if(timeout == 0) {
 			DBG_INFO("ERROR: Init WIFI WLAN 1 timeout!");
+			ret = -1;
 			break;
 		}
 
 		rtw_msleep_os(1000);
 		timeout --;
+	}
+
+	if(ret < 0) {
+		device_mutex_lock(RT_DEV_LOCK_WLAN);
+		rltk_wlan_deinit_idx(WLAN1_IDX);
+		device_mutex_unlock(RT_DEV_LOCK_WLAN);
+		wifi_mode = RTW_MODE_STA;
+		return ret;
 	}
 
 	#if CONFIG_LWIP_LAYER
@@ -1173,7 +1187,7 @@ int wifi_off_coAP(void)
 	
 	_wifi_is_on = 1;
 	device_mutex_unlock(RT_DEV_LOCK_WLAN);
-	device_mutex_free(RT_DEV_LOCK_WLAN);
+	/* WLAN0 still uses this driver-lifetime lock. */
 
 	while(1) {
 		if(rltk_wlan_running(WLAN1_IDX) == 0) {
@@ -1183,6 +1197,7 @@ int wifi_off_coAP(void)
 
 		if(timeout == 0) {
 			DBG_INFO("ERROR: Deinit WIFI timeout!");
+			ret = -1;
 			break;
 		}
 
@@ -1190,7 +1205,8 @@ int wifi_off_coAP(void)
 		timeout --;
 	}
 
-	wifi_mode = RTW_MODE_STA;
+	if(ret == 0)
+		wifi_mode = RTW_MODE_STA;
 	return ret;
 }
 
@@ -1211,7 +1227,17 @@ int wifi_on(rtw_mode_t mode)
 		init_event_callback_list();
 		event_init = 1;
 	}
-	
+
+#ifdef CONFIG_TX_POWER_PERCENTAGE_INDEX
+#if CONFIG_TX_POWER_PERCENTAGE_INDEX < 0 || CONFIG_TX_POWER_PERCENTAGE_INDEX > 4
+#error "CONFIG_TX_POWER_PERCENTAGE_INDEX must be in the range 0..4"
+#endif
+	/* Keep the normal driver calibration and rate offsets, but do not apply a
+	 * percentage reduction. Index 0 is the Realtek 100% setting. */
+	if (rltk_set_tx_power_percentage(CONFIG_TX_POWER_PERCENTAGE_INDEX) != RTW_SUCCESS)
+		DBG_INFO("ERROR: Set WIFI TX power percentage failed!");
+#endif
+
 	wifi_mode = mode;
 
 	if(mode == RTW_MODE_STA_AP)
@@ -1232,7 +1258,11 @@ int wifi_on(rtw_mode_t mode)
 		device_mutex_unlock(RT_DEV_LOCK_WLAN);
 		if(ret <0){
 			DBG_INFO("ERROR: Start WIFI Failed!");
+			device_mutex_lock(RT_DEV_LOCK_WLAN);
 			rltk_wlan_deinit();
+			device_mutex_unlock(RT_DEV_LOCK_WLAN);
+			_wifi_is_on = 0;
+			wifi_mode = RTW_MODE_NONE;
 			return ret;
 		}
 	}
@@ -1246,11 +1276,21 @@ int wifi_on(rtw_mode_t mode)
 
 		if(timeout == 0) {
 			DBG_INFO("ERROR: Init WIFI timeout!");
+			ret = -1;
 			break;
 		}
 
 		rtw_msleep_os(1000);
 		timeout --;
+	}
+
+	if(ret < 0) {
+		device_mutex_lock(RT_DEV_LOCK_WLAN);
+		rltk_wlan_deinit();
+		device_mutex_unlock(RT_DEV_LOCK_WLAN);
+		_wifi_is_on = 0;
+		wifi_mode = RTW_MODE_NONE;
+		return ret;
 	}
 
 	#if CONFIG_LWIP_LAYER
@@ -1297,9 +1337,8 @@ int wifi_off(void)
 	DBG_INFO("Deinitializing WIFI ...");
 	device_mutex_lock(RT_DEV_LOCK_WLAN);
 	rltk_wlan_deinit();
-	_wifi_is_on = 0;
 	device_mutex_unlock(RT_DEV_LOCK_WLAN);
-	device_mutex_free(RT_DEV_LOCK_WLAN);
+	/* Keep this driver-lifetime lock allocated across Wi-Fi restart cycles. */
 
 	while(1) {
 		if((rltk_wlan_running(WLAN0_IDX) == 0) &&
@@ -1310,6 +1349,7 @@ int wifi_off(void)
 
 		if(timeout == 0) {
 			DBG_INFO("ERROR: Deinit WIFI timeout!");
+			ret = -1;
 			break;
 		}
 
@@ -1317,7 +1357,10 @@ int wifi_off(void)
 		timeout --;
 	}
 
-	wifi_mode = RTW_MODE_NONE;
+	if(ret == 0) {
+		_wifi_is_on = 0;
+		wifi_mode = RTW_MODE_NONE;
+	}
 
 	return ret;
 }
