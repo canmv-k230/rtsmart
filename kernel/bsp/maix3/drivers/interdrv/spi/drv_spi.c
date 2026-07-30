@@ -85,9 +85,11 @@ typedef struct {
     uint32_t                ser;
     struct rt_event         event;
     void*                   dma_buf;
-    void*                   pio_buf;
+    void*                   pio_tx_buf;
+    void*                   pio_rx_buf;
     rt_size_t               dma_buf_size;
-    rt_size_t               pio_buf_size;
+    rt_size_t               pio_tx_buf_size;
+    rt_size_t               pio_rx_buf_size;
 } dw_spi_bus_t;
 
 typedef struct {
@@ -270,15 +272,15 @@ static void* dw_spi_get_dma_buf(dw_spi_bus_t* spi_bus, rt_size_t size)
     return buf;
 }
 
-static void* dw_spi_get_pio_buf(dw_spi_bus_t* spi_bus, rt_size_t size)
+static void* dw_spi_get_pio_buf(void** cached_buf, rt_size_t* cached_size, rt_size_t size)
 {
     void* buf;
 
     if (size > DW_SSI_DMA_BOUNCE_MAX_SIZE) {
         return NULL;
     }
-    if (spi_bus->pio_buf && spi_bus->pio_buf_size >= size) {
-        return spi_bus->pio_buf;
+    if (*cached_buf && *cached_size >= size) {
+        return *cached_buf;
     }
 
     buf = rt_malloc_align(size, RT_CPU_CACHE_LINE_SZ);
@@ -286,11 +288,11 @@ static void* dw_spi_get_pio_buf(dw_spi_bus_t* spi_bus, rt_size_t size)
         return NULL;
     }
 
-    if (spi_bus->pio_buf) {
-        rt_free_align(spi_bus->pio_buf);
+    if (*cached_buf) {
+        rt_free_align(*cached_buf);
     }
-    spi_bus->pio_buf      = buf;
-    spi_bus->pio_buf_size = size;
+    *cached_buf  = buf;
+    *cached_size = size;
 
     return buf;
 }
@@ -387,36 +389,45 @@ static rt_err_t dw_spi_finish_user_xfer(const struct rt_qspi_message* msg, void*
     return dw_spi_copy_to_user_buf(user_recv_buf, rx_alloc, length);
 }
 
-static rt_err_t dw_spi_fifo_push(dw_spi_xfer_state_t* xfer, dw_spi_reg_t* spi)
+static rt_err_t dw_spi_fifo_push_limit(dw_spi_xfer_state_t* xfer, dw_spi_reg_t* spi, rt_size_t max_level)
 {
     uint8_t* buf = xfer->send_buf;
+    rt_size_t pushed = 0;
 
     if (!buf) {
-        while (xfer->send_length && (readl(&spi->sr) & DW_SSI_SR_TFNF)) {
+        while (xfer->send_length && pushed < max_level && readl(&spi->txflr) < max_level &&
+               (readl(&spi->sr) & DW_SSI_SR_TFNF)) {
             writel(0, &spi->dr[0]);
             xfer->send_length--;
+            pushed++;
         }
 
         return RT_EOK;
     }
 
     if (xfer->cell_size == 1) {
-        while (xfer->send_length && (readl(&spi->sr) & DW_SSI_SR_TFNF)) {
+        while (xfer->send_length && pushed < max_level && readl(&spi->txflr) < max_level &&
+               (readl(&spi->sr) & DW_SSI_SR_TFNF)) {
             writel(*(uint8_t*)buf, &spi->dr[0]);
             buf += 1;
             xfer->send_length--;
+            pushed++;
         }
     } else if (xfer->cell_size == 2) {
-        while (xfer->send_length && (readl(&spi->sr) & DW_SSI_SR_TFNF)) {
+        while (xfer->send_length && pushed < max_level && readl(&spi->txflr) < max_level &&
+               (readl(&spi->sr) & DW_SSI_SR_TFNF)) {
             writel(*(uint16_t*)buf, &spi->dr[0]);
             buf += 2;
             xfer->send_length--;
+            pushed++;
         }
     } else if (xfer->cell_size == 4) {
-        while (xfer->send_length && (readl(&spi->sr) & DW_SSI_SR_TFNF)) {
+        while (xfer->send_length && pushed < max_level && readl(&spi->txflr) < max_level &&
+               (readl(&spi->sr) & DW_SSI_SR_TFNF)) {
             writel(*(uint32_t*)buf, &spi->dr[0]);
             buf += 4;
             xfer->send_length--;
+            pushed++;
         }
     } else {
         return -RT_EINVAL;
@@ -425,6 +436,11 @@ static rt_err_t dw_spi_fifo_push(dw_spi_xfer_state_t* xfer, dw_spi_reg_t* spi)
     xfer->send_buf = buf;
 
     return RT_EOK;
+}
+
+static rt_err_t dw_spi_fifo_push(dw_spi_xfer_state_t* xfer, dw_spi_reg_t* spi)
+{
+    return dw_spi_fifo_push_limit(xfer, spi, DW_SSI_TX_FIFO_DEPTH);
 }
 
 static rt_err_t dw_spi_fifo_pop(dw_spi_xfer_state_t* xfer, dw_spi_reg_t* spi)
@@ -531,7 +547,8 @@ static rt_err_t dw_spi_standard_prepare_tx(dw_spi_bus_t* spi_bus, struct rt_qspi
         uint8_t* header = sxfer->tmod == SPI_TMOD_EPROMREAD ? sxfer->header_buf : NULL;
 
         if (sxfer->tmod == SPI_TMOD_TO) {
-            sxfer->send_alloc = dw_spi_get_pio_buf(spi_bus, sxfer->send_chunk * sxfer->cell_size);
+            sxfer->send_alloc = dw_spi_get_pio_buf(&spi_bus->pio_tx_buf, &spi_bus->pio_tx_buf_size,
+                                                   sxfer->send_chunk * sxfer->cell_size);
             if (sxfer->send_alloc == NULL) {
                 return -RT_ENOMEM;
             }
@@ -544,7 +561,8 @@ static rt_err_t dw_spi_standard_prepare_tx(dw_spi_bus_t* spi_bus, struct rt_qspi
     } else if (payload_aligned) {
         sxfer->xfer.send_buf = (void*)msg->parent.send_buf;
     } else {
-        sxfer->send_alloc = dw_spi_get_pio_buf(spi_bus, sxfer->send_chunk * sxfer->cell_size);
+        sxfer->send_alloc = dw_spi_get_pio_buf(&spi_bus->pio_tx_buf, &spi_bus->pio_tx_buf_size,
+                                               sxfer->send_chunk * sxfer->cell_size);
         if (sxfer->send_alloc == NULL) {
             return -RT_ENOMEM;
         }
@@ -578,7 +596,8 @@ static rt_err_t dw_spi_standard_prepare_rx(dw_spi_bus_t* spi_bus, struct rt_qspi
     if (dw_spi_buf_aligned(msg->parent.recv_buf, sxfer->cell_size)) {
         sxfer->xfer.recv_buf = msg->parent.recv_buf;
     } else {
-        sxfer->recv_alloc = dw_spi_get_pio_buf(spi_bus, sxfer->recv_chunk * sxfer->cell_size);
+        sxfer->recv_alloc = dw_spi_get_pio_buf(&spi_bus->pio_rx_buf, &spi_bus->pio_rx_buf_size,
+                                               sxfer->recv_chunk * sxfer->cell_size);
         if (sxfer->recv_alloc == NULL) {
             return -RT_ENOMEM;
         }
@@ -728,54 +747,67 @@ static rt_err_t dw_spi_standard_run_to(dw_spi_reg_t* spi, dw_spi_bus_t* spi_bus,
 static rt_err_t dw_spi_standard_run_tr(dw_spi_reg_t* spi, dw_spi_bus_t* spi_bus, struct rt_qspi_message* msg,
                                        dw_spi_standard_xfer_t* sxfer)
 {
-    rt_uint32_t event;
-    rt_err_t    err;
+    uint64_t  last_progress_ms;
+    rt_bool_t tx_complete = RT_FALSE;
+    rt_bool_t rx_complete = RT_FALSE;
+    rt_err_t  err;
 
     rt_event_control(&spi_bus->event, RT_IPC_CMD_RESET, 0);
-    writel(spi_bus->ser, &spi->ser);
+    writel(0, &spi->imr);
+    readl(&spi->rxoicr);
     writel(1, &spi->ssienr);
-    if (dw_spi_fifo_push(&sxfer->xfer, spi) != RT_EOK) {
+    if (dw_spi_fifo_push_limit(&sxfer->xfer, spi, DW_SSI_TX_FIFO_THRESH) != RT_EOK) {
         LOG_E("spi%d tx fifo prime error", spi_bus->hw->idx);
         return -RT_ERROR;
     }
-    writel(dw_spi_standard_get_imr(sxfer), &spi->imr);
+    if (sxfer->xfer.send_length == 0) {
+        tx_complete = !dw_spi_standard_reload_tx(spi, msg, sxfer);
+    }
+    writel(spi_bus->ser, &spi->ser);
+    last_progress_ms = cpu_ticks_ms();
 
-    while (1) {
-        err = rt_event_recv(&spi_bus->event, BIT(SSI_TXE) | BIT(SSI_RXF), RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, 500, &event);
-        if (err == -RT_ETIMEOUT) {
-            LOG_E("spi%d transfer data timeout", spi_bus->hw->idx);
+    while (!rx_complete) {
+        rt_size_t send_done = sxfer->send_done;
+        rt_size_t send_left = sxfer->xfer.send_length;
+        rt_size_t recv_done = sxfer->recv_done;
+        rt_size_t recv_left = sxfer->xfer.recv_length;
+
+        err = dw_spi_fifo_pop(&sxfer->xfer, spi);
+        if (err != RT_EOK) {
+            LOG_E("spi%d rx fifo pop error", spi_bus->hw->idx);
+            return err;
+        }
+        if (sxfer->xfer.recv_length == 0) {
+            rx_complete = !dw_spi_standard_advance_rx(spi, msg, sxfer);
+        }
+        if (!tx_complete) {
+            err = dw_spi_fifo_push_limit(&sxfer->xfer, spi, DW_SSI_TX_FIFO_THRESH);
+            if (err != RT_EOK) {
+                LOG_E("spi%d tx fifo push error", spi_bus->hw->idx);
+                return err;
+            }
+            if (sxfer->xfer.send_length == 0) {
+                tx_complete = !dw_spi_standard_reload_tx(spi, msg, sxfer);
+            }
+        }
+        if (readl(&spi->risr) & DW_SSI_IMR_RXO) {
+            readl(&spi->rxoicr);
+            LOG_E("spi%d full-duplex RX overflow", spi_bus->hw->idx);
+            return -RT_EIO;
+        }
+        if (send_done != sxfer->send_done || send_left != sxfer->xfer.send_length ||
+            recv_done != sxfer->recv_done || recv_left != sxfer->xfer.recv_length) {
+            last_progress_ms = cpu_ticks_ms();
+        } else if (cpu_ticks_ms() - last_progress_ms >= 500) {
+            LOG_E("spi%d full-duplex timeout: sr=%08x risr=%08x txflr=%u rxflr=%u tx_left=%u rx_left=%u",
+                  spi_bus->hw->idx, readl(&spi->sr), readl(&spi->risr), readl(&spi->txflr), readl(&spi->rxflr),
+                  (uint32_t)sxfer->xfer.send_length, (uint32_t)sxfer->xfer.recv_length);
             rt_set_errno(-RT_ETIMEOUT);
             return -RT_ETIMEOUT;
         }
-
-        if (event & BIT(SSI_TXE)) {
-            if (dw_spi_fifo_push(&sxfer->xfer, spi) != RT_EOK) {
-                LOG_E("spi%d tx fifo push error", spi_bus->hw->idx);
-                return -RT_ERROR;
-            }
-
-            if (sxfer->xfer.send_length == 0) {
-                (void)dw_spi_standard_reload_tx(spi, msg, sxfer);
-            }
-            writel(dw_spi_standard_get_imr(sxfer), &spi->imr);
-        }
-
-        if (event & BIT(SSI_RXF)) {
-            if (dw_spi_fifo_pop(&sxfer->xfer, spi) != RT_EOK) {
-                LOG_E("spi%d rx fifo pop error", spi_bus->hw->idx);
-                return -RT_ERROR;
-            }
-
-            if (sxfer->xfer.recv_length == 0) {
-                if (!dw_spi_standard_advance_rx(spi, msg, sxfer)) {
-                    return RT_EOK;
-                }
-            } else if (sxfer->xfer.recv_length <= readl(&spi->rxftlr)) {
-                writel(sxfer->xfer.recv_length - 1, &spi->rxftlr);
-            }
-            writel(dw_spi_standard_get_imr(sxfer), &spi->imr);
-        }
     }
+
+    return tx_complete ? RT_EOK : -RT_EIO;
 }
 
 static rt_err_t dw_spi_standard_run_ro(dw_spi_reg_t* spi, dw_spi_bus_t* spi_bus, struct rt_qspi_message* msg,

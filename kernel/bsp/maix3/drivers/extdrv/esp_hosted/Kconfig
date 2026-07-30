@@ -1,0 +1,125 @@
+menuconfig RT_USING_ESP_HOSTED
+    bool "Enable ESP-Hosted Wi-Fi coprocessor"
+    depends on RT_USING_SPI && RT_USING_QSPI && RT_USING_WIFI
+    depends on !RT_USING_RW007 && !RT_USING_CYW43XX && !RT_USING_REALTEK
+    default n
+
+    if RT_USING_ESP_HOSTED
+
+        choice ESP_HOSTED_SPI_BUS
+            prompt "SPI bus"
+            default ESP_HOSTED_SPI_BUS_SPI0
+
+            config ESP_HOSTED_SPI_BUS_SPI0
+                bool "spi0 (OSPI controller)"
+
+            config ESP_HOSTED_SPI_BUS_SPI1
+                bool "spi1 (QSPI0)"
+
+            config ESP_HOSTED_SPI_BUS_SPI2
+                bool "spi2 (QSPI1)"
+        endchoice
+
+        config ESP_HOSTED_SPI_DEVICE_NAME
+            string "SPI device name"
+            default "esp-hosted"
+
+        config ESP_HOSTED_SPI_MAX_HZ
+            int "SPI clock frequency (Hz)"
+            range 1000000 40000000
+            default 5000000
+
+        config ESP_HOSTED_SPI_MODE
+            int "SPI mode"
+            range 1 3
+            default 3
+            help
+                Must match CONFIG_ESP_SPI_MODE in the ESP-Hosted coprocessor
+                firmware. The full-duplex ESP-Hosted slave does not support
+                SPI mode 0.
+
+        config ESP_HOSTED_SPI_CS_PIN
+            int "Chip-select GPIO"
+            range -1 63
+            default 14
+
+        config ESP_HOSTED_SPI_CLK_PIN
+            int "SPI clock GPIO"
+            range -1 63
+            default 15
+
+        config ESP_HOSTED_SPI_D0_PIN
+            int "SPI D0 GPIO (MOSI)"
+            range -1 63
+            default 16
+
+        config ESP_HOSTED_SPI_D1_PIN
+            int "SPI D1 GPIO (MISO)"
+            range -1 63
+            default 17
+
+        config ESP_HOSTED_HANDSHAKE_PIN
+            int "Handshake GPIO"
+            range -1 63
+            default 18
+
+        config ESP_HOSTED_HANDSHAKE_ACTIVE_LOW
+            bool "Handshake signal is active-low"
+            default n
+
+        config ESP_HOSTED_DATA_READY_PIN
+            int "Data-ready GPIO"
+            range -1 63
+            default 19
+
+        config ESP_HOSTED_DATA_READY_ACTIVE_LOW
+            bool "Data-ready signal is active-low"
+            default n
+
+        config ESP_HOSTED_RESET_PIN
+            int "ESP EN/reset GPIO"
+            range -1 63
+            default -1
+            help
+                SPI full-duplex requires the host and coprocessor transport
+                state to be synchronized at startup. Connect this output to
+                the ESP EN/RST pin, or to the slave reset GPIO selected in the
+                ESP-Hosted-MCU firmware.
+
+        config ESP_HOSTED_RESET_ACTIVE_LOW
+            bool "Reset is asserted low"
+            default y
+
+        config ESP_HOSTED_CHECKSUM
+            bool "Validate and generate transport checksums"
+            default y
+
+        config ESP_HOSTED_RPC_TIMEOUT_MS
+            int "RPC timeout (ms)"
+            range 1000 60000
+            default 10000
+
+        config ESP_HOSTED_MAX_SCAN_RESULTS
+            int "Maximum scan results"
+            range 1 32
+            default 20
+
+        config ESP_HOSTED_THREAD_PRIORITY
+            int "Transport thread priority"
+            range 1 31
+            default 8
+
+        config ESP_HOSTED_THREAD_STACK_SIZE
+            int "Transport thread stack size"
+            range 4096 32768
+            default 8192
+
+        config ESP_HOSTED_EVENT_THREAD_STACK_SIZE
+            int "WLAN event thread stack size"
+            range 8192 32768
+            default 8192
+            help
+                The event thread enters the RT-Thread WLAN management and RPC
+                call chains. It needs more stack than a simple event worker.
+
+    endif

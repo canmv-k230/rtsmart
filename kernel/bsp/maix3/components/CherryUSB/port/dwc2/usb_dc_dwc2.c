@@ -519,8 +519,15 @@ void dwc2_ep_read(uint8_t *dest, uint16_t len)
     uint32_t count32b = ((uint32_t)len + 3U) / 4U;
 
     for (i = 0U; i < count32b; i++) {
-        __UNALIGNED_UINT32_WRITE(pDest, USB_OTG_FIFO(0U));
-        pDest++;
+        uint32_t value = USB_OTG_FIFO(0U);
+
+        /* RX FIFO entries must always be drained. A reset or an OUT packet
+         * received before the endpoint is armed can legitimately have no
+         * destination buffer. */
+        if (pDest) {
+            __UNALIGNED_UINT32_WRITE(pDest, value);
+            pDest++;
+        }
     }
 }
 
@@ -1233,8 +1240,12 @@ void USBD_IRQHandler(uint8_t busid)
             if (((temp & USB_OTG_GRXSTSP_PKTSTS) >> USB_OTG_GRXSTSP_PKTSTS_Pos) == STS_DATA_UPDT) {
                 read_count = (temp & USB_OTG_GRXSTSP_BCNT) >> 4;
                 if (read_count != 0) {
-                    dwc2_ep_read(g_dwc2_udc.out_ep[ep_idx].xfer_buf, read_count);
-                    g_dwc2_udc.out_ep[ep_idx].xfer_buf += read_count;
+                    if (ep_idx < CONFIG_USBDEV_EP_NUM && g_dwc2_udc.out_ep[ep_idx].xfer_buf) {
+                        dwc2_ep_read(g_dwc2_udc.out_ep[ep_idx].xfer_buf, read_count);
+                        g_dwc2_udc.out_ep[ep_idx].xfer_buf += read_count;
+                    } else {
+                        dwc2_ep_read(NULL, read_count);
+                    }
                 }
             } else if (((temp & USB_OTG_GRXSTSP_PKTSTS) >> USB_OTG_GRXSTSP_PKTSTS_Pos) == STS_SETUP_UPDT) {
                 read_count = (temp & USB_OTG_GRXSTSP_BCNT) >> 4;
