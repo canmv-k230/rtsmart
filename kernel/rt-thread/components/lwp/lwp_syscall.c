@@ -877,6 +877,27 @@ int sys_select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, s
 #ifdef RT_USING_USERSPACE
     int ret = -1;
     fd_set *kreadfds = RT_NULL, *kwritefds = RT_NULL, *kexceptfds = RT_NULL;
+    struct timeval ktimeout;
+    struct timeval *ptimeout = RT_NULL;
+
+    if (nfds < 0 || nfds > FD_SETSIZE)
+    {
+        return -EINVAL;
+    }
+
+    if (timeout)
+    {
+        if (!lwp_user_accessable((void *)timeout, sizeof *timeout))
+        {
+            return -EFAULT;
+        }
+        lwp_get_from_user(&ktimeout, timeout, sizeof ktimeout);
+        if (ktimeout.tv_sec < 0 || ktimeout.tv_usec < 0 || ktimeout.tv_usec >= 1000000)
+        {
+            return -EINVAL;
+        }
+        ptimeout = &ktimeout;
+    }
 
     if (readfds)
     {
@@ -924,7 +945,7 @@ int sys_select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, s
         lwp_get_from_user(kexceptfds, exceptfds, sizeof *kexceptfds);
     }
 
-    ret = select(nfds, kreadfds, kwritefds, kexceptfds, timeout);
+    ret = select(nfds, kreadfds, kwritefds, kexceptfds, ptimeout);
     if (kreadfds)
     {
         lwp_put_to_user(readfds, kreadfds, sizeof *kreadfds);
@@ -2899,11 +2920,11 @@ int sys_getpeername (int socket, struct musl_sockaddr *name, socklen_t *namelen)
     socklen_t unamelen;
     socklen_t knamelen;
 
-    if (!lwp_user_accessable(namelen, sizeof (socklen_t *)))
+    if (!lwp_user_accessable(namelen, sizeof (socklen_t)))
     {
         return -EFAULT;
     }
-    lwp_get_from_user(&unamelen, namelen, sizeof (socklen_t *));
+    lwp_get_from_user(&unamelen, namelen, sizeof (socklen_t));
     if (!unamelen)
     {
         return -EINVAL;
@@ -2925,7 +2946,7 @@ int sys_getpeername (int socket, struct musl_sockaddr *name, socklen_t *namelen)
             unamelen = sizeof(struct musl_sockaddr);
         }
         lwp_put_to_user(name, &kname, unamelen);
-        lwp_put_to_user(namelen, &unamelen, sizeof (socklen_t *));
+        lwp_put_to_user(namelen, &unamelen, sizeof (socklen_t));
     }
     else
     {
@@ -2943,11 +2964,11 @@ int sys_getsockname (int socket, struct musl_sockaddr *name, socklen_t *namelen)
     socklen_t unamelen;
     socklen_t knamelen;
 
-    if (!lwp_user_accessable(namelen, sizeof (socklen_t *)))
+    if (!lwp_user_accessable(namelen, sizeof (socklen_t)))
     {
         return -EFAULT;
     }
-    lwp_get_from_user(&unamelen, namelen, sizeof (socklen_t *));
+    lwp_get_from_user(&unamelen, namelen, sizeof (socklen_t));
     if (!unamelen)
     {
         return -EINVAL;
@@ -2968,7 +2989,7 @@ int sys_getsockname (int socket, struct musl_sockaddr *name, socklen_t *namelen)
             unamelen = sizeof(struct musl_sockaddr);
         }
         lwp_put_to_user(name, &kname, unamelen);
-        lwp_put_to_user(namelen, &unamelen, sizeof(socklen_t *));
+        lwp_put_to_user(namelen, &unamelen, sizeof(socklen_t));
     }
     else
     {
@@ -3071,12 +3092,17 @@ int sys_recvfrom(int socket, void *mem, size_t len, int flags,
 #ifdef RT_USING_USERSPACE
     if (!len)
     {
-        return -EINVAL;
+        return 0;
     }
 
     if (from && !fromlen)
     {
         return -EINVAL;
+    }
+
+    if (fromlen && !lwp_user_accessable(fromlen, sizeof(socklen_t)))
+    {
+        return -EFAULT;
     }
 
     if (!lwp_user_accessable((void *)mem, len))
@@ -3131,7 +3157,7 @@ int sys_recvfrom(int socket, void *mem, size_t len, int flags,
 
     if (ret > 0)
     {
-        lwp_put_to_user(mem, kmem, len);
+        lwp_put_to_user(mem, kmem, ret);
     }
 
     kmem_put(kmem);
@@ -3155,12 +3181,7 @@ int sys_recvfrom(int socket, void *mem, size_t len, int flags,
 
 int sys_recv(int socket, void *mem, size_t len, int flags)
 {
-    int flgs = 0;
-    int ret;
-
-    flgs = netflags_muslc_2_lwip(flags);
-    ret = recvfrom(socket, mem, len, flgs, NULL, NULL);
-    return (ret < 0 ? GET_ERRNO() : ret);
+    return sys_recvfrom(socket, mem, len, flags, RT_NULL, RT_NULL);
 }
 
 int sys_sendto(int socket, const void *dataptr, size_t size, int flags,
@@ -3176,7 +3197,7 @@ int sys_sendto(int socket, const void *dataptr, size_t size, int flags,
 #ifdef RT_USING_USERSPACE
     if (!size)
     {
-        return -EINVAL;
+        return 0;
     }
 
     if (!lwp_user_accessable((void *)dataptr, size))
@@ -3195,7 +3216,20 @@ int sys_sendto(int socket, const void *dataptr, size_t size, int flags,
     if (to)
     {
         struct sockaddr sa;
-        sockaddr_tolwip(to, &sa);
+        struct musl_sockaddr kto;
+
+        if (tolen < sizeof(kto))
+        {
+            kmem_put(kmem);
+            return -EINVAL;
+        }
+        if (!lwp_user_accessable((void *)to, sizeof(kto)))
+        {
+            kmem_put(kmem);
+            return -EFAULT;
+        }
+        lwp_get_from_user(&kto, (void *)to, sizeof(kto));
+        sockaddr_tolwip(&kto, &sa);
 
         ret = sendto(socket, kmem, size, flgs, &sa, tolen);
     }
@@ -3225,12 +3259,7 @@ int sys_sendto(int socket, const void *dataptr, size_t size, int flags,
 
 int sys_send(int socket, const void *dataptr, size_t size, int flags)
 {
-    int ret;
-    int flgs = 0;
-
-    flgs = netflags_muslc_2_lwip(flags);
-    ret = sendto(socket, dataptr, size, flgs, NULL, 0);
-    return (ret < 0 ? GET_ERRNO() : ret);
+    return sys_sendto(socket, dataptr, size, flags, RT_NULL, 0);
 }
 
 int sys_socket(int domain, int type, int protocol)
