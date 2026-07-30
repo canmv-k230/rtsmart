@@ -101,24 +101,22 @@ static void realtek_init_do(void)
 
     Set_WLAN_Power_On();
 
-#if defined (REALTEK_SDIO_DEV0)
+#if defined (REALTEK_SDIO_DEV_RESET) && ((-1) != REALTEK_SDIO_DEV_RESET)
+    kd_pin_mode(REALTEK_SDIO_DEV_RESET, GPIO_DM_OUTPUT);
+
+    kd_pin_write(REALTEK_SDIO_DEV_RESET, GPIO_PV_HIGH);
+    rt_thread_mdelay(10);
+    kd_pin_write(REALTEK_SDIO_DEV_RESET, GPIO_PV_LOW);
+    rt_thread_mdelay(200);
+    kd_pin_write(REALTEK_SDIO_DEV_RESET, GPIO_PV_HIGH);
+    rt_thread_mdelay(50);
+#elif defined (REALTEK_SDIO_DEV0)
     kd_sdhci0_reset(1);
     rt_thread_mdelay(10);
     kd_sdhci0_reset(0);
     rt_thread_mdelay(200);
     kd_sdhci0_reset(1);
     rt_thread_mdelay(50);
-#elif defined (REALTEK_SDIO_DEV1)
-    #if (-1) != REALTEK_SDIO_DEV_RESET
-        kd_pin_mode(REALTEK_SDIO_DEV_RESET, GPIO_DM_OUTPUT);
-
-        kd_pin_write(REALTEK_SDIO_DEV_RESET, GPIO_PV_HIGH);
-        rt_thread_mdelay(10);
-        kd_pin_write(REALTEK_SDIO_DEV_RESET, GPIO_PV_LOW);
-        rt_thread_mdelay(200);
-        kd_pin_write(REALTEK_SDIO_DEV_RESET, GPIO_PV_HIGH);
-        rt_thread_mdelay(50);
-    #endif
 #endif
 
     ret = sdio_register_driver(&realtek_drv);

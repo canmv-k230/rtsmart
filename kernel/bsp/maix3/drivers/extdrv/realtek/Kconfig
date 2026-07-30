@@ -18,9 +18,12 @@ menuconfig RT_USING_REALTEK
             default 1 if REALTEK_SDIO_DEV1
         
         config REALTEK_SDIO_DEV_RESET
-            int "RealTek WiFi Card Reset"
+            int "RealTek WiFi Card Reset/REG_ON GPIO"
             default -1
-            depends on REALTEK_SDIO_DEV1
+            help
+                GPIO used to reset or enable the WiFi card, regardless of the
+                selected SDIO controller. Set to -1 to use the SDIO0 reset
+                output, or when the board does not have such a GPIO.
 
         choice
             prompt "realtek module"
