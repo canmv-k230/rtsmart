@@ -9,6 +9,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -481,9 +482,25 @@ static void iperf_client(void *thread_param)
             if (ret > 0)
             {
                 sentlen += ret;
+                continue;
             }
 
-            if (ret <= 0) break;
+            if (ret < 0)
+            {
+                int error = errno;
+
+                if (error == EINTR || error == EAGAIN ||
+                    error == EWOULDBLOCK)
+                {
+                    if (error != EINTR)
+                    {
+                        rt_thread_mdelay(1);
+                    }
+                    continue;
+                }
+                LOG_W("send failed (errno %d)", error);
+            }
+            break;
         }
 
         now = rt_tick_get();
@@ -500,7 +517,7 @@ static void iperf_client(void *thread_param)
             break;
         }
         rt_thread_mdelay(2000);
-        LOG_W("Disconnected, iperf server shut down");
+        LOG_W("Disconnected from iperf server, reconnecting");
         tips = 1;
     }
     rt_free(send_buf);
@@ -514,7 +531,7 @@ void iperf_server(void *thread_param)
     rt_tick_t started;
     rt_tick_t interval_started;
     rt_tick_t now;
-    int sock = -1, connected, bytes_received;
+    int sock = -1, connected, bytes_received, select_result;
     int reuse = 1;
     rt_uint64_t recvlen;
     struct sockaddr_in server_addr, client_addr;
@@ -587,17 +604,50 @@ void iperf_server(void *thread_param)
                        (void *) &flag,  /* the cast is historical cruft */
                        sizeof(int));    /* length of option value */
         }
-        timeout.tv_sec = 1;
-        timeout.tv_usec = 0;
-        setsockopt(connected, SOL_SOCKET, SO_RCVTIMEO, &timeout,
-                   sizeof(timeout));
-
         recvlen = 0;
         interval_started = rt_tick_get();
         while (iperf_should_run(started))
         {
+            FD_ZERO(&readset);
+            FD_SET(connected, &readset);
+            timeout.tv_sec = 1;
+            timeout.tv_usec = 0;
+
+            select_result = select(connected + 1, &readset, RT_NULL,
+                                   RT_NULL, &timeout);
+            if (select_result == 0)
+            {
+                continue;
+            }
+            if (select_result < 0)
+            {
+                int error = errno;
+
+                if (error == EINTR)
+                {
+                    continue;
+                }
+                LOG_W("select failed (errno %d)", error);
+                break;
+            }
+
             bytes_received = recv(connected, recv_data, IPERF_BUFSZ, 0);
-            if (bytes_received <= 0) break;
+            if (bytes_received == 0)
+            {
+                break;
+            }
+            if (bytes_received < 0)
+            {
+                int error = errno;
+
+                if (error == EINTR || error == EAGAIN ||
+                    error == EWOULDBLOCK)
+                {
+                    continue;
+                }
+                LOG_W("recv failed (errno %d)", error);
+                break;
+            }
 
             recvlen += bytes_received;
 
