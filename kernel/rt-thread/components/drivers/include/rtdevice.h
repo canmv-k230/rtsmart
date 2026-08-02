@@ -128,6 +128,10 @@ extern "C" {
 #include "drivers/wlan.h"
 #endif
 
+#ifdef RT_USING_BT_HCI
+#include "drivers/bt_hci.h"
+#endif
+
 #ifdef MTD_USING_NOR
 #include "drivers/mtdnor.h"
 #endif

@@ -544,6 +544,17 @@ if RT_USING_INPUT_CAPTURE
         default 100
 endif
 
+menuconfig RT_USING_BT_HCI
+    bool "Using Bluetooth HCI device framework"
+    select RT_USING_DEVICE
+    select RT_USING_DEVICE_IPC
+    default n
+    help
+        Provide a transport-neutral Bluetooth HCI H:4 character device.
+        Controller drivers register an HCI device and BLE host stacks use the
+        resulting byte stream; GAP, GATT, L2CAP, and SMP belong in a proven
+        host stack such as NimBLE rather than in this device framework.
+
 config RT_USING_DEV_BUS
     bool "Using Device Bus device drivers"
     default y if RT_USING_LWP
