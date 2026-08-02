@@ -704,15 +704,9 @@ static rt_err_t _net_mgmt_dev_cmd_get_dev_list(void* mgmt_dev, void* args)
     rt_base_t      level;
     rt_slist_t*    node       = RT_NULL;
     struct netdev* netdev     = RT_NULL;
-    int            netdev_cnt = 0;
     int            name_idx   = 0;
 
     char result_buffer[32 * NET_DEV_MAX_CNT], *pname = NULL; /* we max support 8 netdev */
-
-    /* Check if netdev list exists */
-    if (RT_NULL == netdev_list) {
-        return -1;
-    }
 
     if ((NULL == args) || !lwp_user_accessable(args, sizeof(result_buffer))) {
         LOG_E("user input buffer error\n");
@@ -723,14 +717,16 @@ static rt_err_t _net_mgmt_dev_cmd_get_dev_list(void* mgmt_dev, void* args)
     rt_memset(result_buffer, 0, sizeof(result_buffer));
 
     level = rt_hw_interrupt_disable();
-    for (node = &(netdev_list->list); node; node = rt_slist_next(node)) {
-        netdev = rt_slist_entry(node, struct netdev, list);
+    if (netdev_list != RT_NULL) {
+        for (node = &(netdev_list->list); node; node = rt_slist_next(node)) {
+            if (name_idx >= NET_DEV_MAX_CNT) {
+                break;
+            }
+            netdev = rt_slist_entry(node, struct netdev, list);
 
-        pname = &result_buffer[name_idx * 32];
-        rt_memcpy(pname, netdev->name, RT_NAME_MAX);
-
-        if ((++name_idx) > NET_DEV_MAX_CNT) {
-            break;
+            pname = &result_buffer[name_idx * 32];
+            rt_memcpy(pname, netdev->name, RT_NAME_MAX);
+            name_idx++;
         }
     }
     rt_hw_interrupt_enable(level);
