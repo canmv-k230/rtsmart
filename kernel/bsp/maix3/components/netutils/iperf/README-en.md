@@ -6,7 +6,7 @@
 
 ## 2. Use
 
-iperf uses a master-slave architecture, that is, one end is a server, and the other end is a client. The iperf component package we provide implements the TCP server mode and the client mode. UDP testing is not currently supported. The usage of the two modes will be explained in detail below.
+iperf uses a client-server architecture and supports both TCP and UDP in server and client modes. Options may be supplied in any order. Use `-i` to select the report interval, `-t` to set a test duration, and `-P` to run parallel client threads. A UDP client automatically increases its paced rate until driver backpressure identifies the maximum stable transport rate; use `-b` with a bits-per-second value or a `K`, `M`, or `G` suffix to select a fixed offered load.
 
 ### 2.1 iperf server mode
 
@@ -101,11 +101,12 @@ msh />iperf -c 192.168.12.45 -p 5001
 udp mode
 
 ```
-msh />iperf -u -c 192.168.12.45 -p 5001
+msh />iperf -c 192.168.12.45 -p 5001 -u -b 10M
 ```
 
 - -c means to start as a client, and then need to add the IP address of the pc running the server
 - -p means to connect to port 5001
+- -b sets the UDP offered bandwidth; compare the server's received rate and packet loss with the client's offered rate
 - Wait for the test to end. During the test, the test data will be displayed on the shell interface and JPerf software.
 
 TCP mode software settings

@@ -82,7 +82,9 @@
 struct eth_tx_msg
 {
     struct netif    *netif;
+    struct eth_device *device;
     struct pbuf     *buf;
+    err_t            result;
 };
 
 static struct rt_mailbox eth_tx_thread_mb;
@@ -416,15 +418,23 @@ static err_t ethernetif_linkoutput(struct netif *netif, struct pbuf *p)
 
     RT_ASSERT(netif != RT_NULL);
     enetif = (struct eth_device*)netif->state;
+    if (enetif == RT_NULL)
+    {
+        return ERR_IF;
+    }
 
     /* send a message to eth tx thread */
     msg.netif = netif;
+    msg.device = enetif;
     msg.buf   = p;
+    msg.result = ERR_IF;
     if (rt_mb_send(&eth_tx_thread_mb, (rt_ubase_t) &msg) == RT_EOK)
     {
         /* waiting for ack */
         rt_sem_take(&(enetif->tx_ack), RT_WAITING_FOREVER);
+        return msg.result;
     }
+    return ERR_MEM;
 #else
     struct eth_device* enetif;
 
@@ -831,14 +841,18 @@ static void eth_tx_thread_entry(void* parameter)
             RT_ASSERT(msg->netif != RT_NULL);
             RT_ASSERT(msg->buf   != RT_NULL);
 
-            enetif = (struct eth_device*)msg->netif->state;
-            if (enetif != RT_NULL)
+            enetif = msg->device;
+            RT_ASSERT(enetif != RT_NULL);
+
+            /* call driver's interface */
+            if (enetif->eth_tx(&(enetif->parent), msg->buf) != RT_EOK)
             {
-                /* call driver's interface */
-                if (enetif->eth_tx(&(enetif->parent), msg->buf) != RT_EOK)
-                {
-                    /* transmit eth packet failed */
-                }
+                /* transmit eth packet failed */
+                msg->result = ERR_IF;
+            }
+            else
+            {
+                msg->result = ERR_OK;
             }
 
             /* send ACK */
