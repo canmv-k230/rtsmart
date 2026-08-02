@@ -32,8 +32,11 @@
 #include <console.h>
 #endif
 
-/* use precision */
+/* printf feature options */
 #define RT_PRINTF_PRECISION
+#define RT_PRINTF_LONGLONG
+#define RT_PRINTF_SPECIAL
+#define RT_PRINTF_FLOAT
 
 /**
  * @addtogroup KernelService
@@ -649,6 +652,191 @@ rt_inline int skip_atoi(const char **s)
 #define SPECIAL     (1 << 5)    /* 0x */
 #define LARGE       (1 << 6)    /* use 'ABCDEF' instead of 'abcdef' */
 
+#ifdef RT_PRINTF_FLOAT
+#define RT_PRINTF_FLOAT_DEFAULT_PRECISION 6
+#define RT_PRINTF_FLOAT_MAX_PRECISION     18
+
+static char *print_char(char *buf, char *end, char value)
+{
+    if (buf < end)
+    {
+        *buf = value;
+    }
+    return buf + 1;
+}
+
+static char *print_float(char *buf,
+                         char *end,
+                         double num,
+                         int size,
+                         int precision,
+                         int type)
+{
+    const char *special = RT_NULL;
+    double divisor = 1.0;
+    double rounding = 0.5;
+    char sign = 0;
+    char padding;
+    int integer_digits = 1;
+    int special_length = 0;
+    int output_length;
+    int digit;
+    int i;
+
+    if (__builtin_signbit(num))
+    {
+        sign = '-';
+        num = -num;
+    }
+    else if (type & PLUS)
+    {
+        sign = '+';
+    }
+    else if (type & SPACE)
+    {
+        sign = ' ';
+    }
+
+    if (__builtin_isnan(num))
+    {
+        special = (type & LARGE) ? "NAN" : "nan";
+        special_length = 3;
+    }
+    else if (__builtin_isinf(num))
+    {
+        special = (type & LARGE) ? "INF" : "inf";
+        special_length = 3;
+    }
+
+    padding = (type & ZEROPAD) ? '0' : ' ';
+    if (type & LEFT)
+    {
+        type &= ~ZEROPAD;
+        padding = ' ';
+    }
+
+    if (special)
+    {
+        output_length = special_length + (sign ? 1 : 0);
+        if (!(type & LEFT) && padding == ' ')
+        {
+            while (output_length < size--)
+            {
+                buf = print_char(buf, end, ' ');
+            }
+        }
+        if (sign)
+        {
+            buf = print_char(buf, end, sign);
+        }
+        if (!(type & LEFT) && padding == '0')
+        {
+            while (output_length < size--)
+            {
+                buf = print_char(buf, end, '0');
+            }
+        }
+        for (i = 0; i < special_length; i++)
+        {
+            buf = print_char(buf, end, special[i]);
+        }
+        while (output_length < size--)
+        {
+            buf = print_char(buf, end, ' ');
+        }
+        return buf;
+    }
+
+    if (precision < 0)
+    {
+        precision = RT_PRINTF_FLOAT_DEFAULT_PRECISION;
+    }
+    if (precision > RT_PRINTF_FLOAT_MAX_PRECISION)
+    {
+        precision = RT_PRINTF_FLOAT_MAX_PRECISION;
+    }
+
+    for (i = 0; i < precision; i++)
+    {
+        rounding /= 10.0;
+    }
+    num += rounding;
+
+    while (num / divisor >= 10.0)
+    {
+        divisor *= 10.0;
+        integer_digits++;
+    }
+
+    output_length = integer_digits + (sign ? 1 : 0);
+    if (precision || (type & SPECIAL))
+    {
+        output_length += precision + 1;
+    }
+
+    if (!(type & LEFT) && padding == ' ')
+    {
+        while (output_length < size--)
+        {
+            buf = print_char(buf, end, ' ');
+        }
+    }
+    if (sign)
+    {
+        buf = print_char(buf, end, sign);
+    }
+    if (!(type & LEFT) && padding == '0')
+    {
+        while (output_length < size--)
+        {
+            buf = print_char(buf, end, '0');
+        }
+    }
+
+    for (i = 0; i < integer_digits; i++)
+    {
+        digit = (int)(num / divisor);
+        if (digit > 9)
+        {
+            digit = 9;
+        }
+        buf = print_char(buf, end, (char)('0' + digit));
+        num -= digit * divisor;
+        if (num < 0.0)
+        {
+            num = 0.0;
+        }
+        divisor /= 10.0;
+    }
+
+    if (precision || (type & SPECIAL))
+    {
+        buf = print_char(buf, end, '.');
+    }
+    for (i = 0; i < precision; i++)
+    {
+        num *= 10.0;
+        digit = (int)num;
+        if (digit > 9)
+        {
+            digit = 9;
+        }
+        buf = print_char(buf, end, (char)('0' + digit));
+        num -= digit;
+        if (num < 0.0)
+        {
+            num = 0.0;
+        }
+    }
+    while (output_length < size--)
+    {
+        buf = print_char(buf, end, ' ');
+    }
+
+    return buf;
+}
+#endif
+
 #ifdef RT_PRINTF_PRECISION
 static char *print_number(char *buf,
                           char *end,
@@ -703,6 +891,10 @@ static char *print_number(char *buf,
     sign = 0;
     if (type & SIGN)
     {
+        /*
+         * Use unsigned subtraction for wide integers to avoid overflow
+         * when formatting their minimum signed values.
+         */
         switch (qualifier)
         {
         case 'h':
@@ -713,11 +905,17 @@ static char *print_number(char *buf,
             }
             break;
         case 'L':
+            if ((long long)num < 0)
+            {
+                sign = '-';
+                num = 0 - num;
+            }
+            break;
         case 'l':
             if ((long)num < 0)
             {
                 sign = '-';
-                num = -(long)num;
+                num = (unsigned long)(0UL - (unsigned long)num);
             }
             break;
         case 0:
@@ -725,7 +923,7 @@ static char *print_number(char *buf,
             if ((rt_int32_t)num < 0)
             {
                 sign = '-';
-                num = -(rt_int32_t)num;
+                num = (rt_uint32_t)(0U - (rt_uint32_t)num);
             }
             break;
         }
@@ -1098,6 +1296,20 @@ rt_int32_t rt_vsnprintf(char       *buf,
 #endif
             continue;
 
+#ifdef RT_PRINTF_FLOAT
+        case 'F':
+            flags |= LARGE;
+        case 'f':
+            str = print_float(str, end, va_arg(args, double), field_width,
+#ifdef RT_PRINTF_PRECISION
+                              precision,
+#else
+                              -1,
+#endif
+                              flags);
+            continue;
+#endif
+
         case '%':
             if (str < end)
             {
@@ -1148,26 +1360,30 @@ rt_int32_t rt_vsnprintf(char       *buf,
 #ifdef RT_PRINTF_LONGLONG
         if (qualifier == 'L')
         {
-            num = va_arg(args, unsigned long long);
+            num = (flags & SIGN)
+                    ? (unsigned long long)va_arg(args, long long)
+                    : va_arg(args, unsigned long long);
         }
         else if (qualifier == 'l')
 #else
         if (qualifier == 'l')
 #endif
         {
-            num = va_arg(args, unsigned long);
+            num = (flags & SIGN)
+                    ? (unsigned long)va_arg(args, long)
+                    : va_arg(args, unsigned long);
         }
         else if (qualifier == 'h')
         {
-            num = (rt_uint16_t)va_arg(args, rt_int32_t);
-            if (flags & SIGN)
-            {
-                num = (rt_int16_t)num;
-            }
+            num = (flags & SIGN)
+                    ? (rt_uint16_t)va_arg(args, int)
+                    : (rt_uint16_t)va_arg(args, unsigned int);
         }
         else
         {
-            num = (rt_uint32_t)va_arg(args, unsigned long);
+            num = (flags & SIGN)
+                    ? (rt_uint32_t)va_arg(args, int)
+                    : va_arg(args, unsigned int);
         }
 #ifdef RT_PRINTF_PRECISION
         str = print_number(str, end, num, base, qualifier, field_width, precision, flags);
