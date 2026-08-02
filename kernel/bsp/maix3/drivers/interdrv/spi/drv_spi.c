@@ -247,6 +247,24 @@ static uint32_t dw_spi_make_txftlr(rt_size_t frames)
     return (uint32_t)irq_level;
 }
 
+static uint32_t dw_spi_make_idma_txftlr(rt_size_t frames)
+{
+    rt_size_t start_level;
+
+    if (frames == 0) {
+        return 0;
+    }
+
+    /* Match the K230 Linux driver: preload short transfers completely and
+     * half of a long transfer before the enhanced-SPI shifter starts. */
+    start_level = frames < 64 ? frames - 1 : frames / 2;
+    if (start_level > DW_SSI_IDMA_TXFTHR_MAX) {
+        start_level = DW_SSI_IDMA_TXFTHR_MAX;
+    }
+
+    return ((uint32_t)start_level << 16) | (DW_SSI_TX_FIFO_DEPTH / 2);
+}
+
 static void* dw_spi_get_dma_buf(dw_spi_bus_t* spi_bus, rt_size_t size)
 {
     void* buf;
@@ -1080,21 +1098,45 @@ static rt_uint32_t drv_spi_xfer_enhanced(dw_spi_bus_t* spi_bus, struct rt_qspi_c
     writel(readl(&spi->ctrlr0) & ~(DW_SSI_CTRLR0_SPI_FRF_MASK | DW_SSI_CTRLR0_TMOD_MASK), &spi->ctrlr0);
 
     if (length) {
-        rt_size_t   txfthr     = length > (SSIC_TX_ABW / 2) ? (SSIC_TX_ABW / 2) : length - 1;
+        rt_size_t   dummy_frames = 0;
+        rt_size_t   dummy_bytes  = 0;
+        rt_size_t   dma_bytes    = total_bytes;
+        rt_size_t   dma_frames   = length;
+        uint32_t    wait_cycles  = msg->dummy_cycles;
         rt_uint32_t event      = 0;
         uint32_t    inst_size  = msg->instruction.size;
         uint32_t    addr_size  = msg->address.size;
         uint32_t    inst_data  = msg->instruction.content;
         uint32_t    addr_data  = msg->address.content;
-        rt_size_t   dma_bytes  = total_bytes;
-        rt_size_t   dma_frames = length;
         const void* src_buf    = msg->parent.send_buf;
         void*       dst_buf    = msg->parent.recv_buf;
         uint32_t    spi_ctrlr0;
         rt_bool_t   dma_copy_back = RT_FALSE;
 
+        /* WAIT_CYCLES is not emitted by this controller in transmit-only
+         * enhanced mode. Prepend whole data frames to produce the requested
+         * idle clocks before the real payload. */
+        if (tmod == SPI_TMOD_TO && wait_cycles) {
+            uint32_t clocks_per_frame = cfg->parent.data_width / msg->qspi_data_lines;
+
+            if (!clocks_per_frame || wait_cycles % clocks_per_frame) {
+                LOG_E("spi%d cannot represent %u TX dummy cycles with %u-bit frames on %u lines", spi_bus->hw->idx,
+                      wait_cycles, cfg->parent.data_width, msg->qspi_data_lines);
+                return 0;
+            }
+            dummy_frames = wait_cycles / clocks_per_frame;
+            if (dummy_frames > DW_SSI_MAX_XFER_FRAMES - dma_frames) {
+                LOG_E("spi%d enhanced TX including dummy cycles exceeds one transaction", spi_bus->hw->idx);
+                return 0;
+            }
+            dummy_bytes = dummy_frames * cell_size;
+            dma_frames += dummy_frames;
+            dma_bytes += dummy_bytes;
+            wait_cycles = 0;
+        }
+
         spi_ctrlr0 = trans_type | DW_SSI_SPI_CTRLR0_ADDR_L(addr_size) | DW_SSI_SPI_CTRLR0_INST_L(inst_size)
-            | DW_SSI_SPI_CTRLR0_WAIT_CYCLES(msg->dummy_cycles);
+            | DW_SSI_SPI_CTRLR0_WAIT_CYCLES(wait_cycles) | DW_SSI_SPI_CTRLR0_CLK_STRETCH_EN;
 
         writel(0, &spi->ssienr);
         writel(spi_ctrlr0, &spi->spi_ctrlr0);
@@ -1102,11 +1144,12 @@ static rt_uint32_t drv_spi_xfer_enhanced(dw_spi_bus_t* spi_bus, struct rt_qspi_c
         writel((readl(&spi->ctrlr0) & ~(DW_SSI_CTRLR0_SPI_FRF_MASK | DW_SSI_CTRLR0_TMOD_MASK))
                    | (spi_ff << DW_SSI_CTRLR0_SPI_FRF_SHIFT) | (tmod << DW_SSI_CTRLR0_TMOD_SHIFT),
                &spi->ctrlr0);
-        writel((txfthr << 16) | (SSIC_TX_ABW / 2), &spi->txftlr);
+        writel(tmod == SPI_TMOD_TO ? dw_spi_make_idma_txftlr(dma_frames) : 0,
+               &spi->txftlr);
         writel(SSIC_RX_ABW - 1, &spi->rxftlr);
         writel(dma_frames ? dma_frames - 1 : 0, &spi->ctrlr1);
 
-        writel(DW_SSI_IMR_DONE | DW_SSI_IMR_AXIE, &spi->imr);
+        writel(0, &spi->imr);
         writel(inst_data, &spi->spidr);
         writel(addr_data, &spi->spiar);
 
@@ -1118,7 +1161,16 @@ static rt_uint32_t drv_spi_xfer_enhanced(dw_spi_bus_t* spi_bus, struct rt_qspi_c
                 goto multi_cleanup;
             }
 
-            if (dw_spi_buf_aligned(src_buf, cell_size)) {
+            if (dummy_bytes) {
+                dma_buf = dw_spi_get_dma_buf(spi_bus, dma_bytes);
+                if (dma_buf == NULL) {
+                    LOG_E("spi%d alloc TX dummy bounce buf failed", spi_bus->hw->idx);
+                    ret_length = 0;
+                    goto multi_cleanup;
+                }
+                rt_memset(dma_buf, 0, dummy_bytes);
+                rvv_memcpy((uint8_t*)dma_buf + dummy_bytes, src_buf, total_bytes);
+            } else if (dw_spi_buf_aligned(src_buf, cell_size)) {
                 dma_buf = (void*)src_buf;
             } else {
                 dma_buf = dw_spi_get_dma_buf(spi_bus, dma_bytes);
@@ -1163,6 +1215,16 @@ static rt_uint32_t drv_spi_xfer_enhanced(dw_spi_bus_t* spi_bus, struct rt_qspi_c
         writel((1U << 6) | (dw_spi_get_dma_atw(dma_buf, tmod == SPI_TMOD_TO ? dma_bytes : total_bytes) << 3)
                    | DW_SSI_DMACR_IDMAE,
                &spi->dmacr);
+
+        /* DONE is level-triggered and can remain pending after the previous
+         * transfer is disabled. Do not let that stale interrupt complete the
+         * new RT event and tear down CS while this transfer is still active. */
+        rt_hw_interrupt_mask(spi_bus->hw->irq_base + SSI_DONE);
+        rt_hw_interrupt_mask(spi_bus->hw->irq_base + SSI_AXIE);
+        writel(0, &spi->imr);
+        readl(&spi->donecr);
+        readl(&spi->axiecr);
+        readl(&spi->icr);
         rt_event_control(&spi_bus->event, RT_IPC_CMD_RESET, 0);
 
         /* cs take */
@@ -1171,7 +1233,10 @@ static rt_uint32_t drv_spi_xfer_enhanced(dw_spi_bus_t* spi_bus, struct rt_qspi_c
         }
         writel(spi_bus->ser, &spi->ser);
 
+        writel(DW_SSI_IMR_DONE | DW_SSI_IMR_AXIE, &spi->imr);
         writel(1, &spi->ssienr); /* start transfer */
+        rt_hw_interrupt_umask(spi_bus->hw->irq_base + SSI_DONE);
+        rt_hw_interrupt_umask(spi_bus->hw->irq_base + SSI_AXIE);
         err = rt_event_recv(&spi_bus->event, BIT(SSI_DONE) | BIT(SSI_AXIE), RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, 1000,
                             &event);
         if (err == -RT_ETIMEOUT) {
@@ -1181,6 +1246,16 @@ static rt_uint32_t drv_spi_xfer_enhanced(dw_spi_bus_t* spi_bus, struct rt_qspi_c
         }
         if (event & BIT(SSI_AXIE)) {
             LOG_E("spi%d dma error", spi_bus->hw->idx);
+            ret_length = 0;
+            goto multi_cleanup;
+        }
+
+        /* IDMA completion only means the source buffer has been consumed.
+         * Keep software CS asserted until the FIFO and shifter are empty. */
+        if (tmod == SPI_TMOD_TO &&
+            dw_spi_wait_tx_complete(spi, 500) != RT_EOK) {
+            LOG_E("spi%d enhanced tx drain timeout", spi_bus->hw->idx);
+            rt_set_errno(-RT_ETIMEOUT);
             ret_length = 0;
             goto multi_cleanup;
         }
@@ -1195,11 +1270,27 @@ static rt_uint32_t drv_spi_xfer_enhanced(dw_spi_bus_t* spi_bus, struct rt_qspi_c
         uint32_t spi_ctrlr0;
         uint8_t  dfs_bits;
         uint32_t addr_left;
+        uint32_t dummy_frames = 0;
+        uint32_t wait_cycles  = msg->dummy_cycles;
+        uint32_t wire_cycles  = 0;
+
+        if (wait_cycles) {
+            uint32_t clocks_per_frame = cfg->parent.data_width / msg->qspi_data_lines;
+
+            if (!clocks_per_frame || wait_cycles % clocks_per_frame) {
+                LOG_E("spi%d cannot represent %u command-only dummy cycles with %u-bit frames on %u lines",
+                      spi_bus->hw->idx, wait_cycles, cfg->parent.data_width, msg->qspi_data_lines);
+                ret_length = 0;
+                goto multi_cleanup;
+            }
+            dummy_frames = wait_cycles / clocks_per_frame;
+            wait_cycles = 0;
+        }
 
         writel(0, &spi->ssienr);
 
         spi_ctrlr0 = trans_type | DW_SSI_SPI_CTRLR0_ADDR_L(msg->address.size) | DW_SSI_SPI_CTRLR0_INST_L(msg->instruction.size)
-            | DW_SSI_SPI_CTRLR0_WAIT_CYCLES(msg->dummy_cycles);
+            | DW_SSI_SPI_CTRLR0_WAIT_CYCLES(wait_cycles);
         writel(spi_ctrlr0, &spi->spi_ctrlr0);
         writel(readl(&spi->ctrlr0) | (spi_ff << DW_SSI_CTRLR0_SPI_FRF_SHIFT) | (SPI_TMOD_TO << DW_SSI_CTRLR0_TMOD_SHIFT),
                &spi->ctrlr0);
@@ -1239,6 +1330,29 @@ static rt_uint32_t drv_spi_xfer_enhanced(dw_spi_bus_t* spi_bus, struct rt_qspi_c
 
             writel((msg->address.content >> shift) & mask, &spi->dr[0]);
             addr_left -= take;
+        }
+
+        while (dummy_frames--) {
+            writel(0, &spi->dr[0]);
+        }
+
+        if (msg->instruction.size) {
+            wire_cycles += (msg->instruction.size + msg->instruction.qspi_lines - 1) /
+                           msg->instruction.qspi_lines;
+        }
+        if (msg->address.size) {
+            wire_cycles += (msg->address.size + msg->address.qspi_lines - 1) /
+                           msg->address.qspi_lines;
+        }
+        wire_cycles += msg->dummy_cycles;
+        if (wire_cycles && cfg->parent.max_hz) {
+            uint64_t wire_time_us = ((uint64_t)wire_cycles * 1000000U +
+                                     cfg->parent.max_hz - 1) /
+                                    cfg->parent.max_hz;
+
+            /* SR can still report idle immediately after the final FIFO
+             * write. Keep CS asserted for at least the on-wire command time. */
+            cpu_ticks_delay_us(wire_time_us + 1);
         }
 
         if (dw_spi_wait_tx_complete(spi, 500) != RT_EOK) {

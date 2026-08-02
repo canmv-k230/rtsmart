@@ -6,6 +6,17 @@ menuconfig RT_USING_ESP_HOSTED
 
     if RT_USING_ESP_HOSTED
 
+        choice ESP_HOSTED_TRANSPORT
+            prompt "Transport"
+            default ESP_HOSTED_TRANSPORT_SPI_FD
+
+            config ESP_HOSTED_TRANSPORT_SPI_FD
+                bool "SPI full-duplex"
+
+            config ESP_HOSTED_TRANSPORT_SPI_HD
+                bool "SPI half-duplex"
+        endchoice
+
         choice ESP_HOSTED_SPI_BUS
             prompt "SPI bus"
             default ESP_HOSTED_SPI_BUS_SPI0
@@ -29,14 +40,49 @@ menuconfig RT_USING_ESP_HOSTED
             range 1000000 40000000
             default 5000000
 
-        config ESP_HOSTED_SPI_MODE
-            int "SPI mode"
-            range 1 3
-            default 3
+        choice ESP_HOSTED_SPI_WORK_MODE
+            prompt "SPI work mode"
+            default ESP_HOSTED_SPI_MODE_3
             help
-                Must match CONFIG_ESP_SPI_MODE in the ESP-Hosted coprocessor
-                firmware. The full-duplex ESP-Hosted slave does not support
-                SPI mode 0.
+                Must match the SPI mode selected in the ESP-Hosted-MCU
+                coprocessor firmware. Full-duplex does not support mode 0.
+
+            config ESP_HOSTED_SPI_MODE_0
+                bool "Mode 0 (CPOL=0, CPHA=0)"
+                depends on ESP_HOSTED_TRANSPORT_SPI_HD
+
+            config ESP_HOSTED_SPI_MODE_1
+                bool "Mode 1 (CPOL=0, CPHA=1)"
+
+            config ESP_HOSTED_SPI_MODE_2
+                bool "Mode 2 (CPOL=1, CPHA=0)"
+
+            config ESP_HOSTED_SPI_MODE_3
+                bool "Mode 3 (CPOL=1, CPHA=1)"
+        endchoice
+
+        config ESP_HOSTED_SPI_MODE
+            int
+            default 0 if ESP_HOSTED_SPI_MODE_0
+            default 1 if ESP_HOSTED_SPI_MODE_1
+            default 2 if ESP_HOSTED_SPI_MODE_2
+            default 3 if ESP_HOSTED_SPI_MODE_3
+            default 3
+
+        if ESP_HOSTED_TRANSPORT_SPI_HD
+
+            choice ESP_HOSTED_SPI_HD_WIDTH
+                prompt "Maximum SPI half-duplex bus width"
+                default ESP_HOSTED_SPI_HD_WIDTH_2
+
+                config ESP_HOSTED_SPI_HD_WIDTH_2
+                    bool "2 data lines (dual SPI)"
+
+                config ESP_HOSTED_SPI_HD_WIDTH_4
+                    bool "4 data lines (quad SPI)"
+            endchoice
+
+        endif
 
         config ESP_HOSTED_SPI_CS_PIN
             int "Chip-select GPIO"
@@ -49,46 +95,118 @@ menuconfig RT_USING_ESP_HOSTED
             default 15
 
         config ESP_HOSTED_SPI_D0_PIN
-            int "SPI D0 GPIO (MOSI)"
+            int "SPI D0 GPIO (MOSI/D0)"
             range -1 63
             default 16
 
         config ESP_HOSTED_SPI_D1_PIN
-            int "SPI D1 GPIO (MISO)"
+            int "SPI D1 GPIO (MISO/D1)"
             range -1 63
             default 17
 
-        config ESP_HOSTED_HANDSHAKE_PIN
-            int "Handshake GPIO"
+        config ESP_HOSTED_SPI_D2_PIN
+            int "SPI D2 GPIO"
+            depends on ESP_HOSTED_TRANSPORT_SPI_HD && ESP_HOSTED_SPI_HD_WIDTH_4
             range -1 63
             default 18
 
-        config ESP_HOSTED_HANDSHAKE_ACTIVE_LOW
-            bool "Handshake signal is active-low"
-            default n
-
-        config ESP_HOSTED_DATA_READY_PIN
-            int "Data-ready GPIO"
+        config ESP_HOSTED_SPI_D3_PIN
+            int "SPI D3 GPIO"
+            depends on ESP_HOSTED_TRANSPORT_SPI_HD && ESP_HOSTED_SPI_HD_WIDTH_4
             range -1 63
             default 19
 
-        config ESP_HOSTED_DATA_READY_ACTIVE_LOW
-            bool "Data-ready signal is active-low"
-            default n
+        if ESP_HOSTED_TRANSPORT_SPI_FD
+
+            config ESP_HOSTED_HANDSHAKE_PIN
+                int "Handshake GPIO"
+                range 0 63
+
+            choice ESP_HOSTED_HANDSHAKE_POLARITY
+                prompt "Handshake GPIO polarity"
+                default ESP_HOSTED_HANDSHAKE_ACTIVE_HIGH
+                help
+                    Must match the handshake GPIO polarity selected in the
+                    ESP-Hosted-MCU coprocessor firmware.
+
+                config ESP_HOSTED_HANDSHAKE_ACTIVE_HIGH
+                    bool "Active High"
+
+                config ESP_HOSTED_HANDSHAKE_ACTIVE_LOW
+                    bool "Active Low"
+            endchoice
+
+            config ESP_HOSTED_DATA_READY_PIN
+                int "Data-ready GPIO"
+                range 0 63
+
+        endif
+
+        if ESP_HOSTED_TRANSPORT_SPI_HD
+
+            config ESP_HOSTED_DATA_READY_PIN
+                int "Data-ready GPIO (-1 to poll)"
+                range -1 63
+
+            config ESP_HOSTED_SPI_HD_STATS
+                bool "Enable SPI-HD transfer statistics"
+                depends on RT_USING_FINSH && FINSH_USING_MSH
+                default n
+                help
+                    Collect SPI transfer timing and transport counters and
+                    provide the esp_spi_hd_stats shell command. Leave this
+                    disabled in production to avoid measurement overhead.
+
+        endif
+
+        choice ESP_HOSTED_DATA_READY_POLARITY
+            prompt "Data-ready GPIO polarity"
+            depends on ESP_HOSTED_DATA_READY_PIN >= 0
+            default ESP_HOSTED_DATA_READY_ACTIVE_HIGH
+            help
+                Must match the DataReady GPIO polarity selected in the
+                ESP-Hosted-MCU coprocessor firmware.
+
+            config ESP_HOSTED_DATA_READY_ACTIVE_HIGH
+                bool "Active High"
+
+            config ESP_HOSTED_DATA_READY_ACTIVE_LOW
+                bool "Active Low"
+        endchoice
+
+        config ESP_HOSTED_SPI_HD_POLL_INTERVAL_MS
+            int "Polling interval without data-ready GPIO (ms)"
+            depends on ESP_HOSTED_TRANSPORT_SPI_HD && ESP_HOSTED_DATA_READY_PIN < 0
+            range 1 1000
 
         config ESP_HOSTED_RESET_PIN
             int "ESP EN/reset GPIO"
             range -1 63
-            default -1
             help
-                SPI full-duplex requires the host and coprocessor transport
-                state to be synchronized at startup. Connect this output to
-                the ESP EN/RST pin, or to the slave reset GPIO selected in the
-                ESP-Hosted-MCU firmware.
+                Connect this output to the ESP EN/RST pin, or to the slave
+                reset GPIO selected in the ESP-Hosted-MCU firmware. If it is
+                disabled, reset the host and coprocessor together.
 
         config ESP_HOSTED_RESET_ACTIVE_LOW
             bool "Reset is asserted low"
             default y
+
+        config ESP_HOSTED_RESET_PULSE_MS
+            int "ESP reset pulse duration (ms)"
+            depends on ESP_HOSTED_RESET_PIN >= 0
+            range 1 1000
+            default 10
+
+        config ESP_HOSTED_SPI_HD_RESET_SETTLE_MS
+            int "SPI-HD reset settling time (ms)"
+            depends on ESP_HOSTED_TRANSPORT_SPI_HD && ESP_HOSTED_RESET_PIN >= 0
+            range 0 5000
+            default 1000
+            help
+                Do not inspect SPI-HD registers immediately after releasing
+                reset. A software-reset GPIO may leave registers from the old
+                session readable while esp_restart is still taking effect.
+                This delay runs only in the transport worker thread.
 
         config ESP_HOSTED_CHECKSUM
             bool "Validate and generate transport checksums"
@@ -104,6 +222,28 @@ menuconfig RT_USING_ESP_HOSTED
             range 1 32
             default 20
 
+        config ESP_HOSTED_BLE
+            bool "Enable Bluetooth HCI for BLE"
+            select RT_USING_BT_HCI
+            default n
+            help
+                Register the ESP coprocessor as an H:4 Bluetooth controller.
+                This is the controller transport boundary; a BLE host stack
+                such as NimBLE provides GAP, GATT, L2CAP, and SMP.
+
+        if ESP_HOSTED_BLE
+
+            config ESP_HOSTED_BT_HCI_DEVICE_NAME
+                string "Bluetooth HCI device name"
+                default "hci0"
+
+            config ESP_HOSTED_BT_HCI_RX_BUFFER_SIZE
+                int "Bluetooth HCI receive buffer size"
+                range 1024 32767
+                default 8192
+
+        endif
+
         config ESP_HOSTED_THREAD_PRIORITY
             int "Transport thread priority"
             range 1 31
@@ -115,11 +255,11 @@ menuconfig RT_USING_ESP_HOSTED
             default 8192
 
         config ESP_HOSTED_EVENT_THREAD_STACK_SIZE
-            int "WLAN event thread stack size"
+            int "WLAN/RPC event thread stack size"
             range 8192 32768
             default 8192
             help
-                The event thread enters the RT-Thread WLAN management and RPC
-                call chains. It needs more stack than a simple event worker.
+                Event threads enter the RT-Thread WLAN management and generic
+                RPC callback chains. They need more stack than simple workers.
 
     endif

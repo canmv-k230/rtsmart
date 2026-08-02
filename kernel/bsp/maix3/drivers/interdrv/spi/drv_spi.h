@@ -12,6 +12,7 @@
 #define DW_SSI_TX_FIFO_DEPTH       256
 #define DW_SSI_RX_FIFO_DEPTH       256
 #define DW_SSI_MAX_XFER_FRAMES     0x10000
+#define DW_SSI_IDMA_TXFTHR_MAX     0x7ff
 #define DW_SSI_DMA_BOUNCE_MAX_SIZE (DW_SSI_MAX_XFER_FRAMES * sizeof(uint32_t))
 
 /* Refill IRQ when TX level <= 1/4 depth so each TXE IRQ refills ~3/4 of the FIFO. */
