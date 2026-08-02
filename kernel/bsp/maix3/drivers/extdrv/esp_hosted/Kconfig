@@ -222,6 +222,16 @@ menuconfig RT_USING_ESP_HOSTED
             range 1 32
             default 20
 
+        config ESP_HOSTED_WIFI_MAX_TX_POWER
+            int "Default maximum Wi-Fi TX power (0.25 dBm units)"
+            range 8 84
+            default 84
+            help
+                Request this maximum transmit power after starting Wi-Fi on
+                the ESP coprocessor. 84 requests the highest ESP-IDF power
+                level (20 dBm); the effective value remains subject to the
+                coprocessor and regulatory country limits.
+
         config ESP_HOSTED_BLE
             bool "Enable Bluetooth HCI for BLE"
             select RT_USING_BT_HCI

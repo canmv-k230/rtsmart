@@ -458,6 +458,7 @@ static rt_err_t eh_set_mode_locked(uint8_t mode)
 
 static rt_err_t eh_start_locked(void)
 {
+    int tx_power;
     rt_err_t result;
 
     if (g_eh.wifi_started)
@@ -468,6 +469,27 @@ static rt_err_t eh_start_locked(void)
     if (result == RT_EOK)
     {
         g_eh.wifi_started = RT_TRUE;
+        result = esp_hosted_rpc_wifi_set_max_tx_power(
+            ESP_HOSTED_WIFI_MAX_TX_POWER);
+        if (result != RT_EOK)
+        {
+            LOG_W("cannot set Wi-Fi max TX power to %d: %d",
+                  ESP_HOSTED_WIFI_MAX_TX_POWER, result);
+        }
+        else
+        {
+            result = esp_hosted_rpc_wifi_get_max_tx_power(&tx_power);
+            if (result == RT_EOK)
+            {
+                LOG_I("Wi-Fi max TX power: %d.%02d dBm (raw=%d)",
+                      tx_power / 4, (tx_power % 4) * 25, tx_power);
+            }
+            else
+            {
+                LOG_W("cannot read Wi-Fi max TX power: %d", result);
+            }
+        }
+        return RT_EOK;
     }
     return result;
 }
@@ -763,7 +785,7 @@ static int eh_wlan_send(struct rt_wlan_device *wlan, void *buffer, int length)
 {
     rt_err_t result;
 
-    if (!g_eh.ready || !esp_hosted_transport_can_send_data() || length <= 0 ||
+    if (!g_eh.ready || length <= 0 ||
         (size_t)length > esp_hosted_transport_max_payload())
     {
         return -RT_EBUSY;

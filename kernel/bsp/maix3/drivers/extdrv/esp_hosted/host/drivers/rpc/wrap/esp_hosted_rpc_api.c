@@ -503,6 +503,41 @@ rt_err_t esp_hosted_rpc_wifi_get_power_save(int *mode)
     return result;
 }
 
+rt_err_t esp_hosted_rpc_wifi_set_max_tx_power(int power)
+{
+    RpcReqWifiSetMaxTxPower request =
+        RPC__REQ__WIFI_SET_MAX_TX_POWER__INIT;
+
+    if (power < 8 || power > 84)
+    {
+        return -RT_EINVAL;
+    }
+    request.power = power;
+    return eh_call_status(RPC_ID__Req_WifiSetMaxTxPower, &request.base,
+                          ESP_HOSTED_RPC_TIMEOUT_MS);
+}
+
+rt_err_t esp_hosted_rpc_wifi_get_max_tx_power(int *power)
+{
+    RpcRespWifiGetMaxTxPower *typed_response;
+    ProtobufCMessage *response;
+    rt_err_t result;
+
+    if (!power)
+    {
+        return -RT_EINVAL;
+    }
+    result = eh_call_checked(RPC_ID__Req_WifiGetMaxTxPower, RT_NULL,
+                             ESP_HOSTED_RPC_TIMEOUT_MS, &response);
+    if (result == RT_EOK)
+    {
+        typed_response = (RpcRespWifiGetMaxTxPower *)response;
+        *power = typed_response->power;
+        rt_esp_hosted_rpc_free_message(response);
+    }
+    return result;
+}
+
 rt_err_t esp_hosted_rpc_wifi_set_channel(int channel)
 {
     RpcReqWifiSetChannel request = RPC__REQ__WIFI_SET_CHANNEL__INIT;

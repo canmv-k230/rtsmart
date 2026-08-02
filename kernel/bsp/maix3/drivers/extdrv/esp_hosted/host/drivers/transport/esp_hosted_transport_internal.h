@@ -19,7 +19,13 @@
 #define EH_TRANSPORT_HCI_QUEUE_DEPTH 16
 #endif
 #define EH_TRANSPORT_DATA_QUEUE_DEPTH 16
-#define EH_TRANSPORT_EVENT_WAKE      (1U << 0)
+#define EH_TRANSPORT_EVENT_DATA      (1U << 0)
+#define EH_TRANSPORT_EVENT_CONTROL   (1U << 1)
+#define EH_TRANSPORT_EVENT_RX        (1U << 2)
+#define EH_TRANSPORT_EVENT_ALL       (EH_TRANSPORT_EVENT_DATA | \
+                                      EH_TRANSPORT_EVENT_CONTROL | \
+                                      EH_TRANSPORT_EVENT_RX)
+#define EH_TRANSPORT_EVENT_TX_READY  (1U << 0)
 #define EH_TRANSPORT_INVALID_LOG_LIMIT 1
 #define EH_TRANSPORT_MQ_POOL_SIZE(depth, type) \
     ((depth) * (RT_ALIGN(sizeof(type), RT_ALIGN_SIZE) + sizeof(void *)))
@@ -43,6 +49,7 @@ struct eh_transport_ops
     const char *name;
     size_t frame_size;
     size_t tx_alignment;
+    rt_int32_t data_queue_send_wait_ms;
     rt_err_t (*init)(struct eh_transport *transport);
     rt_err_t (*start)(struct eh_transport *transport);
     void (*run)(struct eh_transport *transport);
@@ -58,6 +65,7 @@ struct eh_transport
     void *callback_argument;
     void *backend;
     struct rt_event event;
+    struct rt_event tx_event;
     struct rt_messagequeue ctrl_queue;
 #ifdef ESP_HOSTED_BLE
     struct rt_messagequeue hci_queue;
@@ -65,6 +73,11 @@ struct eh_transport
     struct rt_messagequeue data_queue;
     rt_thread_t thread;
     volatile rt_bool_t tx_throttled;
+#ifdef ESP_HOSTED_SPI_HD_STATS
+    uint32_t data_queue_waits;
+    uint32_t data_queue_timeouts;
+    uint16_t data_queue_high_watermark;
+#endif
     uint8_t invalid_rx_log_count;
     uint8_t ctrl_pool[EH_TRANSPORT_MQ_POOL_SIZE(EH_TRANSPORT_CTRL_QUEUE_DEPTH,
                                                 struct eh_transport_tx_item)]
@@ -82,10 +95,15 @@ struct eh_transport
 extern const struct eh_transport_ops g_esp_hosted_spi_fd_ops;
 extern const struct eh_transport_ops g_esp_hosted_spi_hd_ops;
 
-rt_err_t eh_transport_wait(struct eh_transport *transport, rt_int32_t timeout);
-void eh_transport_wake(struct eh_transport *transport);
+rt_err_t eh_transport_wait(struct eh_transport *transport, rt_uint32_t events,
+                           rt_int32_t timeout);
+void eh_transport_wake(struct eh_transport *transport, rt_uint32_t events);
+void eh_transport_set_tx_throttled(struct eh_transport *transport,
+                                   rt_bool_t throttled);
 rt_bool_t eh_transport_next_tx(struct eh_transport *transport,
                                struct eh_transport_tx_item *item);
+rt_bool_t eh_transport_next_control(struct eh_transport *transport,
+                                    struct eh_transport_tx_item *item);
 void eh_transport_complete_tx(struct eh_transport_tx_item *item, rt_err_t result);
 rt_bool_t eh_transport_deliver(struct eh_transport *transport,
                                const uint8_t *frame, size_t frame_length,

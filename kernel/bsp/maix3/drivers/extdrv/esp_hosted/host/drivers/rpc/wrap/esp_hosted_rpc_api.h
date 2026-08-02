@@ -129,6 +129,8 @@ rt_err_t esp_hosted_rpc_wifi_scan_stop(void);
 rt_err_t esp_hosted_rpc_wifi_get_rssi(int *rssi);
 rt_err_t esp_hosted_rpc_wifi_set_power_save(int mode);
 rt_err_t esp_hosted_rpc_wifi_get_power_save(int *mode);
+rt_err_t esp_hosted_rpc_wifi_set_max_tx_power(int power);
+rt_err_t esp_hosted_rpc_wifi_get_max_tx_power(int *power);
 rt_err_t esp_hosted_rpc_wifi_set_channel(int channel);
 rt_err_t esp_hosted_rpc_wifi_get_channel(int *channel);
 rt_err_t esp_hosted_rpc_wifi_get_mac(enum esp_hosted_wifi_interface interface,

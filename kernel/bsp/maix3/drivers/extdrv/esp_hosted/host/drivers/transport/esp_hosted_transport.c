@@ -17,6 +17,84 @@ static uint16_t eh_transport_get_le16(const uint8_t *data)
     return (uint16_t)data[0] | ((uint16_t)data[1] << 8);
 }
 
+static rt_int32_t eh_transport_wait_remaining(rt_tick_t started,
+                                              rt_int32_t timeout)
+{
+    rt_tick_t elapsed = rt_tick_get() - started;
+
+    return elapsed < (rt_tick_t)timeout
+               ? timeout - (rt_int32_t)elapsed : 0;
+}
+
+static rt_err_t eh_transport_wait_tx_ready(struct eh_transport *transport,
+                                           rt_tick_t started,
+                                           rt_int32_t timeout)
+{
+    while (transport->tx_throttled)
+    {
+        rt_uint32_t event;
+        rt_int32_t remaining = eh_transport_wait_remaining(started, timeout);
+        rt_err_t result;
+
+        if (!remaining)
+        {
+            return -RT_EBUSY;
+        }
+        result = rt_event_recv(&transport->tx_event,
+                               EH_TRANSPORT_EVENT_TX_READY,
+                               RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR,
+                               remaining, &event);
+        if (result != RT_EOK && transport->tx_throttled)
+        {
+            return result;
+        }
+    }
+    return RT_EOK;
+}
+
+#ifdef ESP_HOSTED_SPI_HD_STATS
+static void eh_transport_note_data_queue_wait(struct eh_transport *transport)
+{
+    rt_enter_critical();
+    if (transport->data_queue.entry >= transport->data_queue.max_msgs)
+    {
+        transport->data_queue_waits++;
+    }
+    rt_exit_critical();
+}
+
+static void eh_transport_note_data_queue_depth(struct eh_transport *transport)
+{
+    rt_enter_critical();
+    if (transport->data_queue.entry > transport->data_queue_high_watermark)
+    {
+        transport->data_queue_high_watermark = transport->data_queue.entry;
+    }
+    rt_exit_critical();
+}
+
+static void eh_transport_note_data_queue_result(struct eh_transport *transport,
+                                                 rt_err_t result,
+                                                 rt_bool_t bounded_wait)
+{
+    if (result == RT_EOK)
+    {
+        eh_transport_note_data_queue_depth(transport);
+    }
+    else if (bounded_wait)
+    {
+        rt_enter_critical();
+        transport->data_queue_timeouts++;
+        rt_exit_critical();
+    }
+}
+#else
+#define eh_transport_note_data_queue_wait(transport) do { } while (0)
+#define eh_transport_note_data_queue_depth(transport) do { } while (0)
+#define eh_transport_note_data_queue_result(transport, result, bounded_wait) \
+    do { } while (0)
+#endif
+
 static void eh_transport_put_le16(uint8_t *data, uint16_t value)
 {
     data[0] = value & 0xff;
@@ -66,6 +144,11 @@ rt_err_t esp_hosted_transport_init(const struct esp_hosted_transport_callbacks *
     g_transport.callback_argument = argument;
 
     result = rt_event_init(&g_transport.event, "eh-xfer", RT_IPC_FLAG_FIFO);
+    if (result != RT_EOK)
+    {
+        return result;
+    }
+    result = rt_event_init(&g_transport.tx_event, "eh-tx", RT_IPC_FLAG_FIFO);
     if (result != RT_EOK)
     {
         return result;
@@ -122,7 +205,7 @@ rt_err_t esp_hosted_transport_start(void)
     result = rt_thread_startup(g_transport.thread);
     if (result == RT_EOK)
     {
-        eh_transport_wake(&g_transport);
+        eh_transport_wake(&g_transport, EH_TRANSPORT_EVENT_ALL);
     }
     return result;
 }
@@ -137,6 +220,8 @@ rt_err_t esp_hosted_transport_send(uint8_t interface, uint8_t flags,
     struct rt_messagequeue *queue;
     size_t frame_length;
     size_t wire_length;
+    rt_tick_t wait_started = 0;
+    rt_int32_t wait_ticks = 0;
     rt_err_t result;
 
     if (!g_transport.ops || interface >= EH_TRANSPORT_IF_MAX ||
@@ -144,9 +229,17 @@ rt_err_t esp_hosted_transport_send(uint8_t interface, uint8_t flags,
     {
         return -RT_EINVAL;
     }
-    if (!control && g_transport.tx_throttled)
+    if (!control)
     {
-        return -RT_EBUSY;
+        wait_ticks = rt_tick_from_millisecond(
+            g_transport.ops->data_queue_send_wait_ms);
+        wait_started = rt_tick_get();
+        result = eh_transport_wait_tx_ready(&g_transport, wait_started,
+                                            wait_ticks);
+        if (result != RT_EOK)
+        {
+            return result;
+        }
     }
 
     frame_length = ESP_HOSTED_TRANSPORT_HEADER_SIZE + length;
@@ -179,13 +272,33 @@ rt_err_t esp_hosted_transport_send(uint8_t interface, uint8_t flags,
 #endif
 
     queue = control ? &g_transport.ctrl_queue : &g_transport.data_queue;
-    result = rt_mq_send(queue, &item, sizeof(item));
+    if (control)
+    {
+        result = rt_mq_send(queue, &item, sizeof(item));
+    }
+    else
+    {
+        if (wait_ticks)
+        {
+            eh_transport_note_data_queue_wait(&g_transport);
+            result = rt_mq_send_wait(
+                queue, &item, sizeof(item),
+                eh_transport_wait_remaining(wait_started, wait_ticks));
+        }
+        else
+        {
+            result = rt_mq_send(queue, &item, sizeof(item));
+        }
+        eh_transport_note_data_queue_result(&g_transport, result,
+                                            wait_ticks != 0);
+    }
     if (result != RT_EOK)
     {
         rt_free(item.frame);
         return result;
     }
-    eh_transport_wake(&g_transport);
+    eh_transport_wake(&g_transport, control ? EH_TRANSPORT_EVENT_CONTROL :
+                                             EH_TRANSPORT_EVENT_DATA);
     return RT_EOK;
 }
 
@@ -242,7 +355,7 @@ rt_err_t esp_hosted_transport_send_hci(uint8_t packet_type,
         rt_free(item.frame);
         return result;
     }
-    eh_transport_wake(&g_transport);
+    eh_transport_wake(&g_transport, EH_TRANSPORT_EVENT_CONTROL);
     return RT_EOK;
 }
 
@@ -288,22 +401,35 @@ const char *esp_hosted_transport_name(void)
     return g_transport.ops ? g_transport.ops->name : "uninitialized";
 }
 
-rt_err_t eh_transport_wait(struct eh_transport *transport, rt_int32_t timeout)
+rt_err_t eh_transport_wait(struct eh_transport *transport, rt_uint32_t events,
+                           rt_int32_t timeout)
 {
     rt_uint32_t event;
 
-    return rt_event_recv(&transport->event, EH_TRANSPORT_EVENT_WAKE,
+    return rt_event_recv(&transport->event, events,
                          RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR,
                          timeout, &event);
 }
 
-void eh_transport_wake(struct eh_transport *transport)
+void eh_transport_wake(struct eh_transport *transport, rt_uint32_t events)
 {
-    rt_event_send(&transport->event, EH_TRANSPORT_EVENT_WAKE);
+    rt_event_send(&transport->event, events);
 }
 
-rt_bool_t eh_transport_next_tx(struct eh_transport *transport,
-                               struct eh_transport_tx_item *item)
+void eh_transport_set_tx_throttled(struct eh_transport *transport,
+                                   rt_bool_t throttled)
+{
+    rt_bool_t was_throttled = transport->tx_throttled;
+
+    transport->tx_throttled = throttled;
+    if (was_throttled && !throttled)
+    {
+        rt_event_send(&transport->tx_event, EH_TRANSPORT_EVENT_TX_READY);
+    }
+}
+
+rt_bool_t eh_transport_next_control(struct eh_transport *transport,
+                                    struct eh_transport_tx_item *item)
 {
     if (rt_mq_recv(&transport->ctrl_queue, item, sizeof(*item),
                    RT_WAITING_NO) == RT_EOK)
@@ -317,6 +443,17 @@ rt_bool_t eh_transport_next_tx(struct eh_transport *transport,
         return RT_TRUE;
     }
 #endif
+    return RT_FALSE;
+}
+
+rt_bool_t eh_transport_next_tx(struct eh_transport *transport,
+                               struct eh_transport_tx_item *item)
+{
+    if (eh_transport_next_control(transport, item))
+    {
+        return RT_TRUE;
+    }
+    eh_transport_note_data_queue_depth(transport);
     if (!transport->tx_throttled &&
         rt_mq_recv(&transport->data_queue, item, sizeof(*item),
                    RT_WAITING_NO) == RT_EOK)
@@ -367,11 +504,11 @@ rt_bool_t eh_transport_deliver(struct eh_transport *transport,
     flow_control = frame[10] & 0x03;
     if (flow_control == EH_TRANSPORT_FLOW_CTRL_ON)
     {
-        transport->tx_throttled = RT_TRUE;
+        eh_transport_set_tx_throttled(transport, RT_TRUE);
     }
     else if (flow_control == EH_TRANSPORT_FLOW_CTRL_OFF)
     {
-        transport->tx_throttled = RT_FALSE;
+        eh_transport_set_tx_throttled(transport, RT_FALSE);
     }
 
     if (!length)

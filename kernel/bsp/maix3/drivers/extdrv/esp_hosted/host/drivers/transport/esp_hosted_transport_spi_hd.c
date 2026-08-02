@@ -38,8 +38,8 @@
 #define EH_SPI_HD_STOP_THROTTLE   (1U << 25)
 #define EH_SPI_HD_REGISTER_POLLS  3
 #define EH_SPI_HD_MAX_BURST       32
-#define EH_SPI_HD_CREDIT_RETRY_US 50
-#define EH_SPI_HD_CREDIT_FAST_RETRIES 8
+#define EH_SPI_HD_CREDIT_POLL_MS   1
+#define EH_SPI_HD_DATA_QUEUE_SEND_WAIT_MS 50
 #define EH_SPI_HD_READY_POLL_MS   100
 #define EH_SPI_HD_START_WATCHDOG_MS 100
 #define EH_SPI_HD_IRQ_WATCHDOG_MS 1000
@@ -83,8 +83,8 @@ struct eh_spi_hd_stats
     uint64_t rx_dma_max_us;
     uint64_t tx_bytes;
     uint64_t rx_bytes;
-    uint64_t credit_retry_us;
-    uint64_t tx_backoff_us;
+    uint64_t credit_stall_us;
+    uint64_t credit_stall_max_us;
     uint64_t rx_error_backoff_us;
     uint32_t spi_xfers;
     uint32_t spi_errors;
@@ -97,8 +97,8 @@ struct eh_spi_hd_stats
     uint32_t credit_checks;
     uint32_t credit_empty;
     uint32_t credit_read_busy;
-    uint32_t credit_retries;
-    uint32_t tx_backoffs;
+    uint32_t credit_stalls;
+    uint32_t credit_stall_polls;
     uint32_t rx_error_backoffs;
 };
 
@@ -127,6 +127,8 @@ struct eh_spi_hd_context
     uint32_t max_tx_length;
     uint32_t max_rx_length;
 #ifdef ESP_HOSTED_SPI_HD_STATS
+    struct eh_transport *transport;
+    uint64_t credit_stall_started_us;
     struct eh_spi_hd_stats stats;
 #endif
     uint8_t tx_frame[ESP_HOSTED_TRANSPORT_FRAME_SIZE] __attribute__((aligned(64)));
@@ -135,33 +137,55 @@ struct eh_spi_hd_context
 
 static struct eh_spi_hd_context g_spi_hd;
 
-static void eh_spi_hd_credit_retry(struct eh_spi_hd_context *context)
+static rt_int32_t eh_spi_hd_ticks_until(rt_tick_t deadline)
 {
-#ifdef ESP_HOSTED_SPI_HD_STATS
-    uint64_t started_us = cpu_ticks_us();
-#else
+    rt_int32_t remaining = (rt_int32_t)(deadline - rt_tick_get());
+
+    return remaining > 0 ? remaining : 0;
+}
+
+static void eh_spi_hd_credit_stall_start(struct eh_spi_hd_context *context,
+                                         rt_bool_t *credit_stalled)
+{
+#ifndef ESP_HOSTED_SPI_HD_STATS
     (void)context;
 #endif
-
-    cpu_ticks_delay_us(EH_SPI_HD_CREDIT_RETRY_US);
+    if (*credit_stalled)
+    {
+        EH_SPI_HD_STAT_INC(context, credit_stall_polls);
+        return;
+    }
+    *credit_stalled = RT_TRUE;
+    EH_SPI_HD_STAT_INC(context, credit_stalls);
 #ifdef ESP_HOSTED_SPI_HD_STATS
-    context->stats.credit_retries++;
-    context->stats.credit_retry_us += cpu_ticks_us() - started_us;
+    context->credit_stall_started_us = cpu_ticks_us();
 #endif
 }
 
-static void eh_spi_hd_tx_backoff(struct eh_spi_hd_context *context)
+static void eh_spi_hd_credit_stall_end(struct eh_spi_hd_context *context,
+                                       rt_bool_t *credit_stalled)
 {
-#ifdef ESP_HOSTED_SPI_HD_STATS
-    uint64_t started_us = cpu_ticks_us();
-#else
+#ifndef ESP_HOSTED_SPI_HD_STATS
     (void)context;
 #endif
-
-    rt_thread_delay(1);
+    if (!*credit_stalled)
+    {
+        return;
+    }
+    *credit_stalled = RT_FALSE;
 #ifdef ESP_HOSTED_SPI_HD_STATS
-    context->stats.tx_backoffs++;
-    context->stats.tx_backoff_us += cpu_ticks_us() - started_us;
+    if (context->credit_stall_started_us)
+    {
+        uint64_t elapsed_us = cpu_ticks_us() -
+                              context->credit_stall_started_us;
+
+        context->stats.credit_stall_us += elapsed_us;
+        if (elapsed_us > context->stats.credit_stall_max_us)
+        {
+            context->stats.credit_stall_max_us = elapsed_us;
+        }
+        context->credit_stall_started_us = 0;
+    }
 #endif
 }
 
@@ -428,7 +452,7 @@ static rt_bool_t eh_spi_hd_data_ready(void)
 
 static void eh_spi_hd_irq(void *argument)
 {
-    eh_transport_wake(argument);
+    eh_transport_wake(argument, EH_TRANSPORT_EVENT_RX);
 }
 
 static rt_err_t eh_spi_hd_init(struct eh_transport *transport)
@@ -450,6 +474,9 @@ static rt_err_t eh_spi_hd_init(struct eh_transport *transport)
     g_spi_hd.stats.started_us = cpu_ticks_us();
 #endif
     transport->backend = &g_spi_hd;
+#ifdef ESP_HOSTED_SPI_HD_STATS
+    g_spi_hd.transport = transport;
+#endif
     g_spi_hd.configured_width = EH_SPI_HD_MAX_DATA_LINES;
     g_spi_hd.active_width = EH_SPI_HD_MAX_DATA_LINES == 4
                                 ? 2 : EH_SPI_HD_MAX_DATA_LINES;
@@ -627,11 +654,11 @@ static rt_err_t eh_spi_hd_receive(struct eh_transport *transport,
     interrupt_flags = current & EH_SPI_HD_INT_MASK;
     if (interrupt_flags & EH_SPI_HD_START_THROTTLE)
     {
-        transport->tx_throttled = RT_TRUE;
+        eh_transport_set_tx_throttled(transport, RT_TRUE);
     }
     if (interrupt_flags & EH_SPI_HD_STOP_THROTTLE)
     {
-        transport->tx_throttled = RT_FALSE;
+        eh_transport_set_tx_throttled(transport, RT_FALSE);
     }
     current &= EH_SPI_HD_TX_LEN_MASK;
     length = (current - context->rx_byte_count) & EH_SPI_HD_TX_LEN_MASK;
@@ -710,11 +737,15 @@ static void eh_spi_hd_run(struct eh_transport *transport)
 {
     struct eh_spi_hd_context *context = transport->backend;
     struct eh_transport_tx_item pending_item;
+    struct eh_transport_tx_item pending_control_item;
     rt_bool_t have_pending_item = RT_FALSE;
-    uint8_t credit_fast_retries = 0;
+    rt_bool_t have_pending_control_item = RT_FALSE;
+    rt_bool_t credit_stalled = RT_FALSE;
+    rt_tick_t credit_poll_deadline = 0;
     rt_int32_t elapsed_ms = eh_spi_reset_elapsed_ms(&context->bus);
 
     rt_memset(&pending_item, 0, sizeof(pending_item));
+    rt_memset(&pending_control_item, 0, sizeof(pending_control_item));
 
     if (elapsed_ms >= 0 && elapsed_ms < ESP_HOSTED_SPI_HD_RESET_SETTLE_MS)
     {
@@ -728,6 +759,8 @@ static void eh_spi_hd_run(struct eh_transport *transport)
     {
         int transactions;
         rt_int32_t timeout;
+        rt_uint32_t wait_events = EH_TRANSPORT_EVENT_ALL;
+        rt_bool_t credit_poll_due = RT_TRUE;
 
         if (!context->bus_ready)
         {
@@ -750,7 +783,9 @@ static void eh_spi_hd_run(struct eh_transport *transport)
                     if (context->health_failures >= EH_SPI_HD_HEALTH_FAILURES)
                     {
                         LOG_W("SPI-HD data path lost; reopening");
-                        transport->tx_throttled = RT_FALSE;
+                        eh_transport_set_tx_throttled(transport, RT_FALSE);
+                        eh_spi_hd_credit_stall_end(context,
+                                                   &credit_stalled);
                         transport->invalid_rx_log_count = 0;
                         eh_spi_hd_reset_data_path(context);
                     }
@@ -764,7 +799,18 @@ static void eh_spi_hd_run(struct eh_transport *transport)
             }
         }
 
-        if (have_pending_item)
+        if (credit_stalled)
+        {
+            /* RX_COUNT is level-polled. A full ESP receive queue does not
+             * generate a data-ready edge when a credit returns. Ignore new
+             * data queue wakeups until the next poll deadline, but still
+             * service receive interrupts and priority traffic immediately. */
+            timeout = eh_spi_hd_ticks_until(credit_poll_deadline);
+            wait_events = EH_TRANSPORT_EVENT_CONTROL |
+                          EH_TRANSPORT_EVENT_RX;
+            credit_poll_due = timeout == 0;
+        }
+        else if (have_pending_item)
         {
             timeout = RT_WAITING_NO;
         }
@@ -787,7 +833,12 @@ static void eh_spi_hd_run(struct eh_transport *transport)
         {
             timeout = rt_tick_from_millisecond(EH_SPI_HD_START_WATCHDOG_MS);
         }
-        eh_transport_wait(transport, timeout);
+        eh_transport_wait(transport, wait_events, timeout);
+        if (credit_stalled)
+        {
+            credit_poll_due =
+                eh_spi_hd_ticks_until(credit_poll_deadline) == 0;
+        }
         for (transactions = 0; transactions < EH_SPI_HD_MAX_BURST; transactions++)
         {
             rt_bool_t data_ready = ESP_HOSTED_DATA_READY_PIN < 0 ||
@@ -810,29 +861,75 @@ static void eh_spi_hd_run(struct eh_transport *transport)
                 progress = received;
             }
 
-            if (!have_pending_item)
+            /* Keep a blocked data frame local, but allow control and RPC
+             * traffic to bypass it. Requeueing the data frame is racy when
+             * producers have filled the data queue. */
+            if (!have_pending_control_item && have_pending_item &&
+                !pending_item.control)
+            {
+                have_pending_control_item = eh_transport_next_control(
+                    transport, &pending_control_item);
+            }
+            if (!have_pending_item && !have_pending_control_item)
             {
                 have_pending_item = eh_transport_next_tx(transport,
                                                           &pending_item);
+                if (!have_pending_item)
+                {
+                    eh_spi_hd_credit_stall_end(context, &credit_stalled);
+                }
             }
-            if (have_pending_item)
+            if (have_pending_control_item || have_pending_item)
             {
-                result = eh_spi_hd_transmit(transport, &pending_item);
+                struct eh_transport_tx_item *item = have_pending_control_item
+                                                        ? &pending_control_item
+                                                        : &pending_item;
+                rt_bool_t sending_control = item->control;
+
+                if (credit_stalled && !credit_poll_due &&
+                    eh_spi_hd_ticks_until(credit_poll_deadline) == 0)
+                {
+                    credit_poll_due = RT_TRUE;
+                }
+                if (!sending_control && credit_stalled && !credit_poll_due)
+                {
+                    if (!progress)
+                    {
+                        break;
+                    }
+                    continue;
+                }
+                result = eh_spi_hd_transmit(transport, item);
                 if (result == -RT_EBUSY)
                 {
-                    if (credit_fast_retries < EH_SPI_HD_CREDIT_FAST_RETRIES)
-                    {
-                        credit_fast_retries++;
-                        eh_spi_hd_credit_retry(context);
-                        continue;
-                    }
-                    credit_fast_retries = 0;
-                    eh_spi_hd_tx_backoff(context);
+                    eh_spi_hd_credit_stall_start(context, &credit_stalled);
+                    credit_poll_deadline = rt_tick_get() +
+                        rt_tick_from_millisecond(EH_SPI_HD_CREDIT_POLL_MS);
                     break;
                 }
-                credit_fast_retries = 0;
-                eh_transport_complete_tx(&pending_item, result);
-                have_pending_item = RT_FALSE;
+                eh_transport_complete_tx(item, result);
+                if (have_pending_control_item)
+                {
+                    have_pending_control_item = RT_FALSE;
+                }
+                else
+                {
+                    have_pending_item = RT_FALSE;
+                }
+                if (!sending_control || !have_pending_item)
+                {
+                    eh_spi_hd_credit_stall_end(context, &credit_stalled);
+                }
+                else if (result == RT_EOK &&
+                         context->tx_buffers_available)
+                {
+                    eh_spi_hd_credit_stall_end(context, &credit_stalled);
+                }
+                else if (credit_stalled)
+                {
+                    credit_poll_deadline = rt_tick_get() +
+                        rt_tick_from_millisecond(EH_SPI_HD_CREDIT_POLL_MS);
+                }
                 if (result != RT_EOK)
                 {
                     EH_SPI_HD_STAT_INC(context, tx_errors);
@@ -888,6 +985,7 @@ const struct eh_transport_ops g_esp_hosted_spi_hd_ops = {
     .name = "SPI half-duplex",
     .frame_size = ESP_HOSTED_TRANSPORT_FRAME_SIZE,
     .tx_alignment = ESP_HOSTED_SPI_HD_DMA_ALIGNMENT,
+    .data_queue_send_wait_ms = EH_SPI_HD_DATA_QUEUE_SEND_WAIT_MS,
     .init = eh_spi_hd_init,
     .start = eh_spi_hd_start,
     .run = eh_spi_hd_run,
@@ -904,6 +1002,10 @@ static uint64_t eh_spi_hd_rate_kbps(uint64_t bytes, uint64_t elapsed_us)
 static void esp_spi_hd_stats(int argc, char **argv)
 {
     struct eh_spi_hd_stats stats;
+    uint32_t queue_waits = 0;
+    uint32_t queue_timeouts = 0;
+    uint16_t queue_high_watermark = 0;
+    uint16_t queue_capacity = 0;
     uint64_t now_us = cpu_ticks_us();
     uint64_t elapsed_us;
     double utilization;
@@ -913,6 +1015,18 @@ static void esp_spi_hd_stats(int argc, char **argv)
         rt_enter_critical();
         rt_memset(&g_spi_hd.stats, 0, sizeof(g_spi_hd.stats));
         g_spi_hd.stats.started_us = now_us;
+        if (g_spi_hd.credit_stall_started_us)
+        {
+            g_spi_hd.credit_stall_started_us = now_us;
+            g_spi_hd.stats.credit_stalls = 1;
+        }
+        if (g_spi_hd.transport)
+        {
+            g_spi_hd.transport->data_queue_waits = 0;
+            g_spi_hd.transport->data_queue_timeouts = 0;
+            g_spi_hd.transport->data_queue_high_watermark =
+                g_spi_hd.transport->data_queue.entry;
+        }
         rt_exit_critical();
         rt_kprintf("SPI-HD statistics reset\n");
         return;
@@ -925,6 +1039,29 @@ static void esp_spi_hd_stats(int argc, char **argv)
 
     rt_enter_critical();
     stats = g_spi_hd.stats;
+    if (g_spi_hd.transport)
+    {
+        queue_waits = g_spi_hd.transport->data_queue_waits;
+        queue_timeouts = g_spi_hd.transport->data_queue_timeouts;
+        queue_high_watermark =
+            g_spi_hd.transport->data_queue_high_watermark;
+        if (g_spi_hd.transport->data_queue.entry > queue_high_watermark)
+        {
+            queue_high_watermark = g_spi_hd.transport->data_queue.entry;
+        }
+        queue_capacity = g_spi_hd.transport->data_queue.max_msgs;
+    }
+    if (g_spi_hd.credit_stall_started_us)
+    {
+        uint64_t active_stall_us = now_us -
+                                   g_spi_hd.credit_stall_started_us;
+
+        stats.credit_stall_us += active_stall_us;
+        if (active_stall_us > stats.credit_stall_max_us)
+        {
+            stats.credit_stall_max_us = active_stall_us;
+        }
+    }
     rt_exit_critical();
     if (!stats.started_us)
     {
@@ -960,12 +1097,17 @@ static void esp_spi_hd_stats(int argc, char **argv)
                (unsigned long long)(stats.rx_dma_xfers
                                         ? stats.rx_dma_us / stats.rx_dma_xfers : 0),
                (unsigned long long)stats.rx_dma_max_us);
-    rt_kprintf(" Credits: checks=%u empty=%u unstable=%u retries=%u/%llu us\n",
+    rt_kprintf(" Credits: checks=%u empty=%u unstable=%u\n",
                stats.credit_checks, stats.credit_empty,
-               stats.credit_read_busy, stats.credit_retries,
-               (unsigned long long)stats.credit_retry_us);
-    rt_kprintf(" Delays: TX tick backoffs=%u/%llu us RX error backoffs=%u/%llu us\n",
-               stats.tx_backoffs, (unsigned long long)stats.tx_backoff_us,
+               stats.credit_read_busy);
+    rt_kprintf(" Credit stalls: episodes=%u polls=%u total=%llu us max=%llu us\n",
+               stats.credit_stalls, stats.credit_stall_polls,
+               (unsigned long long)stats.credit_stall_us,
+               (unsigned long long)stats.credit_stall_max_us);
+    rt_kprintf(" Data queue: high-water=%u/%u waits=%u timeouts=%u\n",
+               queue_high_watermark, queue_capacity, queue_waits,
+               queue_timeouts);
+    rt_kprintf(" Delays: RX error backoffs=%u/%llu us\n",
                stats.rx_error_backoffs,
                (unsigned long long)stats.rx_error_backoff_us);
 }

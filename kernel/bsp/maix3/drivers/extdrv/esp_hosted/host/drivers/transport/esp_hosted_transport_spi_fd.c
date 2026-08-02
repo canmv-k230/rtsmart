@@ -50,7 +50,7 @@ static rt_bool_t eh_spi_fd_data_ready(void)
 
 static void eh_spi_fd_irq(void *argument)
 {
-    eh_transport_wake(argument);
+    eh_transport_wake(argument, EH_TRANSPORT_EVENT_RX);
 }
 
 static rt_size_t eh_spi_fd_transfer(struct eh_spi_fd_context *context,
@@ -213,7 +213,8 @@ static void eh_spi_fd_run(struct eh_transport *transport)
     {
         int transactions;
 
-        eh_transport_wait(transport, rt_tick_from_millisecond(10));
+        eh_transport_wait(transport, EH_TRANSPORT_EVENT_ALL,
+                          rt_tick_from_millisecond(10));
         for (transactions = 0; transactions < EH_SPI_FD_MAX_BURST; transactions++)
         {
             struct eh_transport_tx_item *item_pointer;
@@ -345,6 +346,7 @@ const struct eh_transport_ops g_esp_hosted_spi_fd_ops = {
     .name = "SPI full-duplex",
     .frame_size = ESP_HOSTED_TRANSPORT_FRAME_SIZE,
     .tx_alignment = 1,
+    .data_queue_send_wait_ms = 0,
     .init = eh_spi_fd_init,
     .start = eh_spi_fd_start,
     .run = eh_spi_fd_run,
