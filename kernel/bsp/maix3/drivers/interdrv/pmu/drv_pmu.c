@@ -9,6 +9,7 @@
 #endif
 
 #include "board.h"
+#include "drv_gpio.h"
 #include "ioremap.h"
 #include "riscv_io.h"
 
@@ -266,6 +267,91 @@ static const struct pmu_pad_wakeup_cfg *pmu_get_shutdown_wakeup_pad(void)
     return RT_NULL;
 }
 
+int pmu_get_shutdown_wakeup_level(struct pmu_dev *pmu, int *level)
+{
+    const struct pmu_pad_wakeup_cfg *cfg;
+    rt_base_t irq_level;
+    uint32_t saved_cfg;
+    uint32_t gpio_cfg;
+    int ret;
+
+    if ((pmu == RT_NULL) || (level == RT_NULL))
+        return -RT_EINVAL;
+
+    cfg = pmu_get_shutdown_wakeup_pad();
+    if (cfg == RT_NULL)
+        return -RT_ENOSYS;
+
+    ret = pmu_ensure_access(pmu);
+    if (ret != RT_EOK)
+        return ret;
+
+    if (pmu->wakeup_pad_gpio) {
+        *level = kd_pin_get_dr(cfg->pad) != 0U ? 1 : 0;
+        return RT_EOK;
+    }
+
+    /* Save and restore the complete runtime register value. */
+    irq_level = rt_hw_interrupt_disable();
+    saved_cfg = pmu_readl(pmu, cfg->io_cfg_reg);
+    gpio_cfg = (saved_cfg & ~PMU_IO_CFG_IO_SEL_MASK) |
+               PMU_IO_CFG_GPIO_SEL;
+    gpio_cfg |= PMU_IO_CFG_IE;
+    gpio_cfg &= ~PMU_IO_CFG_OE;
+    pmu_writel(pmu, gpio_cfg, cfg->io_cfg_reg);
+
+    *level = kd_pin_get_dr(cfg->pad) != 0U ? 1 : 0;
+
+    pmu_writel(pmu, saved_cfg, cfg->io_cfg_reg);
+    rt_hw_interrupt_enable(irq_level);
+
+    return RT_EOK;
+}
+
+static void pmu_restore_shutdown_wakeup_pad(struct pmu_dev *pmu)
+{
+    rt_base_t level;
+    uint32_t value;
+
+    if (!pmu->wakeup_pad_gpio || !pmu->wakeup_pad_cfg_saved)
+        return;
+
+    value = pmu->wakeup_pad_saved_cfg;
+    value &= ~PMU_IO_CFG_IO_SEL_MASK;
+    value |= PMU_IO_CFG_PMU_SEL;
+
+    level = rt_hw_interrupt_disable();
+    pmu_writel(pmu, value, pmu->wakeup_pad_cfg_reg);
+    pmu->wakeup_pad_gpio = false;
+    rt_hw_interrupt_enable(level);
+}
+
+static void pmu_use_shutdown_wakeup_pad_as_gpio(struct pmu_dev *pmu)
+{
+    const struct pmu_pad_wakeup_cfg *cfg;
+    rt_base_t level;
+    uint32_t value;
+
+    cfg = pmu_get_shutdown_wakeup_pad();
+    if (cfg == RT_NULL || pmu->wakeup_pad_gpio)
+        return;
+
+    value = pmu_readl(pmu, cfg->io_cfg_reg);
+    pmu->wakeup_pad_saved_cfg = value;
+    pmu->wakeup_pad_cfg_reg = cfg->io_cfg_reg;
+    pmu->wakeup_pad_cfg_saved = true;
+
+    value &= ~PMU_IO_CFG_IO_SEL_MASK;
+    value |= PMU_IO_CFG_GPIO_SEL;
+    value |= PMU_IO_CFG_IE;
+    value &= ~PMU_IO_CFG_OE;
+
+    level = rt_hw_interrupt_disable();
+    pmu_writel(pmu, value, cfg->io_cfg_reg);
+    pmu->wakeup_pad_gpio = true;
+    rt_hw_interrupt_enable(level);
+}
+
 #ifdef RT_PMU_SHUTDOWN_WAKEUP
 static uint32_t pmu_shutdown_wakeup_type_bits(void)
 {
@@ -369,6 +455,7 @@ static void pmu_prepare_wakeup_sources(struct pmu_dev *pmu)
     }
 
     level = rt_hw_interrupt_disable();
+    pmu_restore_shutdown_wakeup_pad(pmu);
     pmu_configure_shutdown_wakeup_pad(pmu, pad_wakeup);
 
     value = pmu_readl(pmu, PMU_INT0_TO_CTL_REGISTER);
@@ -513,6 +600,8 @@ int pmu_init(struct pmu_dev *pmu)
     ret = pmu_init_rtc(pmu);
     if (ret != RT_EOK)
         return ret;
+
+    pmu_use_shutdown_wakeup_pad_as_gpio(pmu);
 
     pmu->initialized = true;
     return RT_EOK;

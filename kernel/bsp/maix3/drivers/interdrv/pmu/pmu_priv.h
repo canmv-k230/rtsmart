@@ -67,6 +67,12 @@
 #define PMU_IO_CFG_PD                           BIT(5)
 #define PMU_IO_CFG_PULL_MASK                    \
     (PMU_IO_CFG_PU | PMU_IO_CFG_PD)
+#define PMU_IO_CFG_IO_SEL_SHIFT                 11U
+#define PMU_IO_CFG_IO_SEL_MASK                  (0x7U << PMU_IO_CFG_IO_SEL_SHIFT)
+#define PMU_IO_CFG_GPIO_SEL                     (0x1U << PMU_IO_CFG_IO_SEL_SHIFT)
+#define PMU_IO_CFG_PMU_SEL                      (0x2U << PMU_IO_CFG_IO_SEL_SHIFT)
+#define PMU_IO_CFG_IE                           BIT(8)
+#define PMU_IO_CFG_OE                           BIT(7)
 
 #define PMU_CPU_IRQ_MASK                        0x0fffU
 #define PMU_DET_SOURCE_MASK                     0x1fffU
@@ -155,9 +161,6 @@
 
 #define PMU_USERDEV_NAME                        "pmu_pwrkey"
 #define PMU_NOTIFY_DEFAULT_SIGNO                10
-
-#define PMU_EVENT_LONG_PRESS                    0x00000001U
-#define PMU_EVENT_KEY_RELEASE                   0x00000002U
 
 #define PMU_WORK_KEY_LONG                       BIT(0)
 #define PMU_WORK_KEY_RELEASE                    BIT(1)
@@ -256,9 +259,8 @@ struct pmu_notify_cfg {
     int32_t signo;
 };
 
-struct pmu_event {
-    uint32_t events;
-    uint32_t reserved;
+struct pmu_shutdown_request {
+    uint32_t pending;
 };
 
 struct pmu_power_cycle_cfg {
@@ -268,18 +270,26 @@ struct pmu_power_cycle_cfg {
     uint32_t reserved;
 };
 
+struct pmu_wakeup_pad_level {
+    int32_t level;
+};
+
 #define PMU_IOCTL_REGISTER_NOTIFY \
     _IOW('P', 0x00, struct pmu_notify_cfg)
 #define PMU_IOCTL_UNREGISTER_NOTIFY \
-    _IOW('P', 0x01, struct pmu_notify_cfg)
-#define PMU_IOCTL_GET_EVENT \
-    _IOR('P', 0x02, struct pmu_event)
-#define PMU_IOCTL_SHUTDOWN_ACK \
-    _IOW('P', 0x03, struct pmu_event)
+    _IO('P', 0x01)
+#define PMU_IOCTL_GET_SHUTDOWN_REQUEST \
+    _IOR('P', 0x02, struct pmu_shutdown_request)
+#define PMU_IOCTL_CONFIRM_SHUTDOWN \
+    _IO('P', 0x03)
 #define PMU_IOCTL_SCHEDULE_POWER_CYCLE \
     _IOW('P', 0x04, struct pmu_power_cycle_cfg)
 #define PMU_IOCTL_CANCEL_POWER_CYCLE \
     _IO('P', 0x05)
+#define PMU_IOCTL_SHUTDOWN_NOW \
+    _IO('P', 0x06)
+#define PMU_IOCTL_GET_WAKEUP_PAD_LEVEL \
+    _IOR('P', 0x07, struct pmu_wakeup_pad_level)
 
 struct pmu_worker_state {
     rt_thread_t thread;
@@ -299,9 +309,10 @@ struct pmu_notify_state {
     struct rt_device device;
     rt_int32_t pid;
     rt_int32_t signo;
-    rt_uint32_t pending_events;
+    bool shutdown_request_pending;
     bool registered;
-    bool ack_pending;
+    bool confirm_pending;
+    bool confirm_received;
     bool initialized;
 };
 
@@ -310,7 +321,6 @@ struct pmu_pwrkey_state {
     bool pressed;
     bool long_press_seen;
     bool release_seen;
-    bool user_notified;
     bool initialized;
 };
 
@@ -321,7 +331,6 @@ struct pmu_cycle_state {
     uint32_t saved_cpu_route;
     uint32_t saved_out0_route;
     uint32_t saved_out1_route;
-    uint32_t poweron_after_s;
     time_t shutdown_time;
     time_t poweron_time;
 };
@@ -336,6 +345,10 @@ struct pmu_dev {
     struct pmu_rtc_state rtc;
     struct pmu_notify_state notify;
     struct pmu_pwrkey_state pwrkey;
+    bool wakeup_pad_gpio;
+    bool wakeup_pad_cfg_saved;
+    uint32_t wakeup_pad_saved_cfg;
+    uint32_t wakeup_pad_cfg_reg;
     struct pmu_cycle_state cycle;
 };
 
@@ -361,8 +374,8 @@ void pmu_post_work(struct pmu_dev *pmu, uint32_t work);
 
 int pmu_init_userdev(struct pmu_dev *pmu);
 void pmu_notify_unregister_pid(struct pmu_dev *pmu, rt_int32_t pid);
-rt_err_t pmu_notify_send(struct pmu_dev *pmu, rt_uint32_t events,
-             bool wait_ack);
+rt_err_t pmu_notify_send_shutdown_request(struct pmu_dev *pmu);
+int pmu_get_shutdown_wakeup_level(struct pmu_dev *pmu, int *level);
 
 int pmu_init_pwrkey(struct pmu_dev *pmu);
 void pmu_pwrkey_irq(struct pmu_dev *pmu, uint32_t status);

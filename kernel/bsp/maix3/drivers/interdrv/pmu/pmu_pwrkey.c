@@ -49,12 +49,12 @@ static void pmu_pwrkey_reset_state(struct pmu_dev *pmu)
     pmu->pwrkey.pressed = false;
     pmu->pwrkey.long_press_seen = false;
     pmu->pwrkey.release_seen = false;
-    pmu->pwrkey.user_notified = false;
 }
 
 static bool pmu_pwrkey_shutdown_pending(struct pmu_dev *pmu)
 {
-    return pmu->pwrkey.release_seen || pmu->notify.ack_pending;
+    return pmu->pwrkey.release_seen || pmu->notify.confirm_pending ||
+           pmu->notify.confirm_received;
 }
 
 static void pmu_pwrkey_init_output_state(struct pmu_dev *pmu)
@@ -92,7 +92,6 @@ static void pmu_pwrkey_on_press(struct pmu_dev *pmu)
     pmu->pwrkey.pressed = true;
     pmu->pwrkey.long_press_seen = false;
     pmu->pwrkey.release_seen = false;
-    pmu->pwrkey.user_notified = false;
     pmu_pwrkey_set_edge(pmu, true);
     rt_timer_stop(pmu->pwrkey.timer);
     rt_timer_start(pmu->pwrkey.timer);
@@ -121,7 +120,6 @@ static void pmu_pwrkey_timer_cb(void *parameter)
 
     pmu->pwrkey.long_press_seen = true;
     pmu->pwrkey.release_seen = false;
-    pmu->pwrkey.user_notified = false;
     pmu_post_work(pmu, PMU_WORK_KEY_LONG);
 }
 
@@ -132,13 +130,10 @@ void pmu_pwrkey_handle_long_work(struct pmu_dev *pmu)
     if (!pmu->pwrkey.long_press_seen)
         return;
 
-    ret = pmu_notify_send(pmu, PMU_EVENT_LONG_PRESS, false);
-    if (ret == RT_EOK) {
-        pmu->pwrkey.user_notified = true;
+    ret = pmu_notify_send_shutdown_request(pmu);
+    if (ret == RT_EOK)
         return;
-    }
 
-    pmu->pwrkey.user_notified = false;
     rt_kprintf("[pmu] worker: long-press notify unavailable (%d), wait key release then direct shutdown\n",
            ret);
 }
@@ -150,18 +145,15 @@ void pmu_pwrkey_handle_release_work(struct pmu_dev *pmu)
     if (!pmu->pwrkey.long_press_seen || !pmu->pwrkey.release_seen)
         return;
 
-    if (!pmu->pwrkey.user_notified) {
+    if (!pmu->notify.confirm_pending && !pmu->notify.confirm_received) {
         rt_kprintf("[pmu] worker: no userspace listener, direct shutdown on release\n");
         pmu_do_shutdown("power-key-release");
         return;
     }
 
-    ret = pmu_notify_send(pmu, PMU_EVENT_KEY_RELEASE, true);
-    if (ret == RT_EOK)
+    if (!pmu->notify.confirm_received)
         return;
 
-    rt_kprintf("[pmu] worker: release notify unavailable (%d), direct shutdown\n",
-           ret);
     pmu_do_shutdown("power-key-release");
 }
 
@@ -237,7 +229,9 @@ int pmu_init_pwrkey(struct pmu_dev *pmu)
 
     pmu_pwrkey_init_output_state(pmu);
 
-    (void)pmu_init_userdev(pmu);
+    ret = pmu_init_userdev(pmu);
+    if (ret != RT_EOK)
+        return ret;
 
     if (pmu->pwrkey.timer == RT_NULL) {
         pmu->pwrkey.timer = rt_timer_create(

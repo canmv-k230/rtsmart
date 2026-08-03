@@ -15,23 +15,31 @@ static void pmu_notify_reset_locked(struct pmu_notify_state *notify)
 {
     notify->pid = 0;
     notify->signo = 0;
-    notify->pending_events = 0;
+    notify->shutdown_request_pending = false;
     notify->registered = false;
-    notify->ack_pending = false;
+    notify->confirm_pending = false;
+    notify->confirm_received = false;
 }
 
 void pmu_notify_unregister_pid(struct pmu_dev *pmu, rt_int32_t pid)
 {
     struct pmu_notify_state *notify = &pmu->notify;
     rt_base_t level;
+    bool shutdown = false;
 
     if (pid <= 0)
         return;
 
     level = rt_hw_interrupt_disable();
-    if (notify->registered && (notify->pid == pid))
+    if (notify->registered && (notify->pid == pid)) {
         pmu_notify_reset_locked(notify);
+        shutdown = pmu->pwrkey.long_press_seen &&
+                   pmu->pwrkey.release_seen;
+    }
     rt_hw_interrupt_enable(level);
+
+    if (shutdown)
+        pmu_do_shutdown("power-key-release");
 }
 
 static rt_err_t pmu_notify_register(struct pmu_dev *pmu,
@@ -55,15 +63,18 @@ static rt_err_t pmu_notify_register(struct pmu_dev *pmu,
     level = rt_hw_interrupt_disable();
     notify->pid = pid;
     notify->signo = signo;
-    notify->pending_events = 0;
+    notify->shutdown_request_pending = false;
     notify->registered = true;
-    notify->ack_pending = false;
+    notify->confirm_pending = false;
+    notify->confirm_received = false;
     rt_hw_interrupt_enable(level);
 
     return RT_EOK;
 }
 
-static rt_err_t pmu_notify_read(struct pmu_dev *pmu, struct pmu_event *event)
+static rt_err_t pmu_notify_read_request(
+                    struct pmu_dev *pmu,
+                    struct pmu_shutdown_request *request)
 {
     struct pmu_notify_state *notify = &pmu->notify;
     rt_base_t level;
@@ -77,15 +88,14 @@ static rt_err_t pmu_notify_read(struct pmu_dev *pmu, struct pmu_event *event)
         return -RT_ERROR;
     }
 
-    event->events = notify->pending_events;
-    event->reserved = 0;
-    notify->pending_events = 0;
+    request->pending = notify->shutdown_request_pending;
+    notify->shutdown_request_pending = false;
     rt_hw_interrupt_enable(level);
 
     return RT_EOK;
 }
 
-rt_err_t pmu_notify_send(struct pmu_dev *pmu, rt_uint32_t events, bool wait_ack)
+rt_err_t pmu_notify_send_shutdown_request(struct pmu_dev *pmu)
 {
 #ifndef RT_USING_LWP
     return -RT_ENOSYS;
@@ -102,16 +112,15 @@ rt_err_t pmu_notify_send(struct pmu_dev *pmu, rt_uint32_t events, bool wait_ack)
         return -RT_ENOSYS;
     }
 
-    if (wait_ack && notify->ack_pending) {
+    if (notify->confirm_pending) {
         rt_hw_interrupt_enable(level);
         return -RT_EBUSY;
     }
 
     pid = notify->pid;
     signo = notify->signo;
-    notify->pending_events |= events;
-    if (wait_ack)
-        notify->ack_pending = true;
+    notify->shutdown_request_pending = true;
+    notify->confirm_pending = true;
     rt_hw_interrupt_enable(level);
 
     ret = lwp_kill(pid, signo);
@@ -130,12 +139,12 @@ rt_err_t pmu_notify_send(struct pmu_dev *pmu, rt_uint32_t events, bool wait_ack)
 #endif
 }
 
-static rt_err_t pmu_notify_shutdown_ack(struct pmu_dev *pmu,
-                    const struct pmu_event *event)
+static rt_err_t pmu_notify_confirm_shutdown(struct pmu_dev *pmu)
 {
     struct pmu_notify_state *notify = &pmu->notify;
     rt_base_t level;
     rt_int32_t pid;
+    bool shutdown = false;
 
     pid = pmu_current_pid();
     if (pid <= 0)
@@ -147,26 +156,20 @@ static rt_err_t pmu_notify_shutdown_ack(struct pmu_dev *pmu,
         return -RT_ERROR;
     }
 
-    if (!notify->ack_pending) {
+    if (!notify->confirm_pending) {
         rt_hw_interrupt_enable(level);
         return -RT_EBUSY;
     }
 
-    if ((event != RT_NULL) &&
-        ((event->events & PMU_EVENT_KEY_RELEASE) == 0U)) {
-        rt_hw_interrupt_enable(level);
-        return -RT_EINVAL;
+    notify->confirm_received = true;
+    if (pmu->pwrkey.release_seen) {
+        notify->confirm_pending = false;
+        shutdown = true;
     }
-
-    notify->ack_pending = false;
-    notify->pending_events = 0;
-    pmu->pwrkey.pressed = false;
-    pmu->pwrkey.long_press_seen = false;
-    pmu->pwrkey.release_seen = false;
-    pmu->pwrkey.user_notified = false;
     rt_hw_interrupt_enable(level);
 
-    pmu_do_shutdown("userspace-ack");
+    if (shutdown)
+        pmu_do_shutdown("userspace-ack");
     return RT_EOK;
 }
 
@@ -218,8 +221,9 @@ static int pmu_userdev_ioctl(struct dfs_fd *file, int cmd, void *args)
 {
     struct pmu_dev *pmu = pmu_get_dev();
     struct pmu_notify_cfg notify_cfg;
-    struct pmu_event event;
+    struct pmu_shutdown_request request;
     struct pmu_power_cycle_cfg cycle_cfg;
+    struct pmu_wakeup_pad_level wakeup_level;
     rt_err_t ret = -RT_EINVAL;
 
     (void)file;
@@ -241,22 +245,17 @@ static int pmu_userdev_ioctl(struct dfs_fd *file, int cmd, void *args)
         ret = RT_EOK;
         goto out;
 
-    case PMU_IOCTL_GET_EVENT:
+    case PMU_IOCTL_GET_SHUTDOWN_REQUEST:
         if (args == RT_NULL)
             goto out;
-        ret = pmu_notify_read(pmu, &event);
+        ret = pmu_notify_read_request(pmu, &request);
         if (ret != RT_EOK)
             goto out;
-        ret = pmu_copy_to_user(args, &event, sizeof(event));
+        ret = pmu_copy_to_user(args, &request, sizeof(request));
         goto out;
 
-    case PMU_IOCTL_SHUTDOWN_ACK:
-        if (args == RT_NULL)
-            goto out;
-        if (pmu_copy_from_user(&event, args, sizeof(event)) != RT_EOK)
-            ret = -RT_ERROR;
-        else
-            ret = pmu_notify_shutdown_ack(pmu, &event);
+    case PMU_IOCTL_CONFIRM_SHUTDOWN:
+        ret = pmu_notify_confirm_shutdown(pmu);
         goto out;
 
     case PMU_IOCTL_SCHEDULE_POWER_CYCLE:
@@ -272,6 +271,20 @@ static int pmu_userdev_ioctl(struct dfs_fd *file, int cmd, void *args)
 
     case PMU_IOCTL_CANCEL_POWER_CYCLE:
         ret = pmu_cancel_power_cycle(pmu);
+        goto out;
+
+    case PMU_IOCTL_SHUTDOWN_NOW:
+        pmu_do_shutdown("userspace-now");
+        ret = RT_EOK;
+        goto out;
+
+    case PMU_IOCTL_GET_WAKEUP_PAD_LEVEL:
+        if (args == RT_NULL)
+            goto out;
+        ret = pmu_get_shutdown_wakeup_level(pmu, &wakeup_level.level);
+        if (ret != RT_EOK)
+            goto out;
+        ret = pmu_copy_to_user(args, &wakeup_level, sizeof(wakeup_level));
         goto out;
 
     default:

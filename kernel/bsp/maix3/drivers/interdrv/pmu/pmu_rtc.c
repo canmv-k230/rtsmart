@@ -562,7 +562,6 @@ rt_err_t pmu_schedule_power_cycle(struct pmu_dev *pmu,
     pmu->cycle.shutdown_time = now + cfg->shutdown_after_s;
     pmu->cycle.poweron_time = pmu->cycle.shutdown_time +
                   cfg->poweron_after_s;
-    pmu->cycle.poweron_after_s = cfg->poweron_after_s;
     pmu->cycle.active = true;
     pmu->cycle.shutting_down = false;
     rt_hw_interrupt_enable(level);
