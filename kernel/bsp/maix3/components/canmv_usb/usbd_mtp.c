@@ -11,9 +11,6 @@
 #include "usb_osal.h"
 
 #if defined (CHERRY_USB_DEVICE_FUNC_CDC_MTP) || defined (CHERRY_USB_DEVICE_FUNC_HID_CDC_MTP)
-/* Max USB packet size */
-#define MTP_BULK_EP_MPS USB_DEVICE_MAX_MPS
-
 #define MTP_OUT_EP_IDX 0
 #define MTP_IN_EP_IDX  1
 #define MTP_INT_EP_IDX 2
@@ -26,6 +23,8 @@ static rt_event_t mtp_event;
 static volatile uint32_t read_size;
 static volatile uint32_t write_size;
 static volatile uint32_t int_write_size;
+static volatile uint16_t mtp_bulk_ep_mps = USB_DEVICE_FS_MAX_MPS;
+
 #define EV_CONFIGURED 0x01
 #define EV_DISCONNECT 0x02
 #define EV_BULK_READ_FINISH 0x04
@@ -44,11 +43,11 @@ static uint32_t mtp_bulk_transfer_limit(void)
 {
     uint32_t limit;
 
-    limit = MTP_BULK_EP_MPS * MTP_USB_BULK_MAX_PACKET_COUNT;
+    limit = mtp_bulk_ep_mps * MTP_USB_BULK_MAX_PACKET_COUNT;
     if (limit > MTP_USB_BULK_MAX_TRANSFER_SIZE) {
         limit = MTP_USB_BULK_MAX_TRANSFER_SIZE;
     }
-    limit -= limit % MTP_BULK_EP_MPS;
+    limit -= limit % mtp_bulk_ep_mps;
 
     return limit;
 }
@@ -90,8 +89,8 @@ static void mtp_abort_endpoints(void)
     }
 
     /* Drop the active transfer before the responder starts the next one. */
-    mtp_reopen_endpoint(mtp_ep_data[MTP_OUT_EP_IDX].ep_addr, USB_ENDPOINT_TYPE_BULK, MTP_BULK_EP_MPS, 0);
-    mtp_reopen_endpoint(mtp_ep_data[MTP_IN_EP_IDX].ep_addr, USB_ENDPOINT_TYPE_BULK, MTP_BULK_EP_MPS, 0);
+    mtp_reopen_endpoint(mtp_ep_data[MTP_OUT_EP_IDX].ep_addr, USB_ENDPOINT_TYPE_BULK, mtp_bulk_ep_mps, 0);
+    mtp_reopen_endpoint(mtp_ep_data[MTP_IN_EP_IDX].ep_addr, USB_ENDPOINT_TYPE_BULK, mtp_bulk_ep_mps, 0);
     read_size = 0;
     write_size = 0;
 }
@@ -376,7 +375,6 @@ static void usbd_mtp_int_in(uint8_t busid, uint8_t ep, uint32_t nbytes)
 
 static void mtp_notify_handler(uint8_t busid, uint8_t event, void *arg)
 {
-    (void)busid;
     (void)arg;
 
     switch (event) {
@@ -390,7 +388,11 @@ static void mtp_notify_handler(uint8_t busid, uint8_t event, void *arg)
             }
             break;
         case USBD_EVENT_CONFIGURED:
+            mtp_bulk_ep_mps = usbd_get_port_speed(busid, 0) == USB_SPEED_HIGH ?
+                                  USB_DEVICE_MAX_MPS :
+                                  USB_DEVICE_FS_MAX_MPS;
             if (mtp_context) {
+                mtp_set_usb_handle(mtp_context, NULL, mtp_bulk_ep_mps);
                 mtp_context->cancel_req = 0;
                 mtp_context->cancel_status_pending = 0;
                 mtp_context->reset_req = 0;
@@ -488,7 +490,7 @@ static void mtp_device_init(void)
     if (init_usb_mtp_buffer(mtp_context)) {
         goto init_error;
     }
-    mtp_set_usb_handle(mtp_context, NULL, MTP_BULK_EP_MPS);
+    mtp_set_usb_handle(mtp_context, NULL, mtp_bulk_ep_mps);
 
     extern bool g_fs_mount_data_succ;
     extern bool g_fs_mount_sdcard_succ;

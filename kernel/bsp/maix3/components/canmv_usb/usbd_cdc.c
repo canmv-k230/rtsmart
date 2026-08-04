@@ -38,9 +38,9 @@ struct cdc_device {
     bool                    send_break_flag;
     int                     cdc_dtr;
     bool                    is_open;
+    uint16_t                bulk_mps;
 };
 
-#define CDC_MAX_MPS          USB_DEVICE_MAX_MPS
 #define CDC_READ_BUFFER_SIZE (4096)
 
 static struct cdc_device g_usbd_serial_cdc_acm[CANMV_USB_CDC_ACM_COUNT];
@@ -324,7 +324,7 @@ static void usbd_cdc_acm_bulk_in(uint8_t busid, uint8_t ep, uint32_t nbytes, voi
 
     if (!g_usb_device_connected || !usb_device_is_configured(busid)) {
         cdc_complete_tx(cdc);
-    } else if ((nbytes % CDC_MAX_MPS) == 0 && nbytes) {
+    } else if (cdc && nbytes && ((nbytes % cdc->bulk_mps) == 0)) {
         /* send zlp */
         if (usbd_ep_start_write(busid, ep, NULL, 0) < 0) {
             cdc_complete_tx(cdc);
@@ -353,9 +353,14 @@ void usbd_cdc_acm_set_dtr(uint8_t busid, uint8_t intf, bool dtr)
 
 void canmv_usb_device_cdc_on_connected(void)
 {
+    uint16_t bulk_mps = usbd_get_port_speed(USB_DEVICE_BUS_ID, 0) == USB_SPEED_HIGH ?
+                            USB_DEVICE_MAX_MPS :
+                            USB_DEVICE_FS_MAX_MPS;
+
     for (size_t i = 0; i < CANMV_USB_CDC_ACM_COUNT; i++) {
         struct cdc_device *cdc = &g_usbd_serial_cdc_acm[i];
 
+        cdc->bulk_mps = bulk_mps;
         cdc_reset_link_state(cdc);
 
         if (cdc->is_open) {
@@ -428,6 +433,7 @@ void canmv_usb_device_cdc_init(void)
         cdc->line_coding.bCharFormat = 0;
         cdc->line_coding.bParityType = 0;
         cdc->line_coding.bDataBits = 8;
+        cdc->bulk_mps = USB_DEVICE_FS_MAX_MPS;
         cdc_reset_link_state(cdc);
 
         usbd_add_interface(busid, usbd_cdc_acm_init_intf(busid, &cdc->intf_ctrl));

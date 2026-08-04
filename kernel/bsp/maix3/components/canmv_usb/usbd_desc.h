@@ -33,6 +33,20 @@
 #define USB_DEVICE_MAX_MPS 64
 #endif
 
+#define USB_DEVICE_FS_MAX_MPS 64
+
+#define CANMV_USB_CONFIG_DESCRIPTOR_INIT(descriptor_type, wTotalLength, bNumInterfaces,                   \
+                                         bConfigurationValue, bmAttributes, bMaxPower)                    \
+    0x09, descriptor_type, WBVAL(wTotalLength), bNumInterfaces, bConfigurationValue, 0x00, bmAttributes, \
+        USB_CONFIG_POWER_MA(bMaxPower)
+
+#define CANMV_USB_MTP_DESCRIPTOR_INIT(bFirstInterface, out_ep, in_ep, int_ep, str_idx, max_packet_size) \
+    USB_INTERFACE_DESCRIPTOR_INIT(bFirstInterface, 0x00, 0x03, USB_MTP_CLASS, USB_MTP_SUB_CLASS,        \
+                                  USB_MTP_PROTOCOL, str_idx),                                           \
+    USB_ENDPOINT_DESCRIPTOR_INIT(out_ep, USB_ENDPOINT_TYPE_BULK, max_packet_size, 0x00),                \
+    USB_ENDPOINT_DESCRIPTOR_INIT(in_ep, USB_ENDPOINT_TYPE_BULK, max_packet_size, 0x00),                 \
+    USB_ENDPOINT_DESCRIPTOR_INIT(int_ep, USB_ENDPOINT_TYPE_INTERRUPT, 0x1c, 0x06)
+
 #ifdef CHERRY_USB_DEVICE_FUNC_CDC
 #include "usbd_desc_cdc.h"
 #endif

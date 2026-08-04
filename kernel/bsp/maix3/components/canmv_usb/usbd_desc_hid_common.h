@@ -4,11 +4,14 @@
 
 #include "usb_hid.h"
 
+/* The HID report descriptor is shared by the current- and other-speed
+ * configurations. Keep one FS-safe report size so the driver never arms a
+ * 512-byte multi-packet interrupt report on a 64-byte full-speed endpoint. */
+#define CANMV_USB_HID_EP_SIZE 64
+
 #ifdef CONFIG_USB_HS
-#define CANMV_USB_HID_EP_SIZE 512
 #define CANMV_USB_HID_EP_INTERVAL 4
 #else
-#define CANMV_USB_HID_EP_SIZE 64
 #define CANMV_USB_HID_EP_INTERVAL 10
 #endif
 
@@ -19,14 +22,15 @@
 #define CANMV_USB_HID_DESCRIPTOR_SIZE  (9 + 9 + 7 + 7)
 #define CANMV_USB_HID_PAYLOAD_SIZE     (CANMV_USB_HID_EP_SIZE - 1)
 
-#define CANMV_USB_HID_DESCRIPTOR_INIT(intf, in_ep, out_ep)                                    \
+#define CANMV_USB_HID_DESCRIPTOR_INIT_EX(intf, in_ep, out_ep, ep_size, ep_interval)            \
     0x09, USB_DESCRIPTOR_TYPE_INTERFACE, (intf), 0x00, 0x02, 0x03, 0x00, 0x00, 0x00,         \
     0x09, HID_DESCRIPTOR_TYPE_HID, 0x11, 0x01, 0x00, 0x01, 0x22,                              \
     WBVAL(CANMV_USB_HID_REPORT_DESC_SIZE),                                                     \
-    0x07, USB_DESCRIPTOR_TYPE_ENDPOINT, (in_ep), 0x03, WBVAL(CANMV_USB_HID_EP_SIZE),          \
-    CANMV_USB_HID_EP_INTERVAL,                                                                 \
-    0x07, USB_DESCRIPTOR_TYPE_ENDPOINT, (out_ep), 0x03, WBVAL(CANMV_USB_HID_EP_SIZE),         \
-    CANMV_USB_HID_EP_INTERVAL
+    0x07, USB_DESCRIPTOR_TYPE_ENDPOINT, (in_ep), 0x03, WBVAL(ep_size), ep_interval,            \
+    0x07, USB_DESCRIPTOR_TYPE_ENDPOINT, (out_ep), 0x03, WBVAL(ep_size), ep_interval
+
+#define CANMV_USB_HID_DESCRIPTOR_INIT(intf, in_ep, out_ep) \
+    CANMV_USB_HID_DESCRIPTOR_INIT_EX(intf, in_ep, out_ep, CANMV_USB_HID_EP_SIZE, CANMV_USB_HID_EP_INTERVAL)
 
 #if defined(CHERRY_USB_DEVICE_FUNC_HID)
 
@@ -39,6 +43,10 @@
 
 #include "usb_mtp.h"
 #include "usbd_desc_cdc_common.h"
+
+#if defined(CONFIG_ENABLE_DUAL_CDC_PORT) && (CONFIG_USBDEV_EP_NUM <= 7)
+#error "HID + dual CDC + MTP requires EP7, but K230 only provides EP1 through EP6"
+#endif
 
 #define MTP_INTF_NUM CANMV_USB_CDC_NEXT_INTERFACE
 

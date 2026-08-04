@@ -50,6 +50,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 static volatile bool tx_flag     = 0;
 static volatile bool iso_tx_busy = false;
+static volatile uint16_t uvc_payload_size = UVC_FS_MAX_PAYLOAD_SIZE;
 
 ///////////////////////////////////////////////////////////////////////////////
 // UVC Device Functions ///////////////////////////////////////////////////////
@@ -550,7 +551,7 @@ static void _usbd_video_thread_entry(void* args)
 
             rt_mutex_release(&inst->mutex);
 
-            frame_sleep_ms = 1000 / frame_rate;
+            frame_sleep_ms = frame_rate > 0 ? 1000 / frame_rate : 100;
 
             if (10 > frame_sleep_ms) {
                 frame_sleep_ms = 10;
@@ -567,15 +568,16 @@ static void _usbd_video_thread_entry(void* args)
                 uint32_t bytes_sent   = 0;
                 uint32_t buffer_index = 0;
 
-                // Max image data per packet (leaving space for 12-byte header)
-                const uint32_t data_per_packet = MAX_PAYLOAD_SIZE - 12;
+                // Max image data per packet after the UVC payload header.
+                const uint32_t data_per_packet = uvc_payload_size - UVC_PAYLOAD_HEADER_SIZE;
                 const uint32_t total_packets   = (input_len + data_per_packet - 1) / data_per_packet;
 
                 // Pre-fill the first packet
                 uint32_t bytes_to_copy
                     = (bytes_sent + data_per_packet > input_len) ? (input_len - bytes_sent) : data_per_packet;
                 video_payload_header_fill(packet_buffer[buffer_index], 0, total_packets, frame_counter, bytes_to_copy);
-                memcpy(packet_buffer[buffer_index] + 12, input_data + bytes_sent, bytes_to_copy);
+                memcpy(packet_buffer[buffer_index] + UVC_PAYLOAD_HEADER_SIZE,
+                       input_data + bytes_sent, bytes_to_copy);
                 bytes_sent += bytes_to_copy;
 
                 // Loop through and send all packets
@@ -591,7 +593,7 @@ static void _usbd_video_thread_entry(void* args)
                     }
 
                     // Start transmission of the current buffer
-                    uint32_t total_packet_size = 12 + bytes_to_copy;
+                    uint32_t total_packet_size = UVC_PAYLOAD_HEADER_SIZE + bytes_to_copy;
                     iso_tx_busy                = true; // Set busy flag before starting transmission
                     if (usbd_ep_start_write(USB_DEVICE_BUS_ID, VIDEO_IN_EP, packet_buffer[buffer_index], total_packet_size) < 0) {
                         iso_tx_busy = false;
@@ -606,7 +608,8 @@ static void _usbd_video_thread_entry(void* args)
                         bytes_to_copy = (bytes_sent + data_per_packet > input_len) ? (input_len - bytes_sent) : data_per_packet;
                         video_payload_header_fill(packet_buffer[buffer_index], i + 1, total_packets, frame_counter,
                                                   bytes_to_copy);
-                        memcpy(packet_buffer[buffer_index] + 12, input_data + bytes_sent, bytes_to_copy);
+                        memcpy(packet_buffer[buffer_index] + UVC_PAYLOAD_HEADER_SIZE,
+                               input_data + bytes_sent, bytes_to_copy);
                         bytes_sent += bytes_to_copy;
                     }
                 }
@@ -626,8 +629,12 @@ static void _usbd_video_thread_entry(void* args)
             rt_list_insert_after(&inst->free_list, &frame->list);
             rt_mutex_release(&inst->mutex);
 
-            if (frame_sleep_ms >= (uint32_t)frame_send_time_ms) {
-                uint32_t sleep_ms = (frame_sleep_ms - frame_send_time_ms) - 1;
+            if (frame_sleep_ms > (uint32_t)frame_send_time_ms) {
+                uint32_t sleep_ms = frame_sleep_ms - (uint32_t)frame_send_time_ms;
+
+                if (sleep_ms > 1U) {
+                    sleep_ms--;
+                }
 
                 if (10 > sleep_ms) {
                     sleep_ms = 10;
@@ -788,12 +795,18 @@ void usbd_video_close(uint8_t busid, uint8_t intf)
 
 void canmv_usb_device_uvc_on_connected(void)
 {
+    bool high_speed = usbd_get_port_speed(USB_DEVICE_BUS_ID, 0) == USB_SPEED_HIGH;
+
+    uvc_payload_size = high_speed ? MAX_PAYLOAD_SIZE : UVC_FS_MAX_PAYLOAD_SIZE;
+    usbd_video_probe_and_commit_controls_init(USB_DEVICE_BUS_ID, INTERVAL, MAX_FRAME_SIZE,
+                                              uvc_payload_size);
     tx_flag     = 0;
     iso_tx_busy = false;
 }
 
 void canmv_usb_device_uvc_on_disconnected(void)
 {
+    uvc_payload_size = UVC_FS_MAX_PAYLOAD_SIZE;
     tx_flag     = 0;
     iso_tx_busy = false;
 }
@@ -816,8 +829,8 @@ void canmv_usb_device_uvc_init(void)
     rt_thread_t tid;
     uint8_t     busid = USB_DEVICE_BUS_ID;
 
-    usbd_add_interface(busid, usbd_video_init_intf(busid, &intf0, INTERVAL, MAX_FRAME_SIZE, MAX_PAYLOAD_SIZE));
-    usbd_add_interface(busid, usbd_video_init_intf(busid, &intf1, INTERVAL, MAX_FRAME_SIZE, MAX_PAYLOAD_SIZE));
+    usbd_add_interface(busid, usbd_video_init_intf(busid, &intf0, INTERVAL, MAX_FRAME_SIZE, uvc_payload_size));
+    usbd_add_interface(busid, usbd_video_init_intf(busid, &intf1, INTERVAL, MAX_FRAME_SIZE, uvc_payload_size));
     usbd_add_endpoint(busid, &video_in_ep);
 
     usbd_uvc_device_init();

@@ -4,8 +4,10 @@
 
 #define VIDEO_IN_EP 0x81
 
-#define MAX_PAYLOAD_SIZE  1024 // for high speed with one transcations every one micro frame
-#define VIDEO_PACKET_SIZE (unsigned int)(((MAX_PAYLOAD_SIZE / 1)) | (0x00 << 11))
+#define MAX_PAYLOAD_SIZE        1024 // for high speed with one transaction every microframe
+#define UVC_FS_MAX_PAYLOAD_SIZE 1023
+#define UVC_PAYLOAD_HEADER_SIZE  12U
+#define VIDEO_PACKET_SIZE       (unsigned int)(((MAX_PAYLOAD_SIZE / 1)) | (0x00 << 11))
 
 // #define MAX_PAYLOAD_SIZE  2048 // for high speed with two transcations every one micro frame
 // #define VIDEO_PACKET_SIZE (unsigned int)(((MAX_PAYLOAD_SIZE / 2)) | (0x01 << 11))
@@ -27,31 +29,27 @@
 #define VC_TERMINAL_SIZ (unsigned int)(13 + 18 + 12 + 9 - 1)
 #define VS_HEADER_SIZ   (unsigned int)(13 + 1 + 11 + 30 + 6)
 
+#define CANMV_USB_UVC_CONFIG_DESCRIPTOR_INIT(descriptor_type, max_packet_size)                        \
+    CANMV_USB_CONFIG_DESCRIPTOR_INIT(descriptor_type, USB_VIDEO_DESC_SIZ, 0x02, 0x01,                \
+                                     USB_CONFIG_BUS_POWERED, USBD_MAX_POWER),                        \
+    VIDEO_VC_DESCRIPTOR_INIT(0x00, 0, 0x0100, VC_TERMINAL_SIZ, 48000000, 0x02),                     \
+    VIDEO_VS_DESCRIPTOR_INIT(0x01, 0x00, 0x00),                                                      \
+    VIDEO_VS_HEADER_DESCRIPTOR_INIT(0x01, VS_HEADER_SIZ, VIDEO_IN_EP, 0x00),                         \
+    VIDEO_VS_FORMAT_MJPEG_DESCRIPTOR_INIT(0x01, 0x01),                                               \
+    VIDEO_VS_FRAME_MJPEG_DESCRIPTOR_INIT(0x01, CAM_WIDTH, CAM_HEIGHT, MIN_BIT_RATE, MAX_BIT_RATE,    \
+                                         MAX_FRAME_SIZE, DBVAL(INTERVAL), 0x01, DBVAL(INTERVAL)),     \
+    0x06, 0x24, 0x0D, 0x01, 0x01, 0x04,                                                            \
+    VIDEO_VS_DESCRIPTOR_INIT(0x01, 0x01, 0x01),                                                      \
+    USB_ENDPOINT_DESCRIPTOR_INIT(VIDEO_IN_EP, USB_ENDPOINT_TYPE_ISOCHRONOUS, max_packet_size, 0x01)
+
 /*!< global descriptor */
 static const uint8_t canmv_usb_descriptor[] = {
     USB_DEVICE_DESCRIPTOR_INIT(USB_2_0, 0xef, 0x02, 0x01, CHERRY_USB_DEVICE_VID, CHERRY_USB_DEVICE_PID, 0x0001, 0x01),
-    USB_CONFIG_DESCRIPTOR_INIT(USB_VIDEO_DESC_SIZ, 0x02, 0x01, USB_CONFIG_BUS_POWERED, USBD_MAX_POWER),
-    VIDEO_VC_DESCRIPTOR_INIT(0x00, 0, 0x0100, VC_TERMINAL_SIZ, 48000000, 0x02),
-    VIDEO_VS_DESCRIPTOR_INIT(0x01, 0x00, 0x00),
-    VIDEO_VS_HEADER_DESCRIPTOR_INIT(0x01, VS_HEADER_SIZ, VIDEO_IN_EP, 0x00),
-    VIDEO_VS_FORMAT_MJPEG_DESCRIPTOR_INIT(0x01, 0x01),
-    VIDEO_VS_FRAME_MJPEG_DESCRIPTOR_INIT(0x01, CAM_WIDTH, CAM_HEIGHT, MIN_BIT_RATE, MAX_BIT_RATE, MAX_FRAME_SIZE,
-                                         DBVAL(INTERVAL), 0x01, DBVAL(INTERVAL)),
-    /* Color Matching Descriptor */
-    0x06,        // bLength
-    0x24,        // CS_INTERFACE
-    0x0D,        // VS_COLORFORMAT subtype
-    0x01,        // bColorPrimaries      (1 = BT.709, 2 = sRGB)
-    0x01,        // bTransferCharacteristics
-    0x04,         // bMatrixCoefficients
-    VIDEO_VS_DESCRIPTOR_INIT(0x01, 0x01, 0x01),
-    /* 1.2.2.2 Standard VideoStream Isochronous Video Data Endpoint Descriptor */
-    0x07, /* bLength */
-    USB_DESCRIPTOR_TYPE_ENDPOINT, /* bDescriptorType: ENDPOINT */
-    0x81, /* bEndpointAddress: IN endpoint 2 */
-    0x01, /* bmAttributes: Isochronous transfer type. Asynchronous synchronization type. */
-    WBVAL(VIDEO_PACKET_SIZE), /* wMaxPacketSize */
-    0x01, /* bInterval: One frame interval */
+#ifdef CONFIG_USB_HS
+    CANMV_USB_UVC_CONFIG_DESCRIPTOR_INIT(USB_DESCRIPTOR_TYPE_CONFIGURATION, VIDEO_PACKET_SIZE),
+#else
+    CANMV_USB_UVC_CONFIG_DESCRIPTOR_INIT(USB_DESCRIPTOR_TYPE_CONFIGURATION, UVC_FS_MAX_PAYLOAD_SIZE),
+#endif
 
     ///////////////////////////////////////
     /// string0 descriptor
@@ -128,8 +126,11 @@ static const uint8_t canmv_usb_descriptor[] = {
     0x02,
     0x01,
     0x40,
+    0x01,
     0x00,
-    0x00,
+    CANMV_USB_UVC_CONFIG_DESCRIPTOR_INIT(USB_DESCRIPTOR_TYPE_OTHER_SPEED, UVC_FS_MAX_PAYLOAD_SIZE),
 #endif
     0x00,
 };
+
+#undef CANMV_USB_UVC_CONFIG_DESCRIPTOR_INIT

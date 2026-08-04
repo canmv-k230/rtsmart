@@ -195,6 +195,21 @@ menu "Components Configuration"
                         hex "USB Device PID"
                         default 0xABD1
 
+                    config CANMV_USB_DEVICE_MAX_ENDPOINTS
+                        int
+                        default 6
+                        help
+                            Number of non-control bidirectional endpoint
+                            numbers implemented by the K230 USB device
+                            controller. EP0 is not included.
+
+                    config CANMV_USB_DUAL_CDC_PORT
+                        bool
+                        option env="CANMV_USB_DUAL_CDC_PORT"
+                        help
+                            SDK-level dual CDC setting imported to enforce the
+                            K230 endpoint limit in this Kconfig.
+
                     choice
                         prompt "USB Device Function"
                         default CHERRY_USB_DEVICE_FUNC_CDC_MTP
@@ -211,9 +226,15 @@ menu "Components Configuration"
                             select CHERRY_USB_DEVICE_ENABLE_CLASS_MTP
                         config CHERRY_USB_DEVICE_FUNC_HID_CDC_MTP
                             bool "HID Serial + CDC + MTP"
+                            depends on !CANMV_USB_DUAL_CDC_PORT || CANMV_USB_DEVICE_MAX_ENDPOINTS >= 7
                             select CHERRY_USB_DEVICE_ENABLE_CLASS_HID
                             select CHERRY_USB_DEVICE_ENABLE_CLASS_CDC_ACM
                             select CHERRY_USB_DEVICE_ENABLE_CLASS_MTP
+                            help
+                                Requires five endpoint numbers with one CDC
+                                port and seven with dual CDC. K230 only provides
+                                EP1 through EP6, so this function is unavailable
+                                while dual CDC is enabled.
                         config CHERRY_USB_DEVICE_FUNC_CDC_ADB
                             bool "CDC + ADB"
                             select CHERRY_USB_DEVICE_ENABLE_CLASS_CDC_ACM
