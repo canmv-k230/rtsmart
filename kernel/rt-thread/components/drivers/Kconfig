@@ -552,8 +552,10 @@ menuconfig RT_USING_BT_HCI
     help
         Provide a transport-neutral Bluetooth HCI H:4 character device.
         Controller drivers register an HCI device and BLE host stacks use the
-        resulting byte stream; GAP, GATT, L2CAP, and SMP belong in a proven
-        host stack such as NimBLE rather than in this device framework.
+        resulting byte stream. Passing no name to the registration API assigns
+        the next available /dev/hciX name. GAP, GATT, L2CAP, and SMP belong in
+        a proven host stack such as NimBLE rather than in this device
+        framework.
 
 config RT_USING_DEV_BUS
     bool "Using Device Bus device drivers"

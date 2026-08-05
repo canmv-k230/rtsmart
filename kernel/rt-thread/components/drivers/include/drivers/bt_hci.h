@@ -18,6 +18,8 @@ extern "C" {
 #define RT_BT_HCI_H4_EVT 0x04
 #define RT_BT_HCI_H4_ISO 0x05
 
+#define RT_BT_HCI_AUTO_NAME_ATTEMPTS 1024U
+
 struct rt_bt_hci_device;
 
 /* Packet data passed through this API excludes the leading H:4 type byte. */
@@ -54,10 +56,20 @@ struct rt_bt_hci_device
     struct rt_bt_hci_stats stats;
 };
 
+/* Passing RT_NULL for name selects the next available /dev/hciX name. */
 rt_err_t rt_bt_hci_register(struct rt_bt_hci_device *hci, const char *name,
                             const struct rt_bt_hci_ops *ops,
                             rt_uint8_t *rx_buffer, rt_uint16_t rx_buffer_size,
                             void *user_data);
+
+/* Register the controller with the next available /dev/hciX name. At most
+ * RT_BT_HCI_AUTO_NAME_ATTEMPTS candidates are checked before -RT_EFULL is
+ * returned. */
+rt_err_t rt_bt_hci_register_auto(struct rt_bt_hci_device *hci,
+                                  const struct rt_bt_hci_ops *ops,
+                                  rt_uint8_t *rx_buffer,
+                                  rt_uint16_t rx_buffer_size,
+                                  void *user_data);
 rt_err_t rt_bt_hci_send(struct rt_bt_hci_device *hci, rt_uint8_t packet_type,
                         const rt_uint8_t *data, rt_size_t length);
 rt_err_t rt_bt_hci_receive(struct rt_bt_hci_device *hci,

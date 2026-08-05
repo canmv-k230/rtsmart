@@ -261,18 +261,24 @@ static const struct rt_device_ops g_bt_hci_device_ops = {
 };
 #endif
 
-rt_err_t rt_bt_hci_register(struct rt_bt_hci_device *hci, const char *name,
-                            const struct rt_bt_hci_ops *ops,
-                            rt_uint8_t *rx_buffer, rt_uint16_t rx_buffer_size,
-                            void *user_data)
+static rt_uint32_t g_bt_hci_auto_index;
+
+static rt_uint32_t bt_hci_alloc_auto_index(void)
+{
+    /* Registration can be triggered by different transport hotplug paths.
+     * Reserve the monotonically increasing index atomically so two paths do
+     * not select the same name before rt_device_register() is called. */
+    return __atomic_fetch_add(&g_bt_hci_auto_index, 1U, __ATOMIC_RELAXED);
+}
+
+static rt_err_t bt_hci_register_named(struct rt_bt_hci_device *hci,
+                                      const char *name,
+                                      const struct rt_bt_hci_ops *ops,
+                                      rt_uint8_t *rx_buffer,
+                                      rt_uint16_t rx_buffer_size,
+                                      void *user_data)
 {
     rt_err_t result;
-
-    if (!hci || !name || !ops || !ops->send || !rx_buffer ||
-        rx_buffer_size < 64 || rx_buffer_size > 0x7fff)
-    {
-        return -RT_EINVAL;
-    }
 
     rt_memset(hci, 0, sizeof(*hci));
     hci->ops = ops;
@@ -311,7 +317,77 @@ rt_err_t rt_bt_hci_register(struct rt_bt_hci_device *hci, const char *name,
 #endif
     return result;
 }
+
+rt_err_t rt_bt_hci_register(struct rt_bt_hci_device *hci, const char *name,
+                            const struct rt_bt_hci_ops *ops,
+                            rt_uint8_t *rx_buffer, rt_uint16_t rx_buffer_size,
+                            void *user_data)
+{
+    rt_err_t result;
+
+    if (!hci || !ops || !ops->send || !rx_buffer ||
+        rx_buffer_size < 64 || rx_buffer_size > 0x7fff)
+    {
+        return -RT_EINVAL;
+    }
+    if (!name)
+    {
+        return rt_bt_hci_register_auto(hci, ops, rx_buffer,
+                                       rx_buffer_size, user_data);
+    }
+
+    /* rt_device_register() performs a separate lookup and insertion. Keep the
+     * HCI namespace operation inside the kernel critical section so named and
+     * automatic HCI registrations cannot select the same name concurrently. */
+    rt_enter_critical();
+    result = bt_hci_register_named(hci, name, ops, rx_buffer,
+                                   rx_buffer_size, user_data);
+    rt_exit_critical();
+    return result;
+}
 RTM_EXPORT(rt_bt_hci_register);
+
+rt_err_t rt_bt_hci_register_auto(struct rt_bt_hci_device *hci,
+                                  const struct rt_bt_hci_ops *ops,
+                                  rt_uint8_t *rx_buffer,
+                                  rt_uint16_t rx_buffer_size,
+                                  void *user_data)
+{
+    char name[RT_NAME_MAX];
+    rt_uint32_t attempt;
+    rt_err_t result;
+
+    if (!hci || !ops || !ops->send || !rx_buffer ||
+        rx_buffer_size < 64 || rx_buffer_size > 0x7fff)
+    {
+        return -RT_EINVAL;
+    }
+
+    for (attempt = 0; attempt < RT_BT_HCI_AUTO_NAME_ATTEMPTS; attempt++)
+    {
+        rt_uint32_t index = bt_hci_alloc_auto_index();
+        int length = rt_snprintf(name, sizeof(name), "hci%u", index);
+
+        if (length < 0 || (rt_size_t)length >= sizeof(name))
+        {
+            return -RT_EFULL;
+        }
+        rt_enter_critical();
+        if (rt_device_find(name) != RT_NULL)
+        {
+            rt_exit_critical();
+            continue;
+        }
+
+        result = bt_hci_register_named(hci, name, ops, rx_buffer,
+                                       rx_buffer_size, user_data);
+        rt_exit_critical();
+        return result;
+    }
+
+    return -RT_EFULL;
+}
+RTM_EXPORT(rt_bt_hci_register_auto);
 
 rt_err_t rt_bt_hci_send(struct rt_bt_hci_device *hci, rt_uint8_t packet_type,
                         const rt_uint8_t *data, rt_size_t length)
