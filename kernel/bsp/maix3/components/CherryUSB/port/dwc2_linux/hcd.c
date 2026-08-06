@@ -29,6 +29,45 @@ __WEAK void usb_hc_low_level_deinit(struct usbh_bus *bus)
 static void dwc2_kill_all_urbs(struct dwc2_hsotg *hsotg);
 static void dwc2_hcd_cleanup_channels(struct dwc2_hsotg *hsotg);
 
+/* Convert Linux-style HCD status values at the CherryUSB API boundary. */
+static int dwc2_cherryusb_status(int status)
+{
+    switch (status) {
+    case -ENODEV:
+        return -USB_ERR_NOTCONN;
+    case -EINVAL:
+        return -USB_ERR_INVAL;
+    case -ENOMEM:
+        return -USB_ERR_NOMEM;
+    case -EBUSY:
+        return -USB_ERR_BUSY;
+    case -EPIPE:
+        return -USB_ERR_STALL;
+    case -EOVERFLOW:
+        return -USB_ERR_BABBLE;
+    case -EPROTO:
+    case -EIO:
+    case -EREMOTEIO:
+    case -ENOSR:
+    case -ECOMM:
+        return -USB_ERR_IO;
+    /* CherryUSB has no separate in-progress status; BUSY is the closest fit. */
+    case -EINPROGRESS:
+        return -USB_ERR_BUSY;
+    case -ECONNRESET:
+        return -USB_ERR_SHUTDOWN;
+    case -ETIMEDOUT:
+        return -USB_ERR_TIMEOUT;
+    /* DWC2 uses ENOSPC for host-channel or periodic-bandwidth exhaustion. */
+    case -ENOSPC:
+        return -USB_ERR_RANGE;
+    case -EPERM:
+        return -USB_ERR_BUSY;
+    default:
+        return status;
+    }
+}
+
 /**
  * dwc2_check_core_endianness() - Returns true if core and AHB have
  * opposite endianness.
@@ -1892,7 +1931,7 @@ int usb_hc_init(struct usbh_bus *bus)
 
     hsotg = rt_calloc(1, sizeof(*hsotg));
     if (!hsotg)
-        return -ENOMEM;
+        return -USB_ERR_NOMEM;
 
     /* ioremap in main->usbh_initialize */
     hsotg->regs = (volatile void *)bus->hcd.reg_base;
@@ -1974,7 +2013,7 @@ error:
     if (hsotg->ll_hw_enabled)
         dwc2_lowlevel_hw_disable(hsotg);
 #endif
-    return retval;
+    return dwc2_cherryusb_status(retval);
 
 }
 
@@ -2642,7 +2681,7 @@ error:
         break;
     }
 
-    return retval;
+    return dwc2_cherryusb_status(retval);
 }
 #endif
 
@@ -2999,7 +3038,8 @@ void dwc2_host_complete(struct dwc2_hsotg *hsotg, struct dwc2_qtd *qtd,
                 dwc2_hcd_urb_get_iso_desc_actual_length(
                                                         qtd->urb, i);
             urb->iso_packet[i].errorcode =
-                dwc2_hcd_urb_get_iso_desc_status(qtd->urb, i);
+                dwc2_cherryusb_status(
+                    dwc2_hcd_urb_get_iso_desc_status(qtd->urb, i));
         }
     }
 
@@ -3015,6 +3055,8 @@ void dwc2_host_complete(struct dwc2_hsotg *hsotg, struct dwc2_qtd *qtd,
             urb->actual_length < urb->transfer_buffer_length)
             status = -EREMOTEIO;
     }
+
+    status = dwc2_cherryusb_status(status);
 
     if (usb_pipetype(urb->pipe) == PIPE_ISOCHRONOUS ||
         usb_pipetype(urb->pipe) == PIPE_INTERRUPT) {
@@ -3499,7 +3541,7 @@ int usbh_submit_urb(struct usbh_urb *urb)
         if (result != RT_EOK) {
             int dev;
             dev_err(dev, "init sem fail %d\n", __func__);
-            ret = result;
+            ret = -USB_ERR_NOMEM;
             goto out_2;
         }
     }
@@ -3528,6 +3570,7 @@ int usbh_submit_urb(struct usbh_urb *urb)
         if (ret < 0) {
             USB_LOG_ERR("urb timeout = %d, urb->hcpriv = %p\n", timeout, urb->hcpriv);
             usbh_kill_urb(urb);
+            ret = -USB_ERR_TIMEOUT;
             goto out_1;
         }
         ret = urb->errorcode;
@@ -3635,7 +3678,7 @@ int usbh_enqueue_urb(struct usbh_urb *urb)
 
 
     if (!urb || !urb->hport || !urb->ep || !urb->hport->bus) {
-        return -EINVAL;
+        return -USB_ERR_INVAL;
     }
 
     hsotg = dwc2_hcd_to_hsotg(&urb->hport->bus->hcd);
@@ -3700,7 +3743,7 @@ int usbh_enqueue_urb(struct usbh_urb *urb)
     dwc2_urb = dwc2_hcd_urb_alloc(hsotg, urb->num_of_iso_packets,
                                   mem_flags);
     if (!dwc2_urb)
-        return -ENOMEM;
+        return dwc2_cherryusb_status(-ENOMEM);
 
     dwc2_hcd_urb_set_pipeinfo(hsotg, dwc2_urb, usb_pipedevice(urb->pipe),
                               usb_pipeendpoint(urb->pipe), ep_type,
@@ -3862,7 +3905,7 @@ fail0:
     DDD("canaan -- dwc2_urb\n");
     urb->hcpriv = RT_NULL;
 
-    return retval;
+    return dwc2_cherryusb_status(retval);
 }
 
 /**
@@ -4010,7 +4053,7 @@ int dwc2_hcd_endpoint_disable(struct usb_hcd *hcd, struct usb_host_endpoint *ep,
     if (!list_empty(&qh->qtd_list)) {
         //rt_kprintf("disable ep next time\n");
         rt_spin_unlock_irqrestore(&hsotg->lock, level);
-        return -EINVAL;
+        return dwc2_cherryusb_status(-EINVAL);
     }
 
     while (!list_empty(&qh->qtd_list) && retry--) {
@@ -4052,7 +4095,7 @@ err:
     ep->hcpriv = NULL;
     rt_spin_unlock_irqrestore(&hsotg->lock, level);
 
-    return rc;
+    return dwc2_cherryusb_status(rc);
 }
 
 /*
@@ -4071,7 +4114,7 @@ static int _dwc2_hcd_urb_dequeue(struct urb *urb, int status)
     if (!urb->hcpriv) {
         urb->errorcode = status;
         dev_dbg(urb, "%s urb->hcpriv is NULL(%p,%p)\n", __func__, urb, urb->hport);
-        rc = -USB_ERR_INVAL;
+        rc = -EINVAL;
         goto wail_kill;
     }
 
@@ -4129,8 +4172,7 @@ int usbh_kill_urb(struct usbh_urb *urb)
     atomic_dec(&urb->reject);
 
 out:
-
-    return ret;
+    return dwc2_cherryusb_status(ret);
 }
 
 void USBH_IRQHandler(uint8_t busid)
