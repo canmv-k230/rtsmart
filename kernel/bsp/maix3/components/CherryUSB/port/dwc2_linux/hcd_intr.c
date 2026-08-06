@@ -1482,27 +1482,31 @@ static inline int hub_clear_tt_buffer(struct usbh_hubport *hdev, u16 devinfo, u1
                            HUB_CLEAR_TT_BUFFER, USB_RT_PORT, devinfo,
                            tt, NULL, 0, 1000);
 #else
-    struct usb_setup_packet *setup;
+    struct usb_setup_packet setup;
+    int status;
+
+    usb_memset(&setup, 0, sizeof(setup));
     /* Need to clear both directions for control ep */
     if (((devinfo >> 11) & USB_ENDPOINT_XFERTYPE_MASK) ==
         USB_ENDPOINT_XFER_CONTROL) {
 
-        setup->bmRequestType = USB_RT_PORT;
-        setup->bRequest = HUB_CLEAR_TT_BUFFER;
-        setup->wValue = devinfo ^ 0x8000;
-        setup->wIndex = tt;
-        setup->wLength = 0;
-        int status = usbh_control_transfer(hdev, setup, NULL);
-        if (status)
+        setup.bmRequestType = USB_REQUEST_DIR_OUT | USB_RT_PORT;
+        setup.bRequest = HUB_CLEAR_TT_BUFFER;
+        setup.wValue = devinfo ^ 0x8000;
+        setup.wIndex = tt;
+        setup.wLength = 0;
+        status = usbh_control_transfer(hdev, &setup, NULL);
+        if (status < 0)
             return status;
     }
 
-    setup->bmRequestType = USB_RT_PORT;
-    setup->bRequest = HUB_CLEAR_TT_BUFFER;
-    setup->wValue = devinfo;
-    setup->wIndex = tt;
-    setup->wLength = 0;
-    return usbh_control_transfer(hdev, setup, NULL);
+    setup.bmRequestType = USB_REQUEST_DIR_OUT | USB_RT_PORT;
+    setup.bRequest = HUB_CLEAR_TT_BUFFER;
+    setup.wValue = devinfo;
+    setup.wIndex = tt;
+    setup.wLength = 0;
+    status = usbh_control_transfer(hdev, &setup, NULL);
+    return status < 0 ? status : 0;
 
 #endif
 }
@@ -1553,7 +1557,7 @@ void hub_tt_work(struct rt_work* work, void* work_data)
         /* drop lock so HCD can concurrently report other TT errors */
         rt_spin_unlock_irqrestore(&hub->tt.lock, level);
         status = hub_clear_tt_buffer(hdev, clear->devinfo, clear->tt);
-        if (status && status != -ENODEV)
+        if (status && status != -USB_ERR_NODEV)
             dev_err(&hdev->dev,
                     "clear tt %d (%04x) error %d\n",
                     clear->tt, clear->devinfo, status);
@@ -1568,7 +1572,7 @@ void hub_tt_work(struct rt_work* work, void* work_data)
 #endif
 
         rt_free(clear);
-        DDD("canaan -- usb_tt_clear = %d\n", sizeof(sizeof *clear));
+        DDD("canaan -- usb_tt_clear = %d\n", sizeof(*clear));
         rt_spin_lock_irqsave(&hub->tt.lock);
     }
     rt_spin_unlock_irqrestore(&hub->tt.lock, level);
@@ -1606,7 +1610,7 @@ int usb_hub_clear_tt_buffer(struct urb *urb)
         /* FIXME recover somehow ... RESET_TT? */
         return -ENOMEM;
     }
-    DDD("canaan ++ usb_tt_clear = %d\n", sizeof(sizeof *clear));
+    DDD("canaan ++ usb_tt_clear = %d\n", sizeof(*clear));
 
     /* info that CLEAR_TT_BUFFER needs */
     clear->tt = tt->multi ? udev->ttport : 1;
@@ -1660,7 +1664,7 @@ static void dwc2_hc_handle_tt_clear(struct dwc2_hsotg *hsotg,
     if (usb_urb->hport->tt->hub == root_hub)
         return;
 
-    dev_err(hsotg->dev, "%s\n", __func__);
+    dev_dbg(hsotg->dev, "%s\n", __func__);
 
     if (qtd->urb->status != -EPIPE && qtd->urb->status != -EREMOTEIO) {
         chan->qh->tt_buffer_dirty = 1;
