@@ -1,8 +1,0 @@
-menuconfig RT_USING_EEPROM
-    bool "Enable EEPROM over GPIO Driver"
-    default n
-
-    if RT_USING_EEPROM
-
-
-    endif

@@ -1,6 +1,5 @@
 menu "Ext Driver"
     source "drivers/extdrv/cyw43xx/Kconfig"
-    source "drivers/extdrv/eeprom/Kconfig"
     source "drivers/extdrv/realtek/Kconfig"
     source "drivers/extdrv/regulator/Kconfig"
     source "drivers/extdrv/spinand/Kconfig"
