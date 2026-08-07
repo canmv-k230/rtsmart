@@ -35,6 +35,11 @@
 #include "sysctl_boot.h"
 
 #define K230_TRUSTED_PRELOAD_CMD "@preload"
+#define MMCSD_CARD_DETECT_TIMEOUT_MS 600
+
+#ifdef RT_USING_SDIO
+extern int kd_sdhci_wait_card(int id, int timeout);
+#endif
 
 #ifdef ENABLE_CHERRY_USB
 
@@ -152,8 +157,11 @@ static void mnt_mount_table(void)
     sysctl_boot_mode_e          boot_mode;
     const struct dfs_mount_tbl* mnt_tbl = NULL;
 
-    boot_mode = sysctl_boot_get_boot_mode();
-    boot_mode &= 0x03;
+    boot_mode = g_sysctl_boot_mode;
+    if (boot_mode >= SYSCTL_BOOT_MAX) {
+        rt_kprintf("invalid boot mode %d\n", boot_mode);
+        return;
+    }
     mnt_tbl = auto_mount_table[boot_mode];
 
     while (1) {
@@ -222,31 +230,23 @@ static void mnt_mount_table(void)
 
 #ifdef MOUNT_SECOND_CARD
 
-extern void kd_sdhci_change(int id);
-
 static void mount_second_card(void)
 {
-    int      ret;
-    int      err         = 0;
-    uint32_t wait_sd_cnt = 0;
+    int ret;
+    int err = 0;
+    int second_host;
 
-    sysctl_boot_mode_e boot_mode;
-    boot_mode = sysctl_boot_get_boot_mode();
-    boot_mode &= 0x03;
+    sysctl_boot_mode_e boot_mode = g_sysctl_boot_mode;
 
-    const char* device_name = (SYSCTL_BOOT_EMMC == boot_mode) ? "sd10" : "sd01";
+    const char* device_name = (SYSCTL_BOOT_EMMC == boot_mode) ? "sd10" : "sd00";
 
-    if (SYSCTL_BOOT_EMMC == boot_mode) {
-        kd_sdhci_change(1);
-    } else if (SYSCTL_BOOT_SDCARD == boot_mode) {
-        kd_sdhci_change(0);
-    }
-
-    while (mmcsd_wait_cd_changed(100) != MMCSD_HOST_PLUGED) {
-        if (++wait_sd_cnt > 5) {
-            rt_kprintf("no second mmc device\n");
-            break;
-        }
+    second_host = SYSCTL_BOOT_EMMC == boot_mode ? 1 : 0;
+    if (kd_sdhci_wait_card(second_host,
+                           rt_tick_from_millisecond(
+                               MMCSD_CARD_DETECT_TIMEOUT_MS)) !=
+        MMCSD_HOST_PLUGED) {
+        rt_kprintf("no second mmc device on SDIO%d\n", second_host);
+        return;
     }
 
     if (0x00 != (ret = dfs_mount(device_name, "/ext_data", "elm", 0, 0))) {
@@ -327,11 +327,14 @@ int main(void) {
   rt_kprintf("##############################################################\n");
 
 #ifdef RT_USING_SDIO
-  uint32_t wait_sd_cnt = 0;
-  while (mmcsd_wait_cd_changed(100) != MMCSD_HOST_PLUGED) {
-    if(++wait_sd_cnt > 5) {
-      rt_kprintf("no mmc device\n");
-      break;
+  if (g_sysctl_boot_mode == SYSCTL_BOOT_EMMC ||
+      g_sysctl_boot_mode == SYSCTL_BOOT_SDCARD) {
+    int boot_host = g_sysctl_boot_mode == SYSCTL_BOOT_EMMC ? 0 : 1;
+    if (kd_sdhci_wait_card(boot_host,
+                           rt_tick_from_millisecond(
+                               MMCSD_CARD_DETECT_TIMEOUT_MS)) !=
+        MMCSD_HOST_PLUGED) {
+      rt_kprintf("no boot mmc device on SDIO%d\n", boot_host);
     }
   }
 #endif //RT_USING_SDIO

@@ -21,7 +21,6 @@
 #include <ioremap.h>
 #include <cache.h>
 
-#include "sysctl_boot.h"
 #include "tick.h"
 
 #ifdef RT_USING_SDIO
@@ -1087,12 +1086,32 @@ void kd_sdhci0_reset(int value)
     sdhci_writeb(host, emmc_ctl, EMMC_CTRL_R);
 }
 
+static struct rt_mmcsd_host *kd_sdhci_get_host(int id)
+{
+    if (id == 0 && sdhci_host0)
+        return sdhci_host0->host;
+    if (id == 1 && sdhci_host1)
+        return sdhci_host1->host;
+    return RT_NULL;
+}
+
 void kd_sdhci_change(int id)
 {
-    if (id == 0)
-        mmcsd_change(sdhci_host0->host);
-    else if (id == 1)
-        mmcsd_change(sdhci_host1->host);
+    struct rt_mmcsd_host *host = kd_sdhci_get_host(id);
+
+    if (host)
+        mmcsd_change(host);
+    else
+        LOG_W("SDIO%d host is not initialized", id);
+}
+
+int kd_sdhci_wait_card(int id, int timeout)
+{
+    struct rt_mmcsd_host *host = kd_sdhci_get_host(id);
+
+    if (!host)
+        return -RT_EINVAL;
+    return mmcsd_wait_host_ready(host, timeout);
 }
 
 rt_int32_t kd_sdhci_init(void)
@@ -1210,23 +1229,11 @@ rt_int32_t kd_sdhci_init(void)
     sdhci_host1->host = mmcsd_host1;
 #endif
 
-    sysctl_boot_mode_e boot_mode;
-
-    boot_mode = sysctl_boot_get_boot_mode();
-
-    if(SYSCTL_BOOT_EMMC == boot_mode) {
-        kd_sdhci_change(0);
-    } else if(SYSCTL_BOOT_SDCARD == boot_mode) {
-        kd_sdhci_change(1);
-    } else {
-        rt_kprintf("not boot from mmc device (%d)\n", boot_mode);
-    }
-
     rt_iounmap(hi_sys_virt_addr);
 
     return 0;
 }
-INIT_DEVICE_EXPORT(kd_sdhci_init);
+INIT_DEVICE_EXPORT_SEQ(kd_sdhci_init, 200);
 
 #endif /*defined(RT_USING_SDIO0) || defined(RT_USING_SDIO1)*/
 

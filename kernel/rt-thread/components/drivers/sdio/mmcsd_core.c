@@ -617,9 +617,67 @@ int mmcsd_wait_cd_changed(rt_int32_t timeout)
 }
 RTM_EXPORT(mmcsd_wait_cd_changed);
 
+int mmcsd_wait_host_ready(struct rt_mmcsd_host *host, rt_int32_t timeout)
+{
+    rt_err_t result;
+
+    if (!host)
+        return -RT_EINVAL;
+    if (host->card_detect_pending)
+    {
+        result = rt_completion_wait(&host->card_detect_completion, timeout);
+        if (result != RT_EOK)
+            return result;
+    }
+    else if (host->card)
+    {
+        return MMCSD_HOST_PLUGED;
+    }
+    return host->card_detect_status;
+}
+RTM_EXPORT(mmcsd_wait_host_ready);
+
+static void mmcsd_detect_complete(struct rt_mmcsd_host *host,
+                                  rt_bool_t notify_hotplug)
+{
+    host->card_detect_status = host->card ? MMCSD_HOST_PLUGED :
+                                            MMCSD_HOST_UNPLUGED;
+    host->card_detect_pending = RT_FALSE;
+    rt_completion_done(&host->card_detect_completion);
+    if (notify_hotplug)
+        rt_mb_send(&mmcsd_hotpluge_mb, (rt_ubase_t)host);
+}
+
 void mmcsd_change(struct rt_mmcsd_host *host)
 {
-    rt_mb_send(&mmcsd_detect_mb, (rt_ubase_t)host);
+    if (!host)
+        return;
+
+    /* RT-Smart has no SDIO card-removal path.  A repeated rescan request
+     * must not be interpreted as unplugging an attached Wi-Fi function. */
+    if (host->card &&
+        (host->card->card_type == CARD_TYPE_SDIO ||
+         host->card->card_type == CARD_TYPE_SDIO_COMBO))
+    {
+        LOG_D("ignore SDIO rescan while card is attached on %s", host->name);
+        return;
+    }
+
+    if (host->card_detect_pending)
+    {
+        LOG_D("card detection is already pending on %s", host->name);
+        return;
+    }
+
+    rt_completion_init(&host->card_detect_completion);
+    host->card_detect_status = -RT_EBUSY;
+    host->card_detect_pending = RT_TRUE;
+    if (rt_mb_send(&mmcsd_detect_mb, (rt_ubase_t)host) != RT_EOK)
+    {
+        host->card_detect_status = -RT_EFULL;
+        host->card_detect_pending = RT_FALSE;
+        rt_completion_done(&host->card_detect_completion);
+    }
 }
 
 void mmcsd_detect(void *param)
@@ -653,6 +711,7 @@ void mmcsd_detect(void *param)
                     if (init_sdio(host, ocr))
                         mmcsd_power_off(host);
                     mmcsd_host_unlock(host);
+                    mmcsd_detect_complete(host, RT_FALSE);
                     continue;
                 }
 
@@ -665,7 +724,7 @@ void mmcsd_detect(void *param)
                     if (init_sd(host, ocr))
                         mmcsd_power_off(host);
                     mmcsd_host_unlock(host);
-                    rt_mb_send(&mmcsd_hotpluge_mb, (rt_ubase_t)host);
+                    mmcsd_detect_complete(host, RT_TRUE);
                     continue;
                 }
 
@@ -679,10 +738,11 @@ probe_mmc:
                     if (init_mmc(host, ocr))
                         mmcsd_power_off(host);
                     mmcsd_host_unlock(host);
-                    rt_mb_send(&mmcsd_hotpluge_mb, (rt_ubase_t)host);
+                    mmcsd_detect_complete(host, RT_TRUE);
                     continue;
                 }
                 mmcsd_host_unlock(host);
+                mmcsd_detect_complete(host, RT_FALSE);
             }
             else
             {
@@ -700,7 +760,7 @@ probe_mmc:
                     host->card = RT_NULL;
                 }
                 mmcsd_host_unlock(host);
-                rt_mb_send(&mmcsd_hotpluge_mb, (rt_ubase_t)host);
+                mmcsd_detect_complete(host, RT_TRUE);
             }
         }
     }
@@ -717,6 +777,8 @@ void mmcsd_host_init(struct rt_mmcsd_host *host)
 
     rt_mutex_init(&host->bus_lock, "sd_bus_lock", RT_IPC_FLAG_FIFO);
     rt_sem_init(&host->sem_ack, "sd_ack", 0, RT_IPC_FLAG_FIFO);
+    rt_completion_init(&host->card_detect_completion);
+    host->card_detect_status = -RT_EBUSY;
 }
 
 struct rt_mmcsd_host *mmcsd_alloc_host(void)
@@ -786,4 +848,3 @@ int rt_mmcsd_core_init(void)
     return 0;
 }
 INIT_PREV_EXPORT(rt_mmcsd_core_init);
-

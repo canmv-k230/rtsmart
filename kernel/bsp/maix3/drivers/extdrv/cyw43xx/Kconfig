@@ -1,30 +1,22 @@
 menuconfig RT_USING_CYW43XX
-    bool "Enable CYW43XX WiFi Driver"
+    bool "CYW43xx SDIO Wi-Fi"
+    depends on RT_USING_WIFI && RT_USING_SDIO
     default n
+    help
+        Enable the CYW43xx SDIO Wi-Fi driver. It may be built together with
+        other SDIO Wi-Fi drivers; the SDIO manufacturer and product IDs
+        select the driver at runtime.
 
     if RT_USING_CYW43XX
-        choice CYW43XX_SDIO_DEV
-            bool "CYW43XX Wifi Use SDIO Device"
+        menu "Thread Settings"
 
-            config CYW43XX_SDIO_DEV0
-                bool "Using SDIO0"
-            config CYW43XX_SDIO_DEV1
-                bool "Using SDIO1"
-        endchoice
+            config CYW43XX_THREAD_PRIORITY
+                int "Thread priority"
+                default 10
 
-        config CYW43XX_SDIO_DEV
-            int
-            default 0 if CYW43XX_SDIO_DEV0
-            default 1 if CYW43XX_SDIO_DEV1
+            config CYW43XX_THREAD_STACK_SIZE
+                int "Thread stack size"
+                default 4096
 
-        config CYW43_PIN_WL_REG_ON
-            int "CYW43XX REG_ON Pin"
-            default 1
-
-        config CYW43XX_THREAD_PRIORITY
-            int
-            default 10
-        config CYW43XX_THREAD_STACK_SIZE
-            int
-            default 4096
+        endmenu
     endif

@@ -222,6 +222,7 @@ rt_inline rt_uint32_t __rt_fls(rt_uint32_t val)
 
 rt_int32_t mmcsd_excute_tuning(struct rt_mmcsd_card *card);
 int mmcsd_wait_cd_changed(rt_int32_t timeout);
+int mmcsd_wait_host_ready(struct rt_mmcsd_host *host, rt_int32_t timeout);
 void mmcsd_host_lock(struct rt_mmcsd_host *host);
 void mmcsd_host_unlock(struct rt_mmcsd_host *host);
 void mmcsd_req_complete(struct rt_mmcsd_host *host);

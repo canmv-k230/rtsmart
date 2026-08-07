@@ -12,6 +12,7 @@
 #define __HOST_H__
 
 #include <rtthread.h>
+#include <ipc/completion.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -138,6 +139,9 @@ struct rt_mmcsd_host
     rt_uint32_t   spi_use_crc;
     struct rt_mutex  bus_lock;
     struct rt_semaphore  sem_ack;
+    struct rt_completion card_detect_completion;
+    rt_int32_t card_detect_status;
+    rt_bool_t card_detect_pending;
 
     rt_uint32_t       sdio_irq_num;
     struct rt_semaphore    *sdio_irq_sem;

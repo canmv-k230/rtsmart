@@ -1112,7 +1112,7 @@ _error1:
 
     return -RT_ERROR;
 }
-INIT_DEVICE_EXPORT(kd_pin_init);
+INIT_DEVICE_EXPORT_SEQ(kd_pin_init, 010);
 
 #if defined(RT_USING_MSH) && defined(RT_GPIO_ENABLE_BUILTIN_CMD) // Enable GPIO command in MSH
 #include <msh.h>

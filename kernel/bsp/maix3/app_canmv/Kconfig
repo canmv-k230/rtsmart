@@ -6,6 +6,11 @@ menu "Applications CanMV Configuration"
 
     config MOUNT_SECOND_CARD
         bool "Mount second mmc card"
+        depends on RT_USING_SDIO0 && RT_USING_SDIO1
+        depends on !BSP_USING_WIFI_SDIO
         default n
+        help
+            Mount both SD/MMC controllers as storage. This is mutually
+            exclusive with assigning one of the controllers to SDIO Wi-Fi.
 
 endmenu

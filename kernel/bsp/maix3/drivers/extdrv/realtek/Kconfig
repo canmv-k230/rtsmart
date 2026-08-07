@@ -1,32 +1,15 @@
 menuconfig RT_USING_REALTEK
-    bool "Enable Realtek WiFi Driver"
+    bool "Realtek SDIO Wi-Fi"
+    depends on RT_USING_WIFI && RT_USING_SDIO
     default n
+    help
+        Enable a Realtek SDIO Wi-Fi driver. It may be built together with
+        other SDIO Wi-Fi drivers; the SDIO manufacturer and product IDs
+        select the driver at runtime.
 
     if RT_USING_REALTEK
-        choice REALTEK_SDIO_DEV
-            bool "Realtek Wifi Use SDIO Device"
-
-            config REALTEK_SDIO_DEV0
-                bool "Using SDIO0"
-            config REALTEK_SDIO_DEV1
-                bool "Using SDIO1"
-        endchoice
-
-        config REALTEK_SDIO_DEV
-            int
-            default 0 if REALTEK_SDIO_DEV0
-            default 1 if REALTEK_SDIO_DEV1
-        
-        config REALTEK_SDIO_DEV_RESET
-            int "RealTek WiFi Card Reset/REG_ON GPIO"
-            default -1
-            help
-                GPIO used to reset or enable the WiFi card, regardless of the
-                selected SDIO controller. Set to -1 to use the SDIO0 reset
-                output, or when the board does not have such a GPIO.
-
         choice
-            prompt "realtek module"
+            prompt "Realtek module"
             default REALTEK_SDIO_RTL8189FTV
 
             config REALTEK_SDIO_RTL8189FTV

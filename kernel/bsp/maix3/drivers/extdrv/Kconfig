@@ -1,8 +1,71 @@
 menu "Ext Driver"
     source "drivers/extdrv/cyw43xx/Kconfig"
     source "drivers/extdrv/realtek/Kconfig"
-    source "drivers/extdrv/regulator/Kconfig"
+
+    config BSP_USING_WIFI_SDIO
+        bool
+        default y if RT_USING_CYW43XX
+        default y if RT_USING_REALTEK
+
+    if BSP_USING_WIFI_SDIO
+
+        menu "SDIO Wi-Fi Board Bus"
+
+            choice
+                prompt "Host controller"
+                default BSP_WIFI_SDIO_HOST_1 if RT_USING_SDIO1
+                default BSP_WIFI_SDIO_HOST_0
+
+                config BSP_WIFI_SDIO_HOST_0
+                    bool "SDIO0"
+                    depends on RT_USING_SDIO0
+
+                config BSP_WIFI_SDIO_HOST_1
+                    bool "SDIO1"
+                    depends on RT_USING_SDIO1
+            endchoice
+
+            config BSP_WIFI_SDIO_HOST
+                int
+                default 0 if BSP_WIFI_SDIO_HOST_0
+                default 1 if BSP_WIFI_SDIO_HOST_1
+
+            config BSP_WIFI_SDIO_REG_ON_PIN
+                int "REG_ON/reset GPIO (-1 uses board wiring)"
+                range -1 63
+                default -1
+                help
+                    GPIO shared by the SDIO Wi-Fi socket. The board resets
+                    this signal once before probing all enabled vendor
+                    drivers. Use -1 when the signal is not GPIO-controlled.
+
+            config BSP_WIFI_SDIO_RESET_ACTIVE_LOW
+                bool "REG_ON/reset is asserted low"
+                default y
+
+            config BSP_WIFI_SDIO_RESET_PULSE_MS
+                int "Reset assertion time (ms)"
+                range 1 1000
+                default 200
+
+            config BSP_WIFI_SDIO_POWER_UP_DELAY_MS
+                int "Power-up delay before card detection (ms)"
+                range 1 1000
+                default 50
+
+            config BSP_WIFI_SDIO_USE_SDIO0_RESET
+                bool "Use the SDIO0 hardware reset output"
+                depends on BSP_WIFI_SDIO_HOST_0 && BSP_WIFI_SDIO_REG_ON_PIN < 0
+                default y
+                help
+                    Toggle the SDIO0 reset output when the module reset is
+                    wired to the controller rather than a GPIO.
+
+        endmenu
+
+    endif
     source "drivers/extdrv/spinand/Kconfig"
+    source "drivers/extdrv/regulator/Kconfig"
     source "drivers/extdrv/touch/Kconfig"
     source "drivers/extdrv/ws2812/Kconfig"
     source "drivers/extdrv/onewire/Kconfig"

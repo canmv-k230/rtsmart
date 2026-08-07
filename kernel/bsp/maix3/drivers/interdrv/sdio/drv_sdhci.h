@@ -493,4 +493,8 @@ struct sdhci_host
     uint32_t tx_delay_line;
 };
 
+void kd_sdhci_change(int id);
+int kd_sdhci_wait_card(int id, int timeout);
+void kd_sdhci0_reset(int value);
+
 #endif /*__DRV_SDHCI__*/

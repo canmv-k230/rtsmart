@@ -30,7 +30,8 @@
 
 volatile sysctl_boot_t* sysctl_boot = (volatile sysctl_boot_t*)SYSCTL_BOOT_BASE_ADDR;
 
-static int boot_mode = -1;
+sysctl_boot_mode_e g_sysctl_boot_mode = SYSCTL_BOOT_MAX;
+RTM_EXPORT(g_sysctl_boot_mode);
 
 static sysctl_boot_mode_e sysctl_boot_get_boot_mode_r(void)
 {
@@ -54,8 +55,8 @@ static sysctl_boot_mode_e sysctl_boot_get_boot_mode_r(void)
 
 sysctl_boot_mode_e sysctl_boot_get_boot_mode(void)
 {
-    if((-1) != boot_mode) {
-        return (sysctl_boot_mode_e)boot_mode;
+    if(g_sysctl_boot_mode < SYSCTL_BOOT_MAX) {
+        return g_sysctl_boot_mode;
     }
 
     return sysctl_boot_get_boot_mode_r();
@@ -106,7 +107,7 @@ int rt_hw_sysctl_boot_init(void)
         return -1;
     }
 
-    boot_mode = sysctl_boot_get_boot_mode_r();
+    g_sysctl_boot_mode = sysctl_boot_get_boot_mode();
 
     return 0;
 }

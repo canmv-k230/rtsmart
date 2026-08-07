@@ -490,14 +490,16 @@ static rt_int32_t cyw43_probe(struct rt_mmcsd_card* card)
 
 static rt_int32_t cyw43_remove(struct rt_mmcsd_card* card)
 {
+    (void)card;
+    return RT_EOK;
 }
 
 static struct rt_sdio_device_id cyw43_id[] = {
-    { 0, 0x02d0, 0xa9a6 },
+    { SDIO_ANY_FUNC_ID, 0x02d0, 0xa9a6 },
 };
 
 static struct rt_sdio_driver cyw43_drv = {
-    "realtek-wifi",
+    "cyw43xx-wifi",
     cyw43_probe,
     cyw43_remove,
     cyw43_id,
@@ -505,16 +507,9 @@ static struct rt_sdio_driver cyw43_drv = {
 
 int cyw43_driver_init(void)
 {
-    // Reset and power up the WL chip
-    cyw43_hal_pin_config(CYW43_PIN_WL_REG_ON, CYW43_HAL_PIN_MODE_OUTPUT, CYW43_HAL_PIN_PULL_NONE, 0);
-    cyw43_hal_pin_low(CYW43_PIN_WL_REG_ON);
-    cyw43_delay_ms(20);
-    cyw43_hal_pin_high(CYW43_PIN_WL_REG_ON);
-    cyw43_delay_ms(50);
+    rt_int32_t result;
 
-    sdio_register_driver(&cyw43_drv);
-    kd_sdhci_change(CYW43XX_SDIO_DEV);
-
-    return 0;
+    result = sdio_register_driver(&cyw43_drv);
+    return result == -RT_EEMPTY ? RT_EOK : result;
 }
 INIT_COMPONENT_EXPORT(cyw43_driver_init);

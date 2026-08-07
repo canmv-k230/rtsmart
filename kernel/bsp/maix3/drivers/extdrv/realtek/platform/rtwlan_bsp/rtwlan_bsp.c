@@ -6,7 +6,6 @@
 #include "rtthread.h"
 #include "rtdevice.h"
 #include "drivers/sdio.h"
-#include "drv_gpio.h"
 #include "card.h"
 #include "wifi/wifi_conf.h"
 #include "wifi/wifi_util.h"
@@ -15,8 +14,6 @@
 
 static rt_int32_t realtek_probe(struct rt_mmcsd_card* card);
 static rt_err_t wlan_get_mac(struct rt_wlan_device* wlan, rt_uint8_t mac[]);
-static void realtek_init_do(void);
-static void realtek_init_entry(void* parameter);
 static void wlan_log_tx_power(const char* ifname);
 
 struct sdio_func* wifi_sdio_func;
@@ -80,9 +77,9 @@ static rt_int32_t realtek_remove(struct rt_mmcsd_card* card)
 
 static struct rt_sdio_device_id realtek_id[] = {
 #if defined (REALTEK_SDIO_RTL8189FTV)
-    { 1, 0x024c, PRODUCT_RTL8189FTV },
+    { SDIO_ANY_FUNC_ID, 0x024c, PRODUCT_RTL8189FTV },
 #elif defined (REALTEK_SDIO_RTL8733BS)
-    { 1, 0x024c, PRODUCT_RTL8733BS },
+    { SDIO_ANY_FUNC_ID, 0x024c, PRODUCT_RTL8733BS },
 #else
     ERROR
 #endif
@@ -95,59 +92,19 @@ static struct rt_sdio_driver realtek_drv = {
     realtek_id,
 };
 
-static void realtek_init_do(void)
+int realtek_init(void)
 {
     rt_int32_t ret;
 
     Set_WLAN_Power_On();
 
-#if defined (REALTEK_SDIO_DEV_RESET) && ((-1) != REALTEK_SDIO_DEV_RESET)
-    kd_pin_mode(REALTEK_SDIO_DEV_RESET, GPIO_DM_OUTPUT);
-
-    kd_pin_write(REALTEK_SDIO_DEV_RESET, GPIO_PV_HIGH);
-    rt_thread_mdelay(10);
-    kd_pin_write(REALTEK_SDIO_DEV_RESET, GPIO_PV_LOW);
-    rt_thread_mdelay(200);
-    kd_pin_write(REALTEK_SDIO_DEV_RESET, GPIO_PV_HIGH);
-    rt_thread_mdelay(50);
-#elif defined (REALTEK_SDIO_DEV0)
-    kd_sdhci0_reset(1);
-    rt_thread_mdelay(10);
-    kd_sdhci0_reset(0);
-    rt_thread_mdelay(200);
-    kd_sdhci0_reset(1);
-    rt_thread_mdelay(50);
-#endif
-
     ret = sdio_register_driver(&realtek_drv);
     if (ret != RT_EOK && ret != -RT_EEMPTY) {
         rt_kprintf("Realtek Wi-Fi: SDIO driver registration failed\n");
         Set_WLAN_Power_Off();
-        return;
+        return ret;
     }
-    kd_sdhci_change(REALTEK_SDIO_DEV);
-}
-
-static void realtek_init_entry(void* parameter)
-{
-    (void)parameter;
-
-    realtek_init_do();
-}
-
-int realtek_init(void)
-{
-    rt_thread_t tid;
-
-    tid = rt_thread_create("rtl_init", realtek_init_entry, RT_NULL, 4096,
-                           RT_THREAD_PRIORITY_MAX - 1, 10);
-    if (tid == RT_NULL) {
-        realtek_init_do();
-        return 0;
-    }
-
-    rt_thread_startup(tid);
-    return 0;
+    return RT_EOK;
 }
 INIT_COMPONENT_EXPORT(realtek_init);
 

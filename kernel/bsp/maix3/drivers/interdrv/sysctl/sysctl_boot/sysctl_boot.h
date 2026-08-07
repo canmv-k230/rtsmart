@@ -83,6 +83,8 @@ typedef enum
     SYSCTL_BOOT_MAX,
 }sysctl_boot_mode_e;
 
+extern sysctl_boot_mode_e g_sysctl_boot_mode;
+
 sysctl_boot_mode_e sysctl_boot_get_boot_mode(void);
 bool sysctl_boot_get_otp_bypass(void);
 void sysctl_boot_set_pll_lock(void);

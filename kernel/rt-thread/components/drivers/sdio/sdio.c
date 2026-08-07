@@ -788,7 +788,9 @@ static rt_int32_t sdio_register_card(struct rt_mmcsd_card *card)
 {
     struct sdio_card *sc;
     struct sdio_driver *sd;
+    struct rt_sdio_function *function;
     rt_list_t *l;
+    rt_uint8_t function_num;
 
     sc = rt_malloc(sizeof(struct sdio_card));
     if (sc == RT_NULL)
@@ -799,6 +801,23 @@ static rt_int32_t sdio_register_card(struct rt_mmcsd_card *card)
 
     sc->card = card;
     rt_list_insert_after(&sdio_cards, &sc->list);
+
+    LOG_D("SDIO card %04x:%04x functions=%u on %s",
+          card->cis.manufacturer, card->cis.product,
+          card->sdio_function_num,
+          card->host ? card->host->name : "unknown");
+    for (function_num = 1;
+         function_num <= card->sdio_function_num;
+         function_num++)
+    {
+        function = card->sdio_function[function_num];
+        if (function)
+        {
+            LOG_D("SDIO function %u class=0x%02x %04x:%04x",
+                  function->num, function->func_code,
+                  function->manufacturer, function->product);
+        }
+    }
 
     if (rt_list_isempty(&sdio_drivers))
     {
@@ -1302,15 +1321,18 @@ rt_inline rt_int32_t sdio_match_card(struct rt_mmcsd_card           *card,
                                      const struct rt_sdio_device_id *id)
 {
     rt_uint8_t num = 1;
-    
-    if ((id->manufacturer != SDIO_ANY_MAN_ID) && 
-        (id->manufacturer != card->cis.manufacturer))
-        return 0;
-    
+
     while (num <= card->sdio_function_num)
     {
-        if ((id->product != SDIO_ANY_PROD_ID) && 
-            (id->product == card->sdio_function[num]->product))
+        struct rt_sdio_function *function = card->sdio_function[num];
+
+        if ((function != RT_NULL) &&
+            ((id->manufacturer == SDIO_ANY_MAN_ID) ||
+             (id->manufacturer == function->manufacturer)) &&
+            ((id->func_code == SDIO_ANY_FUNC_ID) ||
+             (id->func_code == function->func_code)) &&
+            ((id->product == SDIO_ANY_PROD_ID) ||
+             (id->product == function->product)))
             return 1;
         num++;
     }
@@ -1406,4 +1428,3 @@ void rt_sdio_init(void)
 {
 
 }
-
