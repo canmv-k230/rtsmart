@@ -192,6 +192,13 @@ static int pmu_configure_pwrkey(struct pmu_dev *pmu)
         pmu_writel(pmu, PMU_PWRKEY_DEBOUNCE_TICKS,
                PMU_INT0_LEVEL_DEBOUNCE_VAL);
 
+#ifdef RT_PMU_LONG_PRESS_POWERON_SECONDS
+    value = pmu_readl(pmu, PMU_INT0_LONG_PRESS_SHUTDOWN_VAL);
+    if (value != PMU_PWRKEY_POWERON_LONG_PRESS_TICKS)
+        pmu_writel(pmu, PMU_PWRKEY_POWERON_LONG_PRESS_TICKS,
+               PMU_INT0_LONG_PRESS_SHUTDOWN_VAL);
+#endif
+
     value = pmu_readl(pmu, PMU_INT0_TO_CTL_REGISTER);
     value &= ~PMU_CPU_IRQ_MASK;
     pmu_writel(pmu, value, PMU_INT0_TO_CTL_REGISTER);

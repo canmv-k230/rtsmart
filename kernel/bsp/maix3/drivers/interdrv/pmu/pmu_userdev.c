@@ -224,6 +224,7 @@ static int pmu_userdev_ioctl(struct dfs_fd *file, int cmd, void *args)
     struct pmu_shutdown_request request;
     struct pmu_power_cycle_cfg cycle_cfg;
     struct pmu_wakeup_pad_level wakeup_level;
+    struct pmu_wakeup_source wakeup_source;
     rt_err_t ret = -RT_EINVAL;
 
     (void)file;
@@ -281,10 +282,32 @@ static int pmu_userdev_ioctl(struct dfs_fd *file, int cmd, void *args)
     case PMU_IOCTL_GET_WAKEUP_PAD_LEVEL:
         if (args == RT_NULL)
             goto out;
-        ret = pmu_get_shutdown_wakeup_level(pmu, &wakeup_level.level);
+        if (pmu_copy_from_user(&wakeup_level, args,
+                       sizeof(wakeup_level)) != RT_EOK) {
+            ret = -RT_ERROR;
+            goto out;
+        }
+        ret = pmu_get_shutdown_wakeup_level(pmu, wakeup_level.pad,
+                                            &wakeup_level.level);
         if (ret != RT_EOK)
             goto out;
         ret = pmu_copy_to_user(args, &wakeup_level, sizeof(wakeup_level));
+        goto out;
+
+    case PMU_IOCTL_GET_WAKEUP_SOURCE:
+        if (args == RT_NULL)
+            goto out;
+        if (pmu_copy_from_user(&wakeup_source, args,
+                       sizeof(wakeup_source)) != RT_EOK) {
+            ret = -RT_ERROR;
+            goto out;
+        }
+        ret = pmu_get_shutdown_wakeup_source(pmu, wakeup_source.name,
+                                             sizeof(wakeup_source.name));
+        if (ret != RT_EOK)
+            goto out;
+        ret = pmu_copy_to_user(args, &wakeup_source,
+                               sizeof(wakeup_source));
         goto out;
 
     default:

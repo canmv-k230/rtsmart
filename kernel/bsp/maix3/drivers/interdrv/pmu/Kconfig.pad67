@@ -1,0 +1,48 @@
+config RT_PMU_SHUTDOWN_WAKEUP_SOURCE_PAD67
+    string "PAD67 wakeup source name"
+    default "PAD67_WAKEUP"
+
+choice
+    bool "PAD67 wakeup trigger type"
+    default RT_PMU_SHUTDOWN_WAKEUP_PAD67_RISING_EDGE
+    config RT_PMU_SHUTDOWN_WAKEUP_PAD67_HIGH_LEVEL
+        bool "High level"
+    config RT_PMU_SHUTDOWN_WAKEUP_PAD67_LOW_LEVEL
+        bool "Low level"
+    config RT_PMU_SHUTDOWN_WAKEUP_PAD67_RISING_EDGE
+        bool "Rising edge"
+    config RT_PMU_SHUTDOWN_WAKEUP_PAD67_FALLING_EDGE
+        bool "Falling edge"
+endchoice
+
+config RT_PMU_SHUTDOWN_WAKEUP_PAD67_TRIGGER
+    int
+    default 0 if RT_PMU_SHUTDOWN_WAKEUP_PAD67_HIGH_LEVEL
+    default 1 if RT_PMU_SHUTDOWN_WAKEUP_PAD67_LOW_LEVEL
+    default 2 if RT_PMU_SHUTDOWN_WAKEUP_PAD67_RISING_EDGE
+    default 3 if RT_PMU_SHUTDOWN_WAKEUP_PAD67_FALLING_EDGE
+
+choice
+    bool "PAD67 wakeup PAD pull bias"
+    default RT_PMU_SHUTDOWN_WAKEUP_PAD67_BIAS_KEEP
+    config RT_PMU_SHUTDOWN_WAKEUP_PAD67_BIAS_KEEP
+        bool "Keep current PMU_IO_CFG pull setting"
+    config RT_PMU_SHUTDOWN_WAKEUP_PAD67_BIAS_PULL_UP
+        bool "Pull up"
+    config RT_PMU_SHUTDOWN_WAKEUP_PAD67_BIAS_PULL_DOWN
+        bool "Pull down"
+    config RT_PMU_SHUTDOWN_WAKEUP_PAD67_BIAS_DISABLE
+        bool "Disable pull up/down"
+endchoice
+
+config RT_PMU_SHUTDOWN_WAKEUP_PAD67_BIAS
+    int
+    default 0 if RT_PMU_SHUTDOWN_WAKEUP_PAD67_BIAS_KEEP
+    default 1 if RT_PMU_SHUTDOWN_WAKEUP_PAD67_BIAS_PULL_UP
+    default 2 if RT_PMU_SHUTDOWN_WAKEUP_PAD67_BIAS_PULL_DOWN
+    default 3 if RT_PMU_SHUTDOWN_WAKEUP_PAD67_BIAS_DISABLE
+
+config RT_PMU_SHUTDOWN_WAKEUP_PAD67_DEBOUNCE_TICKS
+    int "PAD67 debounce ticks"
+    default 256
+    range 0 4095

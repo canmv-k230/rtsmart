@@ -1,0 +1,43 @@
+config RT_PMU_SHUTDOWN_WAKEUP_SOURCE_PAD69
+    string "PAD69 wakeup source name"
+    default "PAD69_WAKEUP"
+
+choice
+    bool "PAD69 wakeup trigger type"
+    default RT_PMU_SHUTDOWN_WAKEUP_PAD69_RISING_EDGE
+    config RT_PMU_SHUTDOWN_WAKEUP_PAD69_HIGH_LEVEL
+        bool "High level"
+    config RT_PMU_SHUTDOWN_WAKEUP_PAD69_LOW_LEVEL
+        bool "Low level"
+    config RT_PMU_SHUTDOWN_WAKEUP_PAD69_RISING_EDGE
+        bool "Rising edge"
+    config RT_PMU_SHUTDOWN_WAKEUP_PAD69_FALLING_EDGE
+        bool "Falling edge"
+endchoice
+
+config RT_PMU_SHUTDOWN_WAKEUP_PAD69_TRIGGER
+    int
+    default 0 if RT_PMU_SHUTDOWN_WAKEUP_PAD69_HIGH_LEVEL
+    default 1 if RT_PMU_SHUTDOWN_WAKEUP_PAD69_LOW_LEVEL
+    default 2 if RT_PMU_SHUTDOWN_WAKEUP_PAD69_RISING_EDGE
+    default 3 if RT_PMU_SHUTDOWN_WAKEUP_PAD69_FALLING_EDGE
+
+choice
+    bool "PAD69 wakeup PAD pull bias"
+    default RT_PMU_SHUTDOWN_WAKEUP_PAD69_BIAS_KEEP
+    config RT_PMU_SHUTDOWN_WAKEUP_PAD69_BIAS_KEEP
+        bool "Keep current PMU_IO_CFG pull setting"
+    config RT_PMU_SHUTDOWN_WAKEUP_PAD69_BIAS_PULL_UP
+        bool "Pull up"
+    config RT_PMU_SHUTDOWN_WAKEUP_PAD69_BIAS_PULL_DOWN
+        bool "Pull down"
+    config RT_PMU_SHUTDOWN_WAKEUP_PAD69_BIAS_DISABLE
+        bool "Disable pull up/down"
+endchoice
+
+config RT_PMU_SHUTDOWN_WAKEUP_PAD69_BIAS
+    int
+    default 0 if RT_PMU_SHUTDOWN_WAKEUP_PAD69_BIAS_KEEP
+    default 1 if RT_PMU_SHUTDOWN_WAKEUP_PAD69_BIAS_PULL_UP
+    default 2 if RT_PMU_SHUTDOWN_WAKEUP_PAD69_BIAS_PULL_DOWN
+    default 3 if RT_PMU_SHUTDOWN_WAKEUP_PAD69_BIAS_DISABLE

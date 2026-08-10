@@ -273,111 +273,74 @@ menu "InterDriver"
         select RT_USING_RTC
 
     if RT_USING_RTC_PMU
-        config RT_PMU_SOFT_SHUTDOWN_SECONDS
-            int "PMU long press shutdown seconds"
-            default 5
-            range 1 30
-            help
-                Software long-press shutdown time in seconds while the
-                system is running. This does not change the PMU hardware
-                wakeup long-press threshold after poweroff.
+        menu "PMU PAD64 long press"
+            config RT_PMU_LONG_PRESS_SHUTDOWN_CONFIG
+                bool "Modify PMU long press shutdown seconds"
+                default n
+                help
+                    Enable this option to override the software long-press
+                    shutdown delay while the system is running.
+
+            if RT_PMU_LONG_PRESS_SHUTDOWN_CONFIG
+                config RT_PMU_SOFT_SHUTDOWN_SECONDS
+                    int "PMU long press shutdown seconds"
+                    default 5
+                    range 1 30
+            endif
+
+            config RT_PMU_LONG_PRESS_POWERON_CONFIG
+                bool "Modify PMU long press poweron seconds"
+                default n
+                help
+                    Enable this option to override the PMU hardware
+                    long-press wakeup threshold after poweroff.
+
+            if RT_PMU_LONG_PRESS_POWERON_CONFIG
+                config RT_PMU_LONG_PRESS_POWERON_SECONDS
+                    int "PMU long press poweron seconds"
+                    default 5
+                    range 1 30
+            endif
+        endmenu
 
         menuconfig RT_PMU_SHUTDOWN_WAKEUP
-            bool "PMU shutdown wakeup"
+            bool "PMU shutdown wakeup PADs"
             default n
             help
                 Enable an extra PMU input PAD as a wakeup source after
                 shutdown. PAD64 is reserved for the power-key long-press path.
 
         if RT_PMU_SHUTDOWN_WAKEUP
-            choice
-                bool "PMU shutdown wakeup PAD"
-                default RT_PMU_SHUTDOWN_WAKEUP_PAD68
+            menuconfig RT_PMU_SHUTDOWN_WAKEUP_PAD65
+                bool "Enable PAD65 shutdown wakeup"
+            if RT_PMU_SHUTDOWN_WAKEUP_PAD65
+                source "drivers/interdrv/pmu/Kconfig.pad65"
+            endif
 
-                config RT_PMU_SHUTDOWN_WAKEUP_PAD65
-                    bool "PAD65"
+            menuconfig RT_PMU_SHUTDOWN_WAKEUP_PAD66
+                bool "Enable PAD66 shutdown wakeup"
+            if RT_PMU_SHUTDOWN_WAKEUP_PAD66
+                source "drivers/interdrv/pmu/Kconfig.pad66"
+            endif
 
-                config RT_PMU_SHUTDOWN_WAKEUP_PAD66
-                    bool "PAD66"
+            menuconfig RT_PMU_SHUTDOWN_WAKEUP_PAD67
+                bool "Enable PAD67 shutdown wakeup"
+            if RT_PMU_SHUTDOWN_WAKEUP_PAD67
+                source "drivers/interdrv/pmu/Kconfig.pad67"
+            endif
 
-                config RT_PMU_SHUTDOWN_WAKEUP_PAD67
-                    bool "PAD67"
+            menuconfig RT_PMU_SHUTDOWN_WAKEUP_PAD68
+                bool "Enable PAD68 shutdown wakeup"
+                default y
+            if RT_PMU_SHUTDOWN_WAKEUP_PAD68
+                source "drivers/interdrv/pmu/Kconfig.pad68"
+            endif
 
-                config RT_PMU_SHUTDOWN_WAKEUP_PAD68
-                    bool "PAD68"
-
-                config RT_PMU_SHUTDOWN_WAKEUP_PAD69
-                    bool "PAD69"
-            endchoice
-
-            config RT_PMU_SHUTDOWN_WAKEUP_PAD
-                int
-                default 65 if RT_PMU_SHUTDOWN_WAKEUP_PAD65
-                default 66 if RT_PMU_SHUTDOWN_WAKEUP_PAD66
-                default 67 if RT_PMU_SHUTDOWN_WAKEUP_PAD67
-                default 68 if RT_PMU_SHUTDOWN_WAKEUP_PAD68
-                default 69 if RT_PMU_SHUTDOWN_WAKEUP_PAD69
-
-            choice
-                bool "PMU shutdown wakeup trigger type"
-                default RT_PMU_SHUTDOWN_WAKEUP_RISING_EDGE
-
-                config RT_PMU_SHUTDOWN_WAKEUP_HIGH_LEVEL
-                    bool "High level"
-
-                config RT_PMU_SHUTDOWN_WAKEUP_LOW_LEVEL
-                    bool "Low level"
-
-                config RT_PMU_SHUTDOWN_WAKEUP_RISING_EDGE
-                    bool "Rising edge"
-
-                config RT_PMU_SHUTDOWN_WAKEUP_FALLING_EDGE
-                    bool "Falling edge"
-            endchoice
-
-            config RT_PMU_SHUTDOWN_WAKEUP_TRIGGER
-                int
-                default 0 if RT_PMU_SHUTDOWN_WAKEUP_HIGH_LEVEL
-                default 1 if RT_PMU_SHUTDOWN_WAKEUP_LOW_LEVEL
-                default 2 if RT_PMU_SHUTDOWN_WAKEUP_RISING_EDGE
-                default 3 if RT_PMU_SHUTDOWN_WAKEUP_FALLING_EDGE
-
-            choice
-                bool "PMU shutdown wakeup PAD pull bias"
-                default RT_PMU_SHUTDOWN_WAKEUP_BIAS_KEEP
-                help
-                    Select how the driver updates the PMU_IO_CFG pull-up and
-                    pull-down bits for the selected wakeup PAD before shutdown.
-                    Keep current preserves the existing PMU_IO_CFG state.
-
-                config RT_PMU_SHUTDOWN_WAKEUP_BIAS_KEEP
-                    bool "Keep current PMU_IO_CFG pull setting"
-
-                config RT_PMU_SHUTDOWN_WAKEUP_BIAS_PULL_UP
-                    bool "Pull up"
-
-                config RT_PMU_SHUTDOWN_WAKEUP_BIAS_PULL_DOWN
-                    bool "Pull down"
-
-                config RT_PMU_SHUTDOWN_WAKEUP_BIAS_DISABLE
-                    bool "Disable pull up/down"
-            endchoice
-
-            config RT_PMU_SHUTDOWN_WAKEUP_BIAS
-                int
-                default 0 if RT_PMU_SHUTDOWN_WAKEUP_BIAS_KEEP
-                default 1 if RT_PMU_SHUTDOWN_WAKEUP_BIAS_PULL_UP
-                default 2 if RT_PMU_SHUTDOWN_WAKEUP_BIAS_PULL_DOWN
-                default 3 if RT_PMU_SHUTDOWN_WAKEUP_BIAS_DISABLE
-
-            config RT_PMU_SHUTDOWN_WAKEUP_DEBOUNCE_TICKS
-                int "PMU shutdown wakeup debounce ticks" if RT_PMU_SHUTDOWN_WAKEUP_PAD65 || RT_PMU_SHUTDOWN_WAKEUP_PAD66 || RT_PMU_SHUTDOWN_WAKEUP_PAD67
-                default 256
-                range 0 4095
-                help
-                    Debounce time in 32 KHz PMU clock cycles for PAD65-PAD67
-                    edge/level wakeup detection. PAD68 and PAD69 do not have
-                    debounce registers in the PMU TRM.
+            menuconfig RT_PMU_SHUTDOWN_WAKEUP_PAD69
+                bool "Enable PAD69 shutdown wakeup"
+            if RT_PMU_SHUTDOWN_WAKEUP_PAD69
+                source "drivers/interdrv/pmu/Kconfig.pad69"
+            endif
         endif
     endif
 

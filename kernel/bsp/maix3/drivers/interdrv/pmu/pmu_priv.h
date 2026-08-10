@@ -37,6 +37,7 @@
 #define PMU_INT_DETECT_TYP                      0x50
 #define PMU_INT_DETECT_CLR                      0x54
 #define PMU_INT0_LONG_PRESS_TRIGGER_VAL         0x58
+#define PMU_INT0_LONG_PRESS_SHUTDOWN_VAL        0x5c
 #define PMU_INT0_LEVEL_DEBOUNCE_VAL             0x64
 #define PMU_INT1_LEVEL_DEBOUNCE_VAL             0x6c
 #define PMU_INT2_LEVEL_DEBOUNCE_VAL             0x70
@@ -137,16 +138,18 @@
 #define PMU_WAKEUP_BIAS_PULL_DOWN               2U
 #define PMU_WAKEUP_BIAS_DISABLE                 3U
 
-#if defined(RT_PMU_SHUTDOWN_WAKEUP) && \
-    !defined(RT_PMU_SHUTDOWN_WAKEUP_BIAS)
-#define RT_PMU_SHUTDOWN_WAKEUP_BIAS             PMU_WAKEUP_BIAS_KEEP
-#endif
-
 #define PMU_INT_STATE_RTC_ALARM_INPUT_MASK      BIT(13)
+#define PMU_INT_STATE_RTC_TICK_INPUT_MASK       BIT(12)
+#define PMU_INT_STATE_RTC_INPUT_MASK            \
+    (PMU_INT_STATE_RTC_ALARM_INPUT_MASK | PMU_INT_STATE_RTC_TICK_INPUT_MASK)
 #define PMU_RTC_TICK_EN_BIT                     BIT(8)
 
 #define PMU_PWRKEY_LONG_PRESS_TICKS             96000U
 #define PMU_PWRKEY_DEBOUNCE_TICKS               256U
+#if defined(RT_PMU_LONG_PRESS_POWERON_SECONDS)
+#define PMU_PWRKEY_POWERON_LONG_PRESS_TICKS     \
+    ((RT_PMU_LONG_PRESS_POWERON_SECONDS) * 32768U)
+#endif
 #if defined(RT_PMU_SOFT_SHUTDOWN_SECONDS)
 #define PMU_SOFT_SHUTDOWN_MS                    \
     ((RT_PMU_SOFT_SHUTDOWN_SECONDS) * 1000U)
@@ -271,7 +274,14 @@ struct pmu_power_cycle_cfg {
 };
 
 struct pmu_wakeup_pad_level {
+    uint32_t pad;
     int32_t level;
+};
+
+#define PMU_WAKEUP_SOURCE_NAME_MAX 64U
+
+struct pmu_wakeup_source {
+    char name[PMU_WAKEUP_SOURCE_NAME_MAX];
 };
 
 #define PMU_IOCTL_REGISTER_NOTIFY \
@@ -289,7 +299,9 @@ struct pmu_wakeup_pad_level {
 #define PMU_IOCTL_SHUTDOWN_NOW \
     _IO('P', 0x06)
 #define PMU_IOCTL_GET_WAKEUP_PAD_LEVEL \
-    _IOR('P', 0x07, struct pmu_wakeup_pad_level)
+    _IOWR('P', 0x07, struct pmu_wakeup_pad_level)
+#define PMU_IOCTL_GET_WAKEUP_SOURCE \
+    _IOR('P', 0x08, struct pmu_wakeup_source)
 
 struct pmu_worker_state {
     rt_thread_t thread;
@@ -345,10 +357,9 @@ struct pmu_dev {
     struct pmu_rtc_state rtc;
     struct pmu_notify_state notify;
     struct pmu_pwrkey_state pwrkey;
-    bool wakeup_pad_gpio;
-    bool wakeup_pad_cfg_saved;
-    uint32_t wakeup_pad_saved_cfg;
-    uint32_t wakeup_pad_cfg_reg;
+    uint32_t wakeup_source_count;
+    const char *wakeup_source_name;
+    bool wakeup_source_valid;
     struct pmu_cycle_state cycle;
 };
 
@@ -375,7 +386,9 @@ void pmu_post_work(struct pmu_dev *pmu, uint32_t work);
 int pmu_init_userdev(struct pmu_dev *pmu);
 void pmu_notify_unregister_pid(struct pmu_dev *pmu, rt_int32_t pid);
 rt_err_t pmu_notify_send_shutdown_request(struct pmu_dev *pmu);
-int pmu_get_shutdown_wakeup_level(struct pmu_dev *pmu, int *level);
+int pmu_get_shutdown_wakeup_level(struct pmu_dev *pmu, uint32_t pad, int *level);
+int pmu_get_shutdown_wakeup_source(struct pmu_dev *pmu, char *name,
+                                   size_t size);
 
 int pmu_init_pwrkey(struct pmu_dev *pmu);
 void pmu_pwrkey_irq(struct pmu_dev *pmu, uint32_t status);
