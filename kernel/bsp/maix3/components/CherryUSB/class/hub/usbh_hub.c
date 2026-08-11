@@ -341,6 +341,7 @@ static void hub_int_complete_callback(void *arg, int nbytes)
 #endif
 }
 
+#ifndef CHERRY_USB_HC_DRV_DWC2
 static void hub_int_timeout(void *arg)
 {
     struct usbh_hub *hub = (struct usbh_hub *)arg;
@@ -348,6 +349,7 @@ static void hub_int_timeout(void *arg)
     usbh_int_urb_fill(&hub->intin_urb, hub->parent, hub->intin, hub->int_buffer, 1, 0, hub_int_complete_callback, hub);
     usbh_submit_urb(&hub->intin_urb);
 }
+#endif
 
 #ifdef CHERRY_USB_HC_DRV_DWC2
 extern void hub_tt_work(struct rt_work* work, void* work_data);
@@ -496,8 +498,20 @@ static int usbh_hub_connect(struct usbh_hubport *hport, uint8_t intf)
 
     hub->int_buffer = g_hub_intbuf[hub->bus->busid][hub->index - 1];
 
-    hub->int_timer = usb_osal_timer_create("hubint_tim", USBH_GET_URB_INTERVAL(hub->intin->bInterval, hport->speed), hub_int_timeout, hub, 0);
+#ifndef CHERRY_USB_HC_DRV_DWC2
+#define USBH_GET_URB_INTERVAL_MS(interval, speed) (speed < USB_SPEED_HIGH ? (interval) : ((1 << (interval - 1)) * 125) / 1000)
+    hub->int_timer = usb_osal_timer_create("hubint_tim", USBH_GET_URB_INTERVAL_MS(hub->intin->bInterval, hport->speed), hub_int_timeout, hub, 0);
     usb_osal_timer_start(hub->int_timer);
+#else
+    usbh_int_urb_fill(&hub->intin_urb, hub->parent, hub->intin,
+                      hub->int_buffer, 1, 0,
+                      hub_int_complete_callback, hub);
+    ret = usbh_submit_urb(&hub->intin_urb);
+    if (ret < 0) {
+        USB_LOG_ERR("Failed to submit HUB interrupt URB, ret=%d\r\n", ret);
+        return ret;
+    }
+#endif
     return 0;
 }
 
@@ -513,7 +527,9 @@ static int usbh_hub_disconnect(struct usbh_hubport *hport, uint8_t intf)
             usbh_kill_urb(&hub->intin_urb);
         }
 
+#ifndef CHERRY_USB_HC_DRV_DWC2
         usb_osal_timer_delete(hub->int_timer);
+#endif
 
         for (uint8_t port = 0; port < hub->hub_desc.bNbrPorts; port++) {
             child = &hub->child[port];
