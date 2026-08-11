@@ -854,6 +854,7 @@ err:
 rt_int32_t init_mmc(struct rt_mmcsd_host *host, rt_uint32_t ocr)
 {
     rt_int32_t err;
+    rt_err_t remove_err;
     rt_uint32_t  current_ocr;
     /*
      * We need to get OCR a different way for SPI.
@@ -898,8 +899,13 @@ retry:
     return 0;
 
 remove_card:
+    remove_err = rt_mmcsd_blk_remove(host->card);
     mmcsd_host_lock(host);
-    rt_mmcsd_blk_remove(host->card);
+    if (remove_err != RT_EOK)
+    {
+        err = remove_err;
+        goto err;
+    }
     rt_free(host->card);
     host->card = RT_NULL;
     if (mmc_retry_next_speed(host, "block probe"))

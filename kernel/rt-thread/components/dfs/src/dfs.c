@@ -439,10 +439,11 @@ int sys_dup2(int oldfd, int newfd)
     if (fdt->fds[newfd])
     {
         ret = dfs_file_close(fdt->fds[newfd]);
-        if (ret < 0)
+        if (ret < 0 && !(fdt->fds[newfd]->flags & DFS_F_CLOSE_TERMINAL))
         {
             goto exit;
         }
+        /* dup2 consumes newfd and does not report a terminal close error. */
         fd_release(newfd);
     }
 

@@ -746,20 +746,24 @@ probe_mmc:
             }
             else
             {
+                struct rt_mmcsd_card *card = host->card;
+
                 /* card removed */
-                mmcsd_host_lock(host);
-                if (host->card->sdio_function_num != 0)
+                if (card->sdio_function_num != 0)
                 {
                     LOG_W("unsupport sdio card plug out!");
                 }
+                else if (rt_mmcsd_blk_remove(card) == RT_EOK)
+                {
+                    mmcsd_host_lock(host);
+                    host->card = RT_NULL;
+                    mmcsd_host_unlock(host);
+                    rt_free(card);
+                }
                 else
                 {
-                    rt_mmcsd_blk_remove(host->card);
-                    rt_free(host->card);
-
-                    host->card = RT_NULL;
+                    LOG_E("failed to remove block devices on %s", host->name);
                 }
-                mmcsd_host_unlock(host);
                 mmcsd_detect_complete(host, RT_TRUE);
             }
         }

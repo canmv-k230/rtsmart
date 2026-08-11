@@ -62,6 +62,7 @@
 #define DFS_F_DIRECTORY         0x02000000
 #define DFS_F_EOF               0x04000000
 #define DFS_F_ERR               0x08000000
+#define DFS_F_CLOSE_TERMINAL    0x20000000 /* close consumed private state */
 
 #ifdef __cplusplus
 extern "C" {

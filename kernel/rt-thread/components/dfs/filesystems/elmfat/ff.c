@@ -725,7 +725,55 @@ int lock_fs (
 	FATFS* fs		/* File system object */
 )
 {
-	return ff_req_grant(fs->sobj);
+	rt_enter_critical();
+	if (fs->unmounting) {
+		rt_exit_critical();
+		return 0;
+	}
+	fs->sync_refs++;
+	rt_exit_critical();
+
+	if (!ff_req_grant(fs->sobj)) {
+		rt_enter_critical();
+		fs->sync_refs--;
+		rt_exit_critical();
+		return 0;
+	}
+
+	return 1;
+}
+
+
+static
+FRESULT lock_volume (
+	BYTE vol,			/* Logical drive number */
+	FATFS** rfs			/* File system object that was admitted and locked */
+)
+{
+	FATFS* fs;
+
+	rt_enter_critical();
+	fs = FatFs[vol];
+	if (!fs) {
+		rt_exit_critical();
+		return FR_NOT_ENABLED;
+	}
+	if (fs->unmounting) {
+		rt_exit_critical();
+		return FR_TIMEOUT;
+	}
+	fs->sync_refs++;
+	rt_exit_critical();
+
+	if (!ff_req_grant(fs->sobj)) {
+		rt_enter_critical();
+		fs->sync_refs--;
+		rt_exit_critical();
+		return FR_TIMEOUT;
+	}
+
+	*rfs = fs;
+	return FR_OK;
 }
 
 
@@ -737,7 +785,86 @@ void unlock_fs (
 {
 	if (fs && res != FR_NOT_ENABLED && res != FR_INVALID_DRIVE && res != FR_TIMEOUT) {
 		ff_rel_grant(fs->sobj);
+		rt_enter_critical();
+		RT_ASSERT(fs->sync_refs > 0);
+		fs->sync_refs--;
+		rt_exit_critical();
 	}
+}
+
+
+static
+void retain_object (
+	FATFS* fs		/* File system object */
+)
+{
+	rt_enter_critical();
+	fs->object_refs++;
+	rt_exit_critical();
+}
+
+
+static
+void release_object (
+	FATFS* fs		/* File system object */
+)
+{
+	rt_enter_critical();
+	RT_ASSERT(fs->object_refs > 0);
+	fs->object_refs--;
+	rt_exit_critical();
+}
+
+
+void ff_prepare_unmount (
+	FATFS* fs		/* File system object */
+)
+{
+	rt_enter_critical();
+	fs->unmounting = 1;
+	while (fs->sync_refs != 0) {
+		rt_exit_critical();
+		rt_thread_mdelay(1);
+		rt_enter_critical();
+	}
+	rt_exit_critical();
+}
+
+
+int ff_finish_unmount (
+	FATFS* fs		/* File system object */
+)
+{
+	int reclaim = 0;
+
+	rt_enter_critical();
+	fs->reclaim_state = 1;
+	if (fs->object_refs == 0) {
+		fs->reclaim_state = 2;
+		reclaim = 1;
+	}
+	rt_exit_critical();
+
+	return reclaim;
+}
+
+
+int ff_forget_object (
+	FATFS* fs		/* File system object */
+)
+{
+	int reclaim = 0;
+
+	rt_enter_critical();
+	RT_ASSERT(fs->object_refs > 0);
+	fs->object_refs--;
+	if (fs->object_refs == 0 && fs->reclaim_state == 1) {
+		fs->reclaim_state = 2;
+		reclaim = 1;
+	}
+	rt_exit_critical();
+
+	return reclaim;
 }
 
 #endif
@@ -2949,6 +3076,9 @@ FRESULT find_volume (	/* FR_OK(0): successful, !=0: any error occurred */
 	WORD nrsv;
 	FATFS *fs;
 	UINT i;
+#if _FS_REENTRANT
+	FRESULT lock_res;
+#endif
 
 
 	/* Get logical drive number */
@@ -2957,10 +3087,15 @@ FRESULT find_volume (	/* FR_OK(0): successful, !=0: any error occurred */
 	if (vol < 0) return FR_INVALID_DRIVE;
 
 	/* Check if the file system object is valid or not */
+#if _FS_REENTRANT
+	lock_res = lock_volume((BYTE)vol, &fs);
+	if (lock_res != FR_OK) return lock_res;
+#else
 	fs = FatFs[vol];					/* Get pointer to the file system object */
 	if (!fs) return FR_NOT_ENABLED;		/* Is the file system object available? */
 
 	ENTER_FF(fs);						/* Lock the volume */
+#endif
 	*rfs = fs;							/* Return pointer to the file system object */
 
 	mode &= (BYTE)~FA_READ;				/* Desired access mode, write access or not */
@@ -3206,25 +3341,44 @@ FRESULT f_mount (
 	/* Get logical drive number */
 	vol = get_ldnumber(&rp);
 	if (vol < 0) return FR_INVALID_DRIVE;
+	rt_enter_critical();
 	cfs = FatFs[vol];					/* Pointer to fs object */
+	rt_exit_critical();
 
 	if (cfs) {
+#if _FS_REENTRANT
+		ff_prepare_unmount(cfs);
+#endif
 #if _FS_LOCK != 0
 		clear_lock(cfs);
 #endif
 #if _FS_REENTRANT						/* Discard sync object of the current volume */
-		if (!ff_del_syncobj(cfs->sobj)) return FR_INT_ERR;
+		if (!ff_del_syncobj(cfs->sobj)) {
+			rt_enter_critical();
+			cfs->unmounting = 0;
+			rt_exit_critical();
+			return FR_INT_ERR;
+		}
 #endif
+		rt_enter_critical();
+		if (FatFs[vol] == cfs) FatFs[vol] = 0;
+		rt_exit_critical();
 		cfs->fs_type = 0;				/* Clear old fs object */
 	}
 
 	if (fs) {
 		fs->fs_type = 0;				/* Clear new fs object */
 #if _FS_REENTRANT						/* Create sync object for the new volume */
+		fs->sync_refs = 0;
+		fs->object_refs = 0;
+		fs->unmounting = 0;
+		fs->reclaim_state = 0;
 		if (!ff_cre_syncobj((BYTE)vol, &fs->sobj)) return FR_INT_ERR;
 #endif
 	}
+	rt_enter_critical();
 	FatFs[vol] = fs;					/* Register new fs object */
+	rt_exit_critical();
 
 	if (!fs || opt != 1) return FR_OK;	/* Do not mount now, it will be mounted later */
 
@@ -3430,6 +3584,9 @@ FRESULT f_open (
 	}
 
 	if (res != FR_OK) fp->obj.fs = 0;	/* Invalidate file object on error */
+#if _FS_REENTRANT
+	else retain_object(fs);
+#endif
 
 	LEAVE_FF(fs, res);
 }
@@ -3761,6 +3918,9 @@ FRESULT f_close (
 #endif
 			{
 				fp->obj.fs = 0;			/* Invalidate file object */
+#if _FS_REENTRANT
+				release_object(fs);
+#endif
 			}
 #if _FS_REENTRANT
 			unlock_fs(fs, FR_OK);		/* Unlock volume */
@@ -4142,6 +4302,9 @@ FRESULT f_opendir (
 		if (res == FR_NO_FILE) res = FR_NO_PATH;
 	}
 	if (res != FR_OK) obj->fs = 0;		/* Invalidate the directory object if function faild */
+#if _FS_REENTRANT
+	else retain_object(fs);
+#endif
 
 	LEAVE_FF(fs, res);
 }
@@ -4171,6 +4334,9 @@ FRESULT f_closedir (
 #endif
 		{
 			dp->obj.fs = 0;			/* Invalidate directory object */
+#if _FS_REENTRANT
+			release_object(fs);
+#endif
 		}
 #if _FS_REENTRANT
 		unlock_fs(fs, FR_OK);		/* Unlock volume */

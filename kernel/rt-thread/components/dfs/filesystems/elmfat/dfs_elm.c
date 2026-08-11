@@ -153,6 +153,20 @@ int dfs_elm_mount(struct dfs_filesystem *fs, unsigned long rwflag, const void *d
         result = f_opendir(dir, drive);
         if (result != FR_OK)
         {
+            rt_free(dir);
+            goto __err;
+        }
+
+        result = f_closedir(dir);
+        if (result != FR_OK)
+        {
+#if _FS_REENTRANT
+            if (dir->obj.fs)
+            {
+                ff_forget_object(dir->obj.fs);
+            }
+#endif
+            rt_free(dir);
             goto __err;
         }
 
@@ -188,6 +202,9 @@ int dfs_elm_unmount(struct dfs_filesystem *fs)
     }
 
     logic_nbr[0] = '0' + index;
+#if _FS_REENTRANT
+    ff_prepare_unmount(fat);
+#endif
     result = f_mount(RT_NULL, logic_nbr, (BYTE)1);
     if (result != FR_OK)
     {
@@ -196,7 +213,14 @@ int dfs_elm_unmount(struct dfs_filesystem *fs)
 
     fs->data = RT_NULL;
     disk[index] = RT_NULL;
+#if _FS_REENTRANT
+    if (ff_finish_unmount(fat))
+    {
+        rt_free(fat);
+    }
+#else
     rt_free(fat);
+#endif
 
     return RT_EOK;
 }
@@ -489,12 +513,12 @@ int dfs_elm_open(struct dfs_fd *file)
 int dfs_elm_close(struct dfs_fd *file)
 {
     FRESULT result;
+#if _FS_REENTRANT
+    FATFS *fat = RT_NULL;
+    int reclaim = 0;
+#endif
 
     RT_ASSERT(file->fnode->ref_count > 0);
-    if (file->fnode->ref_count > 1)
-    {
-        return 0;
-    }
     result = FR_OK;
     if (file->fnode->type == FT_DIRECTORY)
     {
@@ -503,8 +527,29 @@ int dfs_elm_close(struct dfs_fd *file)
         dir = (DIR *)(file->data);
         RT_ASSERT(dir != RT_NULL);
 
-        /* release memory */
+#if _FS_REENTRANT
+        fat = dir->obj.fs;
+        if (fat && fat->unmounting)
+        {
+            dir->obj.fs = RT_NULL;
+            reclaim = ff_forget_object(fat);
+        }
+        else
+#endif
+        {
+            result = f_closedir(dir);
+        }
+
+#if _FS_REENTRANT
+        if (result != FR_OK && dir->obj.fs)
+        {
+            dir->obj.fs = RT_NULL;
+            reclaim = ff_forget_object(fat);
+        }
+#endif
+        /* close is terminal even when flushing or media access failed */
         rt_free(dir);
+        file->data = RT_NULL;
     }
     else if (file->fnode->type == FT_REGULAR)
     {
@@ -512,14 +557,41 @@ int dfs_elm_close(struct dfs_fd *file)
         fd = (FIL *)(file->data);
         RT_ASSERT(fd != RT_NULL);
 
-        result = f_close(fd);
-        if (result == FR_OK)
+#if _FS_REENTRANT
+        fat = fd->obj.fs;
+        if (fat && fat->unmounting)
         {
-            /* release memory */
-            rt_free(fd);
+            fd->obj.fs = RT_NULL;
+            reclaim = ff_forget_object(fat);
         }
+        else
+#endif
+        {
+            result = f_close(fd);
+        }
+
+#if _FS_REENTRANT
+        if (result != FR_OK && fd->obj.fs)
+        {
+            fd->obj.fs = RT_NULL;
+            reclaim = ff_forget_object(fat);
+        }
+#endif
+        /* close is terminal even when flushing or media access failed */
+        rt_free(fd);
+        file->data = RT_NULL;
     }
 
+#if _FS_REENTRANT
+    if (reclaim)
+    {
+        rt_free(fat);
+    }
+#endif
+
+    /* FIL/DIR and its volume reference were consumed even if final
+     * writeback failed, so DFS must not retry this close operation. */
+    file->flags |= DFS_F_CLOSE_TERMINAL;
     return elm_result_to_dfs(result);
 }
 

@@ -104,16 +104,6 @@ uint32_t gpt_crc32(const void *data, size_t len)
 }
 
 #if defined(CONFIG_RT_AUTO_RESIZE_PARTITION) && defined(RT_USING_SDIO)
-// @see src/rtsmart/rtsmart/kernel/rt-thread/components/drivers/sdio/block_dev.c
-struct mmcsd_blk_device {
-  struct rt_mmcsd_card *card;
-  rt_list_t list;
-  struct rt_device dev;
-  struct dfs_partition part;
-  struct rt_device_blk_geometry geometry;
-  rt_size_t max_req_size;
-};
-
 #ifndef CONFIG_RT_AUTO_RESIZE_PARTITION_ALIGN_SIZE
 #define CONFIG_RT_AUTO_RESIZE_PARTITION_ALIGN_SIZE 0x40000000ULL
 #endif
@@ -121,22 +111,17 @@ struct mmcsd_blk_device {
 #define AUTO_RESIZE_ALIGN_SIZE_BYTES \
   ((uint64_t)CONFIG_RT_AUTO_RESIZE_PARTITION_ALIGN_SIZE)
 
-static uint32_t get_block_sector_size(rt_device_t dev_sd) {
-  struct rt_device_blk_geometry geometry;
-
-  rt_memset(&geometry, 0, sizeof(geometry));
-  if ((RT_EOK ==
-       rt_device_control(dev_sd, RT_DEVICE_CTRL_BLK_GETGEOME, &geometry)) &&
-      (0 != geometry.bytes_per_sector)) {
-    return geometry.bytes_per_sector;
+static int get_block_geometry(rt_device_t dev_sd,
+                              struct rt_device_blk_geometry *geometry) {
+  rt_memset(geometry, 0, sizeof(*geometry));
+  if ((RT_EOK !=
+       rt_device_control(dev_sd, RT_DEVICE_CTRL_BLK_GETGEOME, geometry)) ||
+      (0 == geometry->bytes_per_sector) ||
+      (0 == geometry->sector_count)) {
+    return -1;
   }
 
-  return SECTOR_SIZE;
-}
-
-static uint64_t get_card_sector_count(struct mmcsd_blk_device *blk_dev,
-                                      uint32_t sector_size) {
-  return ((uint64_t)blk_dev->card->card_capacity * 1024ULL) / sector_size;
+  return 0;
 }
 
 static uint64_t div_round_up_u64(uint64_t value, uint64_t divisor) {
@@ -209,8 +194,8 @@ _Static_assert(sizeof(struct partition_entry) == DPT_ITEM_SIZE,
 _Static_assert(4 > CONFIG_RT_AUTO_RESIZE_PARTITION_NR,
                "MBR max partition is 4");
 
-static int mmc_mbr_part_create_new(struct mmcsd_blk_device *blk_dev,
-                                   rt_device_t dev_sd,
+static int mmc_mbr_part_create_new(rt_device_t dev_sd,
+                                   const struct rt_device_blk_geometry *geometry,
                                    uint32_t sector_size) {
   uint8_t *buffer = NULL;
   uint64_t sector_count = 0;
@@ -221,7 +206,7 @@ static int mmc_mbr_part_create_new(struct mmcsd_blk_device *blk_dev,
   struct dfs_partition part, prev_part;
   struct partition_entry part_entry;
 
-  total_sector_count = get_card_sector_count(blk_dev, sector_size);
+  total_sector_count = geometry->sector_count;
 
   if (0 == total_sector_count) {
     rt_kprintf("%s invalid sector count.\n", __func__);
@@ -326,8 +311,33 @@ _exit:
 
 _Static_assert(sizeof(gpt_entry) == 128, "gpt_entry size error.");
 
-static int mmc_gpt_part_create_new(struct mmcsd_blk_device *blk_dev,
-                                   rt_device_t dev_sd,
+static bool is_empty_gpt_guid(const gpt_guid_t *guid) {
+  const gpt_guid_t empty_guid = NULL_GUID;
+
+  return 0 == rt_memcmp(guid, &empty_guid, sizeof(*guid));
+}
+
+static int block_device_uses_gpt(rt_device_t dev_sd, uint32_t sector_size) {
+  uint8_t *buffer = rt_malloc_align(sector_size, RT_CPU_CACHE_LINE_SZ);
+  int result = -1;
+
+  if (NULL == buffer) {
+    return -1;
+  }
+
+  if (1 == rt_device_read(dev_sd, 0, buffer, 1)) {
+    if ((MBR_SIGNATURE_0 == buffer[MBR_SIGNATURE_OFFSET]) &&
+        (MBR_SIGNATURE_1 == buffer[MBR_SIGNATURE_OFFSET + 1])) {
+      result = is_gpt_protective_mbr(buffer) ? 1 : 0;
+    }
+  }
+
+  rt_free_align(buffer);
+  return result;
+}
+
+static int mmc_gpt_part_create_new(rt_device_t dev_sd,
+                                   const struct rt_device_blk_geometry *geometry,
                                    uint32_t sector_size) {
   uint8_t *buffer = NULL;
   uint64_t sector_count = 0;
@@ -338,15 +348,13 @@ static int mmc_gpt_part_create_new(struct mmcsd_blk_device *blk_dev,
     0x9D, 0x85, 0x6F, 0x14, 0x47, 0xE6, 0xC0, 0x4C, 0xB7, 0x1B, 0xF4, 0x44, 0x72, 0xD2, 0x5F, 0x4D
   };
 
-  struct dfs_partition part, prev_part;
-
   gpt_header _gpt_header;
   gpt_entry *_gpt_entry = NULL, *new_entry, *prev_entry;
   size_t _gpt_entry_size = 0;
   size_t _gpt_entry_sector_count = 0;
   size_t _gpt_entry_buffer_size = 0;
 
-  total_sector_count = get_card_sector_count(blk_dev, sector_size);
+  total_sector_count = geometry->sector_count;
 
   int label_offet = 0;
 
@@ -356,107 +364,106 @@ static int mmc_gpt_part_create_new(struct mmcsd_blk_device *blk_dev,
   }
   sector_count = total_sector_count - 1;
 
-  if(0x00 != gpt_get_partition_param(blk_dev->card, &part, CONFIG_RT_AUTO_RESIZE_PARTITION_NR)) {
-    /* Can't find wanted part */
+  if (NULL == (buffer = rt_malloc_align(sector_size, RT_CPU_CACHE_LINE_SZ))) {
+    rt_kprintf("%s malloc failed 1.\n", __func__);
+    return -1;
+  }
 
-    // get prev part info.
-    if(0x00 != gpt_get_partition_param(blk_dev->card, &prev_part, (CONFIG_RT_AUTO_RESIZE_PARTITION_NR - 1))) {
-      rt_kprintf("%s get last partition info failed.\n", __func__);
-      goto _exit;
-    }
+  // read gpt header
+  if (0x01 != rt_device_read(dev_sd, 1, buffer, 1)) {
+    rt_kprintf("%s read sector failed 1.\n", __func__);
+    goto _exit;
+  }
+  rt_memcpy(&_gpt_header, buffer, sizeof(gpt_header));
 
-    if (NULL == (buffer = rt_malloc_align(sector_size, RT_CPU_CACHE_LINE_SZ))) {
-      rt_kprintf("%s malloc failed 1.\n", __func__);
-      return -1;
-    }
+  if ((GPT_HEADER_SIGNATURE != _gpt_header.signature) ||
+      (GPT_ENTRIES != _gpt_header.num_partition_entries) ||
+      (sizeof(gpt_entry) != _gpt_header.sizeof_partition_entry)) {
+    rt_kprintf("invalid gpt header.\n");
+    goto _exit;
+  }
 
-    // read gpt header
-    if (0x01 != rt_device_read(dev_sd, 1, buffer, 1)) {
-      rt_kprintf("%s read sector failed 1.\n", __func__);
-      goto _exit;
-    }
-    rt_memcpy(&_gpt_header, buffer, sizeof(gpt_header));
+  _gpt_entry_size = _gpt_header.num_partition_entries * _gpt_header.sizeof_partition_entry;
+  _gpt_entry_sector_count = (size_t)div_round_up_u64(_gpt_entry_size, sector_size);
+  _gpt_entry_buffer_size = _gpt_entry_sector_count * sector_size;
+  if(NULL == (_gpt_entry = rt_malloc_align(_gpt_entry_buffer_size, RT_CPU_CACHE_LINE_SZ))) {
+    rt_kprintf("%s malloc failed 2.\n", __func__);
+    goto _exit;
+  }
 
-    if(GPT_ENTRIES != _gpt_header.num_partition_entries) {
-      rt_kprintf("invalid gpt header.\n");
-      goto _exit;
-    }
+  if (_gpt_entry_sector_count != rt_device_read(dev_sd, _gpt_header.partition_entry_lba,
+                                                _gpt_entry, _gpt_entry_sector_count)) {
+    rt_kprintf("%s read sector failed 2.\n", __func__);
+    goto _exit;
+  }
 
-    _gpt_entry_size = _gpt_header.num_partition_entries * _gpt_header.sizeof_partition_entry;
-    _gpt_entry_sector_count = (size_t)div_round_up_u64(_gpt_entry_size, sector_size);
-    _gpt_entry_buffer_size = _gpt_entry_sector_count * sector_size;
-    if(NULL == (_gpt_entry = rt_malloc_align(_gpt_entry_buffer_size, RT_CPU_CACHE_LINE_SZ))) {
-      rt_kprintf("%s malloc failed 2.\n", __func__);
-      goto _exit;
-    }
-
-    if (_gpt_entry_sector_count != rt_device_read(dev_sd, _gpt_header.partition_entry_lba,
-                                                  _gpt_entry, _gpt_entry_sector_count)) {
-      rt_kprintf("%s read sector failed 2.\n", __func__);
-      goto _exit;
-    }
-
-    prev_entry = &_gpt_entry[CONFIG_RT_AUTO_RESIZE_PARTITION_NR - 1];
-    new_entry = &_gpt_entry[CONFIG_RT_AUTO_RESIZE_PARTITION_NR];
-
-    // create a new partition
-    new_entry->partition_type_guid = PARTITION_BASIC_DATA_GUID; // FAT32
-    memcpy(new_entry->unique_partition_guid.b, uuid, sizeof(uuid));
-
-    start_lba = get_aligned_start_lba((uint64_t)prev_entry->ending_lba + 1,
-                                      sector_size);
-    if (start_lba >= sector_count) {
-      rt_kprintf("%s invalid aligned start lba.\n", __func__);
-      goto _exit;
-    }
-    new_entry->starting_lba = start_lba;
-    new_entry->ending_lba = sector_count;
-
-    new_entry->attributes.required_to_function = 0;
-    new_entry->attributes.type_guid_specific = 0;
-
-    // label
-    label_offet = 0;
-    new_entry->partition_name[label_offet++] = 'd';
-    new_entry->partition_name[label_offet++] = 'a';
-    new_entry->partition_name[label_offet++] = 't';
-    new_entry->partition_name[label_offet++] = 'a';
-    new_entry->partition_name[label_offet++] = '\0';
-
-    // update gpt header
-    _gpt_header.last_usable_lba = sector_count;
-
-    _gpt_header.partition_entry_array_crc32 = gpt_crc32(_gpt_entry, _gpt_entry_size);
-
-    _gpt_header.header_crc32 = 0;
-    _gpt_header.header_crc32 = gpt_crc32(&_gpt_header, sizeof(gpt_header));
-
-    if (_gpt_entry_sector_count != rt_device_write(dev_sd, _gpt_header.partition_entry_lba,
-                                                   _gpt_entry, _gpt_entry_sector_count)) {
-      rt_kprintf("%s write sector failed 1.\n", __func__);
-      goto _exit;
-    }
-
-    rt_memcpy(buffer, &_gpt_header, sizeof(_gpt_header));
-    if (0x01 != rt_device_write(dev_sd, 1, buffer, 1)) {
-      rt_kprintf("%s write sector failed 2.\n", __func__);
-      goto _exit;
-    }
-
-    rt_kprintf("Create new GPT partiton 0x%x - 0x%x\n",
-               (unsigned long long)((uint64_t)new_entry->starting_lba *
-                                    sector_size),
-               (unsigned long long)((uint64_t)new_entry->ending_lba *
-                                    sector_size));
-
+  prev_entry = &_gpt_entry[CONFIG_RT_AUTO_RESIZE_PARTITION_NR - 1];
+  new_entry = &_gpt_entry[CONFIG_RT_AUTO_RESIZE_PARTITION_NR];
+  if (!is_empty_gpt_guid(&new_entry->partition_type_guid)) {
     rt_free_align(buffer);
     rt_free_align(_gpt_entry);
-
-    return 0;
-  } else {
-    rt_free_align(buffer);
     return 1;
   }
+  if (is_empty_gpt_guid(&prev_entry->partition_type_guid) ||
+      (prev_entry->ending_lba < prev_entry->starting_lba)) {
+    rt_kprintf("%s get last partition info failed.\n", __func__);
+    goto _exit;
+  }
+
+  // create a new partition
+  new_entry->partition_type_guid = PARTITION_BASIC_DATA_GUID; // FAT32
+  memcpy(new_entry->unique_partition_guid.b, uuid, sizeof(uuid));
+
+  start_lba = get_aligned_start_lba((uint64_t)prev_entry->ending_lba + 1,
+                                    sector_size);
+  if (start_lba >= sector_count) {
+    rt_kprintf("%s invalid aligned start lba.\n", __func__);
+    goto _exit;
+  }
+  new_entry->starting_lba = start_lba;
+  new_entry->ending_lba = sector_count;
+
+  new_entry->attributes.required_to_function = 0;
+  new_entry->attributes.type_guid_specific = 0;
+
+  // label
+  label_offet = 0;
+  new_entry->partition_name[label_offet++] = 'd';
+  new_entry->partition_name[label_offet++] = 'a';
+  new_entry->partition_name[label_offet++] = 't';
+  new_entry->partition_name[label_offet++] = 'a';
+  new_entry->partition_name[label_offet++] = '\0';
+
+  // update gpt header
+  _gpt_header.last_usable_lba = sector_count;
+
+  _gpt_header.partition_entry_array_crc32 = gpt_crc32(_gpt_entry, _gpt_entry_size);
+
+  _gpt_header.header_crc32 = 0;
+  _gpt_header.header_crc32 = gpt_crc32(&_gpt_header, sizeof(gpt_header));
+
+  if (_gpt_entry_sector_count != rt_device_write(dev_sd, _gpt_header.partition_entry_lba,
+                                                 _gpt_entry, _gpt_entry_sector_count)) {
+    rt_kprintf("%s write sector failed 1.\n", __func__);
+    goto _exit;
+  }
+
+  rt_memcpy(buffer, &_gpt_header, sizeof(_gpt_header));
+  if (0x01 != rt_device_write(dev_sd, 1, buffer, 1)) {
+    rt_kprintf("%s write sector failed 2.\n", __func__);
+    goto _exit;
+  }
+
+  rt_kprintf("Create new GPT partiton 0x%x - 0x%x\n",
+             (unsigned long long)((uint64_t)new_entry->starting_lba *
+                                  sector_size),
+             (unsigned long long)((uint64_t)new_entry->ending_lba *
+                                  sector_size));
+
+  rt_free_align(buffer);
+  rt_free_align(_gpt_entry);
+
+  return 0;
 
 _exit:
   if (buffer) {
@@ -513,8 +520,7 @@ static int execute_auto_resize(char *value) {
 
   char dev_name[16];
   rt_device_t dev_sd = NULL;
-
-  struct mmcsd_blk_device *blk_dev = NULL;
+  struct rt_device_blk_geometry geometry;
 
   int mmc_dev = -1;
 
@@ -556,13 +562,13 @@ static int execute_auto_resize(char *value) {
     goto _exit;
   }
 
-  blk_dev = rt_container_of(dev_sd, struct mmcsd_blk_device, dev);
-  if (NULL == blk_dev) {
+  if (0 != get_block_geometry(dev_sd, &geometry)) {
+    rt_kprintf("%s get block geometry failed.\n", __func__);
     ret = -1;
     goto _exit;
   }
 
-  sector_size = get_block_sector_size(dev_sd);
+  sector_size = geometry.bytes_per_sector;
   rt_kprintf("%s using sector size: %u\n", __func__, sector_size);
   if ((SECTOR_SIZE != sector_size) || !is_power_of_two_u32(sector_size)) {
     rt_kprintf("%s invalid sector size: %u\n", __func__, sector_size);
@@ -571,16 +577,18 @@ static int execute_auto_resize(char *value) {
   }
 
 #if defined (ENABLE_GPT_PART_RESIZE) && ENABLE_GPT_PART_RESIZE
-  if (0x00 == check_gpt(blk_dev->card)) {
+  ret = block_device_uses_gpt(dev_sd, sector_size);
+  if (0 == ret) {
     /* MBR */
-    ret = mmc_mbr_part_create_new(blk_dev, dev_sd, sector_size);
-  } else {
+    ret = mmc_mbr_part_create_new(dev_sd, &geometry, sector_size);
+  } else if (1 == ret) {
     /* GPT */
-    ret = mmc_gpt_part_create_new(blk_dev, dev_sd, sector_size);
-    gpt_free();
+    ret = mmc_gpt_part_create_new(dev_sd, &geometry, sector_size);
+  } else {
+    rt_kprintf("%s read partition table failed.\n", __func__);
   }
 #else
-    ret = mmc_mbr_part_create_new(blk_dev, dev_sd, sector_size);
+    ret = mmc_mbr_part_create_new(dev_sd, &geometry, sector_size);
 #endif
 
   if (0x00 == ret) {

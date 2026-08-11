@@ -110,6 +110,10 @@ typedef struct {
 #endif
 #if _FS_REENTRANT
 	_SYNC_t	sobj;			/* Identifier of sync object */
+	volatile UINT sync_refs;	/* Number of admitted file system operations */
+	volatile UINT object_refs;	/* Number of open file and directory objects */
+	volatile BYTE unmounting;	/* Reject new operations while unmounting */
+	volatile BYTE reclaim_state;	/* Deferred volume object reclamation state */
 #endif
 #if !_FS_READONLY
 	DWORD	last_clst;		/* Last allocated cluster */
@@ -319,6 +323,9 @@ int ff_cre_syncobj (BYTE vol, _SYNC_t* sobj);	/* Create a sync object */
 int ff_req_grant (_SYNC_t sobj);				/* Lock sync object */
 void ff_rel_grant (_SYNC_t sobj);				/* Unlock sync object */
 int ff_del_syncobj (_SYNC_t sobj);				/* Delete a sync object */
+void ff_prepare_unmount (FATFS* fs);			/* Drain operations before deleting sync object */
+int ff_finish_unmount (FATFS* fs);			/* Mark detached and report whether it can be freed */
+int ff_forget_object (FATFS* fs);			/* Drop an object from a detached volume */
 #endif
 
 

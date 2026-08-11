@@ -40,6 +40,8 @@ static rt_uint32_t mmcsd_geometry_block_size(const struct rt_mmcsd_card *card)
 struct mmcsd_blk_device
 {
     struct rt_mmcsd_card *card;
+    rt_bool_t removing;
+    rt_bool_t opened;
     rt_list_t list;
     struct rt_device dev;
     struct dfs_partition part;
@@ -369,11 +371,49 @@ static rt_err_t rt_mmcsd_init(rt_device_t dev)
 
 static rt_err_t rt_mmcsd_open(rt_device_t dev, rt_uint16_t oflag)
 {
-    return RT_EOK;
+    struct mmcsd_blk_device *blk_dev;
+    rt_err_t result;
+
+    (void)oflag;
+
+    blk_dev = (struct mmcsd_blk_device *)dev->user_data;
+    result = rt_sem_take(blk_dev->part.lock, RT_WAITING_FOREVER);
+    if (result != RT_EOK)
+    {
+        return result;
+    }
+
+    if (blk_dev->removing)
+    {
+        result = -RT_EBUSY;
+    }
+    else
+    {
+        /* rt_device_open() increments dev.ref_count after this callback.
+         * Record admission here so removal cannot miss an in-flight open. */
+        blk_dev->opened = RT_TRUE;
+        result = RT_EOK;
+    }
+
+    rt_sem_release(blk_dev->part.lock);
+    return result;
 }
 
 static rt_err_t rt_mmcsd_close(rt_device_t dev)
 {
+    struct mmcsd_blk_device *blk_dev;
+    rt_err_t result;
+
+    blk_dev = (struct mmcsd_blk_device *)dev->user_data;
+    result = rt_sem_take(blk_dev->part.lock, RT_WAITING_FOREVER);
+    if (result != RT_EOK)
+    {
+        return result;
+    }
+
+    /* The device core invokes close only when its final reference is dropped. */
+    blk_dev->opened = RT_FALSE;
+    rt_sem_release(blk_dev->part.lock);
     return RT_EOK;
 }
 
@@ -393,7 +433,14 @@ static rt_err_t rt_mmcsd_control(rt_device_t dev, int cmd, void *args)
         {
             rt_err_t ret;
 
-            rt_sem_take(blk_dev->part.lock, RT_WAITING_FOREVER);
+            ret = rt_sem_take(blk_dev->part.lock, RT_WAITING_FOREVER);
+            if (ret != RT_EOK)
+                return ret;
+            if (blk_dev->removing)
+            {
+                rt_sem_release(blk_dev->part.lock);
+                return -RT_EIO;
+            }
             mmcsd_host_lock(blk_dev->card->host);
             ret = mmc_flush_cache(blk_dev->card);
             mmcsd_host_unlock(blk_dev->card->host);
@@ -409,7 +456,14 @@ static rt_err_t rt_mmcsd_control(rt_device_t dev, int cmd, void *args)
             rt_uint32_t end = blk_dev->part.offset + range[1];
             rt_err_t ret;
 
-            rt_sem_take(blk_dev->part.lock, RT_WAITING_FOREVER);
+            ret = rt_sem_take(blk_dev->part.lock, RT_WAITING_FOREVER);
+            if (ret != RT_EOK)
+                return ret;
+            if (blk_dev->removing)
+            {
+                rt_sem_release(blk_dev->part.lock);
+                return -RT_EIO;
+            }
             mmcsd_host_lock(blk_dev->card->host);
             ret = mmcsd_erase_range(blk_dev->card, start, end);
             mmcsd_host_unlock(blk_dev->card->host);
@@ -433,8 +487,8 @@ static rt_size_t rt_mmcsd_read(rt_device_t dev,
     rt_size_t req_size = 0;
     rt_size_t remain_size = size;
     void *rd_ptr = (void *)buffer;
-    struct mmcsd_blk_device *blk_dev = (struct mmcsd_blk_device *)dev->user_data;
-    struct dfs_partition *part = &blk_dev->part;
+    struct mmcsd_blk_device *blk_dev;
+    struct dfs_partition *part;
 
     if (dev == RT_NULL)
     {
@@ -442,7 +496,21 @@ static rt_size_t rt_mmcsd_read(rt_device_t dev,
         return 0;
     }
 
-    rt_sem_take(part->lock, RT_WAITING_FOREVER);
+    blk_dev = (struct mmcsd_blk_device *)dev->user_data;
+    part = &blk_dev->part;
+
+    err = rt_sem_take(part->lock, RT_WAITING_FOREVER);
+    if (err != RT_EOK)
+    {
+        rt_set_errno(-EIO);
+        return 0;
+    }
+    if (blk_dev->removing)
+    {
+        rt_sem_release(part->lock);
+        rt_set_errno(-EIO);
+        return 0;
+    }
     while (remain_size)
     {
         req_size = (remain_size > blk_dev->max_req_size) ? blk_dev->max_req_size : remain_size;
@@ -474,8 +542,8 @@ static rt_size_t rt_mmcsd_write(rt_device_t dev,
     rt_size_t req_size = 0;
     rt_size_t remain_size = size;
     void *wr_ptr = (void *)buffer;
-    struct mmcsd_blk_device *blk_dev = (struct mmcsd_blk_device *)dev->user_data;
-    struct dfs_partition *part = &blk_dev->part;
+    struct mmcsd_blk_device *blk_dev;
+    struct dfs_partition *part;
 
     if (dev == RT_NULL)
     {
@@ -483,7 +551,21 @@ static rt_size_t rt_mmcsd_write(rt_device_t dev,
         return 0;
     }
 
-    rt_sem_take(part->lock, RT_WAITING_FOREVER);
+    blk_dev = (struct mmcsd_blk_device *)dev->user_data;
+    part = &blk_dev->part;
+
+    err = rt_sem_take(part->lock, RT_WAITING_FOREVER);
+    if (err != RT_EOK)
+    {
+        rt_set_errno(-EIO);
+        return 0;
+    }
+    if (blk_dev->removing)
+    {
+        rt_sem_release(part->lock);
+        rt_set_errno(-EIO);
+        return 0;
+    }
     while (remain_size)
     {
         req_size = (remain_size > blk_dev->max_req_size) ? blk_dev->max_req_size : remain_size;
@@ -827,29 +909,136 @@ rt_int32_t rt_mmcsd_blk_probe(struct rt_mmcsd_card *card)
     return err;
 }
 
-void rt_mmcsd_blk_remove(struct rt_mmcsd_card *card)
+rt_err_t rt_mmcsd_blk_remove(struct rt_mmcsd_card *card)
 {
     rt_list_t *l, *n;
     struct mmcsd_blk_device *blk_dev;
+    rt_err_t result;
 
-    for (l = (&blk_devices)->next, n = l->next; l != &blk_devices; l = n, n = n->next)
+    /* Stop new transfers and drain every request that already entered a
+     * partition before unmounting. No MMC host lock may be held here. */
+    for (l = (&blk_devices)->next; l != &blk_devices; l = l->next)
     {
-        blk_dev = (struct mmcsd_blk_device *)rt_list_entry(l, struct mmcsd_blk_device, list);
-        if (blk_dev->card == card)
+        blk_dev = (struct mmcsd_blk_device *)rt_list_entry(
+            l, struct mmcsd_blk_device, list);
+        if (blk_dev->card != card)
         {
-            /* unmount file system */
-            const char *mounted_path = dfs_filesystem_get_mounted_path(&(blk_dev->dev));
-            if (mounted_path)
-            {
-                dfs_unmount(mounted_path);
-                LOG_D("unmount file system %s for device %s.\r\n", mounted_path, blk_dev->dev.parent.name);
-            }
-            rt_sem_delete(blk_dev->part.lock);
-            rt_device_unregister(&blk_dev->dev);
-            rt_list_remove(&blk_dev->list);
-            rt_free(blk_dev);
+            continue;
+        }
+
+        result = rt_sem_take(blk_dev->part.lock, RT_WAITING_FOREVER);
+        if (result != RT_EOK)
+        {
+            LOG_E("failed to stop I/O for device %s: %d",
+                  blk_dev->dev.parent.name, result);
+            goto restore_devices;
+        }
+        blk_dev->removing = RT_TRUE;
+        rt_sem_release(blk_dev->part.lock);
+    }
+
+    for (l = (&blk_devices)->next; l != &blk_devices; l = l->next)
+    {
+        char *mounted_path;
+
+        blk_dev = (struct mmcsd_blk_device *)rt_list_entry(
+            l, struct mmcsd_blk_device, list);
+        if (blk_dev->card != card)
+        {
+            continue;
+        }
+
+        mounted_path = (char *)dfs_filesystem_get_mounted_path(&blk_dev->dev);
+        if (!mounted_path)
+        {
+            continue;
+        }
+
+        mounted_path = rt_strdup(mounted_path);
+        if (!mounted_path)
+        {
+            result = -RT_ENOMEM;
+            goto restore_devices;
+        }
+
+        LOG_D("unmount file system %s for device %s.\r\n",
+              mounted_path, blk_dev->dev.parent.name);
+        result = dfs_unmount(mounted_path);
+        rt_free(mounted_path);
+        if (result != RT_EOK)
+        {
+            LOG_E("failed to unmount file system for device %s: %d",
+                  blk_dev->dev.parent.name, result);
+            goto restore_devices;
         }
     }
+
+    for (l = (&blk_devices)->next; l != &blk_devices; l = l->next)
+    {
+        rt_bool_t busy;
+
+        blk_dev = (struct mmcsd_blk_device *)rt_list_entry(
+            l, struct mmcsd_blk_device, list);
+        if (blk_dev->card != card)
+        {
+            continue;
+        }
+
+        result = rt_sem_take(blk_dev->part.lock, RT_WAITING_FOREVER);
+        if (result != RT_EOK)
+        {
+            goto restore_devices;
+        }
+        busy = blk_dev->opened || blk_dev->dev.ref_count != 0;
+        rt_sem_release(blk_dev->part.lock);
+
+        if (busy)
+        {
+            LOG_E("device %s is still open (%u references)",
+                  blk_dev->dev.parent.name, blk_dev->dev.ref_count);
+            result = -RT_EBUSY;
+            goto restore_devices;
+        }
+    }
+
+    for (l = (&blk_devices)->next, n = l->next;
+         l != &blk_devices; l = n, n = n->next)
+    {
+        blk_dev = (struct mmcsd_blk_device *)rt_list_entry(
+            l, struct mmcsd_blk_device, list);
+        if (blk_dev->card != card)
+        {
+            continue;
+        }
+
+        rt_device_unregister(&blk_dev->dev);
+        result = rt_sem_take(blk_dev->part.lock, RT_WAITING_FOREVER);
+        RT_ASSERT(result == RT_EOK);
+        rt_list_remove(&blk_dev->list);
+        rt_sem_delete(blk_dev->part.lock);
+        rt_free(blk_dev);
+    }
+
+    return RT_EOK;
+
+restore_devices:
+    for (l = (&blk_devices)->next; l != &blk_devices; l = l->next)
+    {
+        blk_dev = (struct mmcsd_blk_device *)rt_list_entry(
+            l, struct mmcsd_blk_device, list);
+        if (blk_dev->card != card || !blk_dev->removing)
+        {
+            continue;
+        }
+
+        if (rt_sem_take(blk_dev->part.lock, RT_WAITING_FOREVER) == RT_EOK)
+        {
+            blk_dev->removing = RT_FALSE;
+            rt_sem_release(blk_dev->part.lock);
+        }
+    }
+
+    return result;
 }
 
 /*

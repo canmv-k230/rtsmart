@@ -348,15 +348,17 @@ int dfs_file_close(struct dfs_fd *fd)
             result = fnode->fops->close(fd);
         }
 
-        /* close fd error, return */
-        if (result < 0)
+        /* Most DFS backends retain their private handle on close failure and
+         * expect the caller to retry. Only tear down a failed close when the
+         * backend explicitly reports that its private state was consumed. */
+        if (result < 0 && !(fd->flags & DFS_F_CLOSE_TERMINAL))
         {
             dfs_fm_unlock();
             return result;
         }
 
 #if defined (CHERRY_USB_DEVICE_ENABLE_CLASS_MTP)
-        if (fd->flags & DFS_F_MTP_DIRTY)
+        if (result >= 0 && (fd->flags & DFS_F_MTP_DIRTY))
         {
             notify_type = NTY_FILE_CHG;
             notify_path = rt_strdup(fnode->fullpath);

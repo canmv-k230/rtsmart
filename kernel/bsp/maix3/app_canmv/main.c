@@ -232,27 +232,12 @@ static void mnt_mount_table(void)
 
 static void mount_second_card(void)
 {
-    int ret;
-    int err = 0;
     int second_host;
 
     sysctl_boot_mode_e boot_mode = g_sysctl_boot_mode;
 
-    const char* device_name = (SYSCTL_BOOT_EMMC == boot_mode) ? "sd10" : "sd00";
-
     second_host = SYSCTL_BOOT_EMMC == boot_mode ? 1 : 0;
-    if (kd_sdhci_wait_card(second_host,
-                           rt_tick_from_millisecond(
-                               MMCSD_CARD_DETECT_TIMEOUT_MS)) !=
-        MMCSD_HOST_PLUGED) {
-        rt_kprintf("no second mmc device on SDIO%d\n", second_host);
-        return;
-    }
-
-    if (0x00 != (ret = dfs_mount(device_name, "/ext_data", "elm", 0, 0))) {
-        err = errno;
-        rt_kprintf("mount fs[elm] on /ext_data failed(%d), error %d.\n", ret, err);
-    }
+    board_sdio_cd_mount(second_host);
 }
 #endif
 

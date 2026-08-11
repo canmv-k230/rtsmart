@@ -86,14 +86,17 @@ int close(int fd)
 
     result = dfs_file_close(d);
 
+    if (result >= 0 || (d->flags & DFS_F_CLOSE_TERMINAL))
+    {
+        fd_release(fd);
+    }
+
     if (result < 0)
     {
         rt_set_errno(result);
 
         return -1;
     }
-
-    fd_release(fd);
 
     return 0;
 }

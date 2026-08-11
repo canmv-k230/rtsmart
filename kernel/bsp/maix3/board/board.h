@@ -53,6 +53,10 @@ void rt_init_user_mem(struct rt_thread *thread, const char *name, unsigned long 
 
 int board_pinmux_init(void);
 
+#ifdef MOUNT_SECOND_CARD
+int board_sdio_cd_mount(int host);
+#endif
+
 /*
 From《K230 Technical Reference Manual》 1.5 Address Space mapping
 
