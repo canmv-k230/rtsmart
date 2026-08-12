@@ -25,6 +25,14 @@ typedef enum
 
 typedef enum
 {
+    RT_WLAN_TRANSPORT_UNKNOWN = 0,
+    RT_WLAN_TRANSPORT_USB,
+    RT_WLAN_TRANSPORT_SDIO,
+    RT_WLAN_TRANSPORT_SPI,
+} rt_wlan_transport_t;
+
+typedef enum
+{
     RT_WLAN_CMD_MODE = 0x10,
     RT_WLAN_CMD_SCAN,              /* trigger scanning (list cells) */
     RT_WLAN_CMD_JOIN,
@@ -461,6 +469,10 @@ struct rt_wlan_device
 {
     struct rt_device device;
     rt_wlan_mode_t mode;
+    rt_wlan_mode_t registered_mode;
+    rt_wlan_transport_t transport;
+    rt_uint8_t radio_index;
+    rt_list_t registration_list;
     struct rt_mutex lock;
     struct rt_wlan_dev_event_desc handler_table[RT_WLAN_DEV_EVT_MAX][RT_WLAN_DEV_EVENT_NUM];
     rt_wlan_pormisc_callback_t pormisc_callback;
@@ -607,6 +619,14 @@ rt_err_t rt_wlan_dev_report_data(struct rt_wlan_device *device, void *buff, int 
  */
 rt_err_t rt_wlan_dev_register(struct rt_wlan_device *wlan, const char *name, 
     const struct rt_wlan_dev_ops *ops, rt_uint32_t flag, void *user_data);
+/* Assign Linux-style radio names and publish transport metadata. */
+rt_err_t rt_wlan_dev_register_auto(struct rt_wlan_device *wlan,
+    rt_wlan_mode_t mode, rt_wlan_transport_t transport,
+    const struct rt_wlan_dev_ops *ops, void *user_data);
+rt_err_t rt_wlan_dev_unregister(struct rt_wlan_device *wlan);
+/* UNKNOWN transport matches the first registered device for the role. */
+rt_err_t rt_wlan_dev_get_name(rt_wlan_mode_t mode,
+    rt_wlan_transport_t transport, char *name, rt_size_t name_size);
 
 #ifdef __cplusplus
 }

@@ -16,6 +16,7 @@
 
 #include "usbh_core.h"
 #include "usbh_rtl8152.h"
+#include "usbh_netdev.h"
 
 static struct eth_device rtl8152_dev;
 static bool rtl8152_netdev_inited;
@@ -80,7 +81,10 @@ void usbh_rtl8152_run(struct usbh_rtl8152 *rtl8152_class)
         rtl8152_dev.eth_tx = rt_usbh_rtl8152_eth_tx;
         rtl8152_dev.parent.user_data = rtl8152_class;
 
-        eth_device_init(&rtl8152_dev, CANMV_USB_HOST_NET_RTL8152_DEV_NAME);
+        if (canmv_usbh_netdev_init(&rtl8152_dev) != RT_EOK) {
+            rtl8152_dev.parent.user_data = RT_NULL;
+            return;
+        }
         rtl8152_netdev_inited = true;
     } else {
         rtl8152_dev.parent.user_data = rtl8152_class;

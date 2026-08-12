@@ -824,7 +824,7 @@ static void rt_wlan_complete_delete(struct rt_wlan_complete_des *complete)
 rt_err_t rt_wlan_set_mode(const char *dev_name, rt_wlan_mode_t mode)
 {
     rt_device_t device = RT_NULL;
-    rt_err_t err;
+    rt_err_t err = RT_EOK;
     rt_int8_t up_event_flag = 0;
     rt_wlan_dev_event_handler handler = RT_NULL;
 
@@ -849,7 +849,11 @@ rt_err_t rt_wlan_set_mode(const char *dev_name, rt_wlan_mode_t mode)
     }
 
     MGNT_LOCK();
-    if (RT_WLAN_DEVICE(device)->mode == mode)
+    if (RT_WLAN_DEVICE(device)->mode == mode &&
+        (mode == RT_WLAN_NONE ||
+         (mode == RT_WLAN_STATION &&
+          RT_WLAN_DEVICE(device) == STA_DEVICE()) ||
+         (mode == RT_WLAN_AP && RT_WLAN_DEVICE(device) == AP_DEVICE())))
     {
         RT_WLAN_LOG_D("L:%d this device mode is set");
         MGNT_UNLOCK();
@@ -887,13 +891,16 @@ rt_err_t rt_wlan_set_mode(const char *dev_name, rt_wlan_mode_t mode)
         }
     }
 
-    /* init device */
-    err = rt_wlan_dev_init(RT_WLAN_DEVICE(device), mode);
-    if (err != RT_EOK)
+    /* init device unless an already initialized radio is being selected */
+    if (RT_WLAN_DEVICE(device)->mode != mode)
     {
-        RT_WLAN_LOG_E("F:%s L:%d wlan init failed", __FUNCTION__, __LINE__);
-        MGNT_UNLOCK();
-        return err;
+        err = rt_wlan_dev_init(RT_WLAN_DEVICE(device), mode);
+        if (err != RT_EOK)
+        {
+            RT_WLAN_LOG_E("F:%s L:%d wlan init failed", __FUNCTION__, __LINE__);
+            MGNT_UNLOCK();
+            return err;
+        }
     }
 
     /* the mode is none */
@@ -917,6 +924,19 @@ rt_err_t rt_wlan_set_mode(const char *dev_name, rt_wlan_mode_t mode)
     /* save sta device */
     else if (mode == RT_WLAN_STATION)
     {
+        if (_sta_mgnt.device &&
+            _sta_mgnt.device != RT_WLAN_DEVICE(device))
+        {
+            rt_wlan_dev_event_t event;
+
+            for (event = RT_WLAN_DEV_EVT_INIT_DONE;
+                 event < RT_WLAN_DEV_EVT_MAX; event++)
+            {
+                rt_wlan_dev_unregister_event_handler(_sta_mgnt.device, event,
+                                                     rt_wlan_event_dispatch);
+            }
+            _sta_mgnt.state = 0;
+        }
         up_event_flag = 1;
         handler = rt_wlan_event_dispatch;
         _sta_mgnt.device = RT_WLAN_DEVICE(device);
@@ -924,6 +944,18 @@ rt_err_t rt_wlan_set_mode(const char *dev_name, rt_wlan_mode_t mode)
     /* save ap device */
     else if (mode == RT_WLAN_AP)
     {
+        if (_ap_mgnt.device && _ap_mgnt.device != RT_WLAN_DEVICE(device))
+        {
+            rt_wlan_dev_event_t event;
+
+            for (event = RT_WLAN_DEV_EVT_INIT_DONE;
+                 event < RT_WLAN_DEV_EVT_MAX; event++)
+            {
+                rt_wlan_dev_unregister_event_handler(_ap_mgnt.device, event,
+                                                     rt_wlan_event_dispatch);
+            }
+            _ap_mgnt.state = 0;
+        }
         up_event_flag = 1;
         handler = rt_wlan_event_dispatch;
         _ap_mgnt.device = RT_WLAN_DEVICE(device);
@@ -971,6 +1003,126 @@ rt_err_t rt_wlan_set_mode(const char *dev_name, rt_wlan_mode_t mode)
     }
 #endif
     return err;
+}
+
+struct rt_wlan_device *rt_wlan_get_device(rt_wlan_mode_t mode)
+{
+    struct rt_wlan_device *device = RT_NULL;
+
+    MGNT_LOCK();
+    if (mode == RT_WLAN_STATION)
+    {
+        device = _sta_mgnt.device;
+    }
+    else if (mode == RT_WLAN_AP)
+    {
+        device = _ap_mgnt.device;
+    }
+    MGNT_UNLOCK();
+    return device;
+}
+
+rt_err_t rt_wlan_select_device(rt_wlan_mode_t mode,
+                               rt_wlan_transport_t transport)
+{
+    static const rt_wlan_transport_t auto_order[] =
+    {
+        RT_WLAN_TRANSPORT_SDIO,
+        RT_WLAN_TRANSPORT_SPI,
+        RT_WLAN_TRANSPORT_USB,
+        RT_WLAN_TRANSPORT_UNKNOWN,
+    };
+    struct rt_wlan_device *current;
+    char name[RT_NAME_MAX];
+    rt_err_t result = -RT_EIO;
+    rt_size_t index;
+
+    if ((mode != RT_WLAN_STATION && mode != RT_WLAN_AP) ||
+        transport < RT_WLAN_TRANSPORT_UNKNOWN ||
+        transport > RT_WLAN_TRANSPORT_SPI)
+    {
+        return -RT_EINVAL;
+    }
+
+    if (transport == RT_WLAN_TRANSPORT_UNKNOWN)
+    {
+        current = rt_wlan_get_device(mode);
+        if (current &&
+            rt_device_find(current->device.parent.name) ==
+                (rt_device_t)current)
+        {
+            return RT_EOK;
+        }
+
+        for (index = 0; index < sizeof(auto_order) / sizeof(auto_order[0]);
+             index++)
+        {
+            result = rt_wlan_dev_get_name(mode, auto_order[index], name,
+                                          sizeof(name));
+            if (result == RT_EOK)
+            {
+                break;
+            }
+        }
+    }
+    else
+    {
+        result = rt_wlan_dev_get_name(mode, transport, name, sizeof(name));
+    }
+
+    if (result != RT_EOK)
+    {
+        return -RT_EIO;
+    }
+
+    result = rt_wlan_set_mode(name, mode);
+    if (result == RT_EOK)
+    {
+        RT_WLAN_LOG_I("selected %s as %s device", name,
+                      mode == RT_WLAN_STATION ? "station" : "AP");
+    }
+    return result;
+}
+
+rt_err_t rt_wlan_mgnt_unregister_device(struct rt_wlan_device *device)
+{
+    rt_wlan_dev_event_t event;
+
+    if (device == RT_NULL)
+    {
+        return -RT_EINVAL;
+    }
+
+    MGNT_LOCK();
+    if (_sta_mgnt.device == device)
+    {
+        _sta_mgnt.device = RT_NULL;
+        _sta_mgnt.state = 0;
+#ifdef RT_WLAN_AUTO_CONNECT_ENABLE
+        if (_sta_mgnt.flags & RT_WLAN_STATE_AUTOEN)
+        {
+            TIME_START();
+        }
+        else
+        {
+            TIME_STOP();
+        }
+#endif
+    }
+    if (_ap_mgnt.device == device)
+    {
+        _ap_mgnt.device = RT_NULL;
+        _ap_mgnt.state = 0;
+    }
+
+    for (event = RT_WLAN_DEV_EVT_INIT_DONE;
+         event < RT_WLAN_DEV_EVT_MAX; event++)
+    {
+        rt_wlan_dev_unregister_event_handler(device, event,
+                                             rt_wlan_event_dispatch);
+    }
+    MGNT_UNLOCK();
+    return RT_EOK;
 }
 
 rt_wlan_mode_t rt_wlan_get_mode(const char *dev_name)

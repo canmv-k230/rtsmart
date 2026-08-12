@@ -276,7 +276,7 @@ void lwip_netdev_netstat(struct netdev *netif)
 
 static int lwip_netdev_set_default(struct netdev *netif)
 {
-    netif_set_default((struct netif *)netif->user_data);
+    netif_set_default(netif ? (struct netif *)netif->user_data : RT_NULL);
     return ERR_OK;
 }
 
@@ -313,14 +313,20 @@ const struct netdev_ops lwip_netdev_ops =
     lwip_netdev_set_default,
 };
 
-static int netdev_add(struct netif *lwip_netif)
+int eth_device_netdev_add(struct netif *lwip_netif)
 {
-#define LWIP_NETIF_NAME_LEN 2
     int result = 0;
+    struct eth_device *ethif;
     struct netdev *netdev = RT_NULL;
-    char name[LWIP_NETIF_NAME_LEN + 1] = {0};
+    const char *name;
 
     RT_ASSERT(lwip_netif);
+    ethif = (struct eth_device *)lwip_netif->state;
+    if (ethif == RT_NULL || ethif->parent.parent.name[0] == '\0')
+    {
+        return -ERR_IF;
+    }
+    name = ethif->parent.parent.name;
 
     netdev = (struct netdev *)rt_calloc(1, sizeof(struct netdev));
     if (netdev == RT_NULL)
@@ -334,9 +340,13 @@ static int netdev_add(struct netif *lwip_netif)
     sal_lwip_netdev_set_pf_info(netdev);
 #endif /* SAL_USING_LWIP */
 
-    rt_strncpy(name, lwip_netif->name, LWIP_NETIF_NAME_LEN);
     result = netdev_register(netdev, name, (void *)lwip_netif);
-	
+    if (result != RT_EOK)
+    {
+        rt_free(netdev);
+        return result;
+    }
+
     /* Update netdev info after registered */
     netdev->flags = lwip_netif->flags;
     netdev->mtu = lwip_netif->mtu;
@@ -364,13 +374,11 @@ rt_bool_t get_work_count(struct netdev *netdev);
 
 static void netdev_del(struct netif *lwip_netif)
 {
-    char name[LWIP_NETIF_NAME_LEN + 1];
     struct netdev *netdev;
 
     RT_ASSERT(lwip_netif);
 
-    rt_strncpy(name, lwip_netif->name, LWIP_NETIF_NAME_LEN);
-    netdev = netdev_get_by_name(name);
+    netdev = netdev_get_by_user_data(lwip_netif);
 #ifdef RT_USING_SAL
     if (netdev != RT_NULL) {
         netdev->is_gone = RT_TRUE;
@@ -397,7 +405,7 @@ static int netdev_flags_sync(struct netif *lwip_netif)
 
     RT_ASSERT(lwip_netif);
 
-    netdev = netdev_get_by_name(lwip_netif->name);
+    netdev = netdev_get_by_user_data(lwip_netif);
     if (netdev == RT_NULL)
     {
         return -ERR_IF;
@@ -458,11 +466,6 @@ static err_t eth_netif_device_init(struct netif *netif)
     {
         rt_device_t device;
 
-#ifdef RT_USING_NETDEV
-    /* network interface device register */
-    netdev_add(netif);
-#endif /* RT_USING_NETDEV */
-
         /* get device object */
         device = (rt_device_t) ethif;
         if (rt_device_init(device) != RT_EOK)
@@ -476,6 +479,14 @@ static err_t eth_netif_device_init(struct netif *netif)
         
         /* set output */
         netif->output       = etharp_output;
+
+#ifdef RT_USING_NETDEV
+        /* register after the lwIP interface fields are initialized */
+        if (eth_device_netdev_add(netif) != RT_EOK)
+        {
+            return ERR_IF;
+        }
+#endif /* RT_USING_NETDEV */
 
 #if LWIP_IPV6
         netif->output_ip6 = ethip6_output;
@@ -499,10 +510,6 @@ static err_t eth_netif_device_init(struct netif *netif)
 #endif /* LWIP_IPV6_MLD */
 
 #endif /* LWIP_IPV6 */
-
-        /* set default netif */
-        if (netif_default == RT_NULL)
-            netif_set_default(ethif->netif);
 
 #if LWIP_DHCP
         /* set interface up */
@@ -642,11 +649,6 @@ static err_t af_unix_eth_netif_device_init(struct netif *netif)
     {
         rt_device_t device;
 
-#ifdef RT_USING_NETDEV
-    /* network interface device register */
-    netdev_add(netif);
-#endif /* RT_USING_NETDEV */
-
         /* get device object */
         device = (rt_device_t) ethif;
         if (rt_device_init(device) != RT_EOK)
@@ -660,6 +662,14 @@ static err_t af_unix_eth_netif_device_init(struct netif *netif)
         
         /* set output */
         netif->output       = etharp_output;
+
+#ifdef RT_USING_NETDEV
+        /* register after the lwIP interface fields are initialized */
+        if (eth_device_netdev_add(netif) != RT_EOK)
+        {
+            return ERR_IF;
+        }
+#endif /* RT_USING_NETDEV */
 
 #if LWIP_IPV6
         netif->output_ip6 = ethip6_output;
@@ -683,10 +693,6 @@ static err_t af_unix_eth_netif_device_init(struct netif *netif)
 #endif /* LWIP_IPV6_MLD */
 
 #endif /* LWIP_IPV6 */
-
-        /* set default netif */
-        if (netif_default == RT_NULL)
-            netif_set_default(ethif->netif);
 
         /* set interface up */
         netif_set_up(ethif->netif);

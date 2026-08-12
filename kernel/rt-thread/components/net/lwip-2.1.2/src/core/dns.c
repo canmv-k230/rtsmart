@@ -98,6 +98,9 @@
 #include <string.h>
 
 #include <rtthread.h>
+#ifdef RT_USING_NETDEV
+#include <netdev.h>
+#endif
 
 /** Random generator function to create random TXIDs and source ports for queries */
 #ifndef DNS_RAND_TXID
@@ -363,26 +366,38 @@ void
 dns_setserver(struct netif *netif, u8_t numdns, const ip_addr_t *dnsserver)
 {
   struct netif *_netif = netif;
+  int update_global = 1;
+
+#ifdef RT_USING_NETDEV
+  struct netdev *netdev = NULL;
+  extern struct netif *netif_default;
+
+  if (_netif != NULL) {
+    netdev = netdev_get_by_user_data(_netif);
+  }
+  update_global = (_netif == NULL) || (_netif == netif_default) ||
+                  (netdev != NULL && netdev == netdev_default);
+#endif
 
   if (numdns < DNS_MAX_SERVERS) {
     if (dnsserver != NULL) {
-      dns_servers[numdns] = (*dnsserver);
+      if (update_global) {
+        dns_servers[numdns] = (*dnsserver);
+      }
 
 #ifdef RT_USING_NETDEV
       extern struct netif *netif_list;
-      extern struct netdev *netdev_get_by_name(const char *name);
-      extern void netdev_low_level_set_dns_server(struct netdev *netdev, uint8_t dns_num, const ip_addr_t *dns_server);
 
       if(NULL != _netif) {
-        netdev_low_level_set_dns_server(netdev_get_by_name(_netif->name), numdns, dnsserver);
+        netdev_low_level_set_dns_server(netdev, numdns, dnsserver);
       } else {
         /* set network interface device DNS server address */
         for (_netif = netif_list; _netif != NULL; _netif = _netif->next) {
-            netdev_low_level_set_dns_server(netdev_get_by_name(_netif->name), numdns, dnsserver);
+            netdev_low_level_set_dns_server(netdev_get_by_user_data(_netif), numdns, dnsserver);
         }
       }
       #endif /* RT_USING_NETDEV */
-    } else {
+    } else if (update_global) {
       dns_servers[numdns] = *IP_ADDR_ANY;
     }
   }

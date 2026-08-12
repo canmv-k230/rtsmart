@@ -235,7 +235,7 @@ time_t ntp_get_time(const char *host_name)
             extern struct netdev *netdev_default;
             struct netdev *dev = netdev_default;
 
-            for (index = 0; index < dev->hwaddr_len; index++)
+            for (index = 0; dev && index < dev->hwaddr_len; index++)
             {
                 send_data[index + 1] = dev->hwaddr[index] + moth_num;
             }
@@ -423,8 +423,10 @@ time_t ntp_sync_to_rtc(const char *host_name)
 static rt_bool_t ntp_check_network(void)
 {
 #ifdef RT_USING_NETDEV
-    struct netdev * netdev = netdev_get_by_family(AF_INET);
-    return (netdev && netdev_is_link_up(netdev));
+    struct netdev *netdev = netdev_default;
+
+    return netdev && netdev_is_up(netdev) && netdev_is_link_up(netdev) &&
+           !ip_addr_isany(&netdev->ip_addr);
 #else
     return RT_TRUE;
 #endif

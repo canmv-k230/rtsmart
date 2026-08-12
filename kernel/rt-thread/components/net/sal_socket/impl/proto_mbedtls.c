@@ -90,7 +90,11 @@ int mbedtls_net_send_cb(void *ctx, const unsigned char *buf, size_t len)
         return -1;
     }
     
-    pf = (struct sal_proto_family *)sock->netdev->sal_user_data;
+    pf = sock->pf;
+    if (pf == RT_NULL || pf->skt_ops == RT_NULL || pf->skt_ops->sendto == RT_NULL)
+    {
+        return -1;
+    }
 
     /* Register scoket sendto option to TLS send data callback */
     ret = pf->skt_ops->sendto((int) sock->user_data, (void *)buf, len, 0, RT_NULL, RT_NULL);
@@ -127,7 +131,11 @@ int mbedtls_net_recv_cb( void *ctx, unsigned char *buf, size_t len)
         return -1;
     }
 
-    pf = (struct sal_proto_family *)sock->netdev->sal_user_data;
+    pf = sock->pf;
+    if (pf == RT_NULL || pf->skt_ops == RT_NULL || pf->skt_ops->recvfrom == RT_NULL)
+    {
+        return -1;
+    }
     
     /* Register scoket recvfrom option to TLS recv data callback */
     ret = pf->skt_ops->recvfrom((int) sock->user_data, (void *)buf, len, 0, RT_NULL, RT_NULL);

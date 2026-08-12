@@ -417,9 +417,7 @@ const static struct rt_device_ops wlan_lwip_ops =
 static struct rt_wlan_prot *rt_wlan_lwip_protocol_register(struct rt_wlan_prot *prot, struct rt_wlan_device *wlan)
 {
     struct eth_device *eth = RT_NULL;
-    rt_uint8_t id = 0;
-    char eth_name[4], timer_name[16];
-    rt_device_t device = RT_NULL;
+    char eth_name[RT_NAME_MAX], timer_name[RT_NAME_MAX];
     struct lwip_prot_des *lwip_prot;
 
     if (wlan == RT_NULL || prot == RT_NULL)
@@ -427,19 +425,25 @@ static struct rt_wlan_prot *rt_wlan_lwip_protocol_register(struct rt_wlan_prot *
 
     LOG_D("F:%s L:%d is run wlan:0x%08x", __FUNCTION__, __LINE__, wlan);
 
-    do
+    if (wlan->registered_mode == RT_WLAN_STATION)
     {
-        /* find ETH device name */
-        eth_name[0] = 'w';
-        eth_name[1] = '0' + id++;
-        eth_name[2] = '\0';
-        device = rt_device_find(eth_name);
+        rt_snprintf(eth_name, sizeof(eth_name), "wlan%d",
+                    wlan->radio_index);
     }
-    while (device);
-
-    if (id > 9)
+    else if (wlan->registered_mode == RT_WLAN_AP)
     {
-        LOG_E("F:%s L:%d not find Empty name", __FUNCTION__, __LINE__, eth_name);
+        rt_snprintf(eth_name, sizeof(eth_name), "wlan%dap",
+                    wlan->radio_index);
+    }
+    else
+    {
+        LOG_E("F:%s L:%d unknown WLAN interface role", __FUNCTION__,
+              __LINE__);
+        return RT_NULL;
+    }
+    if (rt_device_find(eth_name))
+    {
+        LOG_E("WLAN network interface name %s is already in use", eth_name);
         return RT_NULL;
     }
 
@@ -484,13 +488,19 @@ static struct rt_wlan_prot *rt_wlan_lwip_protocol_register(struct rt_wlan_prot *
         return RT_NULL;
     }
     rt_memcpy(&lwip_prot->prot, prot, sizeof(struct rt_wlan_prot));
-    rt_sprintf(timer_name, "timer_%s", eth_name);
+    rt_snprintf(timer_name, sizeof(timer_name), "timer_%s", eth_name);
     rt_timer_init(&lwip_prot->timer, timer_name, timer_callback, wlan, rt_tick_from_millisecond(1000),
                     RT_TIMER_FLAG_SOFT_TIMER | RT_TIMER_FLAG_ONE_SHOT);
     netif_set_up(eth->netif);
     LOG_I("eth device init ok name:%s", eth_name);
 #ifdef RT_USING_NETDEV
     wlan->netdev = netdev_get_by_name(eth_name);
+    if (wlan->netdev)
+    {
+        netdev_set_type(wlan->netdev,
+                        wlan->registered_mode == RT_WLAN_AP ?
+                        NETDEV_TYPE_WLAN_AP : NETDEV_TYPE_WLAN_STA);
+    }
 #endif
     return &lwip_prot->prot;
 }

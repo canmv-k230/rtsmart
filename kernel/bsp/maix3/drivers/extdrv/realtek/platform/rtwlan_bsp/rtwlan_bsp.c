@@ -45,15 +45,15 @@ static rt_int32_t realtek_remove(struct rt_mmcsd_card* card)
 
     if (wlan_ap_registered) {
         if (wlan_ap.mode != RT_WLAN_NONE)
-            rt_wlan_set_mode(RT_WLAN_DEVICE_AP_NAME, RT_WLAN_NONE);
-        rt_device_unregister(&wlan_ap.device);
+            rt_wlan_set_mode(wlan_ap.device.parent.name, RT_WLAN_NONE);
+        rt_wlan_dev_unregister(&wlan_ap);
         wlan_ap_registered = RT_FALSE;
     }
 
     if (wlan_sta_registered) {
         if (wlan_sta.mode != RT_WLAN_NONE)
-            rt_wlan_set_mode(RT_WLAN_DEVICE_STA_NAME, RT_WLAN_NONE);
-        rt_device_unregister(&wlan_sta.device);
+            rt_wlan_set_mode(wlan_sta.device.parent.name, RT_WLAN_NONE);
+        rt_wlan_dev_unregister(&wlan_sta);
         wlan_sta_registered = RT_FALSE;
     }
 
@@ -510,21 +510,23 @@ static rt_int32_t realtek_probe(struct rt_mmcsd_card* card)
         goto fail_disable_sdio;
     }
 
-    ret = rt_wlan_dev_register(&wlan_sta, RT_WLAN_DEVICE_STA_NAME, &ops, 0, NULL);
+    ret = rt_wlan_dev_register_auto(&wlan_sta, RT_WLAN_STATION,
+                                    RT_WLAN_TRANSPORT_SDIO, &ops, NULL);
     if (ret != RT_EOK)
         goto fail_wifi;
     wlan_sta_registered = RT_TRUE;
 
-    ret = rt_wlan_dev_register(&wlan_ap, RT_WLAN_DEVICE_AP_NAME, &ops, 0, NULL);
+    ret = rt_wlan_dev_register_auto(&wlan_ap, RT_WLAN_AP,
+                                    RT_WLAN_TRANSPORT_SDIO, &ops, NULL);
     if (ret != RT_EOK)
         goto fail_wifi;
     wlan_ap_registered = RT_TRUE;
 
-    ret = rt_wlan_set_mode(RT_WLAN_DEVICE_STA_NAME, RT_WLAN_STATION);
+    ret = rt_wlan_set_mode(wlan_sta.device.parent.name, RT_WLAN_STATION);
     if (ret != RT_EOK)
         goto fail_wifi;
 
-    ret = rt_wlan_set_mode(RT_WLAN_DEVICE_AP_NAME, RT_WLAN_AP);
+    ret = rt_wlan_set_mode(wlan_ap.device.parent.name, RT_WLAN_AP);
     if (ret != RT_EOK)
         goto fail_wifi;
 
@@ -537,14 +539,14 @@ fail_wifi:
     }
     if (wlan_ap_registered) {
         if (wlan_ap.mode != RT_WLAN_NONE)
-            rt_wlan_set_mode(RT_WLAN_DEVICE_AP_NAME, RT_WLAN_NONE);
-        rt_device_unregister(&wlan_ap.device);
+            rt_wlan_set_mode(wlan_ap.device.parent.name, RT_WLAN_NONE);
+        rt_wlan_dev_unregister(&wlan_ap);
         wlan_ap_registered = RT_FALSE;
     }
     if (wlan_sta_registered) {
         if (wlan_sta.mode != RT_WLAN_NONE)
-            rt_wlan_set_mode(RT_WLAN_DEVICE_STA_NAME, RT_WLAN_NONE);
-        rt_device_unregister(&wlan_sta.device);
+            rt_wlan_set_mode(wlan_sta.device.parent.name, RT_WLAN_NONE);
+        rt_wlan_dev_unregister(&wlan_sta);
         wlan_sta_registered = RT_FALSE;
     }
 fail_disable_sdio:

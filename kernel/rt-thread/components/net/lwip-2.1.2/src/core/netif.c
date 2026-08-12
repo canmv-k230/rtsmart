@@ -491,7 +491,7 @@ netif_do_set_ipaddr(struct netif *netif, const ip4_addr_t *ipaddr, ip_addr_t *ol
 
 #ifdef RT_USING_NETDEV
   /* rt-thread sal network interface device set IP address operations */
-  netdev_low_level_set_ipaddr(netdev_get_by_name(netif->name), &netif->ip_addr);
+  netdev_low_level_set_ipaddr(netdev_get_by_user_data(netif), &netif->ip_addr);
 #endif /* RT_USING_NETDEV */
 
     return 1; /* address changed */
@@ -557,7 +557,7 @@ netif_do_set_netmask(struct netif *netif, const ip4_addr_t *netmask, ip_addr_t *
 
 #ifdef RT_USING_NETDEV
   /* rt-thread network interface device set netmask address */
-  netdev_low_level_set_netmask(netdev_get_by_name(netif->name), &netif->netmask);
+  netdev_low_level_set_netmask(netdev_get_by_user_data(netif), &netif->netmask);
 #endif /* RT_USING_NETDEV */
 
     return 1; /* netmask changed */
@@ -625,7 +625,7 @@ netif_do_set_gw(struct netif *netif, const ip4_addr_t *gw, ip_addr_t *old_gw)
 
 #ifdef RT_USING_NETDEV
     /* rt_thread network interface device set gateway address */
-    netdev_low_level_set_gw(netdev_get_by_name(netif->name), &netif->gw);
+    netdev_low_level_set_gw(netdev_get_by_user_data(netif), &netif->gw);
 #endif /* RT_USING_NETDEV */
 
     return 1; /* gateway changed */
@@ -894,7 +894,7 @@ netif_set_up(struct netif *netif)
 
 #ifdef RT_USING_NETDEV
     /* rt-thread network interface device set up status */
-    netdev_low_level_set_status(netdev_get_by_name(netif->name), RT_TRUE);
+    netdev_low_level_set_status(netdev_get_by_user_data(netif), RT_TRUE);
 #endif /* RT_USING_NETDEV */
   }
 }
@@ -978,7 +978,7 @@ netif_set_down(struct netif *netif)
 
 #ifdef RT_USING_NETDEV
     /* rt-thread network interface device set down status */
-    netdev_low_level_set_status(netdev_get_by_name(netif->name), RT_FALSE);
+    netdev_low_level_set_status(netdev_get_by_user_data(netif), RT_FALSE);
 #endif /* RT_USING_NETDEV */
   }
 }
@@ -1053,7 +1053,7 @@ netif_set_link_up(struct netif *netif)
 
 #ifdef RT_USING_NETDEV
     /* rt-thread network interface device set link up status */
-    netdev_low_level_set_link_status(netdev_get_by_name(netif->name), RT_TRUE);
+    netdev_low_level_set_link_status(netdev_get_by_user_data(netif), RT_TRUE);
 #endif /* RT_USING_NETDEV */
   }
 }
@@ -1082,7 +1082,7 @@ netif_set_link_down(struct netif *netif)
 
 #ifdef RT_USING_NETDEV
     /* rt-thread network interface device set link down status */
-    netdev_low_level_set_link_status(netdev_get_by_name(netif->name), RT_FALSE);
+    netdev_low_level_set_link_status(netdev_get_by_user_data(netif), RT_FALSE);
 #endif /* RT_USING_NETDEV */
   }
 }
@@ -1588,7 +1588,7 @@ netif_create_ip6_linklocal_address(struct netif *netif, u8_t from_mac_48bit)
 
 #ifdef RT_USING_NETDEV
     /* rt-thread network interface device set ipv6 address */
-    ip_addr_copy(netdev_get_by_name(netif->name)->ip6_addr[0], netif->ip6_addr[0]);
+    ip_addr_copy(netdev_get_by_user_data(netif)->ip6_addr[0], netif->ip6_addr[0]);
 #endif /* RT_USING_NETDEV */
 
   /* Set address state. */
@@ -1636,7 +1636,7 @@ netif_add_ip6_address(struct netif *netif, const ip6_addr_t *ip6addr, s8_t *chos
       ip_addr_copy_from_ip6(netif->ip6_addr[i], *ip6addr);
 #ifdef RT_USING_NETDEV
       /* rt-thread network interface device set ipv6 address */
-      ip_addr_copy(netdev_get_by_name(netif->name)->ip6_addr[i], netif->ip6_addr[i]);
+      ip_addr_copy(netdev_get_by_user_data(netif)->ip6_addr[i], netif->ip6_addr[i]);
 #endif /* RT_USING_NETDEV */
       ip6_addr_assign_zone(ip_2_ip6(&netif->ip6_addr[i]), IP6_UNICAST, netif);
       netif_ip6_addr_set_state(netif, i, IP6_ADDR_TENTATIVE);

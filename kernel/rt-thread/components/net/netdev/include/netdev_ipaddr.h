@@ -131,6 +131,7 @@ typedef struct ip4_addr
 #define ip4_addr_set_any(ipaddr)            ((ipaddr)->addr = IPADDR_ANY)
 #define ip4_addr_isany_val(ipaddr)          ((ipaddr).addr == IPADDR_ANY)
 #define ip4_addr_isany(ipaddr)              ((ipaddr) == NULL || ip4_addr_isany_val(*(ipaddr)))
+#define ip4_addr_isloopback(ipaddr)         (((ipaddr)->addr & PP_HTONL(0xff000000UL)) == PP_HTONL(0x7f000000UL))
 
 in_addr_t netdev_ipaddr_addr(const char *cp);
 int netdev_ip4addr_aton(const char *cp, ip4_addr_t *addr);
@@ -194,6 +195,10 @@ extern const struct in6_addr in6addr_any;
                                      ((ip6addr).addr[2] == 0) && \
                                      ((ip6addr).addr[3] == 0))
 #define ip6_addr_isany(ip6addr)     (((ip6addr) == NULL) || ip6_addr_isany_val(*(ip6addr)))
+#define ip6_addr_isloopback(ip6addr) (((ip6addr)->addr[0] == 0) && \
+                                      ((ip6addr)->addr[1] == 0) && \
+                                      ((ip6addr)->addr[2] == 0) && \
+                                      ((ip6addr)->addr[3] == PP_HTONL(1)))
 
 int netdev_ip6addr_aton(const char *cp, ip6_addr_t *addr);
 char *netdev_ip6addr_ntoa(const ip6_addr_t *addr);
@@ -247,6 +252,9 @@ typedef struct _ip_addr
 #define ip_addr_isany(ipaddr)       ((IP_IS_V6(ipaddr)) ? \
                                       ip6_addr_isany(ip_2_ip6(ipaddr)) : \
                                       ip4_addr_isany(ip_2_ip4(ipaddr)))
+#define ip_addr_isloopback(ipaddr)  ((IP_IS_V6(ipaddr)) ? \
+                                      ip6_addr_isloopback(ip_2_ip6(ipaddr)) : \
+                                      ip4_addr_isloopback(ip_2_ip4(ipaddr)))
 
 /* directly map this to the lwip internal functions */
 #define inet_addr(cp)                       netdev_ipaddr_addr(cp)
@@ -274,6 +282,7 @@ typedef ip4_addr_t ip_addr_t;
 #define ip_addr_set_any(is_ipv6, ipaddr)    ip4_addr_set_any(ipaddr)
 #define ip_addr_isany_val(ipaddr)           ip4_addr_isany_val(ipaddr)
 #define ip_addr_isany(ipaddr)               ip4_addr_isany(ipaddr)
+#define ip_addr_isloopback(ipaddr)          ip4_addr_isloopback(ipaddr)
 
 /* directly map this to the lwip internal functions */
 #define inet_addr(cp)                       netdev_ipaddr_addr(cp)
@@ -295,6 +304,7 @@ typedef ip6_addr_t ip_addr_t;
 #define ip_addr_set_any(is_ipv6, ipaddr)    ip6_addr_set_any(ipaddr)
 #define ip_addr_isany_val(ipaddr)           ip6_addr_isany_val(ipaddr)
 #define ip_addr_isany(ipaddr)               ip6_addr_isany(ipaddr)
+#define ip_addr_isloopback(ipaddr)          ip6_addr_isloopback(ipaddr)
 
 /* directly map this to the lwip internal functions */
 #define inet_aton(cp, addr)                 netdev_ip6addr_aton(cp, (ip6_addr_t*)addr)

@@ -49,10 +49,11 @@ int wifi_spi_device_init(void)
     }
 
     rw007_gpio_init();
-    rt_hw_wifi_init("wspi");
-
-    rt_wlan_set_mode(RT_WLAN_DEVICE_STA_NAME, RT_WLAN_STATION);
-    rt_wlan_set_mode(RT_WLAN_DEVICE_AP_NAME, RT_WLAN_AP);
+    ret = rt_hw_wifi_init("wspi");
+    if (ret != RT_EOK)
+    {
+        return ret;
+    }
 
     rw007_sn_get(sn_version);
     rt_kprintf("\nrw007  sn: [%s]\n", sn_version);

@@ -26,10 +26,16 @@
 #define DBG_LVL              DBG_INFO
 #include <rtdbg.h>
 
+#define NETDEV_METRIC_LAN           100
+#define NETDEV_METRIC_WLAN_STA      600
+#define NETDEV_METRIC_UNKNOWN      1000
+
 /* The list of network interface device */
 struct netdev *netdev_list;
 /* The default network interface device */
 struct netdev *netdev_default;
+/* A userspace-selected uplink is preferred when it is available. */
+static struct netdev *netdev_preferred;
 
 /**
  * This function will register network interface device and
@@ -55,6 +61,8 @@ int netdev_register(struct netdev *netdev, const char *name, void *user_data)
     /* clean network interface device */
     flags_mask = NETDEV_FLAG_UP | NETDEV_FLAG_LINK_UP | NETDEV_FLAG_INTERNET_UP | NETDEV_FLAG_DHCP;
     netdev->flags &= ~flags_mask;
+    netdev->type = NETDEV_TYPE_UNKNOWN;
+    netdev->metric = NETDEV_METRIC_UNKNOWN;
 
     ip_addr_set_zero(&(netdev->ip_addr));
     ip_addr_set_zero(&(netdev->netmask));
@@ -79,14 +87,32 @@ int netdev_register(struct netdev *netdev, const char *name, void *user_data)
     netdev->addr_callback = RT_NULL;
 
     /* fill network interface device */
-    len = (rt_strlen(name) >= RT_NAME_MAX) ? RT_NAME_MAX: rt_strlen(name);
+    len = (rt_strlen(name) >= RT_NAME_MAX) ? RT_NAME_MAX - 1 : rt_strlen(name);
     rt_strncpy(netdev->name, name, len);
+    netdev->name[len] = '\0';
     netdev->user_data = user_data;
 
     /* initialize current network interface device single list */
     rt_slist_init(&(netdev->list));
 
     level = rt_hw_interrupt_disable();
+
+    if (netdev_list != RT_NULL)
+    {
+        rt_slist_t *node;
+
+        for (node = &(netdev_list->list); node; node = rt_slist_next(node))
+        {
+            struct netdev *registered =
+                rt_slist_entry(node, struct netdev, list);
+
+            if (rt_strcmp(registered->name, netdev->name) == 0)
+            {
+                rt_hw_interrupt_enable(level);
+                return -RT_EBUSY;
+            }
+        }
+    }
 
     if (netdev_list == RT_NULL)
     {
@@ -96,11 +122,6 @@ int netdev_register(struct netdev *netdev, const char *name, void *user_data)
     {
         /* tail insertion */
         rt_slist_append(&(netdev_list->list), &(netdev->list));
-    }
-
-    if (netdev_default == RT_NULL)
-    {
-        netdev_default = netdev_list;
     }
 
     rt_hw_interrupt_enable(level);
@@ -154,19 +175,14 @@ int netdev_unregister(struct netdev *netdev)
             {
                 rt_slist_remove(&(netdev_list->list), &(cur_netdev->list));
             }
-            if (netdev_default == netdev)
+            if (netdev_preferred == netdev)
             {
-                netdev_default = RT_NULL;
+                netdev_preferred = RT_NULL;
             }
             break;
         }
     }
     rt_hw_interrupt_enable(level);
-
-    if (netdev_default == RT_NULL)
-    {
-        netdev_default = netdev_list;
-    }
 
     if (cur_netdev == netdev)
     {
@@ -174,7 +190,10 @@ int netdev_unregister(struct netdev *netdev)
         extern int sal_netdev_cleanup(struct netdev *netdev);
         sal_netdev_cleanup(netdev);
 #endif
+        netdev_set_default_auto(RT_NULL);
+        netdev_update_resolv_conf();
         rt_memset(netdev, 0, sizeof(*netdev));
+        return RT_EOK;
     }
 
     return -RT_ERROR;
@@ -279,7 +298,7 @@ struct netdev *netdev_get_by_name(const char *name)
     for (node = &(netdev_list->list); node; node = rt_slist_next(node))
     {
         netdev = rt_slist_entry(node, struct netdev, list);
-        if (netdev && (rt_strncmp(netdev->name, name, rt_strlen(netdev->name)) == 0))
+        if (netdev && rt_strcmp(netdev->name, name) == 0)
         {
             rt_hw_interrupt_enable(level);
             return netdev;
@@ -289,6 +308,74 @@ struct netdev *netdev_get_by_name(const char *name)
     rt_hw_interrupt_enable(level);
 
     return RT_NULL;
+}
+
+/**
+ * This function gets a network interface device by its driver data pointer.
+ *
+ * @param user_data the driver data pointer supplied to netdev_register
+ *
+ * @return != NULL: network interface device object
+ *            NULL: get failed
+ */
+struct netdev *netdev_get_by_user_data(const void *user_data)
+{
+    rt_base_t level;
+    rt_slist_t *node;
+
+    if (netdev_list == RT_NULL || user_data == RT_NULL)
+    {
+        return RT_NULL;
+    }
+
+    level = rt_hw_interrupt_disable();
+    for (node = &(netdev_list->list); node; node = rt_slist_next(node))
+    {
+        struct netdev *netdev = rt_slist_entry(node, struct netdev, list);
+
+        if (netdev->user_data == user_data)
+        {
+            rt_hw_interrupt_enable(level);
+            return netdev;
+        }
+    }
+    rt_hw_interrupt_enable(level);
+
+    return RT_NULL;
+}
+
+struct netdev *netdev_get_by_type(enum netdev_type type)
+{
+    rt_base_t level;
+    rt_slist_t *node;
+    struct netdev *fallback = RT_NULL;
+
+    if (netdev_list == RT_NULL)
+    {
+        return RT_NULL;
+    }
+
+    level = rt_hw_interrupt_disable();
+    for (node = &(netdev_list->list); node; node = rt_slist_next(node))
+    {
+        struct netdev *netdev = rt_slist_entry(node, struct netdev, list);
+
+        if (netdev->type != type)
+        {
+            continue;
+        }
+        if (netdev_is_link_up(netdev))
+        {
+            rt_hw_interrupt_enable(level);
+            return netdev;
+        }
+        if (fallback == RT_NULL)
+        {
+            fallback = netdev;
+        }
+    }
+    rt_hw_interrupt_enable(level);
+    return fallback;
 }
 
 #ifdef RT_USING_SAL
@@ -363,23 +450,161 @@ int netdev_family_get(struct netdev *netdev)
  *
  * @param netdev the network interface device to change
  */
+rt_bool_t netdev_can_be_default(const struct netdev *netdev)
+{
+    return netdev != RT_NULL &&
+           (netdev->type == NETDEV_TYPE_WLAN_STA ||
+            netdev->type == NETDEV_TYPE_LAN);
+}
+
+static uint16_t netdev_type_metric(enum netdev_type type)
+{
+    switch (type)
+    {
+    case NETDEV_TYPE_LAN:
+        return NETDEV_METRIC_LAN;
+    case NETDEV_TYPE_WLAN_STA:
+        return NETDEV_METRIC_WLAN_STA;
+    default:
+        return NETDEV_METRIC_UNKNOWN;
+    }
+}
+
+static int netdev_route_readiness(const struct netdev *netdev)
+{
+    if (!netdev_can_be_default(netdev) || !netdev_is_up(netdev) ||
+        !netdev_is_link_up(netdev))
+    {
+        return -1;
+    }
+    if (ip_addr_isany(&netdev->ip_addr))
+    {
+        return 0;
+    }
+    if (ip_addr_isany(&netdev->gw))
+    {
+        return 1;
+    }
+    return 2;
+}
+
+static void netdev_apply_default(struct netdev *netdev)
+{
+    struct netdev *old_default = netdev_default;
+    struct netdev *dns_netdev = netdev;
+    int index;
+
+    if (netdev == old_default)
+    {
+        return;
+    }
+
+    netdev_default = netdev;
+
+    if (netdev && netdev->ops && netdev->ops->set_default)
+    {
+        netdev->ops->set_default(netdev);
+    }
+    else if (!netdev && old_default && old_default->ops &&
+             old_default->ops->set_default)
+    {
+        old_default->ops->set_default(RT_NULL);
+    }
+
+    if (dns_netdev && dns_netdev->ops && dns_netdev->ops->set_dns_server)
+    {
+        for (index = 0; index < NETDEV_DNS_SERVERS_NUM; index++)
+        {
+            dns_netdev->ops->set_dns_server(
+                dns_netdev, index, &dns_netdev->dns_servers[index]);
+        }
+    }
+
+    netdev_update_resolv_conf();
+
+    LOG_D("Default network interface is now %s.",
+          netdev ? netdev->name : "unset");
+}
+
 void netdev_set_default(struct netdev *netdev)
+{
+    if (!netdev_can_be_default(netdev))
+    {
+        LOG_W("Network interface device(%s) cannot be the default uplink.",
+              netdev ? netdev->name : "NULL");
+        return;
+    }
+    netdev_preferred = netdev;
+    netdev_set_default_auto(netdev);
+}
+
+void netdev_clear_default(void)
+{
+    netdev_preferred = RT_NULL;
+    netdev_set_default_auto(RT_NULL);
+}
+
+void netdev_set_default_auto(struct netdev *netdev)
+{
+    rt_slist_t *node;
+    struct netdev *candidate = RT_NULL;
+    int candidate_readiness = -1;
+
+    (void)netdev;
+    if (netdev_preferred && netdev_can_be_default(netdev_preferred) &&
+        netdev_route_readiness(netdev_preferred) == 2)
+    {
+        netdev_apply_default(netdev_preferred);
+        return;
+    }
+    if (netdev_list != RT_NULL)
+    {
+        for (node = &(netdev_list->list); node; node = rt_slist_next(node))
+        {
+            struct netdev *current =
+                rt_slist_entry(node, struct netdev, list);
+            int readiness = netdev_route_readiness(current);
+
+            if (readiness < 2)
+            {
+                continue;
+            }
+            if (candidate == RT_NULL || readiness > candidate_readiness ||
+                (readiness == candidate_readiness &&
+                 current->metric < candidate->metric))
+            {
+                candidate = current;
+                candidate_readiness = readiness;
+            }
+        }
+    }
+    if (candidate)
+    {
+        netdev_apply_default(candidate);
+    }
+    else
+    {
+        netdev_apply_default(RT_NULL);
+    }
+}
+
+void netdev_set_type(struct netdev *netdev, enum netdev_type type)
 {
     if (netdev)
     {
-        if (0x00 != rt_memcmp(netdev, netdev_default, sizeof(struct netdev))) {
-            /* change the default netdev, update dns server */
-            netdev_change_resolv_conf(NETDEV_DNS_SERVERS_NUM, netdev->dns_servers);
-        }
+        netdev->type = (uint8_t)type;
+        netdev->metric = netdev_type_metric(type);
+        netdev_set_default_auto(netdev);
+        netdev_update_resolv_conf();
+    }
+}
 
-        netdev_default = netdev;
-
-        if (netdev->ops->set_default)
-        {
-            /* set default network interface device in the current network stack */
-            netdev->ops->set_default(netdev);
-        }
-        LOG_D("Setting default network interface device name(%s) successfully.", netdev->name);
+void netdev_set_metric(struct netdev *netdev, uint16_t metric)
+{
+    if (netdev)
+    {
+        netdev->metric = metric;
+        netdev_set_default_auto(netdev);
     }
 }
 
@@ -644,6 +869,10 @@ void netdev_low_level_set_ipaddr(struct netdev *netdev, const ip_addr_t *ip_addr
         {
             netdev->addr_callback(netdev, NETDEV_CB_ADDR_IP);
         }
+
+#ifdef NETDEV_USING_AUTO_DEFAULT
+        netdev_set_default_auto(netdev);
+#endif
     }
 }
 
@@ -708,10 +937,14 @@ void netdev_low_level_set_gw(struct netdev *netdev, const ip_addr_t *gw)
         {
             netdev->addr_callback(netdev, NETDEV_CB_ADDR_GATEWAY);
         }
+
+#ifdef NETDEV_USING_AUTO_DEFAULT
+        netdev_set_default_auto(netdev);
+#endif
     }
 }
 
-RT_WEAK void netdev_change_resolv_conf(int dns_cnt, const ip_addr_t *dns_servers)
+RT_WEAK void netdev_update_resolv_conf(void)
 {
 
 }
@@ -726,61 +959,33 @@ RT_WEAK void netdev_change_resolv_conf(int dns_cnt, const ip_addr_t *dns_servers
  */
 void netdev_low_level_set_dns_server(struct netdev *netdev, uint8_t dns_num, const ip_addr_t *dns_server)
 {
-    int index;
-
     RT_ASSERT(dns_server);
 
-    if (netdev == RT_NULL)
+    if (netdev == RT_NULL || dns_num >= NETDEV_DNS_SERVERS_NUM)
     {
         return;
     }
-    /* check DNS servers is exist */
-    for (index = 0; index < NETDEV_DNS_SERVERS_NUM; index++)
+    if (ip_addr_cmp(&netdev->dns_servers[dns_num], dns_server))
     {
-        if (ip_addr_cmp(&(netdev->dns_servers[index]), dns_server))
-        {
-            return;
-        }
+        return;
     }
 
-    if (dns_num < NETDEV_DNS_SERVERS_NUM)
+    ip_addr_copy(netdev->dns_servers[dns_num], *dns_server);
+
+    /* execute DNS servers address change callback function */
+    if (netdev->addr_callback)
     {
-        ip_addr_copy(netdev->dns_servers[dns_num], *dns_server);
-
-        /* execute DNS servers address change callback function */
-        if (netdev->addr_callback)
-        {
-            netdev->addr_callback(netdev, NETDEV_CB_ADDR_DNS_SERVER);
-        }
-
-        if (0x00 == rt_memcmp(netdev, netdev_default, sizeof(struct netdev))) {
-            netdev_change_resolv_conf(1, dns_server);
-        }
+        netdev->addr_callback(netdev, NETDEV_CB_ADDR_DNS_SERVER);
     }
+
+    netdev_update_resolv_conf();
 }
 
 #ifdef NETDEV_USING_AUTO_DEFAULT
 /* Change to the first link_up network interface device automatically */
 static void netdev_auto_change_default(struct netdev *netdev)
 {
-    struct netdev *new_netdev = RT_NULL;
-
-    if (netdev->flags & NETDEV_FLAG_LINK_UP)
-    {
-        if (!(netdev_default->flags & NETDEV_FLAG_LINK_UP))
-        {
-            netdev_set_default(netdev);
-        }
-        return;
-    }
-    if (rt_memcmp(netdev, netdev_default, sizeof(struct netdev)) == 0)
-    {
-        new_netdev = netdev_get_first_by_flags(NETDEV_FLAG_LINK_UP);
-        if (new_netdev)
-        {
-            netdev_set_default(new_netdev);
-        }
-    }
+    netdev_set_default_auto(netdev);
 }
 #endif /* NETDEV_USING_AUTO_DEFAULT */
 
@@ -802,12 +1007,11 @@ void netdev_low_level_set_status(struct netdev *netdev, rt_bool_t is_up)
         else
         {
             netdev->flags &= ~NETDEV_FLAG_UP;
+        }
 
 #ifdef NETDEV_USING_AUTO_DEFAULT
-            /* change to the first link_up network interface device automatically */
-            netdev_auto_change_default(netdev);
+        netdev_auto_change_default(netdev);
 #endif /* NETDEV_USING_AUTO_DEFAULT */
-        }
 
         /* execute  network interface device status change callback function */
         if (netdev->status_callback)
@@ -918,6 +1122,7 @@ static void netdev_list_if(void)
                    RT_NAME_MAX, netdev->name,
                    (netdev == netdev_default) ? " (Default)" : "");
         rt_kprintf("MTU: %d\n", netdev->mtu);
+        rt_kprintf("Metric: %u\n", netdev->metric);
 
         /* 6 - MAC address, 8 - IEMI */
         if (netdev->hwaddr_len == NETDEV_IFCONFIG_MAC_MAX_LEN)

@@ -806,14 +806,16 @@ rt_err_t rt_hw_wifi_init(const char *spi_device_name)
     rw007_spi.rw007_cmd_event = rt_event_create("wifi_cmd", RT_IPC_FLAG_FIFO);
 
     /* register wlan device for ap */
-    ret = rt_wlan_dev_register(&wlan_ap, RT_WLAN_DEVICE_AP_NAME, &ops, 0, &wifi_ap);
+    ret = rt_wlan_dev_register_auto(&wlan_ap, RT_WLAN_AP,
+                                    RT_WLAN_TRANSPORT_SPI, &ops, &wifi_ap);
     if (ret != RT_EOK)
     {
         return ret;
     }
 
     /* register wlan device for sta */
-    ret = rt_wlan_dev_register(&wlan_sta, RT_WLAN_DEVICE_STA_NAME, &ops, 0, &wifi_sta);
+    ret = rt_wlan_dev_register_auto(&wlan_sta, RT_WLAN_STATION,
+                                    RT_WLAN_TRANSPORT_SPI, &ops, &wifi_sta);
     if (ret != RT_EOK)
     {
         return ret;
@@ -826,7 +828,7 @@ rt_err_t rt_hw_wifi_init(const char *spi_device_name)
         tid = rt_thread_create("wifi_handle",
                                wifi_data_process_thread_entry,
                                &rw007_spi,
-                               2048,
+                               8192,
                                8,
                                20);
         if(!tid)
@@ -839,7 +841,7 @@ rt_err_t rt_hw_wifi_init(const char *spi_device_name)
         tid = rt_thread_create("wifi_xfer",
                                spi_wifi_data_thread_entry,
                                RT_NULL,
-                               2048,
+                               8192,
                                9,
                                20);
         if(!tid)
@@ -850,6 +852,16 @@ rt_err_t rt_hw_wifi_init(const char *spi_device_name)
     }
 
     spi_wifi_hw_init();
+    ret = rt_wlan_set_mode(wlan_sta.device.parent.name, RT_WLAN_STATION);
+    if (ret != RT_EOK)
+    {
+        return ret;
+    }
+    ret = rt_wlan_set_mode(wlan_ap.device.parent.name, RT_WLAN_AP);
+    if (ret != RT_EOK)
+    {
+        return ret;
+    }
     return RT_EOK;
 }
 

@@ -12,6 +12,9 @@
 #include <rtthread.h>
 #include <wlan_dev.h>
 #include <wlan_prot.h>
+#ifdef RT_WLAN_MANAGE_ENABLE
+#include <wlan_mgnt.h>
+#endif
 
 #define DBG_TAG "WLAN.dev"
 #ifdef RT_WLAN_DEV_DEBUG
@@ -29,6 +32,74 @@
 
 #define WLAN_DEV_LOCK(_wlan)      (rt_mutex_take(&(_wlan)->lock, RT_WAITING_FOREVER))
 #define WLAN_DEV_UNLOCK(_wlan)    (rt_mutex_release(&(_wlan)->lock))
+#define WLAN_RADIO_INDEX_MAX      100
+#define WLAN_RADIO_INDEX_INVALID  0xff
+
+static rt_list_t wlan_device_list = RT_LIST_OBJECT_INIT(wlan_device_list);
+static rt_uint8_t wlan_transport_radio_index[RT_WLAN_TRANSPORT_SPI + 1] =
+{
+    WLAN_RADIO_INDEX_INVALID,
+    WLAN_RADIO_INDEX_INVALID,
+    WLAN_RADIO_INDEX_INVALID,
+    WLAN_RADIO_INDEX_INVALID,
+};
+
+static int _rt_wlan_dev_get_radio_index(rt_wlan_transport_t transport)
+{
+    rt_bool_t used[WLAN_RADIO_INDEX_MAX] = {RT_FALSE};
+    struct rt_wlan_device *registered;
+    rt_list_t *node;
+    rt_base_t level;
+    int index;
+    int transport_index;
+
+    level = rt_hw_interrupt_disable();
+    index = wlan_transport_radio_index[transport];
+    if (index != WLAN_RADIO_INDEX_INVALID)
+    {
+        rt_hw_interrupt_enable(level);
+        return index;
+    }
+
+    for (transport_index = RT_WLAN_TRANSPORT_USB;
+         transport_index <= RT_WLAN_TRANSPORT_SPI; transport_index++)
+    {
+        index = wlan_transport_radio_index[transport_index];
+        if (index != WLAN_RADIO_INDEX_INVALID)
+        {
+            used[index] = RT_TRUE;
+        }
+    }
+
+    rt_list_for_each(node, &wlan_device_list)
+    {
+        registered = rt_list_entry(node, struct rt_wlan_device,
+                                   registration_list);
+        if (registered->transport == transport)
+        {
+            index = registered->radio_index;
+            wlan_transport_radio_index[transport] = index;
+            rt_hw_interrupt_enable(level);
+            return index;
+        }
+        if (registered->radio_index < WLAN_RADIO_INDEX_MAX)
+        {
+            used[registered->radio_index] = RT_TRUE;
+        }
+    }
+
+    for (index = 0; index < WLAN_RADIO_INDEX_MAX; index++)
+    {
+        if (!used[index])
+        {
+            wlan_transport_radio_index[transport] = index;
+            rt_hw_interrupt_enable(level);
+            return index;
+        }
+    }
+    rt_hw_interrupt_enable(level);
+    return -1;
+}
 
 #if RT_WLAN_SSID_MAX_LENGTH < 1
 #error "SSID length is too short"
@@ -870,18 +941,30 @@ const static struct rt_device_ops wlan_ops =
 };
 #endif
 
-rt_err_t rt_wlan_dev_register(struct rt_wlan_device *wlan, const char *name, const struct rt_wlan_dev_ops *ops, rt_uint32_t flag, void *user_data)
+static rt_err_t _rt_wlan_dev_register(struct rt_wlan_device *wlan,
+        const char *name, rt_wlan_mode_t registered_mode,
+        rt_wlan_transport_t transport, const struct rt_wlan_dev_ops *ops,
+        rt_uint32_t flag, void *user_data)
 {
     rt_err_t err = RT_EOK;
+    rt_base_t level;
+    char candidate[RT_NAME_MAX];
+    int index;
 
     if ((wlan == RT_NULL) || (name == RT_NULL) || (ops == RT_NULL) ||
+        (registered_mode != RT_WLAN_NONE &&
+         registered_mode != RT_WLAN_STATION &&
+         registered_mode != RT_WLAN_AP) ||
+        transport < RT_WLAN_TRANSPORT_UNKNOWN ||
+        transport > RT_WLAN_TRANSPORT_SPI ||
         (flag & RT_WLAN_FLAG_STA_ONLY && flag & RT_WLAN_FLAG_AP_ONLY))
     {
         LOG_E("F:%s L:%d parameter Wrongful", __FUNCTION__, __LINE__);
-        return RT_NULL;
+        return -RT_EINVAL;
     }
 
     rt_memset(wlan, 0, sizeof(struct rt_wlan_device));
+    rt_list_init(&wlan->registration_list);
 
 #ifdef RT_USING_DEVICE_OPS
     wlan->device.ops = &wlan_ops;
@@ -902,11 +985,254 @@ rt_err_t rt_wlan_dev_register(struct rt_wlan_device *wlan, const char *name, con
     wlan->user_data  = user_data;
 
     wlan->flags = flag;
-    err = rt_device_register(&wlan->device, name, RT_DEVICE_FLAG_RDWR);
+    wlan->registered_mode = registered_mode;
+    wlan->transport = transport;
+    if (rt_strlen(name) >= sizeof(candidate))
+    {
+        return -RT_EINVAL;
+    }
+
+    if (transport != RT_WLAN_TRANSPORT_UNKNOWN)
+    {
+        index = _rt_wlan_dev_get_radio_index(transport);
+        if (index < 0)
+        {
+            return -RT_EFULL;
+        }
+        wlan->radio_index = index;
+        rt_snprintf(candidate, sizeof(candidate),
+                    registered_mode == RT_WLAN_STATION ? "phy%d-sta" :
+                    registered_mode == RT_WLAN_AP ? "phy%d-ap" : "phy%d",
+                    index);
+        if (rt_device_find(candidate))
+        {
+            return -RT_EBUSY;
+        }
+        err = rt_device_register(&wlan->device, candidate,
+                                 RT_DEVICE_FLAG_RDWR);
+        if (err != RT_EOK)
+        {
+            return err;
+        }
+        LOG_I("WLAN device %s registered as %s", name, candidate);
+    }
+    else
+    {
+        for (index = 0; index < WLAN_RADIO_INDEX_MAX; index++)
+        {
+            if (index == 0)
+            {
+                rt_strncpy(candidate, name, sizeof(candidate));
+            }
+            else
+            {
+                rt_snprintf(candidate, sizeof(candidate), "%s%d", name,
+                            index);
+            }
+            candidate[sizeof(candidate) - 1] = '\0';
+            if (rt_device_find(candidate))
+            {
+                continue;
+            }
+            err = rt_device_register(&wlan->device, candidate,
+                                     RT_DEVICE_FLAG_RDWR);
+            if (err == RT_EOK)
+            {
+                wlan->radio_index = index;
+                if (index != 0)
+                {
+                    LOG_I("WLAN device %s registered as %s", name,
+                          candidate);
+                }
+                break;
+            }
+            if (!rt_device_find(candidate))
+            {
+                return err;
+            }
+        }
+    }
+    if (index == WLAN_RADIO_INDEX_MAX)
+    {
+        err = -RT_EFULL;
+    }
+    if (err == RT_EOK)
+    {
+        level = rt_hw_interrupt_disable();
+        rt_list_insert_before(&wlan_device_list,
+                              &wlan->registration_list);
+        rt_hw_interrupt_enable(level);
+    }
 
     LOG_D("F:%s L:%d run", __FUNCTION__, __LINE__);
 
     return err;
+}
+
+rt_err_t rt_wlan_dev_register(struct rt_wlan_device *wlan, const char *name,
+        const struct rt_wlan_dev_ops *ops, rt_uint32_t flag, void *user_data)
+{
+    rt_wlan_mode_t registered_mode = RT_WLAN_NONE;
+
+    if (flag & RT_WLAN_FLAG_STA_ONLY)
+    {
+        registered_mode = RT_WLAN_STATION;
+    }
+    else if (flag & RT_WLAN_FLAG_AP_ONLY)
+    {
+        registered_mode = RT_WLAN_AP;
+    }
+    else if (name && rt_strcmp(name, RT_WLAN_DEVICE_STA_NAME) == 0)
+    {
+        registered_mode = RT_WLAN_STATION;
+    }
+    else if (name && rt_strcmp(name, RT_WLAN_DEVICE_AP_NAME) == 0)
+    {
+        registered_mode = RT_WLAN_AP;
+    }
+
+    return _rt_wlan_dev_register(wlan, name, registered_mode,
+                                 RT_WLAN_TRANSPORT_UNKNOWN, ops, flag,
+                                 user_data);
+}
+
+rt_err_t rt_wlan_dev_register_auto(struct rt_wlan_device *wlan,
+        rt_wlan_mode_t mode, rt_wlan_transport_t transport,
+        const struct rt_wlan_dev_ops *ops, void *user_data)
+{
+    const char *name;
+    rt_uint32_t flag;
+
+    if (mode == RT_WLAN_STATION)
+    {
+        name = RT_WLAN_DEVICE_STA_NAME;
+        flag = RT_WLAN_FLAG_STA_ONLY;
+    }
+    else if (mode == RT_WLAN_AP)
+    {
+        name = RT_WLAN_DEVICE_AP_NAME;
+        flag = RT_WLAN_FLAG_AP_ONLY;
+    }
+    else
+    {
+        return -RT_EINVAL;
+    }
+
+    return _rt_wlan_dev_register(wlan, name, mode, transport, ops, flag,
+                                 user_data);
+}
+
+rt_err_t rt_wlan_dev_get_name(rt_wlan_mode_t mode,
+        rt_wlan_transport_t transport, char *name, rt_size_t name_size)
+{
+    struct rt_wlan_device *wlan;
+    rt_list_t *node;
+    rt_base_t level;
+
+    if ((mode != RT_WLAN_STATION && mode != RT_WLAN_AP) ||
+        transport < RT_WLAN_TRANSPORT_UNKNOWN ||
+        transport > RT_WLAN_TRANSPORT_SPI || !name || name_size == 0)
+    {
+        return -RT_EINVAL;
+    }
+
+    level = rt_hw_interrupt_disable();
+    rt_list_for_each(node, &wlan_device_list)
+    {
+        wlan = rt_list_entry(node, struct rt_wlan_device,
+                             registration_list);
+        if (wlan->registered_mode != mode ||
+            (transport != RT_WLAN_TRANSPORT_UNKNOWN &&
+             wlan->transport != transport))
+        {
+            continue;
+        }
+        rt_strncpy(name, wlan->device.parent.name, name_size - 1);
+        name[name_size - 1] = '\0';
+        rt_hw_interrupt_enable(level);
+        return RT_EOK;
+    }
+    rt_hw_interrupt_enable(level);
+    name[0] = '\0';
+    return -RT_EIO;
+}
+
+rt_err_t rt_wlan_dev_unregister(struct rt_wlan_device *wlan)
+{
+    rt_bool_t lock_initialized;
+    rt_base_t level;
+    rt_err_t result;
+    rt_wlan_mode_t registered_mode;
+
+    if (!wlan ||
+        rt_object_get_type(&wlan->device.parent) != RT_Object_Class_Device)
+    {
+        return -RT_EINVAL;
+    }
+
+    registered_mode = wlan->registered_mode;
+    level = rt_hw_interrupt_disable();
+    rt_list_remove(&wlan->registration_list);
+    rt_hw_interrupt_enable(level);
+
+#ifdef RT_WLAN_MANAGE_ENABLE
+    if (registered_mode == RT_WLAN_STATION ||
+        registered_mode == RT_WLAN_AP)
+    {
+        rt_wlan_mgnt_unregister_device(wlan);
+    }
+#endif
+
+    lock_initialized =
+        rt_object_get_type(&wlan->lock.parent.parent) ==
+        RT_Object_Class_Mutex;
+    if (lock_initialized)
+    {
+        result = WLAN_DEV_LOCK(wlan);
+        if (result != RT_EOK)
+        {
+            return result;
+        }
+    }
+
+#ifdef RT_WLAN_PROT_ENABLE
+    rt_wlan_prot_detach_dev(wlan);
+#endif
+
+    result = rt_device_unregister(&wlan->device);
+    if (result != RT_EOK)
+    {
+        if (lock_initialized)
+        {
+            WLAN_DEV_UNLOCK(wlan);
+        }
+        return result;
+    }
+
+    /* The WLAN lock is initialized lazily by the device init callback.  It is
+     * part of the WLAN device storage, so hot-unplug must remove it from the
+     * RT object list before that storage can be reused. */
+    if (lock_initialized)
+    {
+        WLAN_DEV_UNLOCK(wlan);
+        result = rt_mutex_detach(&wlan->lock);
+        if (result != RT_EOK)
+        {
+            return result;
+        }
+    }
+
+#ifdef RT_WLAN_MANAGE_ENABLE
+    if ((registered_mode == RT_WLAN_STATION ||
+         registered_mode == RT_WLAN_AP) &&
+        rt_wlan_select_device(registered_mode,
+                              RT_WLAN_TRANSPORT_UNKNOWN) != RT_EOK)
+    {
+        LOG_D("no replacement for removed %s device",
+              registered_mode == RT_WLAN_STATION ? "station" : "AP");
+    }
+#endif
+    return result;
 }
 
 #endif

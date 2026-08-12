@@ -465,6 +465,9 @@ static rt_int32_t cyw43_probe(struct rt_mmcsd_card* card)
 {
     static wifi_dev_t wifi_sta, wifi_ap;
     rt_thread_t tid;
+    rt_err_t result;
+    rt_bool_t sta_registered = RT_FALSE;
+    rt_bool_t ap_registered = RT_FALSE;
 
     cyw43_card = card;
     cyw43_thread_mutex = rt_mutex_create("cyw43", RT_IPC_FLAG_PRIO);
@@ -477,15 +480,44 @@ static rt_int32_t cyw43_probe(struct rt_mmcsd_card* card)
     wifi_sta.itf = CYW43_ITF_STA;
     wifi_ap.dev = &cyw43_state;
     wifi_ap.itf = CYW43_ITF_AP;
-    rt_wlan_dev_register(&wlan_sta, RT_WLAN_DEVICE_STA_NAME, &ops, 0, &wifi_sta);
-    rt_wlan_dev_register(&wlan_ap, RT_WLAN_DEVICE_AP_NAME, &ops, 0, &wifi_ap);
-    rt_wlan_set_mode(RT_WLAN_DEVICE_STA_NAME, RT_WLAN_STATION);
-    rt_wlan_set_mode(RT_WLAN_DEVICE_AP_NAME, RT_WLAN_AP);
+    result = rt_wlan_dev_register_auto(&wlan_sta, RT_WLAN_STATION,
+                                       RT_WLAN_TRANSPORT_SDIO, &ops,
+                                       &wifi_sta);
+    if (result != RT_EOK)
+        goto fail;
+    sta_registered = RT_TRUE;
+
+    result = rt_wlan_dev_register_auto(&wlan_ap, RT_WLAN_AP,
+                                       RT_WLAN_TRANSPORT_SDIO, &ops,
+                                       &wifi_ap);
+    if (result != RT_EOK)
+        goto fail;
+    ap_registered = RT_TRUE;
+
+    result = rt_wlan_set_mode(wlan_sta.device.parent.name, RT_WLAN_STATION);
+    if (result != RT_EOK)
+        goto fail;
+    result = rt_wlan_set_mode(wlan_ap.device.parent.name, RT_WLAN_AP);
+    if (result != RT_EOK)
+        goto fail;
 
     tid = rt_thread_create("cyw43", cyw43_thread, NULL, CYW43XX_THREAD_STACK_SIZE, CYW43XX_THREAD_PRIORITY, 10);
     rt_thread_startup(tid);
 
     return 0;
+
+fail:
+    if (ap_registered) {
+        if (wlan_ap.mode != RT_WLAN_NONE)
+            rt_wlan_set_mode(wlan_ap.device.parent.name, RT_WLAN_NONE);
+        rt_wlan_dev_unregister(&wlan_ap);
+    }
+    if (sta_registered) {
+        if (wlan_sta.mode != RT_WLAN_NONE)
+            rt_wlan_set_mode(wlan_sta.device.parent.name, RT_WLAN_NONE);
+        rt_wlan_dev_unregister(&wlan_sta);
+    }
+    return result;
 }
 
 static rt_int32_t cyw43_remove(struct rt_mmcsd_card* card)

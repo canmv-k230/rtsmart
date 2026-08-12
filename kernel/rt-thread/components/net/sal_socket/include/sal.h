@@ -43,6 +43,8 @@ typedef uint32_t socklen_t;
 #define SAL_SOCKET_OFFSET              0
 #endif
 
+struct sal_proto_family;
+
 struct sal_socket
 {
     uint32_t magic;                    /* SAL socket magic word */
@@ -52,7 +54,9 @@ struct sal_socket
     int type;
     int protocol;
 
-    struct netdev *netdev;             /* SAL network interface device */
+    struct netdev *netdev;             /* explicitly selected or initial network interface */
+    struct sal_proto_family *pf;       /* socket protocol backend */
+    rt_bool_t netdev_bound;            /* socket was bound to a netdev address */
 
     void *user_data;                   /* user-specific data */
 #ifdef SAL_USING_TLS

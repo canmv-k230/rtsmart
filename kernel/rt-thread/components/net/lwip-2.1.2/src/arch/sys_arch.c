@@ -82,6 +82,13 @@ static err_t netif_device_init(struct netif *netif)
         /* set output */
         netif->output = etharp_output;
 
+#ifdef RT_USING_NETDEV
+        if (eth_device_netdev_add(netif) != RT_EOK)
+        {
+            return ERR_IF;
+        }
+#endif
+
         return ERR_OK;
     }
 
@@ -127,9 +134,6 @@ static void tcpip_init_done_callback(void *arg)
 
             netif_add(ethif->netif, &ipaddr, &netmask, &gw,
                       ethif, netif_device_init, tcpip_input);
-
-            if (netif_default == RT_NULL)
-                netif_set_default(ethif->netif);
 
 #if LWIP_DHCP
             /* set interface up */

@@ -15,6 +15,7 @@
 
 #include "usbh_core.h"
 #include "usbh_cdc_ecm.h"
+#include "usbh_netdev.h"
 
 struct netif g_cdc_ecm_netif;
 
@@ -81,7 +82,10 @@ void usbh_cdc_ecm_run(struct usbh_cdc_ecm *cdc_ecm_class)
         cdc_ecm_dev.eth_tx = rt_usbh_cdc_ecm_eth_tx;
         cdc_ecm_dev.parent.user_data = cdc_ecm_class;
 
-        eth_device_init(&cdc_ecm_dev, CANMV_USB_HOST_NET_LTE_DEV_NAME);
+        if (canmv_usbh_netdev_init(&cdc_ecm_dev) != RT_EOK) {
+            cdc_ecm_dev.parent.user_data = RT_NULL;
+            return;
+        }
         cdc_ecm_netdev_inited = true;
     } else {
         cdc_ecm_dev.parent.user_data = cdc_ecm_class;

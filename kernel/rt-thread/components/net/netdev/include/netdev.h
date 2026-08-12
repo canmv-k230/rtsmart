@@ -69,6 +69,14 @@ enum netdev_cb_type
     NETDEV_CB_STATUS_DHCP_DISABLE,     /* disable DHCP capability */
 };
 
+enum netdev_type
+{
+    NETDEV_TYPE_UNKNOWN = 0,
+    NETDEV_TYPE_WLAN_STA,
+    NETDEV_TYPE_WLAN_AP,
+    NETDEV_TYPE_LAN,
+};
+
 struct netdev;
 
 /* function prototype for network interface device status or address change callback functions */
@@ -91,6 +99,8 @@ struct netdev
     ip_addr_t dns_servers[NETDEV_DNS_SERVERS_NUM];     /* DNS server */
     uint8_t hwaddr_len;                                /* hardware address length */
     uint8_t hwaddr[NETDEV_HWADDR_MAX_LEN];             /* hardware address */
+    uint8_t type;                                      /* network interface type */
+    uint16_t metric;                                   /* default-route metric */
     
     uint16_t flags;                                    /* network interface device status flag */
     uint16_t mtu;                                      /* maximum transfer unit (in bytes) */
@@ -153,6 +163,8 @@ int netdev_unregister(struct netdev *netdev);
 struct netdev *netdev_get_first_by_flags(uint16_t flags);
 struct netdev *netdev_get_by_ipaddr(ip_addr_t *ip_addr);
 struct netdev *netdev_get_by_name(const char *name);
+struct netdev *netdev_get_by_user_data(const void *user_data);
+struct netdev *netdev_get_by_type(enum netdev_type type);
 #ifdef RT_USING_SAL
 struct netdev *netdev_get_by_family(int family);
 int netdev_family_get(struct netdev *netdev);
@@ -160,6 +172,11 @@ int netdev_family_get(struct netdev *netdev);
 
 /* Set default network interface device in list */
 void netdev_set_default(struct netdev *netdev);
+void netdev_clear_default(void);
+void netdev_set_default_auto(struct netdev *netdev);
+void netdev_set_type(struct netdev *netdev, enum netdev_type type);
+void netdev_set_metric(struct netdev *netdev, uint16_t metric);
+rt_bool_t netdev_can_be_default(const struct netdev *netdev);
 
 /*  Set network interface device status */
 int netdev_set_up(struct netdev *netdev);
@@ -191,7 +208,7 @@ void netdev_low_level_set_status(struct netdev *netdev, rt_bool_t is_up);
 void netdev_low_level_set_link_status(struct netdev *netdev, rt_bool_t is_up);
 void netdev_low_level_set_dhcp_status(struct netdev *netdev, rt_bool_t is_enable);
 
-void netdev_change_resolv_conf(int dns_cnt, const ip_addr_t *dns_servers);
+void netdev_update_resolv_conf(void);
 
 #ifdef __cplusplus
 }

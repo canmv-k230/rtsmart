@@ -23,6 +23,9 @@ if GetDepend(['ENABLE_CHERRY_USB_DEVICE']) or GetDepend(['ENABLE_CHERRY_USB_OTG'
 
 if GetDepend(['ENABLE_CHERRY_USB_HOST']) or GetDepend(['ENABLE_CHERRY_USB_OTG']):
 
+    if GetDepend(['CHERRY_USB_HOST_ENABLE_CLASS_NET_RTL8152']) or GetDepend(['CHERRY_USB_HOST_ENABLE_CLASS_CDC_ECM']) or GetDepend(['CHERRY_USB_HOST_ENABLE_CLASS_CDC_NCM']):
+        src += Glob('usbh_netdev.c')
+
     if GetDepend(['CHERRY_USB_HOST_ENABLE_CLASS_NET_RTL8152']):
         src += Glob('usbh_net_rtl8152.c')
 

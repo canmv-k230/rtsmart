@@ -86,6 +86,10 @@ struct rt_wlan_scan_result
 int rt_wlan_init(void);
 rt_err_t rt_wlan_set_mode(const char *dev_name, rt_wlan_mode_t mode);
 rt_wlan_mode_t rt_wlan_get_mode(const char *dev_name);
+struct rt_wlan_device *rt_wlan_get_device(rt_wlan_mode_t mode);
+rt_err_t rt_wlan_select_device(rt_wlan_mode_t mode,
+                               rt_wlan_transport_t transport);
+rt_err_t rt_wlan_mgnt_unregister_device(struct rt_wlan_device *device);
 
 /*
  * wifi station mode interface
