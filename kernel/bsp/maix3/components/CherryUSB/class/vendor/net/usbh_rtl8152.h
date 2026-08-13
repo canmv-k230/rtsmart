@@ -9,13 +9,16 @@
 #include "lwip/netif.h"
 #include "lwip/pbuf.h"
 
+#define RTL8152_MAX_TX 4
+#define RTL8152_MAX_RX 4
+
 struct usbh_rtl8152 {
     struct usbh_hubport *hport;
     struct usb_endpoint_descriptor *bulkin;  /* Bulk IN endpoint */
     struct usb_endpoint_descriptor *bulkout; /* Bulk OUT endpoint */
     struct usb_endpoint_descriptor *intin;   /* INTR IN endpoint  */
-    struct usbh_urb bulkout_urb;
-    struct usbh_urb bulkin_urb;
+    struct usbh_urb bulkout_urb[RTL8152_MAX_TX];
+    struct usbh_urb bulkin_urb[RTL8152_MAX_RX];
     struct usbh_urb intin_urb;
 
     uint8_t intf;

@@ -85,6 +85,7 @@ void usbh_rtl8152_run(struct usbh_rtl8152 *rtl8152_class)
             rtl8152_dev.parent.user_data = RT_NULL;
             return;
         }
+        rtl8152_dev.flags |= ETHIF_TX_DIRECT;
         rtl8152_netdev_inited = true;
     } else {
         rtl8152_dev.parent.user_data = rtl8152_class;
