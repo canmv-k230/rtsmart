@@ -255,6 +255,15 @@ static void dwc2_init_non_isoc_dma_desc(struct dwc2_hsotg *hsotg,
         qtd->in_process = 1;
         if (qh->ep_type == USB_ENDPOINT_XFER_CONTROL)
             break;
+        /* CherryUSB marks independently submitted URBs for immediate
+         * giveback. Do not merge OUT URBs into one descriptor-DMA
+         * transaction: bulk clients rely on the short packet or ZLP at the
+         * end of each request to preserve device protocol record boundaries.
+         * IN URBs can be chained safely and need that batching to avoid one
+         * host-channel interrupt per received network frame.
+         */
+        if (!chan->ep_is_in && (qtd->urb->flags & URB_GIVEBACK_ASAP))
+            break;
         if (n_desc == MAX_DMA_DESC_NUM_GENERIC)
             break;
     }

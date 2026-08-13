@@ -1766,7 +1766,7 @@ int dwc2_hcd_init(struct dwc2_hsotg *hsotg)
         goto error5;
     }
 
-    hsotg->dwc2_urb_iso_cache = rt_mp_create("dwc2_urb_iso_cache", DWC2_MAX_URB,
+    hsotg->dwc2_urb_iso_cache = rt_mp_create("dwc2_urb_iso_cache", DWC2_MAX_ISO_URB,
                                              sizeof(struct dwc2_hcd_urb) +
                                              MAX_ISO_PACKET *
                                              sizeof(struct dwc2_hcd_iso_packet_desc));
@@ -1775,7 +1775,7 @@ int dwc2_hcd_init(struct dwc2_hsotg *hsotg)
         goto error6;
     }
 
-    hsotg->qh_cache = rt_mp_create("qh_cache", DWC2_MAX_URB, sizeof(struct dwc2_qh));
+    hsotg->qh_cache = rt_mp_create("qh_cache", DWC2_MAX_ENDPOINT, sizeof(struct dwc2_qh));
     if (!hsotg->qh_cache) {
         dev_err(hsotg->dev, "unable to create qh_cache\n");
         goto error7;
@@ -1790,7 +1790,7 @@ int dwc2_hcd_init(struct dwc2_hsotg *hsotg)
     size_t bitmap_size;
 
     bitmap_size = DWC2_ELEMENTS_PER_LS_BITMAP * sizeof(unsigned long);
-    hsotg->bitmap_size_cache = rt_mp_create("bitmap_size_cache", DWC2_MAX_URB,
+    hsotg->bitmap_size_cache = rt_mp_create("bitmap_size_cache", DWC2_MAX_ENDPOINT,
                                             sizeof(struct dwc2_tt) + bitmap_size);
     if (!hsotg->bitmap_size_cache) {
         dev_err(hsotg->dev, "unable to create bitmap_size_cache\n");
@@ -1798,7 +1798,7 @@ int dwc2_hcd_init(struct dwc2_hsotg *hsotg)
     }
 
     bitmap_size *= DWC2_MAX_CHILD;
-    hsotg->bitmap_size_multi_cache = rt_mp_create("bitmap_size_multi_cache", DWC2_MAX_URB,
+    hsotg->bitmap_size_multi_cache = rt_mp_create("bitmap_size_multi_cache", DWC2_MAX_ENDPOINT,
                                             sizeof(struct dwc2_tt) + bitmap_size);
     if (!hsotg->bitmap_size_multi_cache) {
         dev_err(hsotg->dev, "unable to create bitmap_size_multi_cache\n");
@@ -4037,31 +4037,23 @@ static int dwc2_hcd_urb_dequeue(struct dwc2_hsotg *hsotg, struct dwc2_hcd_urb *u
 int dwc2_hcd_endpoint_disable(struct usb_hcd *hcd, struct usb_host_endpoint *ep, int retry)
 {
     struct dwc2_hsotg *hsotg = dwc2_hcd_to_hsotg(hcd);
-    struct dwc2_qtd *qtd, *qtd_tmp;
     struct dwc2_qh *qh;
     rt_base_t level;
-    int rc;
 
     level = rt_spin_lock_irqsave(&hsotg->lock);
 
     qh = ep->hcpriv;
     if (!qh) {
-        rc = -EINVAL;
-        goto err;
-    }
-
-    if (!list_empty(&qh->qtd_list)) {
-        //rt_kprintf("disable ep next time\n");
         rt_spin_unlock_irqrestore(&hsotg->lock, level);
         return dwc2_cherryusb_status(-EINVAL);
     }
 
-    while (!list_empty(&qh->qtd_list) && retry--) {
-        if (retry == 0) {
+    while (!list_empty(&qh->qtd_list)) {
+        if (retry-- <= 0) {
             dev_err(hsotg->dev,
                     "## timeout in dwc2_hcd_endpoint_disable() ##\n");
-            rc = -EBUSY;
-            goto err;
+            rt_spin_unlock_irqrestore(&hsotg->lock, level);
+            return dwc2_cherryusb_status(-EBUSY);
         }
 
         rt_spin_unlock_irqrestore(&hsotg->lock, level);
@@ -4069,17 +4061,12 @@ int dwc2_hcd_endpoint_disable(struct usb_hcd *hcd, struct usb_host_endpoint *ep,
         level = rt_spin_lock_irqsave(&hsotg->lock);
         qh = ep->hcpriv;
         if (!qh) {
-            rc = -EINVAL;
-            goto err;
+            rt_spin_unlock_irqrestore(&hsotg->lock, level);
+            return 0;
         }
     }
 
     dwc2_hcd_qh_unlink(hsotg, qh);
-
-    /* Free each QTD in the QH's QTD list */
-    list_for_each_entry_safe(qtd, qtd_tmp, &qh->qtd_list, qtd_list_entry)
-        dwc2_hcd_qtd_unlink_and_free(hsotg, qtd, qh);
-
     ep->hcpriv = NULL;
 
     if (qh->channel && qh->channel->qh == qh)
@@ -4090,12 +4077,6 @@ int dwc2_hcd_endpoint_disable(struct usb_hcd *hcd, struct usb_host_endpoint *ep,
     dwc2_hcd_qh_free(hsotg, qh);
 
     return 0;
-
-err:
-    ep->hcpriv = NULL;
-    rt_spin_unlock_irqrestore(&hsotg->lock, level);
-
-    return dwc2_cherryusb_status(rc);
 }
 
 /*

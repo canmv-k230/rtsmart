@@ -12,7 +12,6 @@
  * 11. iso
  * 12. WARN_ON is assert, memset
  * 13. usb_hcd_unlink_urb_from_ep(urb->hcpriv will all lock)(urb->hport == NULL)
- * 14. dwc2_hcd_endpoint_disable will unuse all urb in this ep, so now we only submit one urb on one ep
  *
  * */
 

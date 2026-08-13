@@ -12,7 +12,9 @@
 #define INTERRUPT_MALLOC (1)
 /* relate  UVC_MAX_PACKETS in usbh_uvc_thr.c */
 #define MAX_ISO_PACKET (32)
-#define DWC2_MAX_URB (16)
+#define DWC2_MAX_URB (128)
+#define DWC2_MAX_ISO_URB (64)
+#define DWC2_MAX_ENDPOINT (64)
 #define DWC2_MAX_CHILD (10)
 
 #define DWC2_BH_HANDLE (1)
