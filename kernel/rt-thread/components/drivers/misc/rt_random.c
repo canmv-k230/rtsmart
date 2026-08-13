@@ -21,17 +21,39 @@ static rt_uint16_t calc_random(void)
 
 static rt_size_t random_read(rt_device_t dev, rt_off_t pos, void *buffer, rt_size_t size)
 {
-    rt_uint16_t rand = calc_random();
-    ssize_t ret = sizeof(rand);
-    rt_memcpy(buffer, &rand, ret);
-    return ret;
+    rt_uint8_t *data = buffer;
+    rt_size_t offset = 0;
+
+    while (offset < size)
+    {
+        rt_uint16_t value = calc_random();
+        rt_size_t copy_size = size - offset;
+
+        if (copy_size > sizeof(value))
+        {
+            copy_size = sizeof(value);
+        }
+        rt_memcpy(data + offset, &value, copy_size);
+        offset += copy_size;
+    }
+
+    return size;
 }
 
 static rt_size_t random_write(rt_device_t dev, rt_off_t pos, const void *buffer, rt_size_t size)
 {
-    ssize_t ret = sizeof(seed);
-    rt_memcpy(&seed, buffer, ret);
-    return ret;
+    rt_size_t copy_size = size;
+
+    if (copy_size > sizeof(seed))
+    {
+        copy_size = sizeof(seed);
+    }
+    if (copy_size > 0)
+    {
+        rt_memcpy(&seed, buffer, copy_size);
+    }
+
+    return size;
 }
 
 static rt_err_t  random_control(rt_device_t dev, int cmd, void *args)
@@ -95,17 +117,39 @@ static rt_uint16_t calc_urandom(void)
 
 static rt_size_t random_uread(rt_device_t dev, rt_off_t pos, void *buffer, rt_size_t size)
 {
-    rt_uint16_t rand = calc_urandom();
-    ssize_t ret = sizeof(rand);
-    rt_memcpy(buffer, &rand, ret);
-    return ret;
+    rt_uint8_t *data = buffer;
+    rt_size_t offset = 0;
+
+    while (offset < size)
+    {
+        rt_uint16_t value = calc_urandom();
+        rt_size_t copy_size = size - offset;
+
+        if (copy_size > sizeof(value))
+        {
+            copy_size = sizeof(value);
+        }
+        rt_memcpy(data + offset, &value, copy_size);
+        offset += copy_size;
+    }
+
+    return size;
 }
 
 static rt_size_t random_uwrite(rt_device_t dev, rt_off_t pos, const void *buffer, rt_size_t size)
 {
-    ssize_t ret = sizeof(useed);
-    rt_memcpy(&useed, buffer, ret);
-    return ret;
+    rt_size_t copy_size = size;
+
+    if (copy_size > sizeof(useed))
+    {
+        copy_size = sizeof(useed);
+    }
+    if (copy_size > 0)
+    {
+        rt_memcpy(&useed, buffer, copy_size);
+    }
+
+    return size;
 }
 
 static rt_err_t random_ucontrol(rt_device_t dev, int cmd, void *args)
