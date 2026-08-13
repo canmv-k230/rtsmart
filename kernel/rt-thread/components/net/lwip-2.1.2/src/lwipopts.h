@@ -9,12 +9,7 @@
 #define LWIP_SOCKET_POLL 1
 
 #define LWIP_IPV4                   1
-
-#ifdef RT_USING_LWIP_IPV6
-#define LWIP_IPV6                   1
-#else
 #define LWIP_IPV6                   0
-#endif /* RT_USING_LWIP_IPV6 */
 
 #define NO_SYS                      0
 #define LWIP_SOCKET                 1
@@ -43,8 +38,6 @@
 #else
 #define LWIP_DNS                    0
 #endif
-
-#define LWIP_HAVE_LOOPIF            0
 
 #define LWIP_PLATFORM_BYTESWAP      0
 
@@ -249,8 +242,11 @@
 #define MEM_ALIGNMENT               4
 #endif
 
-#define MEMP_OVERFLOW_CHECK         1 ////
-#define LWIP_ALLOW_MEM_FREE_FROM_OTHER_CONTEXT 1 ////
+#ifdef RT_LWIP_DEBUG
+#define MEMP_OVERFLOW_CHECK         1
+#else
+#define MEMP_OVERFLOW_CHECK         0
+#endif
 //#define MEM_LIBC_MALLOC             1
 //#define MEM_USE_POOLS               1
 //#define MEMP_USE_CUSTOM_POOLS       1
@@ -360,6 +356,9 @@
    order. Define to 0 if your device is low on memory. */
 #define TCP_QUEUE_OOSEQ             1
 
+/* Respect the backlog requested by listen(). */
+#define TCP_LISTEN_BACKLOG          1
+
 /* TCP Maximum segment size. */
 #define TCP_MSS                     1460
 
@@ -437,7 +436,7 @@
 #ifdef RT_LWIP_REASSEMBLY_FRAG
 #define IP_REASSEMBLY               1
 #define IP_FRAG                     1
-#define IP_REASS_MAX_PBUFS          10
+#define IP_REASS_MAX_PBUFS          64
 #define MEMP_NUM_REASSDATA          10
 #else
 #define IP_REASSEMBLY               0
@@ -629,6 +628,17 @@
 #ifndef LWIP_SO_RCVBUF
 #define LWIP_SO_RCVBUF                  1
 #endif
+
+#ifndef LWIP_SO_SNDBUF
+#define LWIP_SO_SNDBUF                  1
+#endif
+
+#ifndef LWIP_SO_LINGER
+#define LWIP_SO_LINGER                  1
+#endif
+
+/* Match Linux FIONREAD semantics for datagram sockets. */
+#define LWIP_FIONREAD_LINUXMODE          1
 
 /**
  * If LWIP_SO_RCVBUF is used, this is the default value for recv_bufsize.

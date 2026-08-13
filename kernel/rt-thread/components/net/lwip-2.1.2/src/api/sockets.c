@@ -3003,6 +3003,12 @@ lwip_getsockopt_impl(int s, int level, int optname, void *optval, socklen_t *opt
           *(int *)optval = netconn_get_recvbufsize(sock->conn);
           break;
 #endif /* LWIP_SO_RCVBUF */
+#if LWIP_SO_SNDBUF
+        case SO_SNDBUF:
+          LWIP_SOCKOPT_CHECK_OPTLEN_CONN(sock, *optlen, int);
+          *(int *)optval = SEND_BUFSIZE_DEFAULT;
+          break;
+#endif /* LWIP_SO_SNDBUF */
 #if LWIP_SO_LINGER
         case SO_LINGER: {
           s16_t conn_linger;
@@ -3109,6 +3115,11 @@ lwip_getsockopt_impl(int s, int level, int optname, void *optval, socklen_t *opt
           *(int *)optval = tcp_nagle_disabled(sock->conn->pcb.tcp);
           LWIP_DEBUGF(SOCKETS_DEBUG, ("lwip_getsockopt(%d, IPPROTO_TCP, TCP_NODELAY) = %s\n",
                                       s, (*(int *)optval) ? "on" : "off") );
+          break;
+        case TCP_MAXSEG:
+          *(int *)optval = (int)tcp_mss(sock->conn->pcb.tcp);
+          LWIP_DEBUGF(SOCKETS_DEBUG, ("lwip_getsockopt(%d, IPPROTO_TCP, TCP_MAXSEG) = %d\n",
+                                      s, *(int *)optval));
           break;
         case TCP_KEEPALIVE:
           *(int *)optval = (int)sock->conn->pcb.tcp->keep_idle;
@@ -3403,6 +3414,19 @@ lwip_setsockopt_impl(int s, int level, int optname, const void *optval, socklen_
           netconn_set_recvbufsize(sock->conn, *(const int *)optval);
           break;
 #endif /* LWIP_SO_RCVBUF */
+#if LWIP_SO_SNDBUF
+        case SO_SNDBUF:
+          LWIP_SOCKOPT_CHECK_OPTLEN_CONN(sock, optlen, int);
+          if (*(const int *)optval <= 0) {
+            done_socket(sock);
+            return EINVAL;
+          }
+          if (*(const int *)optval > SEND_BUFSIZE_DEFAULT) {
+            done_socket(sock);
+            return ENOBUFS;
+          }
+          break;
+#endif /* LWIP_SO_SNDBUF */
 #if LWIP_SO_LINGER
         case SO_LINGER: {
           const struct linger *linger = (const struct linger *)optval;

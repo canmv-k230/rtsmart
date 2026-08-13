@@ -208,7 +208,7 @@ struct ifreq {
 #define SO_DONTLINGER   ((int)(~SO_LINGER))
 #define SO_OOBINLINE    0x0100 /* Unimplemented: leave received OOB data in line */
 #define SO_REUSEPORT    0x0200 /* Unimplemented: allow local address & port reuse */
-#define SO_SNDBUF       0x1001 /* Unimplemented: send buffer size */
+#define SO_SNDBUF       0x1001 /* send buffer size */
 #define SO_RCVBUF       0x1002 /* receive buffer size */
 #define SO_SNDLOWAT     0x1003 /* Unimplemented: send low-water mark */
 #define SO_RCVLOWAT     0x1004 /* Unimplemented: receive low-water mark */
@@ -283,6 +283,7 @@ struct linger {
 #define TCP_KEEPIDLE   0x03    /* set pcb->keep_idle  - Same as TCP_KEEPALIVE, but use seconds for get/setsockopt */
 #define TCP_KEEPINTVL  0x04    /* set pcb->keep_intvl - Use seconds for get/setsockopt */
 #define TCP_KEEPCNT    0x05    /* set pcb->keep_cnt   - Use number of probes sent for get/setsockopt */
+#define TCP_MAXSEG     0x06    /* get maximum TCP segment size */
 #endif /* LWIP_TCP */
 
 #if LWIP_IPV6

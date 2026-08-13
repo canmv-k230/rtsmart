@@ -190,6 +190,7 @@ extern void set_user_context(void *stack);
 
 /* IPPROTO_TCP option names */
 #define INTF_TCP_NODELAY    1
+#define INTF_TCP_MAXSEG     2
 #define INTF_TCP_KEEPALIVE  9
 #define INTF_TCP_KEEPIDLE   4
 #define INTF_TCP_KEEPINTVL  5
@@ -200,6 +201,7 @@ extern void set_user_context(void *stack);
 #define IMPL_TCP_KEEPIDLE   0x03
 #define IMPL_TCP_KEEPINTVL  0x04
 #define IMPL_TCP_KEEPCNT    0x05
+#define IMPL_TCP_MAXSEG     0x06
 
 /* IPPROTO_IPV6 option names */
 #define INTF_IPV6_V6ONLY    26
@@ -319,6 +321,9 @@ static void convert_sockopt(int *level, int *optname)
             case INTF_TCP_NODELAY:
                 *optname = IMPL_TCP_NODELAY;
                 break;
+            case INTF_TCP_MAXSEG:
+                *optname = IMPL_TCP_MAXSEG;
+                break;
             case INTF_TCP_KEEPALIVE:
                 *optname = IMPL_TCP_KEEPALIVE;
                 break;
@@ -375,6 +380,45 @@ static void convert_sockopt(int *level, int *optname)
         }
     }
 #endif
+
+#ifdef RT_USING_SAL
+#define LWP_SOCKOPT_MAX_LEN  (64 * 1024)
+
+static int sockaddr_from_user(const struct musl_sockaddr *name, socklen_t namelen,
+        struct sockaddr *sa)
+{
+    struct musl_sockaddr kname;
+
+    if (!name)
+    {
+        return -EFAULT;
+    }
+    if (namelen < sizeof(kname))
+    {
+        return -EINVAL;
+    }
+    if (!lwp_user_accessable((void *)name, sizeof(kname)) ||
+            lwp_get_from_user(&kname, (void *)name, sizeof(kname)) != sizeof(kname))
+    {
+        return -EFAULT;
+    }
+    if (kname.sa_family == AF_INET6)
+    {
+        return -EAFNOSUPPORT;
+    }
+    if (kname.sa_family != AF_INET
+#ifdef SAL_USING_AF_UNIX
+            && kname.sa_family != AF_UNIX
+#endif
+       )
+    {
+        return -EAFNOSUPPORT;
+    }
+
+    sockaddr_tolwip(&kname, sa);
+    return 0;
+}
+#endif /* RT_USING_SAL */
 
 static void _crt_thread_entry(void *parameter)
 {
@@ -2885,31 +2929,22 @@ int sys_bind(int socket, const struct musl_sockaddr *name, socklen_t namelen)
 {
     int ret;
     struct sockaddr sa;
-    struct musl_sockaddr kname;
 
-    if (!lwp_user_accessable((void *)name, namelen))
+    ret = sockaddr_from_user(name, namelen, &sa);
+    if (ret < 0)
     {
-        return -EFAULT;
+        return ret;
     }
 
-#ifdef SAL_USING_AF_UNIX
-    if (name->sa_family  == AF_UNIX)
-    {
-        namelen = sizeof(struct sockaddr);
-    }
-#endif /* SAL_USING_AF_UNIX */
-
-    lwp_get_from_user(&kname, (void *)name, namelen);
-
-    sockaddr_tolwip(&kname, &sa);
-
-    ret = bind(socket, &sa, namelen);
+    ret = bind(socket, &sa, sizeof(sa));
     return (ret < 0 ? GET_ERRNO() : ret);
 }
 
 int sys_shutdown(int socket, int how)
 {
-    return shutdown(socket, how);
+    int ret = shutdown(socket, how);
+
+    return (ret < 0 ? GET_ERRNO() : ret);
 }
 
 int sys_getpeername (int socket, struct musl_sockaddr *name, socklen_t *namelen)
@@ -3001,8 +3036,45 @@ int sys_getsockname (int socket, struct musl_sockaddr *name, socklen_t *namelen)
 int sys_getsockopt(int socket, int level, int optname, void *optval, socklen_t *optlen)
 {
     int ret;
+    void *koptval;
+    socklen_t koptlen;
+    socklen_t user_optlen;
+
+    if (!lwp_user_accessable(optlen, sizeof(*optlen)) ||
+            lwp_get_from_user(&user_optlen, optlen, sizeof(user_optlen)) != sizeof(user_optlen))
+    {
+        return -EFAULT;
+    }
+    if (!optval || user_optlen == 0 || user_optlen > LWP_SOCKOPT_MAX_LEN)
+    {
+        return -EINVAL;
+    }
+    if (!lwp_user_accessable(optval, user_optlen))
+    {
+        return -EFAULT;
+    }
+
+    koptval = rt_malloc(user_optlen);
+    if (!koptval)
+    {
+        return -ENOMEM;
+    }
+
+    koptlen = user_optlen;
     convert_sockopt(&level, &optname);
-    ret = getsockopt(socket, level, optname, optval, optlen);
+    ret = getsockopt(socket, level, optname, koptval, &koptlen);
+    if (ret == 0)
+    {
+        socklen_t copy_len = koptlen < user_optlen ? koptlen : user_optlen;
+
+        if (lwp_put_to_user(optval, koptval, copy_len) != copy_len ||
+                lwp_put_to_user(optlen, &koptlen, sizeof(koptlen)) != sizeof(koptlen))
+        {
+            rt_free(koptval);
+            return -EFAULT;
+        }
+    }
+    rt_free(koptval);
 
     return (ret < 0 ? GET_ERRNO() : ret);
 }
@@ -3010,8 +3082,36 @@ int sys_getsockopt(int socket, int level, int optname, void *optval, socklen_t *
 int sys_setsockopt(int socket, int level, int optname, const void *optval, socklen_t optlen)
 {
     int ret;
+    void *koptval;
+
+    if (!optval)
+    {
+        return -EFAULT;
+    }
+    if (optlen == 0 || optlen > LWP_SOCKOPT_MAX_LEN)
+    {
+        return -EINVAL;
+    }
+    if (!lwp_user_accessable((void *)optval, optlen))
+    {
+        return -EFAULT;
+    }
+
+    koptval = rt_malloc(optlen);
+    if (!koptval)
+    {
+        return -ENOMEM;
+    }
+    if (lwp_get_from_user(koptval, (void *)optval, optlen) != optlen)
+    {
+        rt_free(koptval);
+        return -EFAULT;
+    }
+
     convert_sockopt(&level, &optname);
-    ret = setsockopt(socket, level, optname, optval, optlen);
+    ret = setsockopt(socket, level, optname, koptval, optlen);
+    rt_free(koptval);
+
     return (ret < 0 ? GET_ERRNO() : ret);
 }
 
@@ -3019,31 +3119,22 @@ int sys_connect(int socket, const struct musl_sockaddr *name, socklen_t namelen)
 {
     int ret;
     struct sockaddr sa;
-    struct musl_sockaddr kname;
 
-    if (!lwp_user_accessable((void *)name, namelen))
+    ret = sockaddr_from_user(name, namelen, &sa);
+    if (ret < 0)
     {
-        return -EFAULT;
+        return ret;
     }
 
-#ifdef SAL_USING_AF_UNIX
-    if (name->sa_family  == AF_UNIX)
-    {
-        namelen = sizeof(struct sockaddr);
-    }
-#endif /* SAL_USING_AF_UNIX */
-
-    lwp_get_from_user(&kname, (void *)name, namelen);
-
-    sockaddr_tolwip(&kname, &sa);
-
-    ret = connect(socket, &sa, namelen);
+    ret = connect(socket, &sa, sizeof(sa));
     return (ret < 0 ? GET_ERRNO() : ret);
 }
 
 int sys_listen(int socket, int backlog)
 {
-    return listen(socket, backlog);
+    int ret = listen(socket, backlog);
+
+    return (ret < 0 ? GET_ERRNO() : ret);
 }
 
 #define MUSLC_MSG_OOB       0x0001
@@ -3216,22 +3307,15 @@ int sys_sendto(int socket, const void *dataptr, size_t size, int flags,
     if (to)
     {
         struct sockaddr sa;
-        struct musl_sockaddr kto;
 
-        if (tolen < sizeof(kto))
+        ret = sockaddr_from_user(to, tolen, &sa);
+        if (ret < 0)
         {
             kmem_put(kmem);
-            return -EINVAL;
+            return ret;
         }
-        if (!lwp_user_accessable((void *)to, sizeof(kto)))
-        {
-            kmem_put(kmem);
-            return -EFAULT;
-        }
-        lwp_get_from_user(&kto, (void *)to, sizeof(kto));
-        sockaddr_tolwip(&kto, &sa);
 
-        ret = sendto(socket, kmem, size, flgs, &sa, tolen);
+        ret = sendto(socket, kmem, size, flgs, &sa, sizeof(sa));
     }
     else
     {
@@ -3266,6 +3350,11 @@ int sys_socket(int domain, int type, int protocol)
 {
     int fd = -1;
     int nonblock = 0;
+
+    if (domain == AF_INET6)
+    {
+        return -EAFNOSUPPORT;
+    }
     /* not support SOCK_CLOEXEC type */
     if (type & SOCK_CLOEXEC)
     {

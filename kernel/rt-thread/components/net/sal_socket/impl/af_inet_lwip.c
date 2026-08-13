@@ -316,11 +316,7 @@ static const struct sal_netdb_ops lwip_netdb_ops =
 static const struct sal_proto_family lwip_inet_family =
 {
     AF_INET,
-#if LWIP_VERSION > 0x2000000
-    AF_INET6,
-#else
     AF_INET,
-#endif 
     &lwip_socket_ops,
     &lwip_netdb_ops,
 };

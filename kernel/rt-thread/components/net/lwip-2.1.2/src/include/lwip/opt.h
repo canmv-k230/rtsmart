@@ -2013,6 +2013,15 @@
 #endif
 
 /**
+ * LWIP_SO_SNDBUF==1: Enable limited SO_SNDBUF processing.
+ * lwIP allocates its TCP send buffer at compile time, so this option reports
+ * the configured capacity and accepts requests that do not exceed it.
+ */
+#if !defined LWIP_SO_SNDBUF || defined __DOXYGEN__
+#define LWIP_SO_SNDBUF                  0
+#endif
+
+/**
  * LWIP_SO_LINGER==1: Enable SO_LINGER processing.
  */
 #if !defined LWIP_SO_LINGER || defined __DOXYGEN__
@@ -2024,6 +2033,17 @@
  */
 #if !defined RECV_BUFSIZE_DEFAULT || defined __DOXYGEN__
 #define RECV_BUFSIZE_DEFAULT            INT_MAX
+#endif
+
+/**
+ * Fixed send-buffer capacity reported by SO_SNDBUF.
+ */
+#if !defined SEND_BUFSIZE_DEFAULT || defined __DOXYGEN__
+#if LWIP_TCP
+#define SEND_BUFSIZE_DEFAULT            TCP_SND_BUF
+#else
+#define SEND_BUFSIZE_DEFAULT            65535
+#endif
 #endif
 
 /**

@@ -431,6 +431,12 @@ static err_t ethernetif_linkoutput(struct netif *netif, struct pbuf *p)
         return ERR_IF;
     }
 
+    if (enetif->flags & ETHIF_TX_DIRECT)
+    {
+        return enetif->eth_tx(&(enetif->parent), p) == RT_EOK ?
+               ERR_OK : ERR_BUF;
+    }
+
     /* send a message to eth tx thread */
     msg.netif = netif;
     msg.device = enetif;

@@ -14,6 +14,8 @@
 /* eth flag with auto_linkup or phy_linkup */
 #define ETHIF_LINK_AUTOUP	0x0000
 #define ETHIF_LINK_PHYUP	0x0100
+/* eth_tx consumes or copies the pbuf before returning. */
+#define ETHIF_TX_DIRECT		0x0200
 
 struct eth_device
 {
