@@ -45,6 +45,30 @@ typedef uint32_t socklen_t;
 
 struct sal_proto_family;
 
+struct sal_iovec
+{
+    void *iov_base;
+    size_t iov_len;
+};
+
+struct sal_msghdr
+{
+    void *msg_name;
+    socklen_t msg_namelen;
+    struct sal_iovec *msg_iov;
+    int msg_iovlen;
+    void *msg_control;
+    socklen_t msg_controllen;
+    int msg_flags;
+};
+
+struct sal_cmsghdr
+{
+    socklen_t cmsg_len;
+    int cmsg_level;
+    int cmsg_type;
+};
+
 struct sal_socket
 {
     uint32_t magic;                    /* SAL socket magic word */
@@ -75,6 +99,8 @@ struct sal_socket_ops
     int (*accept)     (int s, struct sockaddr *addr, socklen_t *addrlen);
     int (*sendto)     (int s, const void *data, size_t size, int flags, const struct sockaddr *to, socklen_t tolen);
     int (*recvfrom)   (int s, void *mem, size_t len, int flags, struct sockaddr *from, socklen_t *fromlen);
+    int (*sendmsg)    (int s, const struct sal_msghdr *message, int flags);
+    int (*recvmsg)    (int s, struct sal_msghdr *message, int flags);
     int (*getsockopt) (int s, int level, int optname, void *optval, socklen_t *optlen);
     int (*setsockopt) (int s, int level, int optname, const void *optval, socklen_t optlen);
     int (*shutdown)   (int s, int how);

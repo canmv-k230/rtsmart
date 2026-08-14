@@ -81,6 +81,12 @@ struct lwip_sock {
 
 extern struct lwip_sock *lwip_tryget_socket(int s);
 
+#if LWIP_VERSION >= 0x02020000
+#define SAL_NETCONN_SOCKET(conn) ((conn)->callback_arg.socket)
+#else
+#define SAL_NETCONN_SOCKET(conn) ((conn)->socket)
+#endif
+
 static void event_callback(struct netconn *conn, enum netconn_evt evt, u16_t len)
 {
     int s;
@@ -93,7 +99,7 @@ static void event_callback(struct netconn *conn, enum netconn_evt evt, u16_t len
     /* Get socket */
     if (conn)
     {
-        s = conn->socket;
+        s = SAL_NETCONN_SOCKET(conn);
         if (s < 0)
         {
             /* Data comes in right away after an accept, even though
@@ -102,16 +108,16 @@ static void event_callback(struct netconn *conn, enum netconn_evt evt, u16_t len
              * will use the data later. Note that only receive events
              * can happen before the new socket is set up. */
             SYS_ARCH_PROTECT(lev);
-            if (conn->socket < 0)
+            if (SAL_NETCONN_SOCKET(conn) < 0)
             {
                 if (evt == NETCONN_EVT_RCVPLUS)
                 {
-                    conn->socket--;
+                    SAL_NETCONN_SOCKET(conn)--;
                 }
                 SYS_ARCH_UNPROTECT(lev);
                 return;
             }
-            s = conn->socket;
+            s = SAL_NETCONN_SOCKET(conn);
             SYS_ARCH_UNPROTECT(lev);
         }
 
@@ -223,13 +229,89 @@ static int inet_getsockname(int socket, struct sockaddr *name, socklen_t *namele
     return lwip_getsockname(socket, name, namelen);
 }
 
+#if LWIP_VERSION >= 0x02010000
+static int inet_sendmsg(int socket, const struct sal_msghdr *message, int flags)
+{
+    struct msghdr lwip_message;
+    struct iovec *lwip_iov;
+    int i;
+    int ret;
+
+    lwip_iov = rt_malloc(sizeof(*lwip_iov) * message->msg_iovlen);
+    if (lwip_iov == RT_NULL)
+    {
+        rt_set_errno(-ENOMEM);
+        return -1;
+    }
+
+    for (i = 0; i < message->msg_iovlen; i++)
+    {
+        lwip_iov[i].iov_base = message->msg_iov[i].iov_base;
+        lwip_iov[i].iov_len = message->msg_iov[i].iov_len;
+    }
+
+    lwip_message.msg_name = message->msg_name;
+    lwip_message.msg_namelen = message->msg_namelen;
+    lwip_message.msg_iov = lwip_iov;
+    lwip_message.msg_iovlen = message->msg_iovlen;
+    lwip_message.msg_control = message->msg_control;
+    lwip_message.msg_controllen = message->msg_controllen;
+    lwip_message.msg_flags = message->msg_flags;
+
+    ret = (int)lwip_sendmsg(socket, &lwip_message, flags);
+    rt_free(lwip_iov);
+    return ret;
+}
+
+static int inet_recvmsg(int socket, struct sal_msghdr *message, int flags)
+{
+    struct msghdr lwip_message;
+    struct iovec *lwip_iov;
+    int i;
+    int ret;
+
+    lwip_iov = rt_malloc(sizeof(*lwip_iov) * message->msg_iovlen);
+    if (lwip_iov == RT_NULL)
+    {
+        rt_set_errno(-ENOMEM);
+        return -1;
+    }
+
+    for (i = 0; i < message->msg_iovlen; i++)
+    {
+        lwip_iov[i].iov_base = message->msg_iov[i].iov_base;
+        lwip_iov[i].iov_len = message->msg_iov[i].iov_len;
+    }
+
+    lwip_message.msg_name = message->msg_name;
+    lwip_message.msg_namelen = message->msg_namelen;
+    lwip_message.msg_iov = lwip_iov;
+    lwip_message.msg_iovlen = message->msg_iovlen;
+    lwip_message.msg_control = message->msg_control;
+    lwip_message.msg_controllen = message->msg_controllen;
+    lwip_message.msg_flags = message->msg_flags;
+
+    ret = (int)lwip_recvmsg(socket, &lwip_message, flags);
+    message->msg_namelen = lwip_message.msg_namelen;
+    message->msg_controllen = lwip_message.msg_controllen;
+    message->msg_flags = lwip_message.msg_flags;
+    rt_free(lwip_iov);
+    return ret;
+}
+#endif /* LWIP_VERSION >= 2.1.0 */
+
 int inet_ioctlsocket(int socket, long cmd, void *arg)
 {
     switch (cmd)
     {
     case F_GETFL:
+        return lwip_fcntl(socket, cmd, 0);
+
     case F_SETFL:
-        return lwip_fcntl(socket, cmd, (int)(size_t)arg);
+        /* musl adds O_LARGEFILE to F_SETFL. It is not a mutable socket
+         * status flag and lwIP otherwise rejects it with ENOSYS. */
+        return lwip_fcntl(socket, cmd,
+                ((int)(size_t)arg & O_NONBLOCK) ? O_NONBLOCK : 0);
 
     default:
         return lwip_ioctl(socket, cmd, arg);
@@ -293,6 +375,13 @@ static const struct sal_socket_ops lwip_socket_ops =
     inet_accept,
     (int (*)(int, const void *, size_t, int, const struct sockaddr *, socklen_t))lwip_sendto,
     (int (*)(int, void *, size_t, int, struct sockaddr *, socklen_t *))lwip_recvfrom,
+#if LWIP_VERSION >= 0x02010000
+    inet_sendmsg,
+    inet_recvmsg,
+#else
+    RT_NULL,
+    RT_NULL,
+#endif
     lwip_getsockopt,
     //TODO fix on 1.4.1
     lwip_setsockopt,

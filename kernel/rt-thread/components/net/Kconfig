@@ -126,6 +126,9 @@ config RT_USING_LWIP
             config RT_USING_LWIP212
                 bool "lwIP v2.1.2"
 
+            config RT_USING_LWIP221
+                bool "lwIP v2.2.1"
+
         endchoice
 
         config RT_LWIP_MEM_ALIGNMENT

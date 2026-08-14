@@ -15,6 +15,7 @@
 /* RT-Thread System call */
 #include <rthw.h>
 #include <board.h>
+#include <stddef.h>
 
 #include <lwp.h>
 #include "tick.h"
@@ -24,6 +25,7 @@
 #endif
 
 #ifdef RT_USING_DFS
+#include <dfs_net.h>
 #include <dfs_poll.h>
 #include <dfs_posix.h>
 #include <dfs_select.h>
@@ -86,6 +88,50 @@ struct musl_sockaddr
     uint16_t sa_family;
     char     sa_data[14];
 };
+
+struct musl_iovec
+{
+    void *iov_base;
+    size_t iov_len;
+};
+
+/* musl keeps Linux-compatible padding around the 32-bit length fields. */
+struct musl_msghdr
+{
+    void *msg_name;
+    socklen_t msg_namelen;
+    int __pad_name;
+    struct musl_iovec *msg_iov;
+    int msg_iovlen;
+    int __pad_iov;
+    void *msg_control;
+    socklen_t msg_controllen;
+    int __pad_control;
+    int msg_flags;
+};
+
+struct musl_cmsghdr
+{
+    socklen_t cmsg_len;
+    int __pad;
+    int cmsg_level;
+    int cmsg_type;
+};
+
+#define LWP_ABI_ASSERT(name, condition) \
+    typedef char lwp_abi_assert_##name[(condition) ? 1 : -1]
+
+LWP_ABI_ASSERT(socklen_size, sizeof(socklen_t) == 4);
+LWP_ABI_ASSERT(iovec_size, sizeof(struct musl_iovec) == 16);
+LWP_ABI_ASSERT(msghdr_size, sizeof(struct musl_msghdr) == 56);
+LWP_ABI_ASSERT(msghdr_name_offset, offsetof(struct musl_msghdr, msg_name) == 0);
+LWP_ABI_ASSERT(msghdr_namelen_offset, offsetof(struct musl_msghdr, msg_namelen) == 8);
+LWP_ABI_ASSERT(msghdr_iov_offset, offsetof(struct musl_msghdr, msg_iov) == 16);
+LWP_ABI_ASSERT(msghdr_iovlen_offset, offsetof(struct musl_msghdr, msg_iovlen) == 24);
+LWP_ABI_ASSERT(msghdr_control_offset, offsetof(struct musl_msghdr, msg_control) == 32);
+LWP_ABI_ASSERT(msghdr_controllen_offset, offsetof(struct musl_msghdr, msg_controllen) == 40);
+LWP_ABI_ASSERT(msghdr_flags_offset, offsetof(struct musl_msghdr, msg_flags) == 48);
+LWP_ABI_ASSERT(cmsghdr_size, sizeof(struct musl_cmsghdr) == 16);
 
 int sys_dup(int oldfd);
 int sys_dup2(int oldfd, int new);
@@ -152,6 +198,7 @@ extern void set_user_context(void *stack);
 #define INTF_SO_SNDBUF      7
 #define INTF_SO_SNDLOWAT    19
 #define INTF_SO_RCVLOWAT    18
+#define INTF_SO_BINDTODEVICE 25
 
 #define IMPL_SO_BROADCAST   0x0020
 #define IMPL_SO_KEEPALIVE   0x0008
@@ -170,6 +217,7 @@ extern void set_user_context(void *stack);
 #define IMPL_SO_SNDBUF      0x1001
 #define IMPL_SO_SNDLOWAT    0x1003
 #define IMPL_SO_RCVLOWAT    0x1004
+#define IMPL_SO_BINDTODEVICE 0x100b
 
 /* IPPROTO_IP option names */
 #define INTF_IP_TTL 2
@@ -251,6 +299,9 @@ static void convert_sockopt(int *level, int *optname)
                 break;
             case INTF_SO_RCVLOWAT:
                 *optname = IMPL_SO_RCVLOWAT;
+                break;
+            case INTF_SO_BINDTODEVICE:
+                *optname = IMPL_SO_BINDTODEVICE;
                 break;
             case INTF_SO_SNDTIMEO:
                 *optname = IMPL_SO_SNDTIMEO;
@@ -3142,6 +3193,11 @@ int sys_listen(int socket, int backlog)
 #define MUSLC_MSG_DONTWAIT  0x0040
 #define MUSLC_MSG_WAITALL   0x0100
 #define MUSLC_MSG_MORE      0x8000
+#define MUSLC_MSG_TRUNC     0x0020
+#define MUSLC_MSG_NOSIGNAL  0x4000
+
+#define LWP_MSG_IOV_MAX     1024
+#define LWP_MSG_CONTROL_MAX (64 * 1024)
 
 static int netflags_muslc_2_lwip(int flags)
 {
@@ -3344,6 +3400,424 @@ int sys_sendto(int socket, const void *dataptr, size_t size, int flags,
 int sys_send(int socket, const void *dataptr, size_t size, int flags)
 {
     return sys_sendto(socket, dataptr, size, flags, RT_NULL, 0);
+}
+
+static int copy_msghdr_from_user(struct musl_msghdr *message,
+        struct musl_msghdr *kmessage, struct musl_iovec **user_iov,
+        struct sal_iovec **kernel_iov, int *kernel_iovlen,
+        void **kernel_data, size_t *total_len)
+{
+    struct musl_iovec *kiov;
+    struct sal_iovec *siov;
+    void *data;
+    size_t total = 0;
+    size_t offset = 0;
+    int siov_count = 0;
+    int alloc_iov_count;
+    int i;
+
+    if (!message || !lwp_user_accessable(message, sizeof(*message)) ||
+            lwp_get_from_user(kmessage, message, sizeof(*kmessage)) != sizeof(*kmessage))
+    {
+        return -EFAULT;
+    }
+    if (kmessage->msg_iovlen < 0 || kmessage->msg_iovlen > LWP_MSG_IOV_MAX)
+    {
+        return -EMSGSIZE;
+    }
+    if (kmessage->msg_iovlen > 0 &&
+            (!kmessage->msg_iov || !lwp_user_accessable(kmessage->msg_iov,
+                sizeof(*kiov) * kmessage->msg_iovlen)))
+    {
+        return -EFAULT;
+    }
+
+    alloc_iov_count = kmessage->msg_iovlen ? kmessage->msg_iovlen : 1;
+    kiov = kmessage->msg_iovlen ?
+            rt_malloc(sizeof(*kiov) * kmessage->msg_iovlen) : RT_NULL;
+    siov = rt_malloc(sizeof(*siov) * alloc_iov_count);
+    if ((kmessage->msg_iovlen && !kiov) || !siov)
+    {
+        rt_free(kiov);
+        rt_free(siov);
+        return -ENOMEM;
+    }
+    if (kmessage->msg_iovlen && lwp_get_from_user(kiov, kmessage->msg_iov,
+            sizeof(*kiov) * kmessage->msg_iovlen) !=
+            sizeof(*kiov) * kmessage->msg_iovlen)
+    {
+        rt_free(kiov);
+        rt_free(siov);
+        return -EFAULT;
+    }
+
+    for (i = 0; i < kmessage->msg_iovlen; i++)
+    {
+        if (kiov[i].iov_len > (size_t)SSIZE_MAX - total)
+        {
+            rt_free(kiov);
+            rt_free(siov);
+            return -EINVAL;
+        }
+        if (kiov[i].iov_len &&
+                (!kiov[i].iov_base ||
+                 !lwp_user_accessable(kiov[i].iov_base, kiov[i].iov_len)))
+        {
+            rt_free(kiov);
+            rt_free(siov);
+            return -EFAULT;
+        }
+        total += kiov[i].iov_len;
+    }
+
+    data = kmem_get(total ? total : 1);
+    if (!data)
+    {
+        rt_free(kiov);
+        rt_free(siov);
+        return -ENOMEM;
+    }
+    for (i = 0; i < kmessage->msg_iovlen; i++)
+    {
+        if (!kiov[i].iov_len)
+        {
+            continue;
+        }
+        siov[siov_count].iov_base = (char *)data + offset;
+        siov[siov_count].iov_len = kiov[i].iov_len;
+        siov_count++;
+        offset += kiov[i].iov_len;
+    }
+    if (!siov_count)
+    {
+        siov[0].iov_base = data;
+        siov[0].iov_len = 0;
+        siov_count = 1;
+    }
+
+    *user_iov = kiov;
+    *kernel_iov = siov;
+    *kernel_iovlen = siov_count;
+    *kernel_data = data;
+    *total_len = total;
+    return 0;
+}
+
+static void free_kernel_msghdr(struct musl_iovec *user_iov,
+        struct sal_iovec *kernel_iov, void *kernel_data)
+{
+    rt_free(user_iov);
+    rt_free(kernel_iov);
+    kmem_put(kernel_data);
+}
+
+int sys_sendmsg(int socket, struct musl_msghdr *message, int flags)
+{
+    struct musl_msghdr kmessage;
+    struct musl_iovec *user_iov = RT_NULL;
+    struct sal_iovec *kernel_iov = RT_NULL;
+    struct sal_msghdr sal_message;
+    struct sockaddr address;
+    void *kernel_data = RT_NULL;
+    size_t total_len = 0;
+    size_t offset = 0;
+    int kernel_iovlen = 0;
+    int ret;
+    int i;
+    int sal_socket;
+
+    if (flags & ~(MUSLC_MSG_DONTWAIT | MUSLC_MSG_MORE | MUSLC_MSG_NOSIGNAL))
+    {
+        return -EOPNOTSUPP;
+    }
+
+    ret = copy_msghdr_from_user(message, &kmessage, &user_iov,
+            &kernel_iov, &kernel_iovlen, &kernel_data, &total_len);
+    if (ret < 0)
+    {
+        return ret;
+    }
+    if (kmessage.msg_control && kmessage.msg_controllen)
+    {
+        ret = -EOPNOTSUPP;
+        goto out;
+    }
+
+    for (i = 0; i < kmessage.msg_iovlen; i++)
+    {
+        if (user_iov[i].iov_len &&
+                lwp_get_from_user((char *)kernel_data + offset,
+                    user_iov[i].iov_base, user_iov[i].iov_len) != user_iov[i].iov_len)
+        {
+            ret = -EFAULT;
+            goto out;
+        }
+        offset += user_iov[i].iov_len;
+    }
+
+    rt_memset(&sal_message, 0, sizeof(sal_message));
+    if (kmessage.msg_name)
+    {
+        ret = sockaddr_from_user(kmessage.msg_name, kmessage.msg_namelen, &address);
+        if (ret < 0)
+        {
+            goto out;
+        }
+        sal_message.msg_name = &address;
+        sal_message.msg_namelen = sizeof(address);
+    }
+    sal_message.msg_iov = kernel_iov;
+    sal_message.msg_iovlen = kernel_iovlen;
+
+    sal_socket = dfs_net_getsocket(socket);
+    if (sal_socket < 0)
+    {
+        ret = -EBADF;
+        goto out;
+    }
+    ret = sal_sendmsg(sal_socket, &sal_message, netflags_muslc_2_lwip(flags));
+    if (ret < 0)
+    {
+        ret = GET_ERRNO();
+    }
+
+out:
+    free_kernel_msghdr(user_iov, kernel_iov, kernel_data);
+    return ret;
+}
+
+int sys_recvmsg(int socket, struct musl_msghdr *message, int flags)
+{
+    struct musl_msghdr kmessage;
+    struct musl_iovec *user_iov = RT_NULL;
+    struct sal_iovec *kernel_iov = RT_NULL;
+    struct sal_msghdr sal_message;
+    struct sockaddr address;
+    struct musl_sockaddr musl_address;
+    void *kernel_data = RT_NULL;
+    void *kernel_control = RT_NULL;
+    size_t total_len = 0;
+    size_t user_control_len;
+    size_t copy_len;
+    size_t copied = 0;
+    int kernel_iovlen = 0;
+    int ret;
+    int i;
+    int sal_socket;
+    int socket_type = 0;
+
+    if (flags & ~(MUSLC_MSG_PEEK | MUSLC_MSG_DONTWAIT | MUSLC_MSG_TRUNC))
+    {
+        return -EOPNOTSUPP;
+    }
+
+    ret = copy_msghdr_from_user(message, &kmessage, &user_iov,
+            &kernel_iov, &kernel_iovlen, &kernel_data, &total_len);
+    if (ret < 0)
+    {
+        return ret;
+    }
+
+    rt_memset(&sal_message, 0, sizeof(sal_message));
+    rt_memset(&address, 0, sizeof(address));
+    sal_message.msg_iov = kernel_iov;
+    sal_message.msg_iovlen = kernel_iovlen;
+
+    if (kmessage.msg_name)
+    {
+        if (!kmessage.msg_namelen ||
+                !lwp_user_accessable(kmessage.msg_name, kmessage.msg_namelen))
+        {
+            ret = -EFAULT;
+            goto out;
+        }
+        sal_message.msg_name = &address;
+        sal_message.msg_namelen = sizeof(address);
+    }
+
+    user_control_len = kmessage.msg_controllen;
+    if (kmessage.msg_control && user_control_len)
+    {
+        if (user_control_len > LWP_MSG_CONTROL_MAX ||
+                !lwp_user_accessable(kmessage.msg_control, user_control_len))
+        {
+            ret = -EFAULT;
+            goto out;
+        }
+        kernel_control = rt_calloc(1, user_control_len);
+        if (!kernel_control)
+        {
+            ret = -ENOMEM;
+            goto out;
+        }
+        sal_message.msg_control = kernel_control;
+        sal_message.msg_controllen = user_control_len;
+    }
+
+    sal_socket = dfs_net_getsocket(socket);
+    if (sal_socket < 0)
+    {
+        ret = -EBADF;
+        goto out;
+    }
+    if (kmessage.msg_name || !total_len)
+    {
+        socklen_t option_len = sizeof(socket_type);
+
+        if (sal_getsockopt(sal_socket, IMPL_SOL_SOCKET, IMPL_SO_TYPE,
+                &socket_type, &option_len) < 0)
+        {
+            ret = GET_ERRNO();
+            goto out;
+        }
+    }
+    if (kmessage.msg_name && socket_type == SOCK_STREAM)
+    {
+        sal_message.msg_name = RT_NULL;
+        sal_message.msg_namelen = 0;
+    }
+    if (!total_len)
+    {
+        if (socket_type == SOCK_STREAM)
+        {
+            kmessage.msg_namelen = 0;
+            kmessage.msg_controllen = 0;
+            kmessage.msg_flags = 0;
+            ret = lwp_put_to_user(message, &kmessage, sizeof(kmessage)) ==
+                    sizeof(kmessage) ? 0 : -EFAULT;
+            goto out;
+        }
+
+        /* lwIP requires a non-empty receive vector. A one-byte kernel buffer
+         * preserves datagram consumption while the ABI result is clamped to
+         * zero unless the caller requested MSG_TRUNC. */
+        kernel_iov[0].iov_len = 1;
+    }
+    ret = sal_recvmsg(sal_socket, &sal_message,
+            netflags_muslc_2_lwip(flags & ~MUSLC_MSG_TRUNC));
+    if (ret < 0)
+    {
+        ret = GET_ERRNO();
+        goto out;
+    }
+
+    copy_len = (size_t)ret < total_len ? (size_t)ret : total_len;
+    for (i = 0; i < kmessage.msg_iovlen && copied < copy_len; i++)
+    {
+        size_t len = user_iov[i].iov_len;
+        if (len > copy_len - copied)
+        {
+            len = copy_len - copied;
+        }
+        if (len && lwp_put_to_user(user_iov[i].iov_base,
+                (char *)kernel_data + copied, len) != len)
+        {
+            ret = -EFAULT;
+            goto out;
+        }
+        copied += len;
+    }
+
+    if (kmessage.msg_name && socket_type != SOCK_STREAM)
+    {
+        socklen_t actual_addrlen = sal_message.msg_namelen;
+        socklen_t copy_addrlen = kmessage.msg_namelen;
+
+        if (copy_addrlen > actual_addrlen)
+        {
+            copy_addrlen = actual_addrlen;
+        }
+        sockaddr_tomusl(&address, &musl_address);
+        if (copy_addrlen > sizeof(musl_address))
+        {
+            copy_addrlen = sizeof(musl_address);
+        }
+        if (lwp_put_to_user(kmessage.msg_name, &musl_address, copy_addrlen) != copy_addrlen)
+        {
+            ret = -EFAULT;
+            goto out;
+        }
+        kmessage.msg_namelen = actual_addrlen;
+    }
+    else
+    {
+        kmessage.msg_namelen = 0;
+    }
+
+    kmessage.msg_flags = 0;
+    if (sal_message.msg_flags & SAL_MSG_TRUNC)
+    {
+        kmessage.msg_flags |= MUSLC_MSG_TRUNC;
+    }
+    if (sal_message.msg_flags & SAL_MSG_CTRUNC)
+    {
+        kmessage.msg_flags |= 0x0008;
+    }
+
+    kmessage.msg_controllen = 0;
+    if (kernel_control && sal_message.msg_controllen >= sizeof(struct sal_cmsghdr))
+    {
+        struct sal_cmsghdr *sal_cmsg = kernel_control;
+        struct musl_cmsghdr musl_cmsg;
+        size_t header_len = RT_ALIGN(sizeof(*sal_cmsg), sizeof(long));
+        size_t data_len = sal_cmsg->cmsg_len > header_len ?
+                sal_cmsg->cmsg_len - header_len : 0;
+        unsigned char pktinfo[sizeof(int) + sizeof(struct in_addr) * 2];
+        size_t cmsg_len = RT_ALIGN(sizeof(musl_cmsg), sizeof(long)) + data_len;
+        size_t output_len = RT_ALIGN(cmsg_len, sizeof(long));
+
+        /* lwIP omits Linux's ipi_spec_dst member. Add it at the ABI boundary. */
+        if (sal_cmsg->cmsg_level == IMPL_IPPROTO_IP && sal_cmsg->cmsg_type == 8 &&
+                data_len == sizeof(unsigned int) + sizeof(struct in_addr))
+        {
+            rt_memset(pktinfo, 0, sizeof(pktinfo));
+            rt_memcpy(pktinfo, (char *)kernel_control + header_len, sizeof(unsigned int));
+            rt_memcpy(pktinfo + sizeof(int) + sizeof(struct in_addr),
+                    (char *)kernel_control + header_len + sizeof(unsigned int),
+                    sizeof(struct in_addr));
+            data_len = sizeof(pktinfo);
+            cmsg_len = RT_ALIGN(sizeof(musl_cmsg), sizeof(long)) + data_len;
+            output_len = RT_ALIGN(cmsg_len, sizeof(long));
+        }
+
+        if (output_len <= user_control_len)
+        {
+            rt_memset(&musl_cmsg, 0, sizeof(musl_cmsg));
+            musl_cmsg.cmsg_len = cmsg_len;
+            musl_cmsg.cmsg_level = sal_cmsg->cmsg_level;
+            musl_cmsg.cmsg_type = sal_cmsg->cmsg_type;
+            if (lwp_put_to_user(kmessage.msg_control, &musl_cmsg, sizeof(musl_cmsg)) !=
+                    sizeof(musl_cmsg) ||
+                    (data_len && lwp_put_to_user((char *)kmessage.msg_control + sizeof(musl_cmsg),
+                        (sal_cmsg->cmsg_level == IMPL_IPPROTO_IP && sal_cmsg->cmsg_type == 8 &&
+                         data_len == sizeof(pktinfo)) ? pktinfo :
+                        (unsigned char *)kernel_control + header_len, data_len) != data_len))
+            {
+                ret = -EFAULT;
+                goto out;
+            }
+            kmessage.msg_controllen = output_len;
+        }
+        else
+        {
+            kmessage.msg_flags |= 0x0008;
+        }
+    }
+
+    if (lwp_put_to_user(message, &kmessage, sizeof(kmessage)) != sizeof(kmessage))
+    {
+        ret = -EFAULT;
+        goto out;
+    }
+    if ((size_t)ret > total_len && !(flags & MUSLC_MSG_TRUNC))
+    {
+        ret = (int)total_len;
+    }
+
+out:
+    rt_free(kernel_control);
+    free_kernel_msghdr(user_iov, kernel_iov, kernel_data);
+    return ret;
 }
 
 int sys_socket(int domain, int type, int protocol)
@@ -4800,8 +5274,8 @@ const static void* func_table[] =
     SYSCALL_NET(SYSCALL_SIGN(sys_getaddrinfo)),
     SYSCALL_NET(SYSCALL_SIGN(sys_gethostbyname2_r)), /* 85 */
 
-    SYSCALL_SIGN(sys_notimpl),    //network,
-    SYSCALL_SIGN(sys_notimpl),    //network,
+    SYSCALL_NET(SYSCALL_SIGN(sys_sendmsg)),
+    SYSCALL_NET(SYSCALL_SIGN(sys_recvmsg)),
     SYSCALL_SIGN(sys_notimpl),    //network,
     SYSCALL_SIGN(sys_notimpl),    //network,
     SYSCALL_SIGN(sys_notimpl),    //network, /* 90 */

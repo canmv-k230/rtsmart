@@ -15,6 +15,9 @@
 
 #include <sal_socket.h>
 #include <sal_netdb.h>
+#ifdef SAL_USING_LWIP
+#include <lwip/init.h>
+#endif
 #ifdef SAL_USING_TLS
 #include <sal_tls.h>
 #endif
@@ -66,6 +69,7 @@ do {                                                                            
 do {                                                                              \
     (sock) = sal_get_socket(socket);                                              \
     if ((sock) == RT_NULL) {                                                      \
+        rt_set_errno(-EBADF);                                                     \
         return -1;                                                                \
     }                                                                             \
 }while(0)                                                                         \
@@ -123,7 +127,14 @@ int sal_init(void)
     /* create sal socket lock */
     rt_mutex_init(&sal_core_lock, "sal_lock", RT_IPC_FLAG_FIFO);
 
+#ifdef SAL_USING_LWIP
+    LOG_I("Socket Abstraction Layer initialize success, lwIP %u.%u.%u.",
+            (unsigned int)LWIP_VERSION_MAJOR,
+            (unsigned int)LWIP_VERSION_MINOR,
+            (unsigned int)LWIP_VERSION_REVISION);
+#else
     LOG_I("Socket Abstraction Layer initialize success.");
+#endif
     init_ok = RT_TRUE;
 
     return 0;
@@ -362,17 +373,16 @@ int sal_proto_tls_register(const struct sal_proto_tls *pt)
 struct sal_socket *sal_get_socket(int socket)
 {
     struct sal_socket_table *st = &socket_table;
+    int idx = socket - SAL_SOCKET_OFFSET;
 
-    if (socket < 0 || socket >= (int) st->max_socket)
+    if (idx < 0 || idx >= (int)st->max_socket || st->sockets == RT_NULL ||
+        st->sockets[idx] == RT_NULL ||
+        st->sockets[idx]->magic != SAL_SOCKET_MAGIC)
     {
         return RT_NULL;
     }
 
-    socket = socket - SAL_SOCKET_OFFSET;
-    /* check socket structure valid or not */
-    RT_ASSERT(st->sockets[socket]->magic == SAL_SOCKET_MAGIC);
-
-    return st->sockets[socket];
+    return st->sockets[idx];
 }
 
 /**
@@ -608,7 +618,11 @@ static void socket_delete(int socket)
     }
     sal_lock();
     sock = sal_get_socket(socket);
-    RT_ASSERT(sock != RT_NULL);
+    if (sock == RT_NULL)
+    {
+        sal_unlock();
+        return;
+    }
     sock->magic = 0;
     sock->netdev = RT_NULL;
     sock->pf = RT_NULL;
@@ -920,6 +934,25 @@ int sal_recvfrom(int socket, void *mem, size_t len, int flags,
 #endif
 }
 
+int sal_recvmsg(int socket, struct sal_msghdr *message, int flags)
+{
+    struct sal_socket *sock;
+    struct sal_proto_family *pf;
+
+    SAL_SOCKET_OBJ_GET(sock, socket);
+    SAL_SOCKETOPS_VALID(sock, pf, recvmsg);
+
+#ifdef SAL_USING_TLS
+    if (SAL_SOCKOPS_PROTO_TLS_VALID(sock, recv))
+    {
+        rt_set_errno(-EOPNOTSUPP);
+        return -1;
+    }
+#endif
+
+    return pf->skt_ops->recvmsg((int)(size_t)sock->user_data, message, flags);
+}
+
 int sal_sendto(int socket, const void *dataptr, size_t size, int flags,
                const struct sockaddr *to, socklen_t tolen)
 {
@@ -950,6 +983,25 @@ int sal_sendto(int socket, const void *dataptr, size_t size, int flags,
 #else
     return pf->skt_ops->sendto((int)(size_t)sock->user_data, dataptr, size, flags, to, tolen);
 #endif
+}
+
+int sal_sendmsg(int socket, const struct sal_msghdr *message, int flags)
+{
+    struct sal_socket *sock;
+    struct sal_proto_family *pf;
+
+    SAL_SOCKET_OBJ_GET(sock, socket);
+    SAL_SOCKETOPS_VALID(sock, pf, sendmsg);
+
+#ifdef SAL_USING_TLS
+    if (SAL_SOCKOPS_PROTO_TLS_VALID(sock, send))
+    {
+        rt_set_errno(-EOPNOTSUPP);
+        return -1;
+    }
+#endif
+
+    return pf->skt_ops->sendmsg((int)(size_t)sock->user_data, message, flags);
 }
 
 int sal_socket(int domain, int type, int protocol)
@@ -1027,11 +1079,12 @@ int sal_closesocket(int socket)
         {
             if (proto_tls->ops->closesocket(sock->user_data_tls) < 0)
             {
-                return -1;
+                error = -1;
             }
         }
-#endif
+#else
         error = 0;
+#endif
     }
     else
     {

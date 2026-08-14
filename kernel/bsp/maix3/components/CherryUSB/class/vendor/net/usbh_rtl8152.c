@@ -22,7 +22,6 @@ static USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t
     g_rtl8152_rx_buffer[RTL8152_MAX_RX][CONFIG_USBHOST_RTL8152_ETH_MAX_RX_SEGSZE];
 static USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t
     g_rtl8152_tx_buffer[RTL8152_MAX_TX][CONFIG_USBHOST_RTL8152_ETH_MAX_SEGSZE];
-static USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t g_rtl8152_inttx_buffer[USB_ALIGN_UP(2, CONFIG_USB_ALIGN_SIZE)];
 USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t g_rtl8152_buf[USB_ALIGN_UP(32, CONFIG_USB_ALIGN_SIZE)];
 
 static struct usbh_rtl8152 g_rtl8152_class;
@@ -889,8 +888,6 @@ enum rtl_register_content {
 #define RTL8152_RX_MAX_PENDING 4096
 #define RTL8152_RXFG_HEADSZ    256
 
-#define INTR_LINK 0x0004
-
 #define VLAN_ETH_HLEN      18
 #define ETH_FCS_LEN        4
 #define VLAN_ETH_FRAME_LEN 1514
@@ -1601,7 +1598,7 @@ static void rtl8152_nic_reset(struct usbh_rtl8152 *tp)
             for (i = 0; i < 1000; i++) {
                 if (!(ocp_read_byte(tp, MCU_TYPE_PLA, PLA_CR) & CR_RST))
                     break;
-                usb_osal_msleep(400);
+                usb_osal_msleep(1);
             }
             break;
     }
@@ -2085,22 +2082,37 @@ int r8152_write_hwaddr(struct usbh_rtl8152 *tp, unsigned char *mac)
     return 0;
 }
 
-int usbh_rtl8152_get_connect_status(struct usbh_rtl8152 *rtl8152_class)
+static int usbh_rtl8152_read_link_status(struct usbh_rtl8152 *rtl8152_class,
+                                         bool *connected)
 {
+    uint32_t phystatus = 0;
     int ret;
 
-    usbh_int_urb_fill(&rtl8152_class->intin_urb, rtl8152_class->hport, rtl8152_class->intin, g_rtl8152_inttx_buffer, 2, USB_OSAL_WAITING_FOREVER, NULL, NULL);
-    ret = usbh_submit_urb(&rtl8152_class->intin_urb);
-    if (ret < 0) {
+    /* The interrupt endpoint reports link-change events, not a reliable
+     * snapshot of the current state. Read the PHY status for both initial
+     * carrier detection and periodic checks. */
+    ret = generic_ocp_read(rtl8152_class, PLA_PHYSTATUS,
+                           sizeof(phystatus), &phystatus, MCU_TYPE_PLA);
+    if (ret < 0)
+    {
         return ret;
     }
 
-    if (g_rtl8152_inttx_buffer[0] & INTR_LINK) {
-        rtl8152_class->connect_status = true;
-    } else {
-        rtl8152_class->connect_status = false;
-    }
+    *connected = (phystatus & LINK_STATUS) != 0;
     return 0;
+}
+
+int usbh_rtl8152_get_connect_status(struct usbh_rtl8152 *rtl8152_class)
+{
+    bool connected;
+    int ret;
+
+    ret = usbh_rtl8152_read_link_status(rtl8152_class, &connected);
+    if (ret >= 0)
+    {
+        rtl8152_class->connect_status = connected;
+    }
+    return ret;
 }
 
 static int usbh_rtl8152_connect(struct usbh_hubport *hport, uint8_t intf)
@@ -2324,6 +2336,7 @@ static int usbh_rtl8152_disconnect(struct usbh_hubport *hport, uint8_t intf)
 
 #define CHECK_LINK_DEBOUNCE_CNT (5)
 static struct rt_delayed_work link_check;
+static uint8_t link_down_count;
 
 static void usbh_rtl8152_prepare_recovery(struct usbh_rtl8152 *rtl8152_class,
                                           bool cancel_work,
@@ -2350,26 +2363,32 @@ static void usbh_rtl8152_prepare_recovery(struct usbh_rtl8152 *rtl8152_class,
 
 static void rtl8152_link_check(struct rt_work *work, void *work_data)
 {
-    struct netif *netif = (struct netif *)work_data;
+    (void)work;
+    (void)work_data;
 
     if (g_rtl8152_class.plug) {
+        bool link_up;
         int ret;
 
-        ret = usbh_rtl8152_get_connect_status(&g_rtl8152_class);
-
-        if ((ret >= 0) && (g_rtl8152_class.connect_status == false)) {
-            /* In general, unplug will never in so don't need lock */
-            USB_LOG_ERR("link down then kill urb\n");
-
-            usbh_rtl8152_prepare_recovery(&g_rtl8152_class, false, true);
-
-            usbh_rtl8152_kill_rx_urbs(&g_rtl8152_class);
-            if (g_rtl8152_tx_mutex) {
-                usb_osal_mutex_take(g_rtl8152_tx_mutex);
-                usbh_rtl8152_kill_tx_urbs(&g_rtl8152_class);
-                usb_osal_mutex_give(g_rtl8152_tx_mutex);
+        ret = usbh_rtl8152_read_link_status(&g_rtl8152_class, &link_up);
+        if (ret >= 0) {
+            if (link_up) {
+                link_down_count = 0;
+                if (!g_rtl8152_class.connect_status) {
+                    g_rtl8152_class.connect_status = true;
+                    usbh_rtl8152_link_changed(&g_rtl8152_class, 1);
+                    USB_LOG_INFO("Link up\r\n");
+                }
+            } else if (g_rtl8152_class.connect_status) {
+                if (++link_down_count >= CHECK_LINK_DEBOUNCE_CNT) {
+                    link_down_count = 0;
+                    g_rtl8152_class.connect_status = false;
+                    usbh_rtl8152_link_changed(&g_rtl8152_class, 0);
+                    USB_LOG_WRN("Link down\r\n");
+                }
+            } else {
+                link_down_count = 0;
             }
-            return ;
         }
 
         if (g_rtl8152_class.submit_work) {
@@ -2413,10 +2432,14 @@ void usbh_rtl8152_rx_thread(void *argument)
     g_rtl8152_class.rx_thread_running = true;
 #ifdef CHERRY_USB_RTL8152_LINKCHECK
     rt_delayed_work_init(&link_check, rtl8152_link_check, argument);
+    link_down_count = 0;
 #endif
     // clang-format off
 find_class:
     // clang-format on
+#ifdef CHERRY_USB_RTL8152_LINKCHECK
+    link_down_count = 0;
+#endif
     g_rtl8152_class.connect_status = false;
     usbh_rtl8152_link_changed(&g_rtl8152_class, 0);
     if (!usbh_rtl8152_is_active(&g_rtl8152_class)) {
@@ -2432,30 +2455,26 @@ find_class:
             usb_osal_msleep(100);
             goto find_class;
         }
-        usb_osal_msleep(128);
+        if (!g_rtl8152_class.connect_status) {
+            usb_osal_msleep(100);
+        }
     }
 
     if (g_rtl8152_class.stop_requested) {
         goto delete;
     }
 
-    usbh_rtl8152_link_changed(&g_rtl8152_class, 1);
-
     if (g_rtl8152_class.rtl_ops.enable) {
-        g_rtl8152_class.rtl_ops.enable(&g_rtl8152_class);
+        ret = g_rtl8152_class.rtl_ops.enable(&g_rtl8152_class);
+        if (ret < 0) {
+            usbh_rtl8152_prepare_recovery(&g_rtl8152_class, false, true);
+            goto find_class;
+        }
     } else {
         goto delete;
     }
 
     rtl8152_set_rx_mode(&g_rtl8152_class);
-
-#ifdef CHERRY_USB_RTL8152_LINKCHECK
-    g_rtl8152_class.submit_work = true;
-    ret = rt_work_submit(&link_check.work, rt_tick_from_millisecond(1000) * CHECK_LINK_DEBOUNCE_CNT);
-    if (ret != RT_EOK) {
-        USB_LOG_ERR("submit work fail = %d\n", ret);
-    }
-#endif
 
     transfer_size = g_rtl8152_class.rx_buf_sz;
     if (transfer_size == 0 ||
@@ -2476,6 +2495,20 @@ find_class:
             goto find_class;
         }
     }
+
+    /* DHCP may transmit immediately from the link-up callback, so carrier
+     * must not be published until all receive URBs are ready for the reply. */
+    usbh_rtl8152_link_changed(&g_rtl8152_class, 1);
+
+#ifdef CHERRY_USB_RTL8152_LINKCHECK
+    g_rtl8152_class.submit_work = true;
+    ret = rt_work_submit(&link_check.work,
+                         rt_tick_from_millisecond(1000) *
+                         CHECK_LINK_DEBOUNCE_CNT);
+    if (ret != RT_EOK) {
+        USB_LOG_ERR("submit work fail = %d\n", ret);
+    }
+#endif
 
     while (g_rtl8152_class.plug && !g_rtl8152_class.stop_requested) {
         struct rtl8152_rx_context *context;

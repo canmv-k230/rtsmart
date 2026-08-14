@@ -74,6 +74,8 @@ static const struct sal_socket_ops at_socket_ops =
     NULL,
     at_sendto,
     at_recvfrom,
+    NULL,
+    NULL,
     at_getsockopt,
     at_setsockopt,
     at_shutdown,

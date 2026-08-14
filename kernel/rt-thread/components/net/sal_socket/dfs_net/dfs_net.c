@@ -82,6 +82,9 @@ static int dfs_net_close(struct dfs_fd* file)
     {
         socket = (int)(size_t)file->fnode->data;
         ret = sal_closesocket(socket);
+        /* SAL consumes its socket object even if the protocol close reports
+         * an error. Do not leave a DFS descriptor pointing at freed state. */
+        file->flags |= DFS_F_CLOSE_TERMINAL;
     }
     return ret;
 }

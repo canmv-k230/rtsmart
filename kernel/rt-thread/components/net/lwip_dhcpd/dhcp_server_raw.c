@@ -45,6 +45,7 @@
 #include <netif/ethernetif.h>
 #include <lwip/ip.h>
 #include <lwip/init.h>
+#include <lwip/dns.h>
 #include "lwip/inet.h"
 
 #if (LWIP_VERSION) < 0x02000000U
@@ -707,10 +708,15 @@ void dhcpd_start(const char *netif_name)
 
         set_if(netif_name, DHCPD_SERVER_IP, DHCPD_SERVER_IP, "255.255.255.0");
 
-        extern void dns_setserver(struct netif *netif, uint8_t dns_num, const ip_addr_t *dns_server);
         ip_addr_t dns_ip;
         inet_aton(DHCPD_SERVER_IP, &dns_ip);
+#if LWIP_VERSION >= 0x02020000U
+        dns_setserver_for_netif(netif, 0, &dns_ip);
+#elif LWIP_VERSION >= 0x02010000U
         dns_setserver(netif, 0, &dns_ip);
+#else
+        dns_setserver(0, &dns_ip);
+#endif
 
         netif_set_up(netif);
     }
