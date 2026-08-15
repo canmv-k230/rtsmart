@@ -206,6 +206,7 @@ menu "Components Configuration"
                     config CANMV_USB_DUAL_CDC_PORT
                         bool
                         option env="CANMV_USB_DUAL_CDC_PORT"
+                        default n
                         help
                             SDK-level dual CDC setting imported to enforce the
                             K230 endpoint limit in this Kconfig.
@@ -390,14 +391,6 @@ menu "Components Configuration"
                                 int "CanMV USB Host Power Vaild PIN Value"
                                 default 1
                         endif
-
-                    config CANMV_USB_HOST_NET_RTL8152_DEV_NAME
-                        string
-                        default "u0"
-
-                    config CANMV_USB_HOST_NET_LTE_DEV_NAME
-                        string
-                        default "u1"
 
                         endif
         endif

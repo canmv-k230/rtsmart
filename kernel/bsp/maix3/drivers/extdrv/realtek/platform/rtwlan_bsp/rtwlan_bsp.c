@@ -12,6 +12,15 @@
 #include "net_stack_intf.h"
 #include "customer_rtos_service.h"
 
+/* Realtek headers use DBG_INFO(...) as a vendor logger. Keep that macro
+ * separate while rtdbg.h defines RT-Thread's numeric log-level constants. */
+#pragma push_macro("DBG_INFO")
+#undef DBG_INFO
+#define DBG_TAG "realtek.wifi"
+#define DBG_LVL 2
+#include <rtdbg.h>
+#pragma pop_macro("DBG_INFO")
+
 static rt_int32_t realtek_probe(struct rt_mmcsd_card* card);
 static rt_err_t wlan_get_mac(struct rt_wlan_device* wlan, rt_uint8_t mac[]);
 static void wlan_log_tx_power(const char* ifname);
@@ -100,7 +109,7 @@ int realtek_init(void)
 
     ret = sdio_register_driver(&realtek_drv);
     if (ret != RT_EOK && ret != -RT_EEMPTY) {
-        rt_kprintf("Realtek Wi-Fi: SDIO driver registration failed\n");
+        LOG_E("SDIO driver registration failed: %d", ret);
         Set_WLAN_Power_Off();
         return ret;
     }
@@ -142,7 +151,7 @@ void ethernetif_recv(int idx, int total_len)
 
     buffer = rt_malloc(total_len);
     if(!buffer) {
-        rt_kprintf("%s->%d no mem\n", __func__, __LINE__);
+        LOG_E("RX buffer allocation failed: %d bytes", total_len);
         return;
     }
 
@@ -211,7 +220,7 @@ static rt_err_t wlan_join(struct rt_wlan_device* wlan, struct rt_sta_info* sta_i
         rt_thread_mdelay(20);
         rt_wlan_dev_indicate_event_handle(&wlan_ap, RT_WLAN_DEV_EVT_AP_STOP, NULL);
         if (wifi_on(RTW_MODE_STA) < 0) {
-            rt_kprintf("%s: STA start failed\n", __func__);
+            LOG_E("STA interface restart failed");
             ret = -RT_EIO;
             goto out;
         }
@@ -235,7 +244,7 @@ static rt_err_t wlan_softap(struct rt_wlan_device* wlan, struct rt_ap_info* ap_i
     struct rt_wlan_buff buff = {NULL, 0};
 
     if (!wifi_is_up(RTW_STA_INTERFACE)) {
-        rt_kprintf("%s: STA interface is not running\n", __func__);
+        LOG_W("STA interface is not running");
         ret = -RT_EIO;
         goto out;
     }
@@ -243,7 +252,7 @@ static rt_err_t wlan_softap(struct rt_wlan_device* wlan, struct rt_ap_info* ap_i
     if (!wifi_is_up(RTW_AP_INTERFACE)) {
         /* WLAN0 is kept for STA; add WLAN1 without restarting the driver. */
         if (wifi_on_coAP(RTW_MODE_STA_AP) < 0) {
-            rt_kprintf("%s: AP interface start failed\n", __func__);
+            LOG_E("AP interface start failed");
             ret = -RT_EIO;
             goto out;
         }
@@ -282,7 +291,7 @@ static rt_err_t wlan_ap_stop(struct rt_wlan_device* wlan)
 {
     if (wifi_is_up(RTW_AP_INTERFACE)) {
         if (wifi_off_coAP() < 0) {
-            rt_kprintf("%s: AP interface stop failed\n", __func__);
+            LOG_E("AP interface stop failed");
             return -RT_EIO;
         }
     }
@@ -321,7 +330,7 @@ static void wlan_log_tx_power(const char* ifname)
     int i;
 
     if (wext_get_tx_power(ifname, poweridx) < 0) {
-        rt_kprintf("Realtek Wi-Fi RF %s: unable to read TX power indices\n", ifname);
+        LOG_W("RF %s: unable to read TX power indices", ifname);
         return;
     }
 
@@ -334,9 +343,8 @@ static void wlan_log_tx_power(const char* ifname)
         }
     }
 
-    rt_kprintf("Realtek Wi-Fi RF %s: TX scale 100%%, calibrated indices "
-               "CCK %u-%u, OFDM %u-%u, MCS %u-%u\n",
-               ifname, min[0], max[0], min[1], max[1], min[2], max[2]);
+    LOG_I("RF %s: TX scale 100%%, calibrated indices CCK %u-%u, OFDM %u-%u, MCS %u-%u",
+          ifname, min[0], max[0], min[1], max[1], min[2], max[2]);
 }
 
 static rt_err_t wlan_set_powersave(struct rt_wlan_device* wlan, int level)
@@ -504,8 +512,9 @@ static rt_int32_t realtek_probe(struct rt_mmcsd_card* card)
     wifi_sdio_func->num_info = 0;
 
     if (wifi_on(RTW_MODE_STA) < 0) {
-        rt_kprintf("%s init error\n", (PRODUCT_RTL8189FTV == wifi_sdio_func->device) ?
-                   "rtl8189FTV": "rtl8733BS");
+        LOG_E("%s initialization failed",
+              (PRODUCT_RTL8189FTV == wifi_sdio_func->device) ?
+              "rtl8189FTV" : "rtl8733BS");
         ret = -RT_EIO;
         goto fail_disable_sdio;
     }
@@ -534,7 +543,7 @@ static rt_int32_t realtek_probe(struct rt_mmcsd_card* card)
 
 fail_wifi:
     if (wifi_off() < 0) {
-        rt_kprintf("Realtek Wi-Fi: cleanup failed after probe error %d\n", ret);
+        LOG_E("cleanup failed after probe error %d", ret);
         return -RT_EIO;
     }
     if (wlan_ap_registered) {

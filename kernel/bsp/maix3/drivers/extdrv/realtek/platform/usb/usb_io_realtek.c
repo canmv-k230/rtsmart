@@ -18,6 +18,10 @@
 //#include "usbh_wifi.h"
 #include "rtwlan_bsp.h"
 
+#define DBG_TAG "realtek.usb"
+#define DBG_LVL 2
+#include <rtdbg.h>
+
 #ifndef NULL
 #define	NULL	0
 #endif
@@ -32,7 +36,7 @@ extern void *g_rtk_wifi_usb;
 extern unsigned char g_rtk_wifi_connect;
 static void rtw_usb_probe(struct usb_driver *driver)
 {
-	printf("\n\rrtw_usb_probe start------->\n");
+	LOG_D("USB probe waiting for device");
 
 	while (1) {
             if (g_rtk_wifi_connect)
@@ -41,7 +45,7 @@ static void rtw_usb_probe(struct usb_driver *driver)
                 WLAN_BSP_UsLoop(10000);
 	}
 
-	printf("\n\rrtw_usb_probe end<-------\n");
+	LOG_D("USB probe connected");
 }
 
 static int rtw_usb_ctrl_req(void *priv, unsigned char bdir_in, unsigned int wvalue, unsigned char *buf, unsigned int len)
@@ -62,15 +66,15 @@ static int rtw_usb_get_speed_info(void *priv)
 
 	switch (usb_speed) {
 	case 0:
-		printf("high Speed Case \n");
+		LOG_D("USB link speed: high");
 		ret = RTW_USB_SPEED_3;
 		break;
 	case 1:
-		printf("full speed Case \n");
+		LOG_D("USB link speed: full");
 		ret = RTW_USB_SPEED_2;
 		break;
 	case 2:
-		printf("low speed Case \n");
+		LOG_D("USB link speed: low");
 		ret = RTW_USB_SPEED_1_1;
 		break;
 	default:
