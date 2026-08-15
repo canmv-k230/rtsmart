@@ -1,19 +1,28 @@
-lwIP NAT componenent
+# lwIP IPv4 NAT
 
-If you want to use lwIP NAT componenent, please define LWIP_USING_NAT in rtconfig.h. 
+This component provides stateful IPv4 network address and port translation for
+TCP, UDP, and ICMP echo traffic. It is intended for routing clients on an
+internal interface, such as the Wi-Fi AP interface, through lwIP's default
+uplink, such as the Wi-Fi STA interface.
 
-In this case the network 213.129.231.168/29 is nat'ed when packets are sent to the 
-destination network 10.0.0.0/24 (untypical example - most users will have the other 
-way around).
+Enable `LWIP_USING_NAT` in Kconfig. When the RT-Thread Wi-Fi AP and DHCP server
+are enabled, NAT is enabled automatically while the AP is running. The STA (or
+another routed interface) must have an address, gateway, and default route.
 
-Use following code to add a NAT entry: 
+For a different internal interface, enable and disable translation from a
+non-lwIP thread with:
 
-  ip_nat_entry_t nat_entry;
- 
-  nat_entry.out_if = (struct netif *)&emac_if1;
-  nat_entry.in_if = (struct netif *)&emac_if2;
-  IP4_ADDR(&nat_entry.source_net, 213, 129, 231, 168);
-  IP4_ADDR(&nat_entry.source_netmask, 255, 255, 255, 248);
-  IP4_ADDR(&nat_entry.dest_net, 10, 0, 0, 0);
-  IP4_ADDR(&nat_entry.source_netmask, 255, 0, 0, 0);
-  ip_nat_add(&_nat_entry);
+```c
+#include <ipv4_nat.h>
+
+ip_nat_set_enabled(internal_netif, 1);
+ip_nat_set_enabled(internal_netif, 0);
+```
+
+The session table size, translated port range, and protocol timeouts are
+configurable under `LWIP_USING_NAT`. IPv4 fragments, port forwarding, and ICMP
+error payload translation are not supported.
+
+Use the `nat` MSH command to display enabled internal interfaces and active
+session counts. NAT sessions are forwarding state and do not appear in
+`netstat`, which only lists local TCP and UDP protocol control blocks.

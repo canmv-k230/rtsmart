@@ -57,6 +57,10 @@
 #include "lwip/stats.h"
 #include "lwip/prot/iana.h"
 
+#if IP_NAT
+#include "ipv4_nat.h"
+#endif
+
 #include <string.h>
 
 #ifdef LWIP_HOOK_FILENAME
@@ -333,7 +337,8 @@ ip4_canforward(struct pbuf *p)
  * @param inp the netif on which this packet was received
  */
 static void
-ip4_forward(struct pbuf *p, struct ip_hdr *iphdr, struct netif *inp)
+ip4_forward(struct pbuf *p, struct ip_hdr *iphdr, struct netif *inp,
+            struct netif *nat_input_if)
 {
   struct netif *netif;
 
@@ -383,6 +388,14 @@ ip4_forward(struct pbuf *p, struct ip_hdr *iphdr, struct netif *inp)
 #endif /* LWIP_ICMP */
     return;
   }
+
+#if IP_NAT
+  if (ip_nat_forward(p, iphdr, inp, netif, nat_input_if) != ERR_OK) {
+    return;
+  }
+#else
+  LWIP_UNUSED_ARG(nat_input_if);
+#endif
 
   /* Incrementally update the IP checksum. */
   if (IPH_CHKSUM(iphdr) >= PP_HTONS(0xffffU - 0x100)) {
@@ -484,6 +497,9 @@ ip4_input(struct pbuf *p, struct netif *inp)
   struct netif *netif;
   u16_t iphdr_hlen;
   u16_t iphdr_len;
+#if IP_FORWARD || IP_NAT
+  struct netif *nat_input_if = NULL;
+#endif
 #if IP_ACCEPT_LINK_LAYER_ADDRESSING || LWIP_IGMP
   int check_ip_src = 1;
 #endif /* IP_ACCEPT_LINK_LAYER_ADDRESSING || LWIP_IGMP */
@@ -564,6 +580,11 @@ ip4_input(struct pbuf *p, struct netif *inp)
       return ERR_OK;
     }
   }
+#endif
+
+#if IP_NAT
+  /* Translate replies before selecting the destination interface. */
+  nat_input_if = ip_nat_input(p, (struct ip_hdr *)iphdr, inp);
 #endif
 
   /* copy IP addresses to aligned ip_addr_t */
@@ -677,7 +698,7 @@ ip4_input(struct pbuf *p, struct netif *inp)
     /* non-broadcast packet? */
     if (!ip4_addr_isbroadcast(ip4_current_dest_addr(), inp)) {
       /* try to forward IP packet on (other) interfaces */
-      ip4_forward(p, (struct ip_hdr *)p->payload, inp);
+      ip4_forward(p, (struct ip_hdr *)p->payload, inp, nat_input_if);
     } else
 #endif /* IP_FORWARD */
     {

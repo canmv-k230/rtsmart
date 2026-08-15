@@ -301,6 +301,56 @@ config RT_USING_LWIP
             bool "Enable IP reassembly and frag"
             default n
 
+        menuconfig LWIP_USING_NAT
+            bool "Enable IPv4 network address translation"
+            depends on RT_LWIP_TCP && RT_LWIP_UDP
+            default y if RT_USING_WIFI && LWIP_USING_DHCPD
+            help
+                Enable IPv4 NAPT for forwarding traffic from an internal
+                interface, such as a Wi-Fi AP, through the default uplink.
+
+        if LWIP_USING_NAT
+            config LWIP_NAT_TABLE_SIZE
+                int "Maximum NAT sessions"
+                range 16 1024
+                default 256
+
+            config LWIP_NAT_MAX_INTERFACES
+                int "Maximum NAT internal interfaces"
+                range 1 8
+                default 2
+
+            config LWIP_NAT_PORT_MIN
+                int "First translated source port"
+                range 1024 65535
+                default 40000
+
+            config LWIP_NAT_PORT_MAX
+                int "Last translated source port"
+                range 1024 65535
+                default 45000
+
+            config LWIP_NAT_TCP_TIMEOUT_SECONDS
+                int "Established TCP session timeout (seconds)"
+                range 60 86400
+                default 1800
+
+            config LWIP_NAT_TCP_CLOSE_SECONDS
+                int "Closing TCP session timeout (seconds)"
+                range 1 300
+                default 30
+
+            config LWIP_NAT_UDP_TIMEOUT_SECONDS
+                int "UDP session timeout (seconds)"
+                range 10 3600
+                default 120
+
+            config LWIP_NAT_ICMP_TIMEOUT_SECONDS
+                int "ICMP session timeout (seconds)"
+                range 1 300
+                default 30
+        endif
+
         config LWIP_NETIF_STATUS_CALLBACK
             int "Enable netif status callback"
             default 1
@@ -483,6 +533,8 @@ if RT_USING_LWIP
 
 config LWIP_USING_DHCPD
     bool "Enable DHCP server"
+    select RT_LWIP_UDP
+    select RT_LWIP_DNS
     default n
 
     if LWIP_USING_DHCPD

@@ -99,6 +99,29 @@
 #define LWIP_NETIF_LOCK(...)
 #define LWIP_NETIF_UNLOCK(...)
 
+static void dhcpd_get_dns_server(const struct netif *netif,
+                                 ip4_addr_t *dns_addr)
+{
+#ifdef DHCP_DNS_SERVER_IP
+    if (ip4addr_aton(DHCP_DNS_SERVER_IP, dns_addr))
+    {
+        return;
+    }
+#else
+    const ip_addr_t *server = dns_getserver(0);
+
+    if (server != NULL && IP_IS_V4(server) &&
+        !ip4_addr_isany(ip_2_ip4(server)) &&
+        !ip4_addr_cmp(ip_2_ip4(server), netif_ip4_addr(netif)))
+    {
+        ip4_addr_copy(*dns_addr, *ip_2_ip4(server));
+        return;
+    }
+#endif
+
+    ip4_addr_copy(*dns_addr, *netif_ip4_addr(netif));
+}
+
 #ifndef DHCP_SERVER_PORT
 #define DHCP_SERVER_PORT 67
 #endif
@@ -440,16 +463,12 @@ dhcp_server_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t
 
             *opt_buf++ = DHCP_OPTION_DNS_SERVER;
             *opt_buf++ = 4;
-#ifdef DHCP_DNS_SERVER_IP
             {
-                ip_addr_t dns_addr;
-                ipaddr_aton(DHCP_DNS_SERVER_IP, &dns_addr);
-                SMEMCPY(opt_buf, &ip_2_ip4(&dns_addr)->addr, 4);
+                ip4_addr_t dns_addr;
+
+                dhcpd_get_dns_server(dhcp_server->netif, &dns_addr);
+                SMEMCPY(opt_buf, &dns_addr.addr, 4);
             }
-#else
-            /* default use gatewary dns server */
-            SMEMCPY(opt_buf, &(dhcp_server->netif->ip_addr), 4);
-#endif /* DHCP_DNS_SERVER_IP */
             opt_buf += 4;
 
             *opt_buf++ = DHCP_OPTION_ROUTER;
@@ -460,7 +479,7 @@ dhcp_server_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t
             /* add option end */
             *opt_buf++ = DHCP_OPTION_END;
 
-            length = (u32_t)opt_buf - (u32_t)msg;
+            length = (u16_t)(opt_buf - (u8_t *)msg);
             if (length < q->tot_len)
             {
                 pbuf_realloc(q, length);
@@ -517,16 +536,12 @@ dhcp_server_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t
 
                         *opt_buf++ = DHCP_OPTION_DNS_SERVER;
                         *opt_buf++ = 4;
-#ifdef DHCP_DNS_SERVER_IP
                         {
-                            ip_addr_t dns_addr;
-                            ipaddr_aton(DHCP_DNS_SERVER_IP, &dns_addr);
-                            SMEMCPY(opt_buf, &ip_2_ip4(&dns_addr)->addr, 4);
+                            ip4_addr_t dns_addr;
+
+                            dhcpd_get_dns_server(dhcp_server->netif, &dns_addr);
+                            SMEMCPY(opt_buf, &dns_addr.addr, 4);
                         }
-#else
-                        /* default use gatewary dns server */
-                        SMEMCPY(opt_buf, &(dhcp_server->netif->ip_addr), 4);
-#endif /* DHCP_DNS_SERVER_IP */
                         opt_buf += 4;
 
                         *opt_buf++ = DHCP_OPTION_ROUTER;
@@ -537,7 +552,7 @@ dhcp_server_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t
                         /* add option end */
                         *opt_buf++ = DHCP_OPTION_END;
 
-                        length = (u32_t)opt_buf - (u32_t)msg;
+                        length = (u16_t)(opt_buf - (u8_t *)msg);
                         if (length < q->tot_len)
                         {
                             pbuf_realloc(q, length);
@@ -573,7 +588,7 @@ dhcp_server_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t
 
                         /* add option end */
                         *opt_buf++ = DHCP_OPTION_END;
-                        length = (u32_t)opt_buf - (u32_t)msg;
+                        length = (u16_t)(opt_buf - (u8_t *)msg);
                         if (length < q->tot_len)
                         {
                             pbuf_realloc(q, length);
@@ -716,7 +731,10 @@ void dhcpd_start(const char *netif_name)
                              "255.255.255.0");
 
         ip_addr_t dns_ip;
-        inet_aton(DHCPD_SERVER_IP, &dns_ip);
+        ip4_addr_t dns_addr;
+
+        dhcpd_get_dns_server(netif, &dns_addr);
+        ip_addr_copy_from_ip4(dns_ip, dns_addr);
 #if LWIP_VERSION >= 0x02020000U
         dns_setserver_for_netif(netif, 0, &dns_ip);
 #elif LWIP_VERSION >= 0x02010000U

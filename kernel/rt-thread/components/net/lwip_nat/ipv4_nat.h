@@ -1,81 +1,42 @@
-/**
- * NAT - NAT implementation for lwIP supporting TCP/UDP and ICMP.
- * Copyright (c) 2009 Christian Walter, ?Embedded Solutions, Vienna 2009.
- * Copyright (c) 2010 lwIP project ;-)
- * COPYRIGHT (C) 2015, RT-Thread Development Team
- * All rights reserved.
+/*
+ * Copyright (c) 2009 Christian Walter, Embedded Solutions, Vienna 2009.
+ * Copyright (c) 2010 lwIP project.
+ * Copyright (c) 2015-2026, RT-Thread Development Team.
  *
- * Redistribution and use in source and binary forms, with or without modification,
- * are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice,
- *    this list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- *    this list of conditions and the following disclaimer in the documentation
- *    and/or other materials provided with the distribution.
- * 3. The name of the author may not be used to endorse or promote products
- *    derived from this software without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR IMPLIED
- * WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT
- * SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
- * EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT
- * OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING
- * IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY
- * OF SUCH DAMAGE.
- *
- * Change Logs:
- * Date           Author       Notes
- * 2015-01-26     Hichard      porting to RT-Thread
- * 2015-01-27     Bernard      code cleanup for lwIP in RT-Thread
+ * SPDX-License-Identifier: BSD-3-Clause
  */
 
-#ifndef __LWIP_NAT_H__
-#define __LWIP_NAT_H__
+#ifndef IPV4_NAT_H
+#define IPV4_NAT_H
 
-#include <rtthread.h>
-
-#ifdef LWIP_USING_NAT
-
-#include "lwip/err.h"
-#include "lwip/ip_addr.h"
 #include "lwip/opt.h"
 
-/** Timer interval at which to call ip_nat_tmr() */
-#define LWIP_NAT_TMR_INTERVAL_SEC        (30)
+#if LWIP_IPV4 && defined(LWIP_USING_NAT)
+
+#include "lwip/err.h"
+#include "lwip/netif.h"
+#include "lwip/pbuf.h"
+#include "lwip/prot/ip4.h"
 
 #ifdef __cplusplus
 extern "C" {
-#endif /* __cplusplus */
+#endif
 
-struct netif;
-struct pbuf;
+/* Thread-safe API for enabling NAT on an internal network interface. */
+err_t ip_nat_set_enabled(struct netif *netif, u8_t enabled);
 
-typedef struct ip_nat_entry
-{
-  ip_addr_t    source_net;
-  ip_addr_t    source_netmask;
-  ip_addr_t    dest_net;
-  ip_addr_t    dest_netmask;
-  struct netif *out_if;
-  struct netif *in_if;
-} ip_nat_entry_t;
-
-void  ip_nat_init(void);
-void  ip_nat_tmr(void);
-u8_t  ip_nat_input(struct pbuf *p);
-u8_t  ip_nat_out(struct pbuf *p);
-
-err_t ip_nat_add(const ip_nat_entry_t *new_entry);
-void  ip_nat_remove(const ip_nat_entry_t *remove_entry);
+/* These functions are called by the IPv4 core and must run in its context. */
+/* Returns the internal interface when an incoming reply was translated. */
+struct netif *ip_nat_input(struct pbuf *p, struct ip_hdr *iphdr,
+                           struct netif *inp);
+err_t ip_nat_forward(struct pbuf *p, struct ip_hdr *iphdr,
+                     struct netif *inp, struct netif *outp,
+                     struct netif *input_inside_if);
 
 #ifdef __cplusplus
 }
-#endif /* __cplusplus */
+#endif
 
-#endif /* IP_NAT */
+#endif /* LWIP_IPV4 && LWIP_USING_NAT */
 
-#endif /* __LWIP_NAT_H__ */
+#endif /* IPV4_NAT_H */

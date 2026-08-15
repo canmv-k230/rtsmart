@@ -19,6 +19,9 @@
 #ifdef RT_USING_LWIP
 #include <netif/ethernetif.h>
 #include <lwip/netifapi.h>
+#ifdef LWIP_USING_NAT
+#include <ipv4_nat.h>
+#endif
 #ifdef LWIP_USING_DHCPD
 #include <dhcp_server.h>
 #endif
@@ -182,11 +185,28 @@ static void netif_set_connected(void *parameter)
 #ifdef LWIP_USING_DHCPD
             dhcpd_start(eth_dev->parent.parent.name);
 #endif
+#ifdef LWIP_USING_NAT
+            if (ip_nat_set_enabled(eth_dev->netif, 1) != ERR_OK)
+            {
+                LOG_E("failed to enable NAT on %s", eth_dev->parent.parent.name);
+            }
+            else
+            {
+                LOG_I("NAT enabled on %s", eth_dev->parent.parent.name);
+            }
+#endif
         }
     }
     else
     {
         LOG_D("F:%s L:%d set linkdown", __FUNCTION__, __LINE__);
+#ifdef LWIP_USING_NAT
+        if (wlan->mode == RT_WLAN_AP ||
+            wlan->registered_mode == RT_WLAN_AP)
+        {
+            ip_nat_set_enabled(eth_dev->netif, 0);
+        }
+#endif
         netifapi_netif_common(eth_dev->netif, netif_set_link_down, NULL);
         rt_timer_stop(&lwip_prot->timer);
 #ifdef RT_LWIP_DHCP
@@ -521,6 +541,12 @@ static void rt_wlan_lwip_protocol_unregister(struct rt_wlan_prot *prot, struct r
 
 #ifdef LWIP_USING_DHCPD
     dhcpd_stop(lwip_prot->eth.parent.parent.name);
+#endif
+#ifdef LWIP_USING_NAT
+    if (wlan->registered_mode == RT_WLAN_AP)
+    {
+        ip_nat_set_enabled(lwip_prot->eth.netif, 0);
+    }
 #endif
     eth_device_deinit(&lwip_prot->eth);
     rt_device_close((rt_device_t)wlan);
