@@ -1,0 +1,25 @@
+AIC8800 RT-Smart WLAN offload component
+=======================================
+
+Copyright (c) 2026, Canaan Bright Sight Co., Ltd
+
+The RT-Smart implementation and its protocol declarations are licensed under
+Apache-2.0. The firmware binaries under `firmware/` have separate vendor terms;
+confirm redistribution rights before publishing them or a system image that
+contains them.
+
+Provenance of the AIC8800FC firmware
+------------------------------------
+
+`firmware/usb/aic8800DC/fmacfw_patch_8800dc_fc_u02.bin` (28124 bytes) and
+`fmacfw_patch_tbl_8800dc_fc_u02.bin` (464 bytes) were extracted from the
+AICSemi Windows driver `aicusbwifi.Sys` (win10_x64, 2025-01-13), where they
+are the ROM patch and patch table that `rwnx_plat_patch_load_8800dc()` selects
+for USB a69c:88dc at chip_sub_id 1. Both carry the vendor build stamp
+`li Nov 25 2024 19:26:56 - g9fc3708`.
+
+They are not interchangeable with the `fmacfw_patch_8800dc_u02.bin` /
+`fmacfw_patch_tbl_8800dc_u02.bin` pair shipped for the Linux reference driver
+(`zh May 28 2024 20:54:45 - g2db9716`): the two builds differ in size and in
+the patch RAM description address, 0x00186e00 against 0x00187c00. Prefer an
+official drop from AICSemi if one becomes available.

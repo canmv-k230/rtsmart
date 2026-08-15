@@ -1,0 +1,567 @@
+menuconfig RT_USING_AIC8800_WIFI
+    bool "AIC8800 Wi-Fi offload driver"
+    depends on RT_USING_WIFI
+    depends on ENABLE_CHERRY_USB_HOST || RT_USING_SDIO
+    depends on RT_USING_LWP && RT_USING_DFS && RT_USING_DFS_DEVFS
+    select RT_WLAN_OFFLOAD
+    select RT_WLAN_OFFLOAD_CONTROL
+    select RT_WLAN_OFFLOAD_SUPPLICANT
+    select RT_WLAN_OFFLOAD_EMBEDDED_WPA2
+    select RT_WLAN_OFFLOAD_EMBEDDED_HOSTAPD
+    select RT_USING_TIMER_SOFT
+    default n
+    help
+        Enable the AIC8800 WLAN offload driver over USB and/or SDIO. Each
+        enabled transport loads its firmware from /bin/firmware and exposes
+        Wi-Fi through the RT-Thread WLAN offload framework. Device names are
+        assigned by the WLAN core, so every detected device gets its own
+        phyN-sta, phyN-ap, and /dev/wlanctlN. For SDIO, this driver may be
+        enabled with other vendor drivers; the SDIO core binds only the
+        driver whose manufacturer and product IDs match the card.
+
+if RT_USING_AIC8800_WIFI
+
+    menu "Bus Transports"
+
+        config AIC8800_WIFI_TRANSPORT_USB
+            bool "USB"
+            depends on ENABLE_CHERRY_USB_HOST
+            select RT_USING_MESSAGEQUEUE
+            select RT_USING_MEMPOOL
+            default y if !AIC8800_WIFI_TRANSPORT_SDIO
+            help
+                Build the USB Wi-Fi transport and, when selected below, the
+                USB Bluetooth transport.
+
+        config AIC8800_WIFI_TRANSPORT_SDIO
+            bool "SDIO"
+            depends on RT_USING_SDIO
+            select RT_USING_MESSAGEQUEUE
+            select RT_USING_MEMPOOL
+            default y if !ENABLE_CHERRY_USB_HOST
+            help
+                Build the SDIO Wi-Fi transport. USB and SDIO may be enabled
+                together; each detected Wi-Fi device gets its own driver
+                context and WLAN offload radio.
+
+    endmenu
+
+    menu "General Settings"
+
+        config AIC8800_WIFI_AUTO_START
+            bool "Initialize station and AP interfaces during device attachment"
+            depends on RT_WLAN_MANAGE_ENABLE
+            default y
+            help
+                Register both AIC virtual interfaces with RT-Thread WLAN
+                management after firmware startup. The AP interface remains
+                idle until rt_wlan_start_ap() or the wifi ap command is used.
+
+        config AIC8800_WIFI_FIRMWARE_PATH
+            string "Installed firmware root"
+            default "/bin/firmware"
+            help
+                Directory containing the aic8800, aic8800D80, and optional
+                transport-specific firmware family directories.
+
+        config AIC8800_WIFI_COUNTRY_CODE
+            string "Regulatory country code"
+            default "CN"
+            help
+                Uppercase ISO 3166-1 alpha-2 country used for channel and
+                transmit-power configuration.
+
+        config AIC8800_WIFI_5GHZ
+            bool "Enable 5 GHz channels"
+            default y
+            help
+                Disable for 2.4 GHz-only AIC8801 or AIC8800DC modules.
+
+        config AIC8800_WIFI_VERIFY_FIRMWARE
+            bool "Verify firmware uploads by reading them back"
+            default n
+            help
+                Read every uploaded word back from target memory. This is a
+                slow diagnostic for transport or DMA corruption.
+
+        config AIC8800_WIFI_COMMAND_TIMEOUT_MS
+            int "Firmware command timeout (ms)"
+            range 1000 30000
+            default 5000
+
+        config AIC8800_WIFI_MGMT_CONFIRM_TIMEOUT_MS
+            int "Management TX confirmation timeout (ms)"
+            range 100 10000
+            default 1000
+
+        config AIC8800_WIFI_TX_BUFFER_SIZE
+            int "Maximum transmit record size"
+            range 2048 4096
+            default 2048
+
+        config AIC8800_WIFI_RX_REORDER_FLOWS
+            int "Receive reorder flow count"
+            range 8 128
+            default 128
+
+        config AIC8800_WIFI_RX_REORDER_SLOTS
+            int "Receive reorder packet slots"
+            range 16 256
+            default 128
+            help
+                Preallocated records shared by all receive reorder flows.
+                The bounded default avoids allocating a multi-megabyte pool
+                for every attached radio.
+
+        config AIC8800_WIFI_RX_REORDER_WINDOW
+            int "Receive reorder window"
+            range 8 256
+            default 64
+
+        config AIC8800_WIFI_RX_REORDER_TIMEOUT_MS
+            int "Receive reorder timeout (ms)"
+            range 10 500
+            default 50
+            help
+                Hold out-of-order QoS data frames for this long before
+                advancing across a missing 802.11 sequence number. The AIC
+                reference driver uses 50 ms.
+
+        config AIC8800_WIFI_TCP_ACK_FILTER
+            bool "Coalesce TCP acknowledgements"
+            default y
+            help
+                Keep only the newest pure TCP acknowledgement for up to 5 ms,
+                matching the AIC reference driver's throughput optimization.
+
+        config AIC8800_WIFI_POWER_SAVE
+            bool "Enable firmware station power save"
+            default y
+            help
+                Set ME_CONFIG ps_on when the firmware reports AIC_FW_CAP_PS.
+                Matches the vendor Linux default (ps_on=true, dpsm=false).
+                The vendor never sends ME_SET_PS_MODE after join — its
+                cfg80211 set_power_mgmt is stubbed — so this bit is what
+                actually lets the firmware enter TIM/DTIM sleep.
+
+                Disable it to keep the radio awake. On a receive-heavy UDP
+                server that sleep shows up as pre-USB sawtooth loss (clean
+                host URB/spare counters, iperf seconds flipping between
+                ~1% and ~15%) even at RSSI -40.
+
+    endmenu
+
+    if AIC8800_WIFI_TRANSPORT_USB
+
+        menu "USB Transport Settings"
+
+            config AIC8800_WIFI_FORCE_FIRMWARE_DOWNLOAD
+                bool "Reload firmware when a runtime device is detected"
+                default y
+                help
+                    Reboot a supported runtime device into its USB loader and
+                    download the packaged firmware. If required files are
+                    absent, keep using the already-running firmware.
+
+            config AIC8800_WIFI_RX_BUFFER_SIZE
+                int "Receive buffer size"
+                range 2048 16384
+                default 2048
+                help
+                    Size of each bulk IN transfer on the data endpoint. The
+                    dedicated message endpoint is unaffected; it always uses
+                    AIC8800_USB_MESSAGE_BUFFER_SIZE.
+
+                    Do not raise this expecting fewer URB completions. The
+                    vendor allocates AICWF_USB_AGGR_MAX_PKT_SIZE (20480) only
+                    under CONFIG_USB_RX_AGGR, which its Makefile ships as 'n',
+                    so the vendor's effective buffer is also 2048. With
+                    firmware RX aggregation off the device writes one record
+                    per bulk transfer and terminates it with a short packet,
+                    which completes the host transfer no matter how large the
+                    buffer is. Measured on AIC8800D40: 63639 completions for
+                    63485 received frames, i.e. one record per transfer.
+                    A larger buffer only pays off if firmware RX aggregation
+                    is enabled first. Cost is DATA_RX_URBS buffers of this
+                    size plus one reassembly buffer of this size +
+                    AIC8800_USB_MAX_RECORD_SIZE.
+
+            config AIC8800_WIFI_DATA_RX_URBS
+                int "Queued data receive requests"
+                range 1 16
+                default 5
+                help
+                    Matches the vendor AICWF_USB_RX_URBS. Each request owns one
+                    URB plus AIC8800_WIFI_RX_SPARES_PER_SLOT extra DMA buffers
+                    so giveback can swap and resubmit across a second
+                    high-speed refill wave; those buffers are not extra URBs.
+                    The dwc2_linux host port allocates URBs and QTDs from
+                    fixed pools of DWC2_MAX_URB (128) blocks shared by every
+                    device and endpoint on the controller, where Linux uses a
+                    per-URB kmalloc with no ceiling. The sum of this option,
+                    MESSAGE_RX_URBS, DATA_TX_URBS, the Bluetooth transport and
+                    every other enabled USB class must stay below that budget:
+                    exhausting the pool makes the next submit fail with -ENOMEM
+                    (-12) on whichever endpoint happens to submit, which is why
+                    an over-deep queue shows up as bulk IN errors rather than
+                    transmit errors.
+
+            config AIC8800_WIFI_MESSAGE_RX_URBS
+                int "Queued message receive requests"
+                range 1 32
+                default 1 if DWC2_DRV_DMA_DESC_ENABLE
+                default 20
+                help
+                    Descriptor DMA completes a non-periodic chain at its final
+                    descriptor. Keep one request continuously armed for the
+                    sparse dedicated message endpoint so command replies are
+                    not delayed behind an otherwise idle descriptor chain.
+
+            config AIC8800_WIFI_DATA_TX_URBS
+                int "Queued data transmit requests"
+                range 1 32
+                default 2
+                help
+                    Depth of the bulk OUT pipeline. Measured on AIC8800D40
+                    over high-speed USB, transmit is limited by the radio and
+                    not by this pool: raising it from 2 to 4 left the fraction
+                    of submissions that had to wait for a free request
+                    unchanged at 96%, while aic8800_stat reported bursts of
+                    1000+ frames submitted without ever blocking. Frames queue
+                    up because the firmware drains them at the air rate.
+
+                    Increase it only if aic8800_stat shows a low wait fraction
+                    together with a saturated transmit queue, which would mean
+                    the host really is the bottleneck. Each request also owns a
+                    DMA buffer, so a deep pool costs memory that the USB host
+                    controller needs for its own transfers.
+
+            config AIC8800_WIFI_USB_LIMIT_40MHZ
+                bool "Limit the USB radio to 40 MHz channels"
+                default n
+                help
+                    Enable for AIC8800D40L USB modules. D40L uses the same
+                    D80/D81 boot and runtime USB product IDs and firmware
+                    family, so the USB IDs alone cannot distinguish it from
+                    an 80 MHz-capable D80 module.
+
+            config AIC8800_WIFI_USB_MODESWITCH_PLACEHOLDER_ID
+                bool "Claim mass storage at the placeholder ID 1111:1111"
+                default y
+                help
+                    Run the fake-storage mode switch against USB 1111:1111.
+                    Required for the AIC 88M80 WiFi 6 + Bluetooth module,
+                    which ships behind that ID and switches on a private SCSI
+                    command rather than an eject.
+
+                    1111:1111 is NOT an AIC identity. AIC's USB-IF vendor ID
+                    is 0xa69c, and no INF in any vendor Windows driver package
+                    binds 1111:1111. It is the placeholder that unprogrammed
+                    and no-name devices ship with.
+
+                    The driver only acts on a device at this ID once it has
+                    answered the AIC private command, and leaves anything else
+                    untouched. It does still claim the interface, though, and
+                    the USB host core has no way to hand a declined device to
+                    another class driver - so an unrelated device presenting
+                    this ID will not mount as storage while this is set.
+                    Clear it if that matters more than the 88M80 working
+                    without configuration.
+
+            config AIC8800_WIFI_USB_TX_AGGREGATE_FRAMES
+                int "Maximum frames per USB transmit aggregate"
+                range 1 10
+                default 10
+                help
+                    Batch data records into the vendor USB transmit format.
+                    The original driver supports up to ten records per
+                    transfer on DC/DW devices. D80 keeps ordinary framing:
+                    its bundled runtime drops aggregated data records.
+
+            config AIC8800_WIFI_USB_TX_AGGREGATE_SIZE
+                int "Maximum USB transmit aggregate size"
+                range 4096 32768
+                default 16384
+
+            config AIC8800_WIFI_USB_TX_QUEUE_DEPTH
+                int "USB transmit queue depth"
+                range 16 256
+                default 64
+                help
+                    Queue ordinary data for the dedicated USB transmit worker
+                    so lwIP does not block on USB request completions. DC/DW
+                    devices can additionally aggregate queued records;
+                    D80/D81 sends one ordinary record per USB request.
+
+            config AIC8800_WIFI_USB_TX_AGGREGATE_WAIT_MS
+                int "USB transmit aggregation idle wait (ms)"
+                range 0 10
+                default 1
+                help
+                    Let the producer enqueue a second record before the
+                    higher-priority transmit worker drains the queue.
+
+            config AIC8800_WIFI_USB_TX_THREAD_STACK_SIZE
+                int "USB transmit thread stack size"
+                range 2048 16384
+                default 4096
+
+            config AIC8800_WIFI_USB_TX_THREAD_PRIORITY
+                int "USB transmit thread priority"
+                range 5 30
+                default 14
+
+            config AIC8800_WIFI_TX_WAIT_MS
+                int "Transmit queue wait (ms)"
+                range 1 1000
+                default 100
+                help
+                    Producer backpressure applied when the transmit pool is
+                    saturated. Because transmit is normally limited by the
+                    radio rather than by the host, this wait is what paces the
+                    sender; shortening it does not raise throughput, it just
+                    converts the stall into a dropped frame. A measured 20 ms
+                    dropped datagrams during a saturated UDP transmit where
+                    100 ms dropped none.
+
+            config AIC8800_WIFI_TX_WATCHDOG_MS
+                int "Transmit watchdog (ms)"
+                range 100 30000
+                default 1000
+                help
+                    How long a bulk OUT request may stay in flight before it is
+                    treated as lost and cancelled.
+
+                    The transmit pool only holds AIC8800_WIFI_DATA_TX_URBS
+                    requests and its slot semaphore is released only from the
+                    completion callback, so one request the host controller
+                    never gives back drains the pool and stops transmit for
+                    good. That has been observed after a descriptor-DMA AHB
+                    fault: the endpoint went quiet, every later frame timed out
+                    against AIC8800_WIFI_TX_WAIT_MS, and the link stayed dead
+                    until the device was re-enumerated.
+
+                    Keep this well above the transmit wait. Cancelling costs
+                    one retransmit; a wedged endpoint costs the link.
+
+                    The caller is normally the lwIP protocol thread, which also
+                    feeds received frames into the stack, so do not raise this
+                    far beyond the point where transmit congestion would begin
+                    to delay receive.
+
+            config AIC8800_WIFI_RX_RECOVERY_ERRORS
+                int "Receive errors before firmware recovery"
+                range 8 1024
+                default 64
+
+            config AIC8800_WIFI_BLE
+                bool "Expose USB Bluetooth as an H:4 device"
+                select RT_USING_BT_HCI
+                default y
+                help
+                    Register the Bluetooth USB interface through /dev/hciX.
+                    SCO audio is not implemented.
+
+            if AIC8800_WIFI_BLE
+
+                config AIC8800_BT_HCI_RX_BUFFER_SIZE
+                    int "Bluetooth HCI receive buffer size"
+                    range 1024 32767
+                    default 8192
+
+                config AIC8800_BT_USB_RX_BUFFER_SIZE
+                    int "Bluetooth USB receive buffer size"
+                    range 1024 8192
+                    default 4096
+
+                config AIC8800_BT_RX_THREAD_STACK_SIZE
+                    int "Bluetooth receive thread stack size"
+                    range 2048 16384
+                    default 4096
+
+                config AIC8800_BT_RX_THREAD_PRIORITY
+                    int "Bluetooth receive thread priority"
+                    range 5 30
+                    default 15
+
+            endif
+
+        endmenu
+
+    endif
+
+    if AIC8800_WIFI_TRANSPORT_SDIO
+
+        menu "SDIO Transport Settings"
+
+            config AIC8800_WIFI_SDIO_RX_BUFFER_SIZE
+                int "Maximum receive aggregate size"
+                range 4096 65536
+                default 65536
+
+            config AIC8800_WIFI_SDIO_FLOW_RETRIES
+                int "Flow-control retries"
+                range 10 200
+                default 50
+
+            config AIC8800_WIFI_SDIO_RX_RECOVERY_ERRORS
+                int "Consecutive receive I/O errors before recovery"
+                range 8 1024
+                default 64
+                help
+                    Keep the SDIO bus running across isolated controller
+                    errors. Protocol parsing failures are discarded and do
+                    not count toward this transport recovery threshold.
+
+            config AIC8800_WIFI_SDIO_RX_QUEUE_DEPTH
+                int "Receive data queue depth"
+                range 32 512
+                default 256
+                help
+                    Preallocated firmware data records waiting for protocol,
+                    reorder, and network-stack processing. This queue lets the
+                    SDIO bus worker drain the device FIFO without blocking on
+                    lwIP receive processing. The AIC reference driver allows a
+                    much deeper dynamic queue; 256 records absorbs SDIO and
+                    scheduler bursts without its 2000-entry memory exposure.
+
+            config AIC8800_WIFI_SDIO_RX_LARGE_QUEUE_DEPTH
+                int "Large receive record reserve"
+                range 2 128
+                default 64
+                help
+                    Preallocated records for receive A-MSDUs larger than the
+                    normal 4 KiB record size. Keeping this separate avoids
+                    sizing every receive queue entry for an 11.5 KiB A-MSDU.
+
+            config AIC8800_WIFI_SDIO_BUS_THREAD_PRIORITY
+                int "FIFO drain thread priority"
+                range 5 30
+                default 11
+                help
+                    Priority of the worker that performs SDIO CMD53 reads and
+                    dispatches firmware control records. It should run before
+                    the data processing worker but after latency-sensitive
+                    network-stack consumers.
+
+            config AIC8800_WIFI_SDIO_DATA_THREAD_STACK_SIZE
+                int "Receive data thread stack size"
+                range 4096 32768
+                default 8192
+
+            config AIC8800_WIFI_SDIO_DATA_THREAD_PRIORITY
+                int "Receive data thread priority"
+                range 5 30
+                default 12
+                help
+                    Run immediately after the SDIO FIFO drain worker and ahead
+                    of traffic generators. The bounded processing budget lets
+                    lower-priority system work run during continuous traffic.
+
+            config AIC8800_WIFI_SDIO_DATA_THREAD_BUDGET
+                int "Receive records before scheduler break"
+                range 16 1024
+                default 128
+                help
+                    After this many consecutive queued records, sleep for one
+                    scheduler tick when backlog remains. This prevents a
+                    saturated receive stream from starving lower-priority
+                    system threads.
+
+            config AIC8800_WIFI_SDIO_TX_AGGREGATE_FRAMES
+                int "Maximum frames per transmit aggregate"
+                range 1 32
+                default 32
+                help
+                    Combine queued firmware records into one CMD53 transfer.
+                    The actual aggregate is also limited by the credits
+                    currently advertised by the firmware.
+
+            config AIC8800_WIFI_SDIO_TX_QUEUE_DEPTH
+                int "Transmit queue depth"
+                range 8 256
+                default 256
+                help
+                    Buffer short firmware credit and scheduler stalls. The AIC
+                    reference driver uses an 8192-entry queue; this port keeps
+                    allocation bounded because each entry owns a complete
+                    transmit frame.
+
+            config AIC8800_WIFI_SDIO_TX_AGGREGATE_WAIT_MS
+                int "Transmit aggregation idle wait (ms)"
+                range 0 10
+                default 1
+                help
+                    Wait briefly for the next data frame while building an
+                    SDIO CMD53 aggregate. This prevents the high-priority SDIO
+                    worker from sending every iperf datagram separately.
+
+            config AIC8800_WIFI_SDIO_TX_THREAD_STACK_SIZE
+                int "Transmit thread stack size"
+                range 4096 32768
+                default 4096
+
+            config AIC8800_WIFI_SDIO_TX_THREAD_PRIORITY
+                int "Transmit thread priority"
+                range 5 30
+                default 14
+
+        endmenu
+
+    endif
+
+    menu "Thread Settings"
+
+        config AIC8800_WIFI_RX_THREAD_STACK_SIZE
+            int "Receive thread stack size"
+            range 4096 32768
+            default 8192
+
+        config AIC8800_WIFI_RX_THREAD_PRIORITY
+            int "Receive thread priority"
+            range 5 30
+            default 12
+            help
+                Priority of the USB bulk IN workers. These threads rearm the
+                receive requests, so they must run ahead of the transmit
+                worker (AIC8800_WIFI_USB_TX_THREAD_PRIORITY) and of traffic
+                generators; otherwise a saturated transmit path stops receive
+                entirely. Keep it below the lwIP protocol thread.
+
+        config AIC8800_WIFI_ATTACH_THREAD_STACK_SIZE
+            int "Attachment worker stack size"
+            range 8192 32768
+            default 12288
+
+        config AIC8800_WIFI_ATTACH_THREAD_PRIORITY
+            int "Attachment worker priority"
+            range 5 30
+            default 14
+
+    endmenu
+
+    menu "Logging"
+
+        choice AIC8800_WIFI_LOG_LEVEL
+            prompt "Module log level"
+            default AIC8800_WIFI_LOG_LEVEL_INFO
+            help
+                Select the minimum log level compiled into the AIC8800
+                driver. Debug includes transport and firmware trace output.
+
+            config AIC8800_WIFI_LOG_LEVEL_ERROR
+                bool "Errors only"
+
+            config AIC8800_WIFI_LOG_LEVEL_WARNING
+                bool "Warnings and errors"
+
+            config AIC8800_WIFI_LOG_LEVEL_INFO
+                bool "Information (default)"
+
+            config AIC8800_WIFI_LOG_LEVEL_DEBUG
+                bool "Debug and above"
+        endchoice
+
+    endmenu
+
+endif

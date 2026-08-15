@@ -1,0 +1,75 @@
+import os
+
+from building import *
+
+cwd = GetCurrentDir()
+src = [
+    'aic8800_wifi.c',
+    'aic8800_firmware.c',
+    'aic8800_radio.c',
+]
+
+if GetDepend(['AIC8800_WIFI_TRANSPORT_USB']):
+    src += ['aic8800_usb.c']
+
+if GetDepend(['AIC8800_WIFI_TRANSPORT_SDIO']):
+    src += ['aic8800_sdio.c']
+
+if GetDepend(['AIC8800_WIFI_TRANSPORT_USB', 'AIC8800_WIFI_BLE']):
+    src += ['aic8800_btusb.c']
+
+CPPPATH = [
+    cwd,
+    cwd + '/port',
+    cwd + '/../../../../../rt-thread/components/drivers/wlan/offload',
+]
+
+if GetDepend(['AIC8800_WIFI_TRANSPORT_USB']):
+    CPPPATH += [
+        cwd + '/../../../components/CherryUSB',
+        cwd + '/../../../components/CherryUSB/common',
+        cwd + '/../../../components/CherryUSB/core',
+        cwd + '/../../../components/CherryUSB/class/hub',
+    ]
+
+group = DefineGroup('aic8800', src,
+                    depend=['RT_USING_AIC8800_WIFI'], CPPPATH=CPPPATH)
+
+if GetDepend(['RT_USING_AIC8800_WIFI']):
+    firmware_transports = []
+    if GetDepend(['AIC8800_WIFI_TRANSPORT_USB']):
+        firmware_transports += ['usb']
+    if GetDepend(['AIC8800_WIFI_TRANSPORT_SDIO']):
+        firmware_transports += ['sdio']
+    firmware_stage = os.getenv('RTSMART_FIRMWARE_STAGE_DIR')
+    firmware_targets = []
+
+    if not firmware_stage:
+        raise RuntimeError('RTSMART_FIRMWARE_STAGE_DIR is not set')
+
+    for firmware_transport in firmware_transports:
+        firmware_source = os.path.join(cwd, 'firmware', firmware_transport)
+        transport_stage = firmware_stage
+        if len(firmware_transports) > 1:
+            transport_stage = os.path.join(firmware_stage, firmware_transport)
+
+        for directory, subdirectories, filenames in os.walk(firmware_source):
+            subdirectories.sort()
+            filenames.sort()
+            relative_directory = os.path.relpath(directory, firmware_source)
+            destination = transport_stage
+            if relative_directory != '.':
+                destination = os.path.join(destination, relative_directory)
+
+            for filename in filenames:
+                source = os.path.join(directory, filename)
+                target = os.path.join(destination, filename)
+                firmware_targets += Env.InstallAs(target, source)
+
+    if not firmware_targets:
+        raise RuntimeError('AIC8800 firmware directory is empty')
+
+    Env.Depends(File('#/rtthread.elf'), firmware_targets)
+    Env.Alias('aic8800-firmware', firmware_targets)
+
+Return('group')

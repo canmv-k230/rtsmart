@@ -1,11 +1,17 @@
-menu "Ext Driver"
+menu "External Drivers"
+
+menu "Wi-Fi Drivers"
+    source "drivers/extdrv/rw007/Kconfig"
     source "drivers/extdrv/cyw43xx/Kconfig"
     source "drivers/extdrv/realtek/Kconfig"
+    source "drivers/extdrv/aic8800/Kconfig"
 
     config BSP_USING_WIFI_SDIO
         bool
         default y if RT_USING_CYW43XX
         default y if RT_USING_REALTEK
+        default y if RT_USING_RTL8189
+        default y if AIC8800_WIFI_TRANSPORT_SDIO
 
     if BSP_USING_WIFI_SDIO
 
@@ -64,11 +70,13 @@ menu "Ext Driver"
         endmenu
 
     endif
+endmenu
+
     source "drivers/extdrv/spinand/Kconfig"
-    source "drivers/extdrv/regulator/Kconfig"
+    source "drivers/extdrv/lsm6dsm/Kconfig"
     source "drivers/extdrv/touch/Kconfig"
+    source "drivers/extdrv/regulator/Kconfig"
     source "drivers/extdrv/ws2812/Kconfig"
     source "drivers/extdrv/onewire/Kconfig"
-    source "drivers/extdrv/rw007/Kconfig"
-    source "drivers/extdrv/lsm6dsm/Kconfig"
+
 endmenu

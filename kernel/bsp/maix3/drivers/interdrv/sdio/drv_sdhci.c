@@ -339,19 +339,11 @@ static void sdhci_clear_int_status_flag(struct sdhci_host* sdhci_host, uint32_t 
 
 static void sdhic_error_recovery(struct sdhci_host* sdhci_host)
 {
-    uint32_t status;
-    /* get host present status */
-    status = sdhci_get_present_status_flag(sdhci_host);
-    /* check command inhibit status flag */
-    if ((status & SDHCI_CMD_INHIBIT) != 0U) {
-        /* reset command line */
-        sdhci_reset(sdhci_host, SDHCI_RESET_CMD);
-    }
-    /* check data inhibit status flag */
-    if ((status & SDHCI_DATA_INHIBIT) != 0U) {
-        /* reset data line */
-        sdhci_reset(sdhci_host, SDHCI_RESET_DATA);
-    }
+    /* Error status can clear the inhibit bits before recovery runs. Reset
+     * both state machines after a failed transfer, matching the original
+     * recovery behavior without resetting successful transfers. */
+    sdhci_reset(sdhci_host, SDHCI_RESET_CMD);
+    sdhci_reset(sdhci_host, SDHCI_RESET_DATA);
 }
 
 static rt_err_t sdhci_receive_command_response(struct sdhci_host* sdhci_host, struct sdhci_command* command)
@@ -590,8 +582,8 @@ static rt_err_t sdhci_transfer_blocking(struct sdhci_host* sdhci_host)
     sdhci_writel(sdhci_host, sdhci_readl(sdhci_host, SDHCI_SIGNAL_ENABLE) &
         ~(SDHCI_INT_DATA_MASK | SDHCI_INT_CMD_MASK), SDHCI_SIGNAL_ENABLE);
     sdhci_writel(sdhci_host, SDHCI_INT_ALL_MASK, SDHCI_INT_STATUS);
-    sdhci_reset(sdhci_host, SDHCI_RESET_CMD);
-    sdhci_reset(sdhci_host, SDHCI_RESET_DATA);
+    if (ret != RT_EOK)
+        sdhic_error_recovery(sdhci_host);
     return ret;
 }
 
