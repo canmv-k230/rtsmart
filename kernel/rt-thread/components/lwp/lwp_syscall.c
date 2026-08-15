@@ -25,7 +25,6 @@
 #endif
 
 #ifdef RT_USING_DFS
-#include <dfs_net.h>
 #include <dfs_poll.h>
 #include <dfs_posix.h>
 #include <dfs_select.h>
@@ -34,6 +33,7 @@
 #include "syscall_data.h"
 
 #if (defined(RT_USING_SAL) && defined(SAL_USING_POSIX))
+#include <dfs_net.h>
 #include <sys/socket.h>
 
 #define SYSCALL_NET(f)      f
@@ -89,6 +89,7 @@ struct musl_sockaddr
     char     sa_data[14];
 };
 
+#if defined(RT_USING_SAL) && defined(SAL_USING_POSIX)
 struct musl_iovec
 {
     void *iov_base;
@@ -132,6 +133,7 @@ LWP_ABI_ASSERT(msghdr_control_offset, offsetof(struct musl_msghdr, msg_control) 
 LWP_ABI_ASSERT(msghdr_controllen_offset, offsetof(struct musl_msghdr, msg_controllen) == 40);
 LWP_ABI_ASSERT(msghdr_flags_offset, offsetof(struct musl_msghdr, msg_flags) == 48);
 LWP_ABI_ASSERT(cmsghdr_size, sizeof(struct musl_cmsghdr) == 16);
+#endif /* RT_USING_SAL && SAL_USING_POSIX */
 
 int sys_dup(int oldfd);
 int sys_dup2(int oldfd, int new);
@@ -3402,6 +3404,7 @@ int sys_send(int socket, const void *dataptr, size_t size, int flags)
     return sys_sendto(socket, dataptr, size, flags, RT_NULL, 0);
 }
 
+#if defined(RT_USING_SAL) && defined(SAL_USING_POSIX)
 static int copy_msghdr_from_user(struct musl_msghdr *message,
         struct musl_msghdr *kmessage, struct musl_iovec **user_iov,
         struct sal_iovec **kernel_iov, int *kernel_iovlen,
@@ -3819,6 +3822,7 @@ out:
     free_kernel_msghdr(user_iov, kernel_iov, kernel_data);
     return ret;
 }
+#endif /* RT_USING_SAL && SAL_USING_POSIX */
 
 int sys_socket(int domain, int type, int protocol)
 {
