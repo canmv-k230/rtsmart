@@ -133,7 +133,7 @@ static void tcpip_init_done_callback(void *arg)
             LOCK_TCPIP_CORE();
 
             netif_add(ethif->netif, &ipaddr, &netmask, &gw,
-                      ethif, netif_device_init, tcpip_input);
+                      ethif, netif_device_init, eth_device_input);
 
 #if LWIP_DHCP
             /* set interface up */

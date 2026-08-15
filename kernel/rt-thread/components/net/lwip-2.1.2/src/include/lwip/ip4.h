@@ -52,7 +52,7 @@
 extern "C" {
 #endif
 
-#ifdef LWIP_HOOK_IP4_ROUTE_SRC
+#if defined(LWIP_HOOK_IP4_ROUTE_SRC) || defined(RT_USING_NETDEV)
 #define LWIP_IPV4_SRC_ROUTING   1
 #else
 #define LWIP_IPV4_SRC_ROUTING   0
@@ -107,5 +107,4 @@ void ip4_debug_print(struct pbuf *p);
 #endif /* LWIP_IPV4 */
 
 #endif /* LWIP_HDR_IP_H */
-
 

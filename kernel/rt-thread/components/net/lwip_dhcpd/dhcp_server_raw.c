@@ -130,6 +130,25 @@ struct dhcp_server
 
 static u8_t *dhcp_server_option_find(u8_t *buf, u16_t len, u8_t option);
 
+static void dhcpd_set_netif_addr(struct netif *netif, const char *ip_addr,
+                                 const char *gw_addr, const char *nm_addr)
+{
+    ip4_addr_t addr;
+
+    if (ip_addr != RT_NULL && ip4addr_aton(ip_addr, &addr))
+    {
+        netif_set_ipaddr(netif, &addr);
+    }
+    if (gw_addr != RT_NULL && ip4addr_aton(gw_addr, &addr))
+    {
+        netif_set_gw(netif, &addr);
+    }
+    if (nm_addr != RT_NULL && ip4addr_aton(nm_addr, &addr))
+    {
+        netif_set_netmask(netif, &addr);
+    }
+}
+
 /**
 * The dhcp server struct list.
 */
@@ -306,6 +325,7 @@ static void
 dhcp_server_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t *recv_addr, u16_t port)
 {
     struct dhcp_server *dhcp_server = (struct dhcp_server *)arg;
+    char netif_name[RT_NAME_MAX];
     struct dhcp_msg *msg;
     struct pbuf *q;
     u8_t *opt_buf;
@@ -316,7 +336,12 @@ dhcp_server_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t
     ip_addr_t addr = *recv_addr;
     u32_t tmp;
 
-    LWIP_DEBUGF(DHCP_DEBUG | LWIP_DBG_TRACE, ("[%s:%d] %c%c recv %d\n", __FUNCTION__, __LINE__, dhcp_server->netif->name[0], dhcp_server->netif->name[1], p->tot_len));
+    LWIP_DEBUGF(DHCP_DEBUG | LWIP_DBG_TRACE,
+                ("[%s:%d] %s recv %d\n", __FUNCTION__, __LINE__,
+                 rt_lwip_netif_name(dhcp_server->netif, netif_name,
+                                    sizeof(netif_name)),
+                 p->tot_len));
+    LWIP_UNUSED_ARG(netif_name);
     /* prevent warnings about unused arguments */
     LWIP_UNUSED_ARG(pcb);
     LWIP_UNUSED_ARG(addr);
@@ -668,37 +693,18 @@ dhcp_server_start(struct netif *netif, ip4_addr_t *start, ip4_addr_t *end)
     return ERR_OK;
 }
 
-extern void set_if(const char *netif_name, const char *ip_addr, const char *gw_addr, const char *nm_addr);
-
 void dhcpd_start(const char *netif_name)
 {
-    struct netif *netif = netif_list;
+    struct netif *netif;
     err_t res;
 
     DEBUG_PRINTF("%s: %s\r\n", __FUNCTION__, netif_name);
 
     LWIP_NETIF_LOCK();
-    if (strlen(netif_name) > sizeof(netif->name))
-    {
-        DEBUG_PRINTF("network interface name too long!\r\n");
-        goto _exit;
-    }
-
-    while (netif != RT_NULL)
-    {
-        if (strncmp(netif_name, netif->name, sizeof(netif->name)) == 0)
-            break;
-
-        netif = netif->next;
-        if (netif == RT_NULL)
-        {
-            DEBUG_PRINTF("network interface: %s not found!\r\n", netif_name);
-            break;
-        }
-    }
-
+    netif = rt_lwip_netif_find(netif_name);
     if (netif == RT_NULL)
     {
+        DEBUG_PRINTF("network interface: %s not found!\r\n", netif_name);
         goto _exit;
     }
 
@@ -706,7 +712,8 @@ void dhcpd_start(const char *netif_name)
     {
         dhcp_stop(netif);
 
-        set_if(netif_name, DHCPD_SERVER_IP, DHCPD_SERVER_IP, "255.255.255.0");
+        dhcpd_set_netif_addr(netif, DHCPD_SERVER_IP, DHCPD_SERVER_IP,
+                             "255.255.255.0");
 
         ip_addr_t dns_ip;
         inet_aton(DHCPD_SERVER_IP, &dns_ip);
@@ -764,33 +771,16 @@ _exit:
 void dhcpd_stop(const char *netif_name)
 {
     struct dhcp_server *dhcp_server, *server_node;
-    struct netif *netif = netif_list;
+    struct netif *netif;
     struct dhcp_client_node *node, *next;
 
     DEBUG_PRINTF("%s: %s\r\n", __FUNCTION__, netif_name);
 
     LWIP_NETIF_LOCK();
-    if (strlen(netif_name) > sizeof(netif->name))
-    {
-        DEBUG_PRINTF("network interface name too long!\r\n");
-        goto _exit;
-    }
-
-    while (netif != RT_NULL)
-    {
-        if (strncmp(netif_name, netif->name, sizeof(netif->name)) == 0)
-            break;
-
-        netif = netif->next;
-        if (netif == RT_NULL)
-        {
-            DEBUG_PRINTF("network interface: %s not found!\r\n", netif_name);
-            break;
-        }
-    }
-
+    netif = rt_lwip_netif_find(netif_name);
     if (netif == RT_NULL)
     {
+        DEBUG_PRINTF("network interface: %s not found!\r\n", netif_name);
         goto _exit;
     }
 
@@ -836,7 +826,7 @@ void dhcpd_stop(const char *netif_name)
     }
 
     mem_free(dhcp_server);
-    set_if(netif_name, "0.0.0.0", "0.0.0.0", "0.0.0.0");
+    dhcpd_set_netif_addr(netif, "0.0.0.0", "0.0.0.0", "0.0.0.0");
 
 _exit:
     LWIP_NETIF_UNLOCK();

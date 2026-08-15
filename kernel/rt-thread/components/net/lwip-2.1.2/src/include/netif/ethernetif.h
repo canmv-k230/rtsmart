@@ -25,6 +25,9 @@ struct eth_device
     /* network interface for lwip */
     struct netif *netif;
     struct rt_semaphore tx_ack;
+    struct rt_semaphore io_idle;
+    rt_size_t io_inflight;
+    rt_bool_t io_removing;
 
     rt_uint16_t flags;
     rt_uint8_t  link_changed;
@@ -42,8 +45,12 @@ extern "C" {
     rt_err_t eth_device_ready(struct eth_device* dev);
     rt_err_t eth_device_init(struct eth_device * dev, const char *name);
     rt_err_t eth_device_init_with_flag(struct eth_device *dev, const char *name, rt_uint16_t flag);
+    err_t eth_device_input(struct pbuf *p, struct netif *netif);
     rt_err_t eth_device_linkchange(struct eth_device* dev, rt_bool_t up);
     void eth_device_deinit(struct eth_device *dev);
+    struct netif *rt_lwip_netif_find(const char *name);
+    const char *rt_lwip_netif_name(const struct netif *netif,
+                                   char *buffer, rt_size_t size);
 #ifdef RT_USING_NETDEV
     int eth_device_netdev_add(struct netif *netif);
 #endif

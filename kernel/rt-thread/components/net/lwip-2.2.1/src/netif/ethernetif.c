@@ -495,6 +495,116 @@ static int netdev_flags_sync(struct netif *lwip_netif)
 }
 #endif /* RT_USING_NETDEV */
 
+struct netif *rt_lwip_netif_find(const char *name)
+{
+    rt_device_t device;
+    struct netif *netif;
+    rt_size_t name_len;
+
+    if (name == RT_NULL || name[0] == '\0')
+    {
+        return RT_NULL;
+    }
+
+#ifdef RT_USING_NETDEV
+    {
+        struct netdev *netdev = netdev_get_by_name(name);
+
+        if (netdev != RT_NULL && netdev->user_data != RT_NULL)
+        {
+            for (netif = netif_list; netif != RT_NULL; netif = netif->next)
+            {
+                if (netif == netdev->user_data)
+                {
+                    return netif;
+                }
+            }
+        }
+    }
+#endif /* RT_USING_NETDEV */
+
+    device = rt_device_find(name);
+    if (device != RT_NULL && device->type == RT_Device_Class_NetIf)
+    {
+        for (netif = netif_list; netif != RT_NULL; netif = netif->next)
+        {
+            if (netif->state == device)
+            {
+                return netif;
+            }
+        }
+    }
+
+    name_len = rt_strlen(name);
+    if (name_len > sizeof(netif->name))
+    {
+        const char *number = name + sizeof(netif->name);
+        rt_uint32_t num = 0;
+
+        do
+        {
+            if (*number < '0' || *number > '9')
+            {
+                return RT_NULL;
+            }
+            num = num * 10U + (rt_uint32_t)(*number - '0');
+            if (num > 0xffU)
+            {
+                return RT_NULL;
+            }
+            number++;
+        }
+        while (*number != '\0');
+
+        for (netif = netif_list; netif != RT_NULL; netif = netif->next)
+        {
+            if (netif->name[0] == name[0] && netif->name[1] == name[1] &&
+                netif->num == (u8_t)num)
+            {
+                return netif;
+            }
+        }
+        return RT_NULL;
+    }
+
+    if (name_len == sizeof(netif->name))
+    {
+        /* Keep accepting the legacy two-character lwIP interface prefix. */
+        for (netif = netif_list; netif != RT_NULL; netif = netif->next)
+        {
+            if (rt_memcmp(name, netif->name, sizeof(netif->name)) == 0)
+            {
+                return netif;
+            }
+        }
+    }
+
+    return RT_NULL;
+}
+
+const char *rt_lwip_netif_name(const struct netif *netif, char *buffer,
+                               rt_size_t size)
+{
+#ifdef RT_USING_NETDEV
+    struct netdev *netdev;
+
+    netdev = netdev_get_by_user_data(netif);
+    if (netdev != RT_NULL)
+    {
+        return netdev->name;
+    }
+#endif /* RT_USING_NETDEV */
+
+    if (netif == RT_NULL || buffer == RT_NULL || size == 0)
+    {
+        return "";
+    }
+
+    rt_snprintf(buffer, size, "%c%c%u", netif->name[0], netif->name[1],
+                (unsigned int)netif->num);
+    return buffer;
+}
+
 static err_t ethernetif_linkoutput(struct netif *netif, struct pbuf *p)
 {
 #ifndef LWIP_NO_TX_THREAD
@@ -1062,25 +1172,14 @@ void set_if(char* netif_name, char* ip_addr, char* gw_addr, char* nm_addr)
 {
     ip4_addr_t *ip;
     ip4_addr_t addr;
-    struct netif * netif = netif_list;
+    struct netif *netif;
 
-    if(strlen(netif_name) > sizeof(netif->name))
+    netif = rt_lwip_netif_find(netif_name);
+    if (netif == RT_NULL)
     {
-        rt_kprintf("network interface name too long!\r\n");
+        rt_kprintf("network interface: %s not found!\r\n",
+                   netif_name != RT_NULL ? netif_name : "(null)");
         return;
-    }
-
-    while(netif != RT_NULL)
-    {
-        if(strncmp(netif_name, netif->name, sizeof(netif->name)) == 0)
-            break;
-
-        netif = netif->next;
-        if( netif == RT_NULL )
-        {
-            rt_kprintf("network interface: %s not found!\r\n", netif_name);
-            return;
-        }
     }
 
     ip = (ip4_addr_t *)&addr;
@@ -1126,6 +1225,7 @@ void list_if(void)
 {
     rt_ubase_t index;
     struct netif * netif;
+    char netif_name[RT_NAME_MAX];
 
     rt_enter_critical();
 
@@ -1133,9 +1233,9 @@ void list_if(void)
 
     while( netif != RT_NULL )
     {
-        rt_kprintf("network interface: %c%c%s\n",
-                   netif->name[0],
-                   netif->name[1],
+        rt_kprintf("network interface: %s%s\n",
+                   rt_lwip_netif_name(netif, netif_name,
+                                      sizeof(netif_name)),
                    (netif == netif_default)?" (Default)":"");
         rt_kprintf("MTU: %d\n", netif->mtu);
         rt_kprintf("MAC: ");

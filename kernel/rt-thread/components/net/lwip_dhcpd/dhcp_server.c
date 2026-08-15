@@ -512,24 +512,14 @@ static void dhcpd_thread_entry(void *parameter)
 void dhcpd_start(const char *netif_name)
 {
     rt_thread_t thread;
-    struct netif *netif = netif_list;
+    struct netif *netif;
 
-    if (strlen(netif_name) > sizeof(netif->name))
+    netif = rt_lwip_netif_find(netif_name);
+    if (netif == RT_NULL)
     {
-        rt_kprintf("network interface name too long!\r\n");
+        rt_kprintf("network interface: %s not found!\r\n",
+                   netif_name != RT_NULL ? netif_name : "(null)");
         return;
-    }
-    while (netif != RT_NULL)
-    {
-        if (strncmp(netif_name, netif->name, sizeof(netif->name)) == 0)
-            break;
-
-        netif = netif->next;
-        if (netif == RT_NULL)
-        {
-            rt_kprintf("network interface: %s not found!\r\n", netif_name);
-            return;
-        }
     }
 
     if (1)

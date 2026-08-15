@@ -108,6 +108,7 @@ menu "light weight TCP/IP stack"
 config RT_USING_LWIP
     bool "Enable lwIP stack"
     select RT_USING_DEVICE
+    select RT_USING_SEMAPHORE
     default n
 
     if RT_USING_LWIP
@@ -116,12 +117,6 @@ config RT_USING_LWIP
             default RT_USING_LWIP212
             help
                 Select the lwIP version
-
-            config RT_USING_LWIP141
-                bool "lwIP v1.4.1"
-
-            config RT_USING_LWIP202
-                bool "lwIP v2.0.2"
 
             config RT_USING_LWIP212
                 bool "lwIP v2.1.2"

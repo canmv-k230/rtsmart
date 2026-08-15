@@ -289,12 +289,10 @@ RTM_EXPORT(socket);
 
 int closesocket(int s)
 {
-    int error = 0;
-    int socket = -1;
+    int error;
     struct dfs_fd *d;
 
-    socket = dfs_net_getsocket(s);
-    if (socket < 0)
+    if (dfs_net_getsocket(s) < 0)
     {
         rt_set_errno(-ENOTSOCK);
         return -1;
@@ -313,21 +311,19 @@ int closesocket(int s)
         return -1;
     }
 
-    if (sal_closesocket(socket) == 0)
+    error = dfs_file_close(d);
+    if (error >= 0 || (d->flags & DFS_F_CLOSE_TERMINAL))
     {
-        error = 0;
-    }
-    else
-    {
-        rt_set_errno(-ENOTSOCK);
-        error = -1;
+        fd_release(s);
     }
 
-    // rt_free(d->fnode);
-    /* socket has been closed, delete it from file system fd */
-    fd_release(s);
+    if (error < 0)
+    {
+        rt_set_errno(error);
+        return -1;
+    }
 
-    return error;
+    return 0;
 }
 RTM_EXPORT(closesocket);
 

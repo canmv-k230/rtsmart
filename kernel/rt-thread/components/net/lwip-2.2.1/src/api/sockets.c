@@ -54,6 +54,7 @@
 #include "lwip/netif.h"
 #include "lwip/priv/tcpip_priv.h"
 #include "lwip/mld6.h"
+#include "netif/ethernetif.h"
 #if LWIP_CHECKSUM_ON_COPY
 #include "lwip/inet_chksum.h"
 #endif
@@ -3544,14 +3545,25 @@ lwip_setsockopt_impl(int s, int level, int optname, const void *optval, socklen_
           break;
 #endif /* LWIP_UDP */
         case SO_BINDTODEVICE: {
-          const struct ifreq *iface;
+          const char *name = (const char *)optval;
+          char ifname[RT_NAME_MAX];
+          size_t name_len = 0;
           struct netif *n = NULL;
 
-          LWIP_SOCKOPT_CHECK_OPTLEN_CONN(sock, optlen, struct ifreq);
+          LWIP_SOCKOPT_CHECK_OPTLEN_CONN(sock, optlen, char);
 
-          iface = (const struct ifreq *)optval;
-          if (iface->ifr_name[0] != 0) {
-            n = netif_find(iface->ifr_name);
+          while ((name_len < optlen) && (name[name_len] != '\0')) {
+            name_len++;
+          }
+          if (name_len >= sizeof(ifname)) {
+            done_socket(sock);
+            return EINVAL;
+          }
+          MEMCPY(ifname, name, name_len);
+          ifname[name_len] = '\0';
+
+          if (ifname[0] != '\0') {
+            n = rt_lwip_netif_find(ifname);
             if (n == NULL) {
               done_socket(sock);
               return ENODEV;

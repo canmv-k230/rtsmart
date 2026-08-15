@@ -44,6 +44,9 @@ extern "C" {
     rt_err_t eth_device_init_with_flag(struct eth_device *dev, const char *name, rt_uint16_t flag);
     rt_err_t eth_device_linkchange(struct eth_device* dev, rt_bool_t up);
     void eth_device_deinit(struct eth_device *dev);
+    struct netif *rt_lwip_netif_find(const char *name);
+    const char *rt_lwip_netif_name(const struct netif *netif,
+                                   char *buffer, rt_size_t size);
 #ifdef RT_USING_NETDEV
     int eth_device_netdev_add(struct netif *netif);
 #endif

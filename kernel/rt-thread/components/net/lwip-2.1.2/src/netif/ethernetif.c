@@ -192,6 +192,8 @@ int lwip_netdev_ping(struct netdev *netif, const char *host, size_t data_len,
     int s, ttl, recv_len, result = 0;
     int elapsed_time;
     rt_tick_t recv_start_tick;
+    struct netif *lwip_netif;
+    struct sockaddr_in local_addr;
 #if LWIP_VERSION_MAJOR >= 2U
     struct timeval recv_timeout = { timeout / RT_TICK_PER_SECOND, timeout % RT_TICK_PER_SECOND };
 #else
@@ -205,6 +207,12 @@ int lwip_netdev_ping(struct netdev *netif, const char *host, size_t data_len,
     RT_ASSERT(netif);
     RT_ASSERT(host);
     RT_ASSERT(ping_resp);
+
+    lwip_netif = (struct netif *)netif->user_data;
+    if (lwip_netif == RT_NULL)
+    {
+        return -RT_ERROR;
+    }
 
     rt_memset(&hint, 0x00, sizeof(hint));
     /* convert URL to IP */
@@ -225,6 +233,23 @@ int lwip_netdev_ping(struct netdev *netif, const char *host, size_t data_len,
     if ((s = lwip_socket(AF_INET, SOCK_RAW, IP_PROTO_ICMP)) < 0)
     {
         return -RT_ERROR;
+    }
+
+    if (ip4_addr_isany_val(*netif_ip4_addr(lwip_netif)))
+    {
+        result = -RT_ERROR;
+        goto __exit;
+    }
+    rt_memset(&local_addr, 0, sizeof(local_addr));
+    local_addr.sin_len = sizeof(local_addr);
+    local_addr.sin_family = AF_INET;
+    local_addr.sin_addr.s_addr = ip4_addr_get_u32(
+        netif_ip4_addr(lwip_netif));
+    if (lwip_bind(s, (const struct sockaddr *)&local_addr,
+                  sizeof(local_addr)) != 0)
+    {
+        result = -RT_ERROR;
+        goto __exit;
     }
 
     lwip_setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &recv_timeout, sizeof(recv_timeout));
@@ -379,19 +404,21 @@ static void netdev_del(struct netif *lwip_netif)
     RT_ASSERT(lwip_netif);
 
     netdev = netdev_get_by_user_data(lwip_netif);
+    if (netdev == RT_NULL)
+    {
+        return;
+    }
 #ifdef RT_USING_SAL
-    if (netdev != RT_NULL) {
-        netdev->is_gone = RT_TRUE;
-        if (get_work_count(netdev)) {
-            do {
-                int ret;
-                ret = rt_wqueue_wait(&netdev->wait_work, get_work_count(netdev) == 0, 5000);
-                if (ret == -RT_ETIMEOUT) {
-                    rt_kprintf("wait worker timeout, work cnt = %d\n", get_work_count(netdev));
-                    break;
-                }
-            } while (get_work_count(netdev));
-        }
+    netdev->is_gone = RT_TRUE;
+    if (get_work_count(netdev)) {
+        do {
+            int ret;
+            ret = rt_wqueue_wait(&netdev->wait_work, get_work_count(netdev) == 0, 5000);
+            if (ret == -RT_ETIMEOUT) {
+                rt_kprintf("wait worker timeout, work cnt = %d\n", get_work_count(netdev));
+                break;
+            }
+        } while (get_work_count(netdev));
     }
 #endif
     netdev_unregister(netdev);
@@ -418,23 +445,227 @@ static int netdev_flags_sync(struct netif *lwip_netif)
 }
 #endif /* RT_USING_NETDEV */
 
+struct netif *rt_lwip_netif_find(const char *name)
+{
+    rt_device_t device;
+    struct netif *netif;
+    rt_size_t name_len;
+
+    if (name == RT_NULL || name[0] == '\0')
+    {
+        return RT_NULL;
+    }
+
+#ifdef RT_USING_NETDEV
+    {
+        struct netdev *netdev = netdev_get_by_name(name);
+
+        if (netdev != RT_NULL && netdev->user_data != RT_NULL)
+        {
+            for (netif = netif_list; netif != RT_NULL; netif = netif->next)
+            {
+                if (netif == netdev->user_data)
+                {
+                    return netif;
+                }
+            }
+        }
+    }
+#endif /* RT_USING_NETDEV */
+
+    device = rt_device_find(name);
+    if (device != RT_NULL && device->type == RT_Device_Class_NetIf)
+    {
+        for (netif = netif_list; netif != RT_NULL; netif = netif->next)
+        {
+            if (netif->state == device)
+            {
+                return netif;
+            }
+        }
+    }
+
+    name_len = rt_strlen(name);
+    if (name_len > sizeof(netif->name))
+    {
+        const char *number = name + sizeof(netif->name);
+        rt_uint32_t num = 0;
+
+        do
+        {
+            if (*number < '0' || *number > '9')
+            {
+                return RT_NULL;
+            }
+            num = num * 10U + (rt_uint32_t)(*number - '0');
+            if (num > 0xffU)
+            {
+                return RT_NULL;
+            }
+            number++;
+        }
+        while (*number != '\0');
+
+        for (netif = netif_list; netif != RT_NULL; netif = netif->next)
+        {
+            if (netif->name[0] == name[0] && netif->name[1] == name[1] &&
+                netif->num == (u8_t)num)
+            {
+                return netif;
+            }
+        }
+        return RT_NULL;
+    }
+
+    if (name_len == sizeof(netif->name))
+    {
+        /* Keep accepting the legacy two-character lwIP interface prefix. */
+        for (netif = netif_list; netif != RT_NULL; netif = netif->next)
+        {
+            if (rt_memcmp(name, netif->name, sizeof(netif->name)) == 0)
+            {
+                return netif;
+            }
+        }
+    }
+
+    return RT_NULL;
+}
+
+const char *rt_lwip_netif_name(const struct netif *netif, char *buffer,
+                               rt_size_t size)
+{
+#ifdef RT_USING_NETDEV
+    struct netdev *netdev;
+
+    netdev = netdev_get_by_user_data(netif);
+    if (netdev != RT_NULL)
+    {
+        return netdev->name;
+    }
+#endif /* RT_USING_NETDEV */
+
+    if (netif == RT_NULL || buffer == RT_NULL || size == 0)
+    {
+        return "";
+    }
+
+    rt_snprintf(buffer, size, "%c%c%u", netif->name[0], netif->name[1],
+                (unsigned int)netif->num);
+    return buffer;
+}
+
+static rt_err_t eth_device_io_init(struct eth_device *device,
+                                   const char *device_name)
+{
+    char semaphore_name[RT_NAME_MAX];
+
+    device->io_inflight = 0;
+    device->io_removing = RT_FALSE;
+    rt_snprintf(semaphore_name, sizeof(semaphore_name), "i%.2s", device_name);
+    return rt_sem_init(&device->io_idle, semaphore_name, 0,
+                       RT_IPC_FLAG_FIFO);
+}
+
+static rt_bool_t eth_device_io_begin(struct eth_device *device)
+{
+    rt_base_t level;
+    rt_bool_t accepted = RT_FALSE;
+
+    if (device == RT_NULL)
+    {
+        return RT_FALSE;
+    }
+
+    level = rt_hw_interrupt_disable();
+    if (!device->io_removing)
+    {
+        device->io_inflight++;
+        accepted = RT_TRUE;
+    }
+    rt_hw_interrupt_enable(level);
+    return accepted;
+}
+
+static void eth_device_io_end(struct eth_device *device)
+{
+    rt_base_t level;
+    rt_bool_t idle;
+
+    level = rt_hw_interrupt_disable();
+    RT_ASSERT(device->io_inflight > 0);
+    device->io_inflight--;
+    idle = device->io_removing && device->io_inflight == 0;
+    rt_hw_interrupt_enable(level);
+
+    if (idle)
+    {
+        rt_sem_release(&device->io_idle);
+    }
+}
+
+static void eth_device_io_quiesce(struct eth_device *device)
+{
+    rt_base_t level;
+    rt_bool_t wait;
+    rt_err_t result;
+
+    level = rt_hw_interrupt_disable();
+    device->io_removing = RT_TRUE;
+    wait = device->io_inflight != 0;
+    rt_hw_interrupt_enable(level);
+
+    if (wait)
+    {
+        do
+        {
+            result = rt_sem_take(&device->io_idle, RT_WAITING_FOREVER);
+        }
+        while (result == -RT_EINTR);
+        RT_ASSERT(result == RT_EOK);
+    }
+}
+
+err_t eth_device_input(struct pbuf *p, struct netif *netif)
+{
+    struct eth_device *device;
+    err_t result;
+
+    if (netif == RT_NULL)
+    {
+        return ERR_ARG;
+    }
+    device = (struct eth_device *)netif->state;
+    if (!eth_device_io_begin(device))
+    {
+        return ERR_IF;
+    }
+
+    result = tcpip_input(p, netif);
+    eth_device_io_end(device);
+    return result;
+}
+
 static err_t ethernetif_linkoutput(struct netif *netif, struct pbuf *p)
 {
 #ifndef LWIP_NO_TX_THREAD
     struct eth_tx_msg msg;
     struct eth_device* enetif;
+    err_t result = ERR_MEM;
 
     RT_ASSERT(netif != RT_NULL);
     enetif = (struct eth_device*)netif->state;
-    if (enetif == RT_NULL)
+    if (!eth_device_io_begin(enetif))
     {
         return ERR_IF;
     }
 
     if (enetif->flags & ETHIF_TX_DIRECT)
     {
-        return enetif->eth_tx(&(enetif->parent), p) == RT_EOK ?
-               ERR_OK : ERR_BUF;
+        result = enetif->eth_tx(&(enetif->parent), p) == RT_EOK ?
+                 ERR_OK : ERR_BUF;
+        eth_device_io_end(enetif);
+        return result;
     }
 
     /* send a message to eth tx thread */
@@ -445,22 +676,26 @@ static err_t ethernetif_linkoutput(struct netif *netif, struct pbuf *p)
     if (rt_mb_send(&eth_tx_thread_mb, (rt_ubase_t) &msg) == RT_EOK)
     {
         /* waiting for ack */
-        rt_sem_take(&(enetif->tx_ack), RT_WAITING_FOREVER);
-        return msg.result;
+        result = rt_sem_take(&(enetif->tx_ack), RT_WAITING_FOREVER) == RT_EOK ?
+                 msg.result : ERR_IF;
     }
-    return ERR_MEM;
+    eth_device_io_end(enetif);
+    return result;
 #else
     struct eth_device* enetif;
+    err_t result;
 
     RT_ASSERT(netif != RT_NULL);
     enetif = (struct eth_device*)netif->state;
-
-    if (enetif->eth_tx(&(enetif->parent), p) != RT_EOK)
+    if (!eth_device_io_begin(enetif))
     {
         return ERR_IF;
     }
+
+    result = enetif->eth_tx(&(enetif->parent), p) == RT_EOK ? ERR_OK : ERR_IF;
+    eth_device_io_end(enetif);
+    return result;
 #endif
-    return ERR_OK;
 }
 
 static err_t eth_netif_device_init(struct netif *netif)
@@ -543,6 +778,7 @@ static err_t eth_netif_device_init(struct netif *netif)
 rt_err_t eth_device_init_with_flag(struct eth_device *dev, const char *name, rt_uint16_t flags)
 {
     struct netif* netif;
+    rt_err_t result;
 #if LWIP_NETIF_HOSTNAME
 #define LWIP_HOSTNAME_LEN 16
     char *hostname = RT_NULL;
@@ -564,8 +800,30 @@ rt_err_t eth_device_init_with_flag(struct eth_device *dev, const char *name, rt_
     dev->link_changed = 0x00;
     dev->parent.type = RT_Device_Class_NetIf;
     /* register to RT-Thread device manager */
-    rt_device_register(&(dev->parent), name, RT_DEVICE_FLAG_RDWR);
-    rt_sem_init(&(dev->tx_ack), name, 0, RT_IPC_FLAG_FIFO);
+    result = rt_device_register(&(dev->parent), name, RT_DEVICE_FLAG_RDWR);
+    if (result != RT_EOK)
+    {
+        rt_free(netif);
+        dev->netif = RT_NULL;
+        return result;
+    }
+    result = rt_sem_init(&(dev->tx_ack), name, 0, RT_IPC_FLAG_FIFO);
+    if (result != RT_EOK)
+    {
+        rt_device_unregister(&(dev->parent));
+        rt_free(netif);
+        dev->netif = RT_NULL;
+        return result;
+    }
+    result = eth_device_io_init(dev, name);
+    if (result != RT_EOK)
+    {
+        rt_sem_detach(&(dev->tx_ack));
+        rt_device_unregister(&(dev->parent));
+        rt_free(netif);
+        dev->netif = RT_NULL;
+        return result;
+    }
 
     /* set name */
     netif->name[0] = name[0];
@@ -603,7 +861,17 @@ rt_err_t eth_device_init_with_flag(struct eth_device *dev, const char *name, rt_
         IP4_ADDR(&gw, 0, 0, 0, 0);
         IP4_ADDR(&netmask, 0, 0, 0, 0);
 #endif
-        netifapi_netif_add(netif, &ipaddr, &netmask, &gw, dev, eth_netif_device_init, tcpip_input);
+        result = netifapi_netif_add(netif, &ipaddr, &netmask, &gw, dev,
+                                    eth_netif_device_init, eth_device_input);
+        if (result != ERR_OK)
+        {
+            rt_sem_detach(&(dev->io_idle));
+            rt_sem_detach(&(dev->tx_ack));
+            rt_device_unregister(&(dev->parent));
+            rt_free(netif);
+            dev->netif = RT_NULL;
+            return result;
+        }
     }
 
 #ifdef RT_USING_NETDEV
@@ -626,21 +894,86 @@ rt_err_t eth_device_init(struct eth_device * dev, const char *name)
     return eth_device_init_with_flag(dev, name, flags);
 }
 
-void eth_device_deinit(struct eth_device *dev)
+struct eth_netif_remove_context
 {
-    struct netif* netif = dev->netif;
+    struct netif *netif;
+    struct eth_device *device;
+};
 
+static void eth_netif_remove(struct netif *netif)
+{
 #if LWIP_DHCP
     dhcp_stop(netif);
     dhcp_cleanup(netif);
 #endif
     netif_set_down(netif);
     netif_remove(netif);
+}
+
+static void eth_netif_remove_callback(void *parameter)
+{
+    struct eth_netif_remove_context *context = parameter;
+
+    eth_netif_remove(context->netif);
+    rt_sem_release(&context->device->io_idle);
+}
+
+static void eth_netif_remove_sync(struct eth_device *device,
+                                  struct netif *netif)
+{
+    struct eth_netif_remove_context context;
+    err_t callback_result;
+    rt_err_t result;
+
+    if (rt_thread_self() == rt_thread_find(TCPIP_THREAD_NAME))
+    {
+        eth_netif_remove(netif);
+        return;
+    }
+
+    context.netif = netif;
+    context.device = device;
+    do
+    {
+        callback_result = tcpip_callback(eth_netif_remove_callback, &context);
+        if (callback_result != ERR_OK)
+        {
+            rt_thread_mdelay(1);
+        }
+    }
+    while (callback_result != ERR_OK);
+
+    do
+    {
+        result = rt_sem_take(&device->io_idle, RT_WAITING_FOREVER);
+    }
+    while (result == -RT_EINTR);
+    RT_ASSERT(result == RT_EOK);
+}
+
+void eth_device_deinit(struct eth_device *dev)
+{
+    struct netif *netif;
+
+    if (dev == RT_NULL || dev->netif == RT_NULL)
+    {
+        return;
+    }
+    netif = dev->netif;
+
+    eth_device_io_quiesce(dev);
+    /* The callback is queued behind all packets already submitted to lwIP. */
+    if (netif->state == dev)
+    {
+        eth_netif_remove_sync(dev, netif);
+    }
 #ifdef RT_USING_NETDEV
     netdev_del(netif);
 #endif
+    dev->netif = RT_NULL;
     rt_device_close(&(dev->parent));
     rt_device_unregister(&(dev->parent));
+    rt_sem_detach(&(dev->io_idle));
     rt_sem_detach(&(dev->tx_ack));
     rt_free(netif);
 }
@@ -720,6 +1053,7 @@ static err_t af_unix_eth_netif_device_init(struct netif *netif)
 rt_err_t af_unix_eth_device_init_with_flag(struct eth_device *dev, const char *name, rt_uint16_t flags)
 {
     struct netif* netif;
+    rt_err_t result;
 #if LWIP_NETIF_HOSTNAME
 #define LWIP_HOSTNAME_LEN 16
     char *hostname = RT_NULL;
@@ -741,8 +1075,30 @@ rt_err_t af_unix_eth_device_init_with_flag(struct eth_device *dev, const char *n
     dev->link_changed = 0x00;
     dev->parent.type = RT_Device_Class_NetIf;
     /* register to RT-Thread device manager */
-    rt_device_register(&(dev->parent), name, RT_DEVICE_FLAG_RDWR);
-    rt_sem_init(&(dev->tx_ack), name, 0, RT_IPC_FLAG_FIFO);
+    result = rt_device_register(&(dev->parent), name, RT_DEVICE_FLAG_RDWR);
+    if (result != RT_EOK)
+    {
+        rt_free(netif);
+        dev->netif = RT_NULL;
+        return result;
+    }
+    result = rt_sem_init(&(dev->tx_ack), name, 0, RT_IPC_FLAG_FIFO);
+    if (result != RT_EOK)
+    {
+        rt_device_unregister(&(dev->parent));
+        rt_free(netif);
+        dev->netif = RT_NULL;
+        return result;
+    }
+    result = eth_device_io_init(dev, name);
+    if (result != RT_EOK)
+    {
+        rt_sem_detach(&(dev->tx_ack));
+        rt_device_unregister(&(dev->parent));
+        rt_free(netif);
+        dev->netif = RT_NULL;
+        return result;
+    }
 
     /* set name */
     netif->name[0] = name[0];
@@ -775,7 +1131,18 @@ rt_err_t af_unix_eth_device_init_with_flag(struct eth_device *dev, const char *n
         gw.addr = inet_addr("255.0.0.0");
         netmask.addr = inet_addr("127.0.0.1");
 
-        netifapi_netif_add(netif, &ipaddr, &netmask, &gw, dev, af_unix_eth_netif_device_init, tcpip_input);
+        result = netifapi_netif_add(netif, &ipaddr, &netmask, &gw, dev,
+                                    af_unix_eth_netif_device_init,
+                                    eth_device_input);
+        if (result != ERR_OK)
+        {
+            rt_sem_detach(&(dev->io_idle));
+            rt_sem_detach(&(dev->tx_ack));
+            rt_device_unregister(&(dev->parent));
+            rt_free(netif);
+            dev->netif = RT_NULL;
+            return result;
+        }
     }
 
 #ifdef RT_USING_NETDEV
@@ -802,18 +1169,36 @@ rt_err_t af_unix_eth_device_init(struct eth_device * dev, const char *name)
 #ifndef LWIP_NO_RX_THREAD
 rt_err_t eth_device_ready(struct eth_device* dev)
 {
-    if (dev->netif)
-        /* post message to Ethernet thread */
-        return rt_mb_send(&eth_rx_thread_mb, (rt_ubase_t)dev);
-    else
+    rt_err_t result;
+
+    if (!dev->netif)
+    {
         return ERR_OK; /* netif is not initialized yet, just return. */
+    }
+    if (!eth_device_io_begin(dev))
+    {
+        return -RT_EBUSY;
+    }
+
+    /* post message to Ethernet thread */
+    result = rt_mb_send(&eth_rx_thread_mb, (rt_ubase_t)dev);
+    if (result != RT_EOK)
+    {
+        eth_device_io_end(dev);
+    }
+    return result;
 }
 
 rt_err_t eth_device_linkchange(struct eth_device* dev, rt_bool_t up)
 {
     rt_uint32_t level;
+    rt_err_t result;
 
     RT_ASSERT(dev != RT_NULL);
+    if (!eth_device_io_begin(dev))
+    {
+        return -RT_EBUSY;
+    }
 
     level = rt_hw_interrupt_disable();
     dev->link_changed = 0x01;
@@ -824,18 +1209,30 @@ rt_err_t eth_device_linkchange(struct eth_device* dev, rt_bool_t up)
     rt_hw_interrupt_enable(level);
 
     /* post message to ethernet thread */
-    return rt_mb_send(&eth_rx_thread_mb, (rt_ubase_t)dev);
+    result = rt_mb_send(&eth_rx_thread_mb, (rt_ubase_t)dev);
+    if (result != RT_EOK)
+    {
+        eth_device_io_end(dev);
+    }
+    return result;
 }
 #else
 /* NOTE: please not use it in interrupt when no RxThread exist */
 rt_err_t eth_device_linkchange(struct eth_device* dev, rt_bool_t up)
 {
-    if (up == RT_TRUE)
-        netifapi_netif_set_link_up(dev->netif);
-    else
-        netifapi_netif_set_link_down(dev->netif);
+    rt_err_t result;
 
-    return RT_EOK;
+    if (!eth_device_io_begin(dev))
+    {
+        return -RT_EBUSY;
+    }
+    if (up == RT_TRUE)
+        result = netifapi_netif_set_link_up(dev->netif);
+    else
+        result = netifapi_netif_set_link_down(dev->netif);
+
+    eth_device_io_end(dev);
+    return result;
 }
 #endif
 
@@ -920,6 +1317,7 @@ static void eth_rx_thread_entry(void* parameter)
                 }
                 else break;
             }
+            eth_device_io_end(device);
         }
         else
         {
@@ -981,25 +1379,14 @@ void set_if(char* netif_name, char* ip_addr, char* gw_addr, char* nm_addr)
 {
     ip4_addr_t *ip;
     ip4_addr_t addr;
-    struct netif * netif = netif_list;
+    struct netif *netif;
 
-    if(strlen(netif_name) > sizeof(netif->name))
+    netif = rt_lwip_netif_find(netif_name);
+    if (netif == RT_NULL)
     {
-        rt_kprintf("network interface name too long!\r\n");
+        rt_kprintf("network interface: %s not found!\r\n",
+                   netif_name != RT_NULL ? netif_name : "(null)");
         return;
-    }
-
-    while(netif != RT_NULL)
-    {
-        if(strncmp(netif_name, netif->name, sizeof(netif->name)) == 0)
-            break;
-
-        netif = netif->next;
-        if( netif == RT_NULL )
-        {
-            rt_kprintf("network interface: %s not found!\r\n", netif_name);
-            return;
-        }
     }
 
     ip = (ip4_addr_t *)&addr;
@@ -1045,6 +1432,7 @@ void list_if(void)
 {
     rt_ubase_t index;
     struct netif * netif;
+    char netif_name[RT_NAME_MAX];
 
     rt_enter_critical();
 
@@ -1052,9 +1440,9 @@ void list_if(void)
 
     while( netif != RT_NULL )
     {
-        rt_kprintf("network interface: %c%c%s\n",
-                   netif->name[0],
-                   netif->name[1],
+        rt_kprintf("network interface: %s%s\n",
+                   rt_lwip_netif_name(netif, netif_name,
+                                      sizeof(netif_name)),
                    (netif == netif_default)?" (Default)":"");
         rt_kprintf("MTU: %d\n", netif->mtu);
         rt_kprintf("MAC: ");

@@ -120,24 +120,64 @@ ip4_set_default_multicast_netif(struct netif *default_multicast_netif)
 }
 #endif /* LWIP_MULTICAST_TX_OPTIONS */
 
-#ifdef LWIP_HOOK_IP4_ROUTE_SRC
+#if LWIP_IPV4_SRC_ROUTING
 /**
- * Source based IPv4 routing must be fully implemented in
- * LWIP_HOOK_IP4_ROUTE_SRC(). This function only provides the parameters.
+ * Route using an explicit source address before applying destination policy.
  */
 struct netif *
 ip4_route_src(const ip4_addr_t *src, const ip4_addr_t *dest)
 {
+#ifdef LWIP_HOOK_IP4_ROUTE_SRC
   if (src != NULL) {
-    /* when src==NULL, the hook is called from ip4_route(dest) */
     struct netif *netif = LWIP_HOOK_IP4_ROUTE_SRC(src, dest);
     if (netif != NULL) {
       return netif;
     }
   }
+#endif
+  if ((src != NULL) && !ip4_addr_isany(src)) {
+    struct netif *netif;
+
+    NETIF_FOREACH(netif) {
+      if (ip4_addr_cmp(src, netif_ip4_addr(netif))) {
+        return (netif_is_up(netif) && netif_is_link_up(netif)) ? netif : NULL;
+      }
+    }
+  }
   return ip4_route(dest);
 }
-#endif /* LWIP_HOOK_IP4_ROUTE_SRC */
+#endif /* LWIP_IPV4_SRC_ROUTING */
+
+#if !LWIP_SINGLE_NETIF
+static u8_t
+ip4_route_prefix_length(const ip4_addr_t *netmask)
+{
+  u32_t mask = lwip_ntohl(ip4_addr_get_u32(netmask));
+  u8_t prefix = 0;
+
+  while ((mask & 0x80000000UL) != 0) {
+    prefix++;
+    mask <<= 1;
+  }
+  return prefix;
+}
+
+static int
+ip4_route_connected_better(struct netif *candidate, u8_t candidate_prefix,
+                           struct netif *selected, u8_t selected_prefix)
+{
+  if ((selected == NULL) || (candidate_prefix > selected_prefix)) {
+    return 1;
+  }
+  if (candidate_prefix < selected_prefix) {
+    return 0;
+  }
+  if ((candidate == netif_default) || (selected == netif_default)) {
+    return candidate == netif_default;
+  }
+  return candidate->num < selected->num;
+}
+#endif /* !LWIP_SINGLE_NETIF */
 
 /**
  * Finds the appropriate network interface for a given IP address. It
@@ -153,6 +193,8 @@ ip4_route(const ip4_addr_t *dest)
 {
 #if !LWIP_SINGLE_NETIF
   struct netif *netif;
+  struct netif *connected = NULL;
+  u8_t connected_prefix = 0;
 
   LWIP_ASSERT_CORE_LOCKED();
 
@@ -170,10 +212,19 @@ ip4_route(const ip4_addr_t *dest)
   NETIF_FOREACH(netif) {
     /* is the netif up, does it have a link and a valid address? */
     if (netif_is_up(netif) && netif_is_link_up(netif) && !ip4_addr_isany_val(*netif_ip4_addr(netif))) {
+      /* An interface's own address is always a more specific route. */
+      if (ip4_addr_cmp(dest, netif_ip4_addr(netif))) {
+        return netif;
+      }
       /* network mask matches? */
       if (ip4_addr_netcmp(dest, netif_ip4_addr(netif), netif_ip4_netmask(netif))) {
-        /* return netif on which to forward IP packet */
-        return netif;
+        u8_t prefix = ip4_route_prefix_length(netif_ip4_netmask(netif));
+
+        if (ip4_route_connected_better(netif, prefix, connected,
+                                       connected_prefix)) {
+          connected = netif;
+          connected_prefix = prefix;
+        }
       }
       /* gateway matches on a non broadcast interface? (i.e. peer in a point to point interface) */
       if (((netif->flags & NETIF_FLAG_BROADCAST) == 0) && ip4_addr_cmp(dest, netif_ip4_gw(netif))) {
@@ -181,6 +232,10 @@ ip4_route(const ip4_addr_t *dest)
         return netif;
       }
     }
+  }
+
+  if (connected != NULL) {
+    return connected;
   }
 
 #if LWIP_NETIF_LOOPBACK && !LWIP_HAVE_LOOPIF
