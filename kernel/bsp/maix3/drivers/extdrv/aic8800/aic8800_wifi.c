@@ -23,7 +23,6 @@
 #define AIC_ETHERTYPE_EAPOL                   0x888eU
 #define AIC_TX_ACCESS_CATEGORY_BEST_EFFORT        1U
 #define AIC_TX_ACCESS_CATEGORY_VOICE              3U
-#define AIC_TX_ACCESS_CATEGORY_BROADCAST          4U
 #define AIC_TX_TID_BEST_EFFORT                    0U
 #define AIC_TX_TID_NON_QOS                     0xffU
 
@@ -6539,8 +6538,15 @@ static rt_err_t aic_transmit_frame(struct aic8800_context *context,
         }
         else if (!management && (destination[0] & 1U))
         {
+            /* Group-addressed traffic goes to the VIF's BC/MC pseudo-station,
+             * which is not a QoS peer: it has no block-ack agreement and no
+             * per-TID queue, so the frame has to be described as non-QoS.
+             * Vendor Linux keeps the BC/MC queue on the best-effort hardware
+             * queue as well - it defines a separate broadcast queue but never
+             * selects it, so a frame handed over on that queue is accepted by
+             * the firmware and then never transmitted. */
             station_index = context->ap_broadcast_station_index;
-            descriptor->access_category = AIC_TX_ACCESS_CATEGORY_BROADCAST;
+            descriptor->tid = AIC_TX_TID_NON_QOS;
         }
     }
     descriptor->station_index = station_index;
