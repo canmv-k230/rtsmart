@@ -675,7 +675,11 @@ menuconfig RT_USING_WIFI
 
             config RT_WLAN_WORKQUEUE_THREAD_SIZE
                 int "WLAN work queue thread size"
-                default 2048
+                default 16384
+                help
+                    Auto reconnect performs scanning, WPA key derivation, and
+                    driver command submission on this work queue. Keep enough
+                    stack for the complete connection path.
 
             config RT_WLAN_WORKQUEUE_THREAD_PRIO
                 int "WLAN work queue thread priority"
