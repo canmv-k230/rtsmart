@@ -64,8 +64,8 @@ typedef struct sysctl_clk {
     volatile uint32_t reserved_9;               /* 0x68 */
     volatile uint32_t reserved_10;              /* 0x6c */
     volatile uint32_t reserved_11;              /* 0x70 */
-    volatile uint32_t reserved_12;              /* 0x74 */
-    volatile uint32_t reserved_13;              /* 0x78 */
+    volatile uint32_t vo_clk_cfg;               /* 0x74 */
+    volatile uint32_t disp_clk_div;             /* 0x78 */
     volatile uint32_t reserved2[1];             /* 0x7c */
     volatile uint32_t sec_clk_div;              /* 0x80 */
     volatile uint32_t reserved3[31];             /* 0x84 0x88 0x8c 0x90 0x94 0x98 0x9c 0xa0-0xac 0xb0-0xbc 0xc0-0xcc 0xd0-0xdc 0xe0-0xec 0xf0-0xfc*/
@@ -752,6 +752,9 @@ sysctl_clk_node_e sysctl_clk_get_leaf_parent(sysctl_clk_node_e leaf);
 /* 设置时钟节点enable,注意:只设置本时钟节点的enable，不会设置上游时钟的enable。
    同linux kernel的区别: linux kernel clock framework 会自动设置上游时钟的enable，测试代码没有kernel框架，因此只设置本节点时钟的enable */
 void sysctl_clk_set_leaf_en(sysctl_clk_node_e leaf, bool enable);
+
+/* Enable or disable the display-domain VG-Lite clock gate. */
+void sysctl_clk_set_disp_gpu_en(bool enable);
 
 /* 获取本时钟节点的enable状态 */
 bool sysctl_clk_get_leaf_en(sysctl_clk_node_e leaf);

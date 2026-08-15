@@ -3438,6 +3438,18 @@ uint32_t sysctl_clk_get_leaf_freq(sysctl_clk_node_e leaf)
     return (uint32_t)(sysctl_boot_get_root_clk_freq(node) * div);
 }
 
+void sysctl_clk_set_disp_gpu_en(bool enable)
+{
+    rt_base_t level = rt_hw_interrupt_disable();
+
+    if (enable)
+        sysctl_clk->vo_clk_cfg |= (1U << 6);
+    else
+        sysctl_clk->vo_clk_cfg &= ~(1U << 6);
+
+    rt_hw_interrupt_enable(level);
+}
+
 int rt_hw_sysctl_clk_init(void)
 {
     sysctl_clk = rt_ioremap((void*)CMU_BASE_ADDR, CMU_IO_SIZE);

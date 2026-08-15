@@ -1,0 +1,19 @@
+# RT-Thread building script for the VG-Lite GPU driver
+
+from building import *
+import os
+
+cwd = GetCurrentDir()
+sysctl_dir = os.path.join(cwd, '..', 'sysctl')
+
+src = Glob('*.c')
+CPPPATH = [
+    cwd,
+    os.path.join(sysctl_dir, 'sysctl_clock'),
+    os.path.join(sysctl_dir, 'sysctl_power'),
+    os.path.join(sysctl_dir, 'sysctl_reset'),
+]
+
+group = DefineGroup('VG-Lite', src, depend = ['RT_USING_VG_LITE'], CPPPATH = CPPPATH)
+
+Return('group')

@@ -78,6 +78,11 @@ menu "InterDriver"
         bool "Enable fpioa test command"
         default n
 
+    config RT_USING_VG_LITE
+        bool "Enable VG-Lite GPU driver"
+        default y
+        depends on RT_USING_USERSPACE
+
     config RT_USING_GNNE
         bool "Enable GNNE driver for ai"
         default y
