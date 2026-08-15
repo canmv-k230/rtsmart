@@ -118,20 +118,20 @@ static void rt_wlan_prot_event_handle(struct rt_wlan_device *wlan, rt_wlan_dev_e
 
 static struct rt_wlan_device *rt_wlan_prot_find_by_name(const char *name)
 {
-    rt_device_t device;
+    struct rt_wlan_device *wlan;
 
     if (name == RT_NULL)
     {
         LOG_E("F:%s L:%d Parameter Wrongful", __FUNCTION__, __LINE__);
         return RT_NULL;
     }
-    device = rt_device_find(name);
-    if (device == RT_NULL)
+    wlan = rt_wlan_dev_find(name);
+    if (wlan == RT_NULL)
     {
         LOG_E("F:%s L:%d not find wlan dev!! name:%s", __FUNCTION__, __LINE__, name);
         return RT_NULL;
     }
-    return (struct rt_wlan_device *)device;
+    return wlan;
 }
 
 rt_err_t rt_wlan_prot_attach(const char *dev_name, const char *prot_name)
@@ -161,7 +161,7 @@ rt_err_t rt_wlan_prot_detach(const char *name)
 rt_err_t rt_wlan_prot_attach_dev(struct rt_wlan_device *wlan, const char *prot_name)
 {
     int i = 0;
-    struct rt_wlan_prot *prot = wlan->prot;
+    struct rt_wlan_prot *prot;
     rt_wlan_dev_event_handler handler = rt_wlan_prot_event_handle;
 
     if (wlan == RT_NULL)
@@ -169,6 +169,7 @@ rt_err_t rt_wlan_prot_attach_dev(struct rt_wlan_device *wlan, const char *prot_n
         LOG_E("F:%s L:%d wlan is null", __FUNCTION__, __LINE__);
         return -RT_ERROR;
     }
+    prot = wlan->prot;
 
     if (prot != RT_NULL &&
             (rt_strcmp(prot->name, prot_name) == 0))

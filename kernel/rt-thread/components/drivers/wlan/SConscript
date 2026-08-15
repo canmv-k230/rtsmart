@@ -26,5 +26,8 @@ if GetDepend(['RT_WLAN_WORK_THREAD_ENABLE']):
     src += ['wlan_workqueue.c']
 
 group   = DefineGroup('DeviceDrivers', src, depend = ['RT_USING_WIFI'], CPPPATH = CPPPATH)
+objs = [group]
 
-Return('group')
+objs += SConscript('offload/SConscript')
+
+Return('objs')

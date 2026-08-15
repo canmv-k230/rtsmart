@@ -1,0 +1,27 @@
+from building import *
+
+cwd = GetCurrentDir()
+src = ['wlan_offload.c', 'wlan_offload_bus.c', 'wlan_offload_command.c']
+
+if GetDepend('RT_WLAN_OFFLOAD_CONTROL'):
+    src += ['wlan_offload_control.c']
+
+if GetDepend('RT_WLAN_OFFLOAD_EMBEDDED_WPA2'):
+    src += [
+        'wlan_offload_crypto.c',
+        'wlan_offload_sae.c',
+        'wlan_offload_supplicant.c',
+        'third_party/tinycrypt/ecc.c',
+    ]
+
+if GetDepend('RT_WLAN_OFFLOAD_EMBEDDED_HOSTAPD'):
+    src += ['wlan_offload_hostapd.c']
+
+CPPPATH = [cwd]
+if GetDepend('RT_WLAN_OFFLOAD_EMBEDDED_WPA2'):
+    CPPPATH += [cwd + '/third_party/tinycrypt/include']
+
+group = DefineGroup('WLANOffload', src,
+                    depend=['RT_USING_WIFI', 'RT_WLAN_OFFLOAD'], CPPPATH=CPPPATH)
+
+Return('group')

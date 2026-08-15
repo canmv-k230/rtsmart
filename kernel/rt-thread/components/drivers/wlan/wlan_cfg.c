@@ -395,12 +395,12 @@ void rt_wlan_cfg_dump(void)
     int index = 0;
     struct rt_wlan_info *info;
     struct rt_wlan_key *key;
-    char *security;
+    const char *security;
 
     rt_wlan_cfg_init();
 
-    rt_kprintf("             SSID                           PASSWORD                   MAC            security     chn\n");
-    rt_kprintf("------------------------------- ------------------------------- -----------------  --------------  ---\n");
+    rt_kprintf("             SSID                           PASSWORD                   MAC                   security                  chn\n");
+    rt_kprintf("------------------------------- ------------------------------- -----------------  ----------------------------  ---\n");
     for (index = 0; index < cfg_cache->num; index ++)
     {
         info = &cfg_cache->cfg_info[index].info;
@@ -424,43 +424,8 @@ void rt_wlan_cfg_dump(void)
                    info->bssid[4],
                    info->bssid[5]
                   );
-        switch (info->security)
-        {
-        case SECURITY_OPEN:
-            security = "OPEN";
-            break;
-        case SECURITY_WEP_PSK:
-            security = "WEP_PSK";
-            break;
-        case SECURITY_WEP_SHARED:
-            security = "WEP_SHARED";
-            break;
-        case SECURITY_WPA_TKIP_PSK:
-            security = "WPA_TKIP_PSK";
-            break;
-        case SECURITY_WPA_AES_PSK:
-            security = "WPA_AES_PSK";
-            break;
-        case SECURITY_WPA2_AES_PSK:
-            security = "WPA2_AES_PSK";
-            break;
-        case SECURITY_WPA2_TKIP_PSK:
-            security = "WPA2_TKIP_PSK";
-            break;
-        case SECURITY_WPA2_MIXED_PSK:
-            security = "WPA2_MIXED_PSK";
-            break;
-        case SECURITY_WPS_OPEN:
-            security = "WPS_OPEN";
-            break;
-        case SECURITY_WPS_SECURE:
-            security = "WPS_SECURE";
-            break;
-        default:
-            security = "UNKNOWN";
-            break;
-        }
-        rt_kprintf("%-14.14s  ", security);
+        security = rt_wlan_security_name(info->security);
+        rt_kprintf("%-28.28s  ", security);
         rt_kprintf("%3d    \n", info->channel);
     }
 }

@@ -77,6 +77,23 @@ typedef enum
 #define WSEC_SWFLAG         0x0008
 #define AES_CMAC_ENABLED    0x0010
 
+/* Additional security attributes. Keep the original values above stable:
+ * rt_wlan_security_t is persisted by the WLAN configuration component and is
+ * also carried over the WLAN offload control protocol. */
+#define SAE_ENABLED             0x0020
+#define OWE_ENABLED             0x0040
+#define FT_ENABLED              0x0080
+#define SHA256_ENABLED          0x0100
+#define SHA384_ENABLED          0x0200
+#define FILS_ENABLED            0x0400
+#define DPP_ENABLED             0x0800
+#define OSEN_ENABLED            0x1000
+#define WAPI_ENABLED            0x2000
+#define CCKM_ENABLED            0x4000
+#define WPA3_192BIT_ENABLED     0x00010000
+#define OWE_TRANSITION_ENABLED  0x00020000
+#define EXT_KEY_ENABLED         0x00040000
+
 #define SHARED_ENABLED  0x00008000
 #define WPA_SECURITY    0x00200000
 #define WPA2_SECURITY   0x00400000
@@ -87,6 +104,8 @@ typedef enum
 
 #define RT_WLAN_FLAG_STA_ONLY    (0x1 << 0)
 #define RT_WLAN_FLAG_AP_ONLY     (0x1 << 1)
+/* The driver copies outgoing frames before wlan_send returns. */
+#define RT_WLAN_FLAG_DIRECT_TX   (0x1 << 2)
 
 #ifndef RT_WLAN_SSID_MAX_LENGTH
 #define RT_WLAN_SSID_MAX_LENGTH  (32)   /* SSID MAX LEN */
@@ -117,7 +136,7 @@ typedef enum
     SECURITY_WPA_AES_PSK    = ( WPA_SECURITY  | AES_ENABLED ),                              /**< WPA PSK Security with AES                     */
     SECURITY_WPA_AES_8021X    = ( IEEE_8021X_ENABLED | WPA_SECURITY  | AES_ENABLED ),       /**< WPA 8021X Security with AES                   */
     SECURITY_WPA2_AES_PSK   = ( WPA2_SECURITY | AES_ENABLED ),                              /**< WPA2 PSK Security with AES                    */
-    SECURITY_WPA2_AES_8021X   = ( IEEE_8021X_ENABLED | WPA2_SECURITY | WEP_ENABLED ),       /**< WPA2 8021X Security with AES                  */
+    SECURITY_WPA2_AES_8021X   = ( IEEE_8021X_ENABLED | WPA2_SECURITY | AES_ENABLED ),       /**< WPA2 8021X Security with AES                  */
     SECURITY_WPA2_TKIP_PSK  = ( WPA2_SECURITY | TKIP_ENABLED ),                             /**< WPA2 PSK Security with TKIP                   */
     SECURITY_WPA2_TKIP_8021X  = ( IEEE_8021X_ENABLED | WPA2_SECURITY | TKIP_ENABLED ),      /**< WPA2 8021X Security with TKIP                 */
     SECURITY_WPA2_MIXED_PSK = ( WPA2_SECURITY | AES_ENABLED | TKIP_ENABLED ),               /**< WPA2 PSK Security with AES & TKIP             */
@@ -130,9 +149,58 @@ typedef enum
 
 	SECURITY_WPA3_AES_PSK 	= (WPA3_SECURITY | AES_ENABLED),						        /**< WPA3-AES with AES security  */
 
-    SECURITY_UNKNOWN        = -1,                                                           /**< May be returned by scan function if security is unknown. Do not pass this to the join function! */
+    /* Keep SECURITY_WPA3_AES_PSK above at its legacy wire value. New code
+     * uses the explicit SAE attribute so AKM properties remain testable. */
+    SECURITY_WPA3_SAE       = (WPA3_SECURITY | AES_ENABLED | SAE_ENABLED),                  /**< WPA3-SAE/CCMP                            */
+
+    SECURITY_WPA2_WPA3_MIXED_PSK = (WPA2_SECURITY | WPA3_SECURITY |
+                                    AES_ENABLED | SAE_ENABLED),                              /**< WPA2-PSK/WPA3-SAE transition             */
+    SECURITY_WPA3_AES_8021X = (IEEE_8021X_ENABLED | WPA3_SECURITY |
+                               AES_ENABLED),                                                 /**< WPA3 802.1X                              */
+    SECURITY_WPA2_WPA3_MIXED_8021X = (IEEE_8021X_ENABLED | WPA2_SECURITY |
+                                      WPA3_SECURITY | AES_ENABLED),                          /**< WPA2/WPA3 802.1X transition              */
+    SECURITY_WPA3_192BIT_8021X = (IEEE_8021X_ENABLED | WPA3_SECURITY |
+                                  AES_ENABLED | WPA3_192BIT_ENABLED),                        /**< WPA3-Enterprise 192-bit                  */
+    SECURITY_OWE             = (OWE_ENABLED | AES_ENABLED),                                 /**< Opportunistic Wireless Encryption        */
+    SECURITY_OWE_TRANSITION  = (OWE_ENABLED | OWE_TRANSITION_ENABLED |
+                                AES_ENABLED),                                                /**< OWE transition mode                      */
+
+    SECURITY_WPA2_AES_PSK_SHA256 = (WPA2_SECURITY | AES_ENABLED |
+                                    SHA256_ENABLED),                                         /**< WPA2-PSK with SHA-256 AKM                */
+    SECURITY_WPA3_AES_PSK_SHA384 = (WPA3_SECURITY | AES_ENABLED |
+                                    SHA384_ENABLED),                                         /**< WPA3-PSK with SHA-384 AKM                */
+    SECURITY_WPA2_AES_8021X_SHA256 = (IEEE_8021X_ENABLED | WPA2_SECURITY |
+                                      AES_ENABLED | SHA256_ENABLED),                         /**< WPA2 802.1X with SHA-256 AKM              */
+    SECURITY_FT_WPA2_AES_PSK = (WPA2_SECURITY | AES_ENABLED | FT_ENABLED),                  /**< FT-WPA2-PSK/CCMP                         */
+    SECURITY_FT_WPA3_AES_PSK_SHA384 = (WPA3_SECURITY | AES_ENABLED |
+                                       SHA384_ENABLED | FT_ENABLED),                         /**< FT-WPA3-PSK with SHA-384 AKM             */
+    SECURITY_FT_WPA2_AES_8021X = (IEEE_8021X_ENABLED | WPA2_SECURITY |
+                                  AES_ENABLED | FT_ENABLED),                                /**< FT-WPA2 802.1X/CCMP                      */
+    SECURITY_FT_WPA3_SAE = (WPA3_SECURITY | AES_ENABLED | SAE_ENABLED |
+                            FT_ENABLED),                                                     /**< FT-WPA3-SAE                              */
+    SECURITY_FT_WPA3_8021X_SHA384 = (IEEE_8021X_ENABLED | WPA3_SECURITY |
+                                     AES_ENABLED | FT_ENABLED | SHA384_ENABLED),             /**< FT-WPA3-Enterprise/SHA-384               */
+
+    SECURITY_WPA3_SAE_EXT_KEY = (WPA3_SECURITY | AES_ENABLED | SAE_ENABLED |
+                                 EXT_KEY_ENABLED),                                           /**< WPA3-SAE with extended key               */
+    SECURITY_FT_WPA3_SAE_EXT_KEY = (WPA3_SECURITY | AES_ENABLED | SAE_ENABLED |
+                                    FT_ENABLED | EXT_KEY_ENABLED),                           /**< FT-WPA3-SAE with extended key            */
+
+    SECURITY_FILS_SHA256      = (FILS_ENABLED | SHA256_ENABLED),                             /**< FILS with SHA-256                        */
+    SECURITY_FILS_SHA384      = (FILS_ENABLED | SHA384_ENABLED),                             /**< FILS with SHA-384                        */
+    SECURITY_FT_FILS_SHA256   = (FILS_ENABLED | FT_ENABLED | SHA256_ENABLED),               /**< FT-FILS with SHA-256                     */
+    SECURITY_FT_FILS_SHA384   = (FILS_ENABLED | FT_ENABLED | SHA384_ENABLED),               /**< FT-FILS with SHA-384                     */
+    SECURITY_DPP              = DPP_ENABLED,                                                 /**< Device Provisioning Protocol             */
+    SECURITY_OSEN             = OSEN_ENABLED,                                                /**< OSEN                                      */
+    SECURITY_WAPI_PSK         = WAPI_ENABLED,                                                /**< WAPI-PSK                                  */
+    SECURITY_WAPI_CERT        = (WAPI_ENABLED | IEEE_8021X_ENABLED),                        /**< WAPI certificate                          */
+    SECURITY_CCKM             = (CCKM_ENABLED | IEEE_8021X_ENABLED),                        /**< Cisco CCKM                                */
+
+    SECURITY_UNKNOWN        = -1,                                                            /**< May be returned by scan function if security is unknown. Do not pass this to the join function! */
 
 } rt_wlan_security_t;
+
+const char *rt_wlan_security_name(rt_wlan_security_t security);
 
 typedef enum
 {
@@ -484,6 +552,16 @@ struct rt_wlan_device
     void *user_data;
 };
 
+struct rt_wlan_device_info
+{
+    char device_name[RT_NAME_MAX];
+    char netif_name[RT_NAME_MAX];
+    rt_wlan_mode_t registered_mode;
+    rt_wlan_mode_t mode;
+    rt_wlan_transport_t transport;
+    rt_uint8_t radio_index;
+};
+
 struct rt_sta_info
 {
     rt_wlan_ssid_t ssid;
@@ -500,6 +578,7 @@ struct rt_ap_info
     rt_bool_t hidden;
     rt_uint16_t channel;
     rt_wlan_security_t security;
+    rt_802_11_band_t band;
 };
 
 struct rt_scan_info
@@ -590,6 +669,7 @@ rt_err_t rt_wlan_dev_enter_promisc(struct rt_wlan_device *device);
 rt_err_t rt_wlan_dev_exit_promisc(struct rt_wlan_device *device);
 rt_err_t rt_wlan_dev_set_promisc_callback(struct rt_wlan_device *device, rt_wlan_pormisc_callback_t callback);
 void rt_wlan_dev_promisc_handler(struct rt_wlan_device *device, void *data, int len);
+void rt_wlan_dev_mgnt_filter_handler(struct rt_wlan_device *device, void *data, int len);
 
 /*
  * wlan device filter interface
@@ -624,6 +704,11 @@ rt_err_t rt_wlan_dev_register_auto(struct rt_wlan_device *wlan,
     rt_wlan_mode_t mode, rt_wlan_transport_t transport,
     const struct rt_wlan_dev_ops *ops, void *user_data);
 rt_err_t rt_wlan_dev_unregister(struct rt_wlan_device *wlan);
+/* Accepts either a WLAN device name or its associated network interface. */
+struct rt_wlan_device *rt_wlan_dev_find(const char *name);
+/* Returns the total count, copying up to capacity entries when info is set. */
+rt_size_t rt_wlan_dev_get_info(struct rt_wlan_device_info *info,
+    rt_size_t capacity);
 /* UNKNOWN transport matches the first registered device for the role. */
 rt_err_t rt_wlan_dev_get_name(rt_wlan_mode_t mode,
     rt_wlan_transport_t transport, char *name, rt_size_t name_size);

@@ -575,13 +575,73 @@ menuconfig RT_USING_WIFI
             string "The device name for ap"
             default "wlan1"
 
+        config RT_WLAN_OFFLOAD
+            bool "Enable WLAN offload Wi-Fi driver framework"
+            default n
+            select RT_USING_DEVICE_IPC
+            select RT_USING_SYSTEM_WORKQUEUE
+            help
+                Provides a common device and transport layer for firmware-based
+                Wi-Fi devices. Vendor drivers implement WLAN offload operations while
+                SPI, SDIO, and USB transports remain independent of the RT-Thread
+                WLAN management and lwIP layers.
+
+        config RT_WLAN_OFFLOAD_CONTROL
+            bool "Enable WLAN offload userspace control device"
+            default n
+            depends on RT_WLAN_OFFLOAD && RT_USING_LWP
+            depends on RT_USING_DFS && RT_USING_DFS_DEVFS
+            help
+                Adds the versioned /dev/wlanctlN command and event interface used
+                by diagnostic applications and userspace Wi-Fi integrations.
+
+        config RT_WLAN_OFFLOAD_SUPPLICANT
+            bool "Enable WLAN offload userspace supplicant interface"
+            default n
+            depends on RT_WLAN_OFFLOAD && RT_USING_LWP
+            depends on RT_USING_DFS && RT_USING_DFS_DEVFS
+            select RT_WLAN_OFFLOAD_CONTROL
+            help
+                Enables the host-supplicant contract on top of the WLAN offload
+                userspace control device. Firmware-offload drivers can expose
+                the control device without enabling this option.
+
+        config RT_WLAN_OFFLOAD_EMBEDDED_WPA2
+            bool "Enable embedded WLAN offload WPA/WPA2/WPA3 Personal support"
+            default n
+            depends on RT_WLAN_OFFLOAD
+            select RT_USING_TIMER_SOFT
+            help
+                Handles WPA-PSK/TKIP, WPA2-PSK/TKIP/CCMP, WPA2-PSK-SHA256,
+                and WPA3-SAE/CCMP authentication inside the WLAN offload
+                framework for firmware-MAC devices without firmware PSK
+                offload. SHA-256 AKM uses its required PTK KDF, AES-CMAC key
+                descriptor, and protected management frames. WPA3 uses SAE
+                group 19, hunting-and-pecking, protected management frames,
+                and the driver's external-auth contract. SAE H2E and
+                enterprise security still require a complete external
+                supplicant.
+
+        config RT_WLAN_OFFLOAD_EMBEDDED_HOSTAPD
+            bool "Enable embedded WLAN offload SoftAP authenticator"
+            default n
+            depends on RT_WLAN_OFFLOAD
+            select RT_WLAN_OFFLOAD_EMBEDDED_WPA2
+            help
+                Adds a compact in-kernel AP MLME and WPA2-PSK/CCMP
+                authenticator for firmware-MAC devices which expose raw
+                management frames and host key installation. It supports an
+                open SoftAP and a WPA2-Personal SoftAP without requiring a
+                userspace hostapd process. Enterprise authentication, WPA3,
+                WPS, 802.11r, and dynamic VLANs still require full hostapd.
+
         config RT_WLAN_SSID_MAX_LENGTH
             int "SSID maximum length"
             default 32
 
         config RT_WLAN_PASSWORD_MAX_LENGTH
             int "Password maximum length"
-            default 32
+            default 64
 
         config RT_WLAN_DEV_EVENT_NUM
             int "Driver events maxcount"

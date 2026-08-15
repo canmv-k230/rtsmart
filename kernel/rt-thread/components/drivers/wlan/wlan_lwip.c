@@ -180,13 +180,7 @@ static void netif_set_connected(void *parameter)
 
             netifapi_netif_common(eth_dev->netif, netif_set_link_up, NULL);
 #ifdef LWIP_USING_DHCPD
-            {
-                char netif_name[RT_NAME_MAX];
-
-                rt_memset(netif_name, 0, sizeof(netif_name));
-                rt_memcpy(netif_name, eth_dev->netif->name, sizeof(eth_dev->netif->name));
-                dhcpd_start(netif_name);
-            }
+            dhcpd_start(eth_dev->parent.parent.name);
 #endif
         }
     }
@@ -203,12 +197,7 @@ static void netif_set_connected(void *parameter)
         }
 #endif
 #ifdef LWIP_USING_DHCPD
-        {
-            char netif_name[RT_NAME_MAX];
-            rt_memset(netif_name, 0, sizeof(netif_name));
-            rt_memcpy(netif_name, lwip_prot->eth.netif->name, sizeof(lwip_prot->eth.netif->name));
-            dhcpd_stop(netif_name);
-        }
+        dhcpd_stop(eth_dev->parent.parent.name);
 #endif
     }
 }
@@ -300,19 +289,23 @@ static rt_err_t rt_wlan_lwip_protocol_control(rt_device_t device, int cmd, void 
 
 static rt_err_t rt_wlan_lwip_protocol_recv(struct rt_wlan_device *wlan, void *buff, int len)
 {
-    struct eth_device *eth_dev = &((struct lwip_prot_des *)wlan->prot)->eth;
+    struct lwip_prot_des *lwip_prot;
+    struct eth_device *eth_dev;
     struct pbuf *p = RT_NULL;
 
     LOG_D("F:%s L:%d run", __FUNCTION__, __LINE__);
 
-    if (eth_dev == RT_NULL)
+    if (wlan == RT_NULL || wlan->prot == RT_NULL)
     {
         return -RT_ERROR;
     }
+    lwip_prot = (struct lwip_prot_des *)wlan->prot;
+    eth_dev = &lwip_prot->eth;
 #ifdef RT_WLAN_PROT_LWIP_PBUF_FORCE
     {
         p = buff;
-        if ((eth_dev->netif->input(p, eth_dev->netif)) != ERR_OK)
+        if (eth_dev->netif == RT_NULL ||
+            eth_device_input(p, eth_dev->netif) != ERR_OK)
         {
             return -RT_ERROR;
         }
@@ -345,11 +338,12 @@ static rt_err_t rt_wlan_lwip_protocol_recv(struct rt_wlan_device *wlan, void *bu
         }
         /*copy data dat -> pbuf*/
         pbuf_take(p, buff, len);
-        if ((eth_dev->netif->input(p, eth_dev->netif)) != ERR_OK)
+        if (eth_dev->netif == RT_NULL ||
+            eth_device_input(p, eth_dev->netif) != ERR_OK)
         {
             LOG_D("F:%s L:%d IP input error", __FUNCTION__, __LINE__);
             pbuf_free(p);
-            p = RT_NULL;
+            return -RT_ERROR;
         }
         LOG_D("F:%s L:%d netif iput success! len:%d", __FUNCTION__, __LINE__, len);
         return RT_EOK;
@@ -418,6 +412,7 @@ static struct rt_wlan_prot *rt_wlan_lwip_protocol_register(struct rt_wlan_prot *
 {
     struct eth_device *eth = RT_NULL;
     char eth_name[RT_NAME_MAX], timer_name[RT_NAME_MAX];
+    rt_uint16_t eth_flags = NETIF_FLAG_BROADCAST | NETIF_FLAG_ETHARP;
     struct lwip_prot_des *lwip_prot;
 
     if (wlan == RT_NULL || prot == RT_NULL)
@@ -480,7 +475,14 @@ static struct rt_wlan_prot *rt_wlan_lwip_protocol_register(struct rt_wlan_prot *
     eth->eth_tx     = rt_wlan_lwip_protocol_send;
 
     /* register ETH device */
-    if (eth_device_init(eth, eth_name) != RT_EOK)
+#if LWIP_IGMP
+    eth_flags |= NETIF_FLAG_IGMP;
+#endif
+    if (wlan->flags & RT_WLAN_FLAG_DIRECT_TX)
+    {
+        eth_flags |= ETHIF_TX_DIRECT;
+    }
+    if (eth_device_init_with_flag(eth, eth_name, eth_flags) != RT_EOK)
     {
         LOG_E("eth device init failed");
         rt_device_close((rt_device_t)wlan);
@@ -518,12 +520,7 @@ static void rt_wlan_lwip_protocol_unregister(struct rt_wlan_prot *prot, struct r
     }
 
 #ifdef LWIP_USING_DHCPD
-    {
-        char netif_name[RT_NAME_MAX];
-        rt_memset(netif_name, 0, sizeof(netif_name));
-        rt_memcpy(netif_name, lwip_prot->eth.netif->name, sizeof(lwip_prot->eth.netif->name));
-        dhcpd_stop(netif_name);
-    }
+    dhcpd_stop(lwip_prot->eth.parent.parent.name);
 #endif
     eth_device_deinit(&lwip_prot->eth);
     rt_device_close((rt_device_t)wlan);

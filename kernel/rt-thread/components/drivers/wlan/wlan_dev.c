@@ -117,6 +117,70 @@ static int _rt_wlan_dev_get_radio_index(rt_wlan_transport_t transport)
 #error "dev num Too little"
 #endif
 
+_Static_assert(SECURITY_WPA3_AES_PSK == 0x00800004 &&
+               SECURITY_WPA3_SAE == 0x00800024 &&
+               SECURITY_WPA2_WPA3_MIXED_PSK == 0x00c00024 &&
+               SECURITY_WPA3_AES_PSK_SHA384 == 0x00800204 &&
+               SECURITY_FT_WPA3_AES_PSK_SHA384 == 0x00800284 &&
+               SECURITY_WPA3_192BIT_8021X == 0x80810004 &&
+               SECURITY_WAPI_CERT == 0x80002000,
+               "WLAN security wire values changed");
+
+const char *rt_wlan_security_name(rt_wlan_security_t security)
+{
+    switch (security)
+    {
+    case SECURITY_OPEN: return "OPEN";
+    case SECURITY_WEP_PSK: return "WEP_PSK";
+    case SECURITY_WEP_SHARED: return "WEP_SHARED";
+    case SECURITY_WPA_TKIP_PSK: return "WPA_TKIP_PSK";
+    case SECURITY_WPA_TKIP_8021X: return "WPA_TKIP_8021X";
+    case SECURITY_WPA_AES_PSK: return "WPA_AES_PSK";
+    case SECURITY_WPA_AES_8021X: return "WPA_AES_8021X";
+    case SECURITY_WPA2_AES_PSK: return "WPA2_AES_PSK";
+    case SECURITY_WPA2_AES_8021X: return "WPA2_AES_8021X";
+    case SECURITY_WPA2_TKIP_PSK: return "WPA2_TKIP_PSK";
+    case SECURITY_WPA2_TKIP_8021X: return "WPA2_TKIP_8021X";
+    case SECURITY_WPA2_MIXED_PSK: return "WPA2_MIXED_PSK";
+    case SECURITY_WPA_WPA2_MIXED_PSK: return "WPA_WPA2_MIXED_PSK";
+    case SECURITY_WPA_WPA2_MIXED_8021X: return "WPA_WPA2_MIXED_8021X";
+    case SECURITY_WPA2_AES_CMAC: return "WPA2_AES_CMAC";
+    case SECURITY_WPS_OPEN: return "WPS_OPEN";
+    case SECURITY_WPS_SECURE: return "WPS_SECURE";
+    case SECURITY_WPA3_AES_PSK: return "WPA3_AES_PSK_LEGACY";
+    case SECURITY_WPA3_SAE: return "WPA3_SAE";
+    case SECURITY_WPA2_WPA3_MIXED_PSK: return "WPA2_WPA3_MIXED_PSK";
+    case SECURITY_WPA3_AES_8021X: return "WPA3_AES_8021X";
+    case SECURITY_WPA2_WPA3_MIXED_8021X:
+        return "WPA2_WPA3_MIXED_8021X";
+    case SECURITY_WPA3_192BIT_8021X: return "WPA3_192BIT_8021X";
+    case SECURITY_OWE: return "OWE";
+    case SECURITY_OWE_TRANSITION: return "OWE_TRANSITION";
+    case SECURITY_WPA2_AES_PSK_SHA256: return "WPA2_AES_PSK_SHA256";
+    case SECURITY_WPA3_AES_PSK_SHA384: return "WPA3_AES_PSK_SHA384";
+    case SECURITY_WPA2_AES_8021X_SHA256:
+        return "WPA2_AES_8021X_SHA256";
+    case SECURITY_FT_WPA2_AES_PSK: return "FT_WPA2_AES_PSK";
+    case SECURITY_FT_WPA3_AES_PSK_SHA384: return "FT_WPA3_AES_PSK_SHA384";
+    case SECURITY_FT_WPA2_AES_8021X: return "FT_WPA2_AES_8021X";
+    case SECURITY_FT_WPA3_SAE: return "FT_WPA3_SAE";
+    case SECURITY_FT_WPA3_8021X_SHA384:
+        return "FT_WPA3_8021X_SHA384";
+    case SECURITY_WPA3_SAE_EXT_KEY: return "WPA3_SAE_EXT_KEY";
+    case SECURITY_FT_WPA3_SAE_EXT_KEY: return "FT_WPA3_SAE_EXT_KEY";
+    case SECURITY_FILS_SHA256: return "FILS_SHA256";
+    case SECURITY_FILS_SHA384: return "FILS_SHA384";
+    case SECURITY_FT_FILS_SHA256: return "FT_FILS_SHA256";
+    case SECURITY_FT_FILS_SHA384: return "FT_FILS_SHA384";
+    case SECURITY_DPP: return "DPP";
+    case SECURITY_OSEN: return "OSEN";
+    case SECURITY_WAPI_PSK: return "WAPI_PSK";
+    case SECURITY_WAPI_CERT: return "WAPI_CERT";
+    case SECURITY_CCKM: return "CCKM";
+    default: return "UNKNOWN";
+    }
+}
+
 rt_err_t rt_wlan_dev_init(struct rt_wlan_device *device, rt_wlan_mode_t mode)
 {
     rt_err_t result = RT_EOK;
@@ -235,6 +299,7 @@ rt_err_t rt_wlan_dev_ap_start(struct rt_wlan_device *device, struct rt_wlan_info
     ap_info.hidden = info->hidden;
     ap_info.channel = info->channel;
     ap_info.security = info->security;
+    ap_info.band = info->band;
 
     result = rt_device_control(RT_DEVICE(device), RT_WLAN_CMD_SOFTAP, &ap_info);
     return result;
@@ -721,7 +786,11 @@ static rt_err_t _rt_wlan_dev_init(rt_device_t dev)
     struct rt_wlan_device *wlan = (struct rt_wlan_device *)dev;
     rt_err_t result = RT_EOK;
 
-    rt_mutex_init(&wlan->lock, "wlan_dev", RT_IPC_FLAG_FIFO);
+    result = rt_mutex_init(&wlan->lock, "wlan_dev", RT_IPC_FLAG_FIFO);
+    if (result != RT_EOK)
+    {
+        return result;
+    }
 
     if (wlan->ops->wlan_init)
         result = wlan->ops->wlan_init(wlan);
@@ -733,6 +802,7 @@ static rt_err_t _rt_wlan_dev_init(rt_device_t dev)
     else
     {
         LOG_I("wlan init failed");
+        rt_mutex_detach(&wlan->lock);
     }
 
     return result;
@@ -745,7 +815,11 @@ static rt_err_t _rt_wlan_dev_control(rt_device_t dev, int cmd, void *args)
 
     RT_ASSERT(dev != RT_NULL);
 
-    WLAN_DEV_LOCK(wlan);
+    err = WLAN_DEV_LOCK(wlan);
+    if (err != RT_EOK)
+    {
+        return err;
+    }
 
     switch (cmd)
     {
@@ -1120,6 +1194,104 @@ rt_err_t rt_wlan_dev_register_auto(struct rt_wlan_device *wlan,
 
     return _rt_wlan_dev_register(wlan, name, mode, transport, ops, flag,
                                  user_data);
+}
+
+struct rt_wlan_device *rt_wlan_dev_find(const char *name)
+{
+    struct rt_wlan_device *wlan;
+    rt_device_t device;
+    rt_list_t *node;
+    rt_base_t level;
+
+    if (name == RT_NULL)
+    {
+        return RT_NULL;
+    }
+
+    device = rt_device_find(name);
+    if (device == RT_NULL)
+    {
+        return RT_NULL;
+    }
+
+    level = rt_hw_interrupt_disable();
+    rt_list_for_each(node, &wlan_device_list)
+    {
+        wlan = rt_list_entry(node, struct rt_wlan_device,
+                             registration_list);
+        if ((rt_device_t)&wlan->device == device ||
+            (device->type == RT_Device_Class_NetIf &&
+             device->user_data == wlan))
+        {
+            rt_hw_interrupt_enable(level);
+            return wlan;
+        }
+    }
+    rt_hw_interrupt_enable(level);
+    return RT_NULL;
+}
+
+rt_size_t rt_wlan_dev_get_info(struct rt_wlan_device_info *info,
+        rt_size_t capacity)
+{
+    struct rt_wlan_device_info *entry;
+    struct rt_wlan_device *linked;
+    struct rt_wlan_device *wlan;
+    char netif_name[RT_NAME_MAX];
+    rt_size_t count = 0;
+    rt_size_t copied;
+    rt_size_t index;
+    rt_list_t *node;
+    rt_base_t level;
+
+    level = rt_hw_interrupt_disable();
+    rt_list_for_each(node, &wlan_device_list)
+    {
+        wlan = rt_list_entry(node, struct rt_wlan_device,
+                             registration_list);
+        if (info != RT_NULL && count < capacity)
+        {
+            entry = &info[count];
+            rt_memset(entry, 0, sizeof(*entry));
+            rt_strncpy(entry->device_name, wlan->device.parent.name,
+                       sizeof(entry->device_name) - 1);
+            entry->registered_mode = wlan->registered_mode;
+            entry->mode = wlan->mode;
+            entry->transport = wlan->transport;
+            entry->radio_index = wlan->radio_index;
+        }
+        count++;
+    }
+    rt_hw_interrupt_enable(level);
+
+    copied = count < capacity ? count : capacity;
+    for (index = 0; info != RT_NULL && index < copied; index++)
+    {
+        if (info[index].registered_mode == RT_WLAN_STATION)
+        {
+            rt_snprintf(netif_name, sizeof(netif_name), "wlan%d",
+                        info[index].radio_index);
+        }
+        else if (info[index].registered_mode == RT_WLAN_AP)
+        {
+            rt_snprintf(netif_name, sizeof(netif_name), "wlan%dap",
+                        info[index].radio_index);
+        }
+        else
+        {
+            continue;
+        }
+
+        linked = rt_wlan_dev_find(netif_name);
+        if (linked != RT_NULL &&
+            rt_strcmp(linked->device.parent.name,
+                      info[index].device_name) == 0)
+        {
+            rt_strncpy(info[index].netif_name, netif_name,
+                       sizeof(info[index].netif_name) - 1);
+        }
+    }
+    return count;
 }
 
 rt_err_t rt_wlan_dev_get_name(rt_wlan_mode_t mode,

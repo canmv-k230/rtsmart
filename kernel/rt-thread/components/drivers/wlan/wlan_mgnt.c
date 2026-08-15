@@ -50,6 +50,12 @@
 #define COMPLETE_LOCK()       (rt_mutex_take(&complete_mutex, RT_WAITING_FOREVER))
 #define COMPLETE_UNLOCK()     (rt_mutex_release(&complete_mutex))
 
+/* Prefer a usable 5 GHz BSS when a dual-band AP advertises one SSID on both
+ * bands.  5 GHz normally has a lower RSSI than 2.4 GHz, so comparing only
+ * RSSI can select the slower band or a BSS rejected by band steering. */
+#define RT_WLAN_5GHZ_PREFERRED_RSSI  (-70)
+#define RT_WLAN_5GHZ_RSSI_MARGIN     (15)
+
 #ifdef RT_WLAN_AUTO_CONNECT_ENABLE
 #define TIME_STOP()    (rt_timer_stop(&reconnect_time))
 #define TIME_START()   (rt_timer_start(&reconnect_time))
@@ -144,7 +150,8 @@ rt_inline int _ap_is_null(void)
 
 rt_inline rt_bool_t _is_do_connect(void)
 {
-    if ((rt_wlan_get_autoreconnect_mode() == RT_FALSE) ||
+    if (_sta_is_null() ||
+            (rt_wlan_get_autoreconnect_mode() == RT_FALSE) ||
             (rt_wlan_is_connected() == RT_TRUE) ||
             (_sta_mgnt.state & RT_WLAN_STATE_CONNECTING))
     {
@@ -840,11 +847,12 @@ rt_err_t rt_wlan_set_mode(const char *dev_name, rt_wlan_mode_t mode)
                   mode == RT_WLAN_AP ? "AP" : ""
                  );
 
-    /* find device */
-    device = rt_device_find(dev_name);
+    /* Resolve both the WLAN device and its protocol interface name. */
+    device = (rt_device_t)rt_wlan_dev_find(dev_name);
     if (device == RT_NULL)
     {
-        RT_WLAN_LOG_E("not find device, set mode failed! name:%s", dev_name);
+        RT_WLAN_LOG_E("not find WLAN device, set mode failed! name:%s",
+                      dev_name);
         return -RT_EIO;
     }
 
@@ -882,7 +890,7 @@ rt_err_t rt_wlan_set_mode(const char *dev_name, rt_wlan_mode_t mode)
     if (((mode == RT_WLAN_STATION) && (RT_WLAN_DEVICE(device) == AP_DEVICE())) ||
             ((mode == RT_WLAN_AP) && (RT_WLAN_DEVICE(device) == STA_DEVICE())))
     {
-        err = rt_wlan_set_mode(dev_name, RT_WLAN_NONE);
+        err = rt_wlan_set_mode(device->parent.name, RT_WLAN_NONE);
         if (err != RT_EOK)
         {
             RT_WLAN_LOG_E("change mode failed!");
@@ -999,7 +1007,7 @@ rt_err_t rt_wlan_set_mode(const char *dev_name, rt_wlan_mode_t mode)
 #if defined(RT_WLAN_PROT_ENABLE) && defined(RT_WLAN_DEFAULT_PROT)
     if (err == RT_EOK)
     {
-        rt_wlan_prot_attach(dev_name, RT_WLAN_DEFAULT_PROT);
+        rt_wlan_prot_attach(device->parent.name, RT_WLAN_DEFAULT_PROT);
     }
 #endif
     return err;
@@ -1099,6 +1107,9 @@ rt_err_t rt_wlan_mgnt_unregister_device(struct rt_wlan_device *device)
         _sta_mgnt.device = RT_NULL;
         _sta_mgnt.state = 0;
 #ifdef RT_WLAN_AUTO_CONNECT_ENABLE
+        /* Keep the periodic timer alive while the hot-plug device is absent.
+         * _is_do_connect() rejects a NULL device, and the saved auto-connect
+         * configuration can be used again after the replacement is bound. */
         if (_sta_mgnt.flags & RT_WLAN_STATE_AUTOEN)
         {
             TIME_START();
@@ -1115,6 +1126,9 @@ rt_err_t rt_wlan_mgnt_unregister_device(struct rt_wlan_device *device)
         _ap_mgnt.state = 0;
     }
 
+    /* A hot-unplug cannot call rt_wlan_set_mode(..., RT_WLAN_NONE), because
+     * the transport has already gone away.  Remove the same management event
+     * bindings without invoking the device driver. */
     for (event = RT_WLAN_DEV_EVT_INIT_DONE;
          event < RT_WLAN_DEV_EVT_MAX; event++)
     {
@@ -1136,11 +1150,11 @@ rt_wlan_mode_t rt_wlan_get_mode(const char *dev_name)
         return RT_WLAN_NONE;
     }
 
-    /* find device */
-    device = rt_device_find(dev_name);
+    /* Resolve both the WLAN device and its protocol interface name. */
+    device = (rt_device_t)rt_wlan_dev_find(dev_name);
     if (device == RT_NULL)
     {
-        RT_WLAN_LOG_E("device not find! name:%s", dev_name);
+        RT_WLAN_LOG_E("WLAN device not find! name:%s", dev_name);
         return RT_WLAN_NONE;
     }
 
@@ -1179,6 +1193,30 @@ rt_bool_t rt_wlan_find_best_by_cache(const char *ssid, struct rt_wlan_info *info
             /* Signal strength effective */
             if ((result->info[i].rssi < 0) && (info_best->rssi < 0))
             {
+                if (((result->info[i].band == RT_802_11_BAND_5GHZ) &&
+                     (info_best->band == RT_802_11_BAND_2_4GHZ)) ||
+                    ((result->info[i].band == RT_802_11_BAND_2_4GHZ) &&
+                     (info_best->band == RT_802_11_BAND_5GHZ)))
+                {
+                    struct rt_wlan_info *info_5g =
+                        result->info[i].band == RT_802_11_BAND_5GHZ ?
+                        &result->info[i] : info_best;
+                    struct rt_wlan_info *info_2g =
+                        result->info[i].band == RT_802_11_BAND_2_4GHZ ?
+                        &result->info[i] : info_best;
+
+                    /* Prefer 5 GHz when it is usable and not substantially
+                     * weaker than the 2.4 GHz candidate. */
+                    if ((info_5g->band == RT_802_11_BAND_5GHZ) &&
+                        (info_5g->rssi >= RT_WLAN_5GHZ_PREFERRED_RSSI) &&
+                        (info_5g->rssi + RT_WLAN_5GHZ_RSSI_MARGIN >=
+                         info_2g->rssi))
+                    {
+                        info_best = info_5g;
+                        continue;
+                    }
+                }
+
                 /* Find the strongest signal. */
                 if (result->info[i].rssi > info_best->rssi)
                 {
@@ -1213,12 +1251,15 @@ rt_err_t rt_wlan_connect(const char *ssid, const char *password)
     rt_err_t err = RT_EOK;
     int ssid_len = 0;
     struct rt_wlan_info info;
+    struct rt_wlan_info scan_info;
     struct rt_wlan_complete_des *complete;
     rt_uint32_t set = 0, recved = 0;
     rt_uint32_t scan_retry = RT_WLAN_SCAN_RETRY_CNT;
 
     /* sta dev Can't be NULL */
-    if (_sta_is_null())
+    if (_sta_is_null() &&
+        rt_wlan_select_device(RT_WLAN_STATION,
+                              RT_WLAN_TRANSPORT_UNKNOWN) != RT_EOK)
     {
         return -RT_EIO;
     }
@@ -1243,10 +1284,15 @@ rt_err_t rt_wlan_connect(const char *ssid, const char *password)
     }
     /* get info from cache */
     INVALID_INFO(&info);
+    INVALID_INFO(&scan_info);
+    SSID_SET(&scan_info, ssid);
     MGNT_LOCK();
     while (scan_retry-- && rt_wlan_find_best_by_cache(ssid, &info) != RT_TRUE)
     {
-        rt_wlan_scan_sync();
+        /* Match the reference cfg80211 path: include the requested SSID so
+         * firmware sends a directed probe instead of relying on beacons and
+         * wildcard probe responses. */
+        rt_wlan_scan_with_info(&scan_info);
     }
     rt_wlan_scan_result_clean();
 
@@ -1299,7 +1345,9 @@ rt_err_t rt_wlan_connect_adv(struct rt_wlan_info *info, const char *password)
     int password_len = 0;
     rt_err_t err = RT_EOK;
 
-    if (_sta_is_null())
+    if (_sta_is_null() &&
+        rt_wlan_select_device(RT_WLAN_STATION,
+                              RT_WLAN_TRANSPORT_UNKNOWN) != RT_EOK)
     {
         return -RT_EIO;
     }
@@ -1540,17 +1588,56 @@ int rt_wlan_get_rssi(void)
 
 rt_err_t rt_wlan_start_ap(const char *ssid, const char *password)
 {
+    rt_802_11_band_t band = RT_802_11_BAND_2_4GHZ;
+    int channel = 6;
+    struct rt_wlan_info sta_info;
+
+    if (_ap_is_null() &&
+        rt_wlan_select_device(RT_WLAN_AP,
+                              RT_WLAN_TRANSPORT_UNKNOWN) != RT_EOK)
+    {
+        return -RT_EIO;
+    }
+
+    /* A concurrent STA/AP pair on one radio must share its RF channel. */
+    if (!_sta_is_null() && !_ap_is_null() &&
+        STA_DEVICE()->transport != RT_WLAN_TRANSPORT_UNKNOWN &&
+        STA_DEVICE()->transport == AP_DEVICE()->transport &&
+        rt_wlan_get_info(&sta_info) == RT_EOK &&
+        (sta_info.band == RT_802_11_BAND_2_4GHZ ||
+         sta_info.band == RT_802_11_BAND_5GHZ) &&
+        sta_info.channel > 0)
+    {
+        band = sta_info.band;
+        channel = sta_info.channel;
+        RT_WLAN_LOG_I("start concurrent AP on station channel %d", channel);
+    }
+
+    return rt_wlan_start_ap_with_channel(ssid, password, band, channel);
+}
+
+rt_err_t rt_wlan_start_ap_with_channel(const char *ssid, const char *password,
+                                       rt_802_11_band_t band, int channel)
+{
     rt_err_t err = RT_EOK;
     int ssid_len = 0;
     struct rt_wlan_info info;
     struct rt_wlan_complete_des *complete;
     rt_uint32_t set = 0, recved = 0;
 
-    if (_ap_is_null())
+    if (_ap_is_null() &&
+        rt_wlan_select_device(RT_WLAN_AP,
+                              RT_WLAN_TRANSPORT_UNKNOWN) != RT_EOK)
     {
         return -RT_EIO;
     }
     if (ssid == RT_NULL) return -RT_EINVAL;
+    if ((band != RT_802_11_BAND_2_4GHZ &&
+         band != RT_802_11_BAND_5GHZ) ||
+        channel <= 0 || channel > 0x7fff)
+    {
+        return -RT_EINVAL;
+    }
 
     rt_memset(&info, 0, sizeof(struct rt_wlan_info));
     RT_WLAN_LOG_D("%s is run ssid:%s password:%s", __FUNCTION__, ssid, password);
@@ -1559,16 +1646,17 @@ rt_err_t rt_wlan_start_ap(const char *ssid, const char *password)
         info.security = SECURITY_WPA2_AES_PSK;
     }
     ssid_len = rt_strlen(ssid);
-    if (ssid_len > RT_WLAN_SSID_MAX_LENGTH)
+    if (ssid_len == 0 || ssid_len > RT_WLAN_SSID_MAX_LENGTH)
     {
-        RT_WLAN_LOG_E("ssid is to long! len:%d", ssid_len);
+        RT_WLAN_LOG_E("ssid is empty or too long! len:%d", ssid_len);
+        return -RT_EINVAL;
     }
 
     /* copy info */
     rt_memcpy(&info.ssid.val, ssid, ssid_len);
     info.ssid.len = ssid_len;
-    info.channel = 6;
-    info.band = RT_802_11_BAND_2_4GHZ;
+    info.channel = channel;
+    info.band = band;
 
     /* Initializing events that need to wait */
     MGNT_LOCK();
@@ -1618,6 +1706,11 @@ rt_err_t rt_wlan_start_ap_adv(struct rt_wlan_info *info, const char *password)
     {
         return -RT_EIO;
     }
+    if (info == RT_NULL || info->ssid.len == 0 ||
+        info->ssid.len > RT_WLAN_SSID_MAX_LENGTH)
+    {
+        return -RT_EINVAL;
+    }
     RT_WLAN_LOG_D("%s is run", __FUNCTION__);
     if (password != RT_NULL)
     {
@@ -1634,16 +1727,34 @@ rt_err_t rt_wlan_start_ap_adv(struct rt_wlan_info *info, const char *password)
     {
         if ((_ap_mgnt.info.ssid.len == info->ssid.len) &&
                 (_ap_mgnt.info.security == info->security) &&
+                (_ap_mgnt.info.band == info->band) &&
                 (_ap_mgnt.info.channel == info->channel) &&
                 (_ap_mgnt.info.hidden == info->hidden) &&
                 (_ap_mgnt.key.len == password_len) &&
                 (rt_memcmp(&_ap_mgnt.info.ssid.val[0], &info->ssid.val[0], info->ssid.len) == 0) &&
-                (rt_memcmp(&_ap_mgnt.key.val[0], password, password_len)))
+                (!password_len ||
+                 rt_memcmp(&_ap_mgnt.key.val[0], password,
+                           password_len) == 0))
         {
             RT_WLAN_LOG_D("wifi Already Start");
             MGNT_UNLOCK();
+
+            COMPLETE_LOCK();
+            for (int i = 0; i < sizeof(complete_tab) / sizeof(complete_tab[0]); i++)
+            {
+                if (complete_tab[i] != RT_NULL)
+                {
+                    complete_tab[i]->event_flag |=
+                        0x1 << RT_WLAN_DEV_EVT_AP_START;
+                    rt_event_send(&complete_tab[i]->complete,
+                                  0x1 << RT_WLAN_DEV_EVT_AP_START);
+                }
+            }
+            COMPLETE_UNLOCK();
             return RT_EOK;
         }
+        MGNT_UNLOCK();
+        return -RT_EBUSY;
     }
 
     rt_memcpy(&_ap_mgnt.info, info, sizeof(struct rt_wlan_info));
@@ -1657,7 +1768,10 @@ rt_err_t rt_wlan_start_ap_adv(struct rt_wlan_info *info, const char *password)
         return err;
     }
 
-    rt_memcpy(&_ap_mgnt.key.val, password, password_len);
+    if (password_len)
+    {
+        rt_memcpy(&_ap_mgnt.key.val, password, password_len);
+    }
     _ap_mgnt.key.len = password_len;
 
     MGNT_UNLOCK();
@@ -1738,6 +1852,25 @@ rt_err_t rt_wlan_ap_get_info(struct rt_wlan_info *info)
         return RT_EOK;
     }
     return -RT_ERROR;
+}
+
+rt_err_t rt_wlan_ap_update_channel(rt_802_11_band_t band, int channel)
+{
+    if ((band != RT_802_11_BAND_2_4GHZ &&
+         band != RT_802_11_BAND_5GHZ) || channel <= 0)
+    {
+        return -RT_EINVAL;
+    }
+    MGNT_LOCK();
+    if (_ap_is_null() || !(_ap_mgnt.state & RT_WLAN_STATE_ACTIVE))
+    {
+        MGNT_UNLOCK();
+        return -RT_EBUSY;
+    }
+    _ap_mgnt.info.band = band;
+    _ap_mgnt.info.channel = channel;
+    MGNT_UNLOCK();
+    return RT_EOK;
 }
 
 /* get sta number  */
@@ -1901,7 +2034,9 @@ rt_err_t rt_wlan_scan(void)
 {
     rt_err_t err = RT_EOK;
 
-    if (_sta_is_null())
+    if (_sta_is_null() &&
+        rt_wlan_select_device(RT_WLAN_STATION,
+                              RT_WLAN_TRANSPORT_UNKNOWN) != RT_EOK)
     {
         return -RT_EIO;
     }
@@ -1933,7 +2068,9 @@ struct rt_wlan_scan_result *rt_wlan_scan_with_info(struct rt_wlan_info *info)
     rt_base_t level;
     struct rt_wlan_scan_result *result;
 
-    if (_sta_is_null())
+    if (_sta_is_null() &&
+        rt_wlan_select_device(RT_WLAN_STATION,
+                              RT_WLAN_TRANSPORT_UNKNOWN) != RT_EOK)
     {
         return RT_NULL;
     }

@@ -19,9 +19,11 @@ struct wifi_cmd_des
 {
     const char *cmd;
     int (*fun)(int argc, char *argv[]);
+    rt_wlan_mode_t mode;
 };
 
 static int wifi_help(int argc, char *argv[]);
+static int wifi_devices(int argc, char *argv[]);
 static int wifi_scan(int argc, char *argv[]);
 static int wifi_status(int argc, char *argv[]);
 static int wifi_join(int argc, char *argv[]);
@@ -45,17 +47,18 @@ static int wifi_debug_set_autoconnect(int argc, char *argv[]);
 /* cmd table */
 static const struct wifi_cmd_des cmd_tab[] =
 {
-    {"scan", wifi_scan},
-    {"help", wifi_help},
-    {"status", wifi_status},
-    {"join", wifi_join},
-    {"ap", wifi_ap},
-    {"list_sta", wifi_list_sta},
-    {"disc", wifi_disconnect},
-    {"ap_stop", wifi_ap_stop},
-    {"smartconfig", RT_NULL},
+    {"help", wifi_help, RT_WLAN_NONE},
+    {"devices", wifi_devices, RT_WLAN_NONE},
+    {"scan", wifi_scan, RT_WLAN_STATION},
+    {"join", wifi_join, RT_WLAN_STATION},
+    {"ap", wifi_ap, RT_WLAN_AP},
+    {"list_sta", wifi_list_sta, RT_WLAN_AP},
+    {"disc", wifi_disconnect, RT_WLAN_STATION},
+    {"ap_stop", wifi_ap_stop, RT_WLAN_AP},
+    {"status", wifi_status, RT_WLAN_MODE_MAX},
+    {"smartconfig", RT_NULL, RT_WLAN_STATION},
 #ifdef RT_WLAN_CMD_DEBUG
-    {"-d", wifi_debug},
+    {"-d", wifi_debug, RT_WLAN_NONE},
 #endif
 };
 
@@ -63,13 +66,13 @@ static const struct wifi_cmd_des cmd_tab[] =
 /* debug cmd table */
 static const struct wifi_cmd_des debug_tab[] =
 {
-    {"save_cfg", wifi_debug_save_cfg},
-    {"dump_cfg", wifi_debug_dump_cfg},
-    {"clear_cfg", wifi_debug_clear_cfg},
-    {"dump_prot", wifi_debug_dump_prot},
-    {"mode", wifi_debug_set_mode},
-    {"prot", wifi_debug_set_prot},
-    {"auto", wifi_debug_set_autoconnect},
+    {"save_cfg", wifi_debug_save_cfg, RT_WLAN_NONE},
+    {"dump_cfg", wifi_debug_dump_cfg, RT_WLAN_NONE},
+    {"clear_cfg", wifi_debug_clear_cfg, RT_WLAN_NONE},
+    {"dump_prot", wifi_debug_dump_prot, RT_WLAN_NONE},
+    {"mode", wifi_debug_set_mode, RT_WLAN_NONE},
+    {"prot", wifi_debug_set_prot, RT_WLAN_NONE},
+    {"auto", wifi_debug_set_autoconnect, RT_WLAN_NONE},
 };
 #endif
 
@@ -77,17 +80,199 @@ static int wifi_help(int argc, char *argv[])
 {
     rt_kprintf("wifi\n");
     rt_kprintf("wifi help\n");
-    rt_kprintf("wifi scan [SSID]\n");
-    rt_kprintf("wifi join [SSID] [PASSWORD]\n");
-    rt_kprintf("wifi ap SSID [PASSWORD]\n");
-    rt_kprintf("wifi disc\n");
-    rt_kprintf("wifi ap_stop\n");
-    rt_kprintf("wifi status\n");
+    rt_kprintf("wifi devices\n");
+    rt_kprintf("wifi [-i DEVICE] scan [SSID]\n");
+    rt_kprintf("wifi [-i DEVICE] join [SSID] [PASSWORD]\n");
+    rt_kprintf("wifi [-i DEVICE] ap SSID [PASSWORD] [2g|5g] [CHANNEL]\n");
+    rt_kprintf("wifi [-i DEVICE] list_sta\n");
+    rt_kprintf("wifi [-i DEVICE] disc\n");
+    rt_kprintf("wifi [-i DEVICE] ap_stop\n");
+    rt_kprintf("wifi [-i DEVICE] status\n");
     rt_kprintf("wifi smartconfig\n");
+    rt_kprintf("DEVICE: auto, usb, sdio, spi, WLAN device, or network interface\n");
 #ifdef RT_WLAN_CMD_DEBUG
     rt_kprintf("wifi -d debug command\n");
 #endif
     return 0;
+}
+
+static const char *wifi_mode_name(rt_wlan_mode_t mode)
+{
+    switch (mode)
+    {
+    case RT_WLAN_STATION:
+        return "sta";
+    case RT_WLAN_AP:
+        return "ap";
+    default:
+        return "none";
+    }
+}
+
+static const char *wifi_transport_name(rt_wlan_transport_t transport)
+{
+    switch (transport)
+    {
+    case RT_WLAN_TRANSPORT_USB:
+        return "usb";
+    case RT_WLAN_TRANSPORT_SDIO:
+        return "sdio";
+    case RT_WLAN_TRANSPORT_SPI:
+        return "spi";
+    default:
+        return "unknown";
+    }
+}
+
+static int wifi_devices(int argc, char *argv[])
+{
+    struct rt_wlan_device_info *devices;
+    struct rt_wlan_device *selected_sta;
+    struct rt_wlan_device *selected_ap;
+    const char *netif_name;
+    rt_size_t count;
+    rt_size_t index;
+    rt_size_t total;
+    rt_bool_t selected;
+
+    if (argc != 2)
+    {
+        return -1;
+    }
+
+    count = rt_wlan_dev_get_info(RT_NULL, 0);
+    if (count == 0)
+    {
+        rt_kprintf("No Wi-Fi devices registered\n");
+        return 0;
+    }
+
+    devices = rt_calloc(count, sizeof(*devices));
+    if (devices == RT_NULL)
+    {
+        rt_kprintf("wifi: cannot allocate device list\n");
+        return 0;
+    }
+    total = rt_wlan_dev_get_info(devices, count);
+    if (total < count)
+    {
+        count = total;
+    }
+
+    selected_sta = rt_wlan_get_device(RT_WLAN_STATION);
+    selected_ap = rt_wlan_get_device(RT_WLAN_AP);
+    rt_kprintf("device               netif                role bus     state selected\n");
+    rt_kprintf("-------------------- -------------------- ---- ------- ----- --------\n");
+    for (index = 0; index < count; index++)
+    {
+        netif_name = devices[index].netif_name[0] ?
+                     devices[index].netif_name : "-";
+        selected = (selected_sta != RT_NULL &&
+                    rt_strcmp(devices[index].device_name,
+                              selected_sta->device.parent.name) == 0) ||
+                   (selected_ap != RT_NULL &&
+                    rt_strcmp(devices[index].device_name,
+                              selected_ap->device.parent.name) == 0);
+        rt_kprintf("%-20.20s %-20.20s %-4.4s %-7.7s %-5.5s %s\n",
+                   devices[index].device_name, netif_name,
+                   wifi_mode_name(devices[index].registered_mode),
+                   wifi_transport_name(devices[index].transport),
+                   wifi_mode_name(devices[index].mode),
+                   selected ? "yes" : "no");
+    }
+    rt_free(devices);
+    return 0;
+}
+
+static rt_bool_t wifi_parse_transport(const char *name,
+                                      rt_wlan_transport_t *transport)
+{
+    if (rt_strcmp(name, "auto") == 0)
+    {
+        *transport = RT_WLAN_TRANSPORT_UNKNOWN;
+    }
+    else if (rt_strcmp(name, "usb") == 0)
+    {
+        *transport = RT_WLAN_TRANSPORT_USB;
+    }
+    else if (rt_strcmp(name, "sdio") == 0)
+    {
+        *transport = RT_WLAN_TRANSPORT_SDIO;
+    }
+    else if (rt_strcmp(name, "spi") == 0)
+    {
+        *transport = RT_WLAN_TRANSPORT_SPI;
+    }
+    else
+    {
+        return RT_FALSE;
+    }
+    return RT_TRUE;
+}
+
+static rt_err_t wifi_select_status_device(const char *selector)
+{
+    rt_wlan_transport_t transport;
+    rt_wlan_mode_t mode;
+    rt_err_t sta_result;
+    rt_err_t ap_result;
+
+    if (wifi_parse_transport(selector, &transport))
+    {
+        sta_result = rt_wlan_select_device(RT_WLAN_STATION, transport);
+        ap_result = rt_wlan_select_device(RT_WLAN_AP, transport);
+        return sta_result == RT_EOK || ap_result == RT_EOK ? RT_EOK : -RT_EIO;
+    }
+
+    mode = rt_wlan_get_mode(selector);
+    if (mode == RT_WLAN_STATION || mode == RT_WLAN_AP)
+    {
+        return rt_wlan_set_mode(selector, mode);
+    }
+
+    sta_result = rt_wlan_set_mode(selector, RT_WLAN_STATION);
+    if (sta_result == RT_EOK)
+    {
+        return RT_EOK;
+    }
+    return rt_wlan_set_mode(selector, RT_WLAN_AP);
+}
+
+static rt_err_t wifi_select_command_device(const char *selector,
+                                           rt_wlan_mode_t mode)
+{
+    rt_wlan_transport_t transport;
+
+    if (mode == RT_WLAN_MODE_MAX)
+    {
+        return wifi_select_status_device(selector);
+    }
+    if (mode != RT_WLAN_STATION && mode != RT_WLAN_AP)
+    {
+        return -RT_EINVAL;
+    }
+    if (wifi_parse_transport(selector, &transport))
+    {
+        return rt_wlan_select_device(mode, transport);
+    }
+    return rt_wlan_set_mode(selector, mode);
+}
+
+static void wifi_print_selected_device(rt_wlan_mode_t mode)
+{
+    struct rt_wlan_device *device;
+    const char *role;
+
+    device = rt_wlan_get_device(mode);
+    role = mode == RT_WLAN_STATION ? "STA" : "AP";
+    if (device == RT_NULL)
+    {
+        rt_kprintf("Wi-Fi %s Device: none\n", role);
+        return;
+    }
+    rt_kprintf("Wi-Fi %s Device: %s (%s)\n", role,
+               device->device.parent.name,
+               wifi_transport_name(device->transport));
 }
 
 static int wifi_status(int argc, char *argv[])
@@ -98,6 +283,7 @@ static int wifi_status(int argc, char *argv[])
     if (argc > 2)
         return -1;
 
+    wifi_print_selected_device(RT_WLAN_STATION);
     if (rt_wlan_is_connected() == 1)
     {
         rssi = rt_wlan_get_rssi();
@@ -119,6 +305,7 @@ static int wifi_status(int argc, char *argv[])
         rt_kprintf("wifi disconnected!\n");
     }
 
+    wifi_print_selected_device(RT_WLAN_AP);
     if (rt_wlan_ap_is_active() == 1)
     {
         rt_wlan_ap_get_info(&info);
@@ -165,11 +352,11 @@ static int wifi_scan(int argc, char *argv[])
     if (scan_result)
     {
         int index, num;
-        char *security;
+        const char *security;
 
         num = scan_result->num;
-        rt_kprintf("             SSID                      MAC            security    rssi chn Mbps\n");
-        rt_kprintf("------------------------------- -----------------  -------------- ---- --- ----\n");
+        rt_kprintf("             SSID                      MAC                   security                 rssi chn Mbps\n");
+        rt_kprintf("------------------------------- -----------------  ---------------------------- ---- --- ----\n");
         for (index = 0; index < num; index ++)
         {
             rt_kprintf("%-32.32s", &scan_result->info[index].ssid.val[0]);
@@ -181,43 +368,9 @@ static int wifi_scan(int argc, char *argv[])
                        scan_result->info[index].bssid[4],
                        scan_result->info[index].bssid[5]
                       );
-            switch (scan_result->info[index].security)
-            {
-            case SECURITY_OPEN:
-                security = "OPEN";
-                break;
-            case SECURITY_WEP_PSK:
-                security = "WEP_PSK";
-                break;
-            case SECURITY_WEP_SHARED:
-                security = "WEP_SHARED";
-                break;
-            case SECURITY_WPA_TKIP_PSK:
-                security = "WPA_TKIP_PSK";
-                break;
-            case SECURITY_WPA_AES_PSK:
-                security = "WPA_AES_PSK";
-                break;
-            case SECURITY_WPA2_AES_PSK:
-                security = "WPA2_AES_PSK";
-                break;
-            case SECURITY_WPA2_TKIP_PSK:
-                security = "WPA2_TKIP_PSK";
-                break;
-            case SECURITY_WPA2_MIXED_PSK:
-                security = "WPA2_MIXED_PSK";
-                break;
-            case SECURITY_WPS_OPEN:
-                security = "WPS_OPEN";
-                break;
-            case SECURITY_WPS_SECURE:
-                security = "WPS_SECURE";
-                break;
-            default:
-                security = "UNKNOWN";
-                break;
-            }
-            rt_kprintf("%-14.14s ", security);
+            security = rt_wlan_security_name(
+                scan_result->info[index].security);
+            rt_kprintf("%-28.28s ", security);
             rt_kprintf("%-4d ", scan_result->info[index].rssi);
             rt_kprintf("%3d ", scan_result->info[index].channel);
             rt_kprintf("%4d\n", scan_result->info[index].datarate / 1000000);
@@ -236,6 +389,7 @@ static int wifi_join(int argc, char *argv[])
     const char *ssid = RT_NULL;
     const char *key = RT_NULL;
     struct rt_wlan_cfg_info cfg_info;
+    rt_err_t result;
 
     rt_memset(&cfg_info, 0, sizeof(cfg_info));
     if (argc ==  2)
@@ -269,31 +423,140 @@ static int wifi_join(int argc, char *argv[])
     {
         return -1;
     }
-    rt_wlan_connect(ssid, key);
-    return 0;
+    result = rt_wlan_connect(ssid, key);
+    if (result != RT_EOK)
+    {
+        rt_kprintf("wifi join failed: %d\n", result);
+    }
+    return result;
+}
+
+static rt_bool_t wifi_ap_parse_band(const char *name,
+                                    rt_802_11_band_t *band,
+                                    int *default_channel)
+{
+    if (rt_strcmp(name, "2g") == 0 ||
+        rt_strcmp(name, "2.4") == 0 ||
+        rt_strcmp(name, "2.4g") == 0 ||
+        rt_strcmp(name, "2.4ghz") == 0)
+    {
+        *band = RT_802_11_BAND_2_4GHZ;
+        *default_channel = 6;
+        return RT_TRUE;
+    }
+    if (rt_strcmp(name, "5g") == 0 ||
+        rt_strcmp(name, "5.8") == 0 ||
+        rt_strcmp(name, "5.8g") == 0 ||
+        rt_strcmp(name, "5ghz") == 0 ||
+        rt_strcmp(name, "5.8ghz") == 0)
+    {
+        *band = RT_802_11_BAND_5GHZ;
+        *default_channel = 149;
+        return RT_TRUE;
+    }
+    return RT_FALSE;
+}
+
+static rt_bool_t wifi_ap_parse_channel(const char *text, int *channel)
+{
+    int value = 0;
+
+    if (!text[0])
+    {
+        return RT_FALSE;
+    }
+    while (*text)
+    {
+        if (*text < '0' || *text > '9' || value > 3276)
+        {
+            return RT_FALSE;
+        }
+        value = value * 10 + (*text++ - '0');
+    }
+    if (value <= 0 || value > 0x7fff)
+    {
+        return RT_FALSE;
+    }
+    *channel = value;
+    return RT_TRUE;
 }
 
 static int wifi_ap(int argc, char *argv[])
 {
     const char *ssid = RT_NULL;
     const char *key = RT_NULL;
+    rt_802_11_band_t band = RT_802_11_BAND_2_4GHZ;
+    int channel = 6;
+    rt_bool_t channel_selected = RT_FALSE;
+    int result;
 
-    if (argc == 3)
-    {
-        ssid = argv[2];
-    }
-    else if (argc == 4)
-    {
-        ssid = argv[2];
-        key = argv[3];
-    }
-    else
+    if (argc < 3 || argc > 6)
     {
         return -1;
     }
+    ssid = argv[2];
 
-    rt_wlan_start_ap(ssid, key);
-    return 0;
+    if (argc == 4)
+    {
+        if (wifi_ap_parse_band(argv[3], &band, &channel))
+        {
+            channel_selected = RT_TRUE;
+        }
+        else
+        {
+            key = argv[3];
+        }
+    }
+    else if (argc == 5)
+    {
+        channel_selected = RT_TRUE;
+        if (wifi_ap_parse_band(argv[3], &band, &channel))
+        {
+            if (!wifi_ap_parse_channel(argv[4], &channel))
+            {
+                rt_kprintf("invalid channel\n");
+                return -RT_EINVAL;
+            }
+        }
+        else
+        {
+            key = argv[3];
+            if (!wifi_ap_parse_band(argv[4], &band, &channel))
+            {
+                rt_kprintf("invalid band: use 2g or 5g\n");
+                return -RT_EINVAL;
+            }
+        }
+    }
+    else if (argc == 6)
+    {
+        channel_selected = RT_TRUE;
+        key = argv[3];
+        if (!wifi_ap_parse_band(argv[4], &band, &channel))
+        {
+            rt_kprintf("invalid band: use 2g or 5g\n");
+            return -RT_EINVAL;
+        }
+        if (!wifi_ap_parse_channel(argv[5], &channel))
+        {
+            rt_kprintf("invalid channel\n");
+            return -RT_EINVAL;
+        }
+    }
+
+    if (channel_selected)
+    {
+        result = rt_wlan_start_ap_with_channel(ssid, key, band, channel);
+    }
+    else
+    {
+        result = rt_wlan_start_ap(ssid, key);
+    }
+    if (result != RT_EOK)
+    {
+        rt_kprintf("wifi ap start failed: %d\n", result);
+    }
+    return result;
 }
 
 static int wifi_list_sta(int argc, char *argv[])
@@ -547,8 +810,10 @@ static int wifi_debug(int argc, char *argv[])
 
 static int wifi_msh(int argc, char *argv[])
 {
-    int i, result = 0;
+    int i, command_index = 1, command_argc, result = 0;
+    const char *selector = RT_NULL;
     const struct wifi_cmd_des *run_cmd = RT_NULL;
+    char *command_argv[argc];
 
     if (argc == 1)
     {
@@ -556,10 +821,21 @@ static int wifi_msh(int argc, char *argv[])
         return 0;
     }
 
+    if (rt_strcmp(argv[1], "-i") == 0)
+    {
+        if (argc < 4)
+        {
+            wifi_help(argc, argv);
+            return 0;
+        }
+        selector = argv[2];
+        command_index = 3;
+    }
+
     /* find fun */
     for (i = 0; i < sizeof(cmd_tab) / sizeof(cmd_tab[0]); i++)
     {
-        if (rt_strcmp(cmd_tab[i].cmd, argv[1]) == 0)
+        if (rt_strcmp(cmd_tab[i].cmd, argv[command_index]) == 0)
         {
             run_cmd = &cmd_tab[i];
             break;
@@ -573,15 +849,41 @@ static int wifi_msh(int argc, char *argv[])
         return 0;
     }
 
+    if (selector != RT_NULL)
+    {
+        result = wifi_select_command_device(selector, run_cmd->mode);
+        if (result != RT_EOK)
+        {
+            rt_kprintf("wifi: cannot select device %s for %s: %d\n",
+                       selector, run_cmd->cmd, result);
+            return 0;
+        }
+
+        command_argv[0] = argv[0];
+        command_argc = 1;
+        for (i = command_index; i < argc; i++)
+        {
+            command_argv[command_argc++] = argv[i];
+        }
+    }
+    else
+    {
+        command_argc = argc;
+        for (i = 0; i < argc; i++)
+        {
+            command_argv[i] = argv[i];
+        }
+    }
+
     /* run fun */
     if (run_cmd->fun != RT_NULL)
     {
-        result = run_cmd->fun(argc, argv);
+        result = run_cmd->fun(command_argc, command_argv);
     }
 
     if (result)
     {
-        wifi_help(argc, argv);
+        wifi_help(command_argc, command_argv);
     }
     return 0;
 }
