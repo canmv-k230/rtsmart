@@ -31,6 +31,12 @@
 #define AIC8800_DBG_LVL DBG_INFO
 #endif
 
+#ifdef AIC8800_WIFI_DEBUG_STATS
+#define AIC8800_STAT(statement) ((void)(statement))
+#else
+#define AIC8800_STAT(statement) ((void)0)
+#endif
+
 #define AIC8800_USB_VENDOR_ID             0xa69c
 #define AIC8800_USB_VENDOR_ID_V2          0x368b
 
@@ -241,22 +247,20 @@ struct aic8800_tx_worker
     rt_sem_t available;
     rt_size_t slot_count;
     rt_uint32_t pending;
-    rt_uint32_t completion_count;
-    rt_uint64_t byte_count;
     rt_uint32_t error_count;
-    rt_uint32_t wait_count;
     rt_uint32_t timeout_count;
     rt_uint32_t recovery_count;
-    /* Requests the watchdog had to cancel because the host controller never
-     * gave them back, and of those, the ones whose giveback still did not
-     * arrive so the slot had to be reclaimed by hand. */
+#ifdef AIC8800_WIFI_DEBUG_STATS
+    rt_uint32_t completion_count;
+    rt_uint64_t byte_count;
+    rt_uint32_t wait_count;
+    /* Watchdog cancellations and slots reclaimed without a giveback. */
     rt_uint32_t watchdog_count;
     rt_uint32_t reclaim_count;
-    /* Frames submitted without blocking on a free request.  A large burst
-     * means the transmit worker held the CPU across that many frames, which
-     * starves any lower-priority receive worker. */
+    /* Consecutive submissions that acquired a slot without blocking. */
     rt_uint32_t burst_count;
     rt_uint32_t max_burst_count;
+#endif
     rt_size_t next_slot;
     int last_error;
     volatile rt_bool_t active;
@@ -307,23 +311,23 @@ struct aic8800_rx_worker
     rt_uint8_t **spare;
     rt_size_t spare_count;
     rt_size_t spare_available;
-    rt_uint32_t spare_empty_count;
-    rt_uint32_t complete_rearm_count;
     rt_uint8_t *assembly;
     rt_size_t assembly_length;
     rt_size_t assembly_capacity;
     rt_size_t padding_length;
+    rt_uint32_t recovery_count;
+    rt_uint32_t consecutive_errors;
+#ifdef AIC8800_WIFI_DEBUG_STATS
+    rt_uint32_t spare_empty_count;
+    rt_uint32_t complete_rearm_count;
     rt_uint32_t completion_count;
     rt_uint32_t zero_length_count;
     rt_uint32_t rearm_count;
     rt_uint32_t error_count;
     rt_uint32_t retry_count;
-    rt_uint32_t recovery_count;
-    rt_uint32_t consecutive_errors;
-    /* Completions still queued when this worker picked one up.  A non-zero
-     * value means the worker is not keeping up with the endpoint and its
-     * requests are being rearmed late. */
+    /* Completions still queued when this worker picked one up. */
     rt_uint16_t queue_high_water;
+#endif
     int last_error;
     rt_uint8_t completion_log_count;
     volatile rt_bool_t active;
@@ -499,11 +503,6 @@ struct aic8800_context
         rx_reorder_flows[AIC8800_WIFI_RX_REORDER_FLOWS];
     struct aic8800_rx_reorder_slot *rx_reorder_slots;
     volatile rt_uint16_t rx_reorder_pending;
-    rt_uint32_t rx_reorder_queued;
-    rt_uint32_t rx_reorder_delivered;
-    rt_uint32_t rx_reorder_timeouts;
-    rt_uint32_t rx_reorder_duplicates;
-    rt_uint32_t rx_reorder_drops;
     rt_bool_t rx_reorder_mutex_initialized;
     rt_bool_t rx_reorder_timer_initialized;
     rt_bool_t rx_reorder_work_initialized;
@@ -516,8 +515,6 @@ struct aic8800_context
     struct rt_work tcp_ack_work;
     struct aic8800_tcp_ack_flow
         tcp_ack_flows[AIC8800_TCP_ACK_FLOW_COUNT];
-    rt_uint32_t tcp_ack_suppressed;
-    rt_uint32_t tcp_ack_flushed;
     rt_bool_t tcp_ack_mutex_initialized;
     rt_bool_t tcp_ack_timer_initialized;
     rt_bool_t tcp_ack_timer_armed;
@@ -548,12 +545,8 @@ struct aic8800_context
     rt_mq_t usb_tx_queue;
     rt_mp_t usb_tx_pool;
     rt_uint8_t *usb_tx_aggregate_buffer;
-    rt_uint32_t usb_tx_frame_count;
-    rt_uint32_t usb_tx_aggregate_count;
     rt_uint32_t usb_tx_queue_drop_count;
     rt_uint32_t usb_tx_error_count;
-    rt_uint16_t usb_tx_max_aggregate;
-    rt_uint16_t usb_tx_queue_high_water;
     rt_bool_t usb_tx_thread_started;
     rt_bool_t usb_tx_queue_enabled;
     rt_bool_t usb_tx_aggregation_enabled;
@@ -696,8 +689,6 @@ struct aic8800_context
     rt_bool_t wep_auth_error;
     rt_bool_t station_control_port_pending;
     rt_bool_t station_control_port_open;
-    rt_uint32_t station_control_port_set_count;
-    rt_uint32_t station_control_port_error_count;
     enum rt_wlan_offload_auth_type wep_last_auth_type;
     struct aic8800_auth_cache auth;
     struct aic8800_hardware_key hardware_keys[AIC8800_HARDWARE_KEY_COUNT];
@@ -709,6 +700,20 @@ struct aic8800_context
     rt_uint32_t next_mgmt_confirmation;
     rt_bool_t mgmt_confirmation_mutex_initialized;
     rt_bool_t mgmt_confirmation_timer_initialized;
+#ifdef AIC8800_WIFI_DEBUG_STATS
+    rt_uint32_t rx_reorder_queued;
+    rt_uint32_t rx_reorder_delivered;
+    rt_uint32_t rx_reorder_timeouts;
+    rt_uint32_t rx_reorder_duplicates;
+    rt_uint32_t rx_reorder_drops;
+    rt_uint32_t tcp_ack_suppressed;
+    rt_uint32_t tcp_ack_flushed;
+    rt_uint32_t usb_tx_frame_count;
+    rt_uint32_t usb_tx_aggregate_count;
+    rt_uint16_t usb_tx_max_aggregate;
+    rt_uint16_t usb_tx_queue_high_water;
+    rt_uint32_t station_control_port_set_count;
+    rt_uint32_t station_control_port_error_count;
     rt_uint32_t ethernet_tx_count;
     rt_uint32_t ethernet_tx_error_count;
     rt_uint32_t ethernet_rx_count;
@@ -726,6 +731,7 @@ struct aic8800_context
     rt_uint32_t rx_amsdu_subframe_count;
     rt_uint32_t rx_no_llc_count;
     rt_uint32_t rx_invalid_data_count;
+#endif
     rt_uint8_t invalid_rx_log_count;
     rt_uint8_t command_tx_log_count;
     rt_uint8_t command_rx_log_count;
@@ -740,7 +746,9 @@ rt_err_t aic8800_core_attach(struct aic8800_context *context);
 rt_err_t aic8800_core_detach(struct aic8800_context *context);
 rt_err_t aic8800_core_receive(struct rt_wlan_offload_bus *bus, const void *data,
                               rt_size_t length, void *parameter);
+#ifdef AIC8800_WIFI_DEBUG_STATS
 void aic8800_core_print_rc_stats(struct aic8800_context *context);
+#endif
 
 rt_err_t aic8800_protocol_command(struct aic8800_context *context,
                                 rt_uint16_t request_id,

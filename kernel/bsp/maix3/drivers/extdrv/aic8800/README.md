@@ -379,6 +379,12 @@ error reporting are preserved. A reusable frame staging buffer also removes
 per-packet heap allocation from the normal Wi-Fi transmit path. The default
 pool contains two requests: one active and one ready.
 
+Enable `AIC8800_WIFI_DEBUG_STATS` to collect the optional USB, network, and
+receive-reorder diagnostics and export the `aic8800_stat` FinSH command. It
+also enables transmit ICMP checksum validation and firmware rate-control
+statistics used for transport tuning and fault diagnosis. With the option
+disabled, stat-only fields and per-frame accounting are not compiled.
+
 Transmit throughput is limited by the radio, not by this pool. Measured on an
 AIC8800D40 over high-speed USB with a saturated UDP stream, raising
 `AIC8800_WIFI_DATA_TX_URBS` from two to four left the fraction of submissions

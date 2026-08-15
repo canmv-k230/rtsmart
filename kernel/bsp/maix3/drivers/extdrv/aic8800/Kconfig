@@ -226,9 +226,10 @@ if RT_USING_AIC8800_WIFI
                     over high-speed USB, transmit is limited by the radio and
                     not by this pool: raising it from 2 to 4 left the fraction
                     of submissions that had to wait for a free request
-                    unchanged at 96%, while aic8800_stat reported bursts of
-                    1000+ frames submitted without ever blocking. Frames queue
-                    up because the firmware drains them at the air rate.
+                    unchanged at 96%, while aic8800_stat (enabled by
+                    AIC8800_WIFI_DEBUG_STATS) reported bursts of 1000+
+                    frames submitted without ever blocking. Frames queue up
+                    because the firmware drains them at the air rate.
 
                     Increase it only if aic8800_stat shows a low wait fraction
                     together with a saturated transmit queue, which would mean
@@ -561,6 +562,21 @@ if RT_USING_AIC8800_WIFI
             config AIC8800_WIFI_LOG_LEVEL_DEBUG
                 bool "Debug and above"
         endchoice
+
+    endmenu
+
+    menu "Debugging"
+
+        config AIC8800_WIFI_DEBUG_STATS
+            bool "Enable debug statistics and shell commands"
+            depends on RT_USING_MSH
+            depends on AIC8800_WIFI_TRANSPORT_USB
+            default n
+            help
+                Collect diagnostic USB, network, and receive-reorder counters
+                and export aic8800_stat through the FinSH shell. This also
+                enables transmit ICMP checksum validation and firmware
+                rate-control statistics used by that command.
 
     endmenu
 

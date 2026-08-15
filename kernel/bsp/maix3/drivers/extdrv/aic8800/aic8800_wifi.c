@@ -467,6 +467,7 @@ static rt_uint32_t aic_get_le32(const void *data)
            ((rt_uint32_t)bytes[2] << 16) | ((rt_uint32_t)bytes[3] << 24);
 }
 
+#ifdef AIC8800_WIFI_DEBUG_STATS
 static rt_uint16_t aic_network_checksum(const rt_uint8_t *data,
                                         rt_size_t length)
 {
@@ -501,7 +502,7 @@ static void aic_validate_icmp_frame(struct aic8800_context *context,
     {
         if (context)
         {
-            context->icmp_tx_malformed_count++;
+            AIC8800_STAT(context->icmp_tx_malformed_count++);
         }
         return;
     }
@@ -512,19 +513,20 @@ static void aic_validate_icmp_frame(struct aic8800_context *context,
         total_length < header_length + 4U ||
         total_length > length - 14U || ip[9] != 1U)
     {
-        context->icmp_tx_malformed_count++;
+        AIC8800_STAT(context->icmp_tx_malformed_count++);
         return;
     }
     if (aic_network_checksum(ip, header_length) != 0U)
     {
-        context->icmp_tx_ip_checksum_error_count++;
+        AIC8800_STAT(context->icmp_tx_ip_checksum_error_count++);
     }
     if (aic_network_checksum(ip + header_length,
                              total_length - header_length) != 0U)
     {
-        context->icmp_tx_checksum_error_count++;
+        AIC8800_STAT(context->icmp_tx_checksum_error_count++);
     }
 }
+#endif
 
 static void aic_put_le16(void *data, rt_uint16_t value)
 {
@@ -2206,7 +2208,7 @@ static rt_bool_t aic_tcp_ack_filter(
         {
             flow->pending = RT_FALSE;
             flow->suppressed = 0;
-            context->tcp_ack_flushed++;
+            AIC8800_STAT(context->tcp_ack_flushed++);
         }
         else
         {
@@ -2215,7 +2217,7 @@ static rt_bool_t aic_tcp_ack_filter(
             flow->pending = RT_TRUE;
             if (aic_tcp_ack_arm_locked(context) == RT_EOK)
             {
-                context->tcp_ack_suppressed++;
+                AIC8800_STAT(context->tcp_ack_suppressed++);
                 consume = RT_TRUE;
             }
             else
@@ -2295,7 +2297,7 @@ static void aic_tcp_ack_flush_work(struct rt_work *work, void *work_data)
             vif = &context->radio.vifs[vif_index];
             flow->pending = RT_FALSE;
             flow->suppressed = 0;
-            context->tcp_ack_flushed++;
+            AIC8800_STAT(context->tcp_ack_flushed++);
         }
         rt_mutex_release(&context->tcp_ack_mutex);
         if (vif && length)
@@ -2395,9 +2397,11 @@ static void aic_tcp_ack_deinit(struct aic8800_context *context)
         rt_mutex_detach(&context->tcp_ack_mutex);
         context->tcp_ack_mutex_initialized = RT_FALSE;
     }
+#ifdef AIC8800_WIFI_DEBUG_STATS
     LOG_I("TCP ACK filter: suppressed=%u flushed=%u",
           (unsigned int)context->tcp_ack_suppressed,
           (unsigned int)context->tcp_ack_flushed);
+#endif
 }
 
 static rt_err_t aic_tcp_ack_init(struct aic8800_context *context)
@@ -2433,7 +2437,9 @@ static rt_err_t aic_submit_ethernet(struct aic8800_context *context,
                                     rt_size_t length)
 {
     rt_err_t result;
-    rt_uint16_t ethertype = 0;
+#ifdef AIC8800_WIFI_DEBUG_STATS
+    rt_uint16_t ethertype;
+#endif
 
 #ifdef AIC8800_WIFI_TCP_ACK_FILTER
     aic_tcp_ack_note_rx(context, iftype, ethernet, length);
@@ -2442,24 +2448,26 @@ static rt_err_t aic_submit_ethernet(struct aic8800_context *context,
     {
         return RT_EOK;
     }
-    context->ethernet_rx_count++;
+#ifdef AIC8800_WIFI_DEBUG_STATS
+    AIC8800_STAT(context->ethernet_rx_count++);
     if (length >= 14U)
     {
         ethertype = ((rt_uint16_t)ethernet[12] << 8) | ethernet[13];
         if (ethertype == 0x0806U)
         {
-            context->arp_rx_count++;
+            AIC8800_STAT(context->arp_rx_count++);
         }
         else if (ethertype == 0x0800U && length >= 24U &&
                  ethernet[23] == 1U)
         {
-            context->icmp_rx_count++;
+            AIC8800_STAT(context->icmp_rx_count++);
         }
     }
+#endif
     result = rt_wlan_offload_rx(&context->radio, iftype, ethernet, length);
     if (result != RT_EOK && result != -RT_EEMPTY)
     {
-        context->ethernet_rx_error_count++;
+        AIC8800_STAT(context->ethernet_rx_error_count++);
     }
     /* Authentication and network-stack failures belong to the frame
      * consumer; the SDIO/USB record itself was received successfully. */
@@ -2557,7 +2565,7 @@ static rt_err_t aic_deliver_amsdu(struct aic8800_context *context,
         }
         (void)aic_submit_ethernet(context, iftype, ethernet,
                                   ethernet_length);
-        context->rx_amsdu_subframe_count++;
+        AIC8800_STAT(context->rx_amsdu_subframe_count++);
         delivered = RT_TRUE;
 
         if (subframe_length == remaining)
@@ -2606,22 +2614,22 @@ static rt_err_t aic_deliver_ethernet(struct aic8800_context *context,
     if (length < AIC8800_USB_RX_HEADER_SIZE || frame_length < 24 ||
         frame_length > length - AIC8800_USB_RX_HEADER_SIZE)
     {
-        context->rx_invalid_data_count++;
+        AIC8800_STAT(context->rx_invalid_data_count++);
         return -RT_EIO;
     }
     if ((frame[0] & 0x0cU) != 0x08U)
     {
-        context->rx_invalid_data_count++;
+        AIC8800_STAT(context->rx_invalid_data_count++);
         return -RT_EEMPTY;
     }
-    context->rx_data_record_count++;
+    AIC8800_STAT(context->rx_data_record_count++);
     ds = frame[1] & 3U;
     header_length = ds == 3 ? 30U : 24U;
     if (frame[0] & 0x80U)
     {
         qos_offset = header_length;
         header_length += 2U;
-        context->rx_qos_record_count++;
+        AIC8800_STAT(context->rx_qos_record_count++);
     }
     if (frame[1] & 0x80U)
     {
@@ -2629,7 +2637,7 @@ static rt_err_t aic_deliver_ethernet(struct aic8800_context *context,
     }
     if (frame_length < header_length)
     {
-        context->rx_invalid_data_count++;
+        AIC8800_STAT(context->rx_invalid_data_count++);
         return -RT_EIO;
     }
     switch (ds)
@@ -2667,13 +2675,13 @@ static rt_err_t aic_deliver_ethernet(struct aic8800_context *context,
     }
     if (amsdu)
     {
-        context->rx_amsdu_record_count++;
+        AIC8800_STAT(context->rx_amsdu_record_count++);
         return aic_deliver_amsdu(context, iftype, frame, frame_length,
                                  header_length);
     }
     if (frame_length < header_length + 8U)
     {
-        context->rx_invalid_data_count++;
+        AIC8800_STAT(context->rx_invalid_data_count++);
         return -RT_EIO;
     }
     for (index = 0; index < sizeof(iv_lengths); index++)
@@ -2691,13 +2699,13 @@ static rt_err_t aic_deliver_ethernet(struct aic8800_context *context,
     }
     if (!llc_offset)
     {
-        context->rx_no_llc_count++;
+        AIC8800_STAT(context->rx_no_llc_count++);
         return -RT_EEMPTY;
     }
     payload_length = frame_length - llc_offset - 8U;
     if (payload_length > sizeof(ethernet) - 14U)
     {
-        context->rx_invalid_data_count++;
+        AIC8800_STAT(context->rx_invalid_data_count++);
         return -RT_EFULL;
     }
     rt_memcpy(ethernet, destination, 6);
@@ -2922,7 +2930,7 @@ static rt_err_t aic_rx_reorder_deliver_head_locked(
     {
         context->rx_reorder_pending--;
     }
-    context->rx_reorder_delivered++;
+    AIC8800_STAT(context->rx_reorder_delivered++);
     return result;
 }
 
@@ -2973,7 +2981,7 @@ static void aic_rx_reorder_discard_flow_locked(
         {
             context->rx_reorder_pending--;
         }
-        context->rx_reorder_drops++;
+        AIC8800_STAT(context->rx_reorder_drops++);
     }
 }
 
@@ -3083,7 +3091,7 @@ static rt_err_t aic_rx_reorder_queue_locked(
 
         if (queued->sequence == metadata->sequence)
         {
-            context->rx_reorder_duplicates++;
+            AIC8800_STAT(context->rx_reorder_duplicates++);
             return -RT_EEMPTY;
         }
         queued_distance = aic_rx_reorder_distance(queued->sequence,
@@ -3099,7 +3107,7 @@ static rt_err_t aic_rx_reorder_queue_locked(
     slot = aic_rx_reorder_alloc_slot_locked(context, &slot_index);
     if (!slot)
     {
-        context->rx_reorder_drops++;
+        AIC8800_STAT(context->rx_reorder_drops++);
         return -RT_EEMPTY;
     }
     slot->sequence = metadata->sequence;
@@ -3111,7 +3119,7 @@ static rt_err_t aic_rx_reorder_queue_locked(
         if (!slot->external_data)
         {
             aic_rx_reorder_release_slot(slot);
-            context->rx_reorder_drops++;
+            AIC8800_STAT(context->rx_reorder_drops++);
             return -RT_EEMPTY;
         }
         rt_memcpy(slot->external_data, record, length);
@@ -3123,7 +3131,7 @@ static rt_err_t aic_rx_reorder_queue_locked(
     slot->next = *link;
     *link = slot_index;
     context->rx_reorder_pending++;
-    context->rx_reorder_queued++;
+    AIC8800_STAT(context->rx_reorder_queued++);
     return RT_EOK;
 }
 
@@ -3160,7 +3168,7 @@ static rt_err_t aic_rx_reorder_receive(
     }
     if (!flow)
     {
-        context->rx_reorder_drops++;
+        AIC8800_STAT(context->rx_reorder_drops++);
         rt_mutex_release(&context->rx_reorder_mutex);
         return aic_deliver_ethernet(context, record, length);
     }
@@ -3195,7 +3203,7 @@ static rt_err_t aic_rx_reorder_receive(
     }
     else
     {
-        context->rx_reorder_duplicates++;
+        AIC8800_STAT(context->rx_reorder_duplicates++);
         result = -RT_EEMPTY;
     }
     rt_mutex_release(&context->rx_reorder_mutex);
@@ -3234,7 +3242,7 @@ static void aic_rx_reorder_timeout_work(struct rt_work *work,
                         flow->expected = slot->sequence;
                         (void)aic_rx_reorder_deliver_head_locked(context, flow);
                         (void)aic_rx_reorder_drain_locked(context, flow);
-                        context->rx_reorder_timeouts++;
+                        AIC8800_STAT(context->rx_reorder_timeouts++);
                     }
                 }
             }
@@ -3378,6 +3386,7 @@ static void aic_rx_reorder_deinit(struct aic8800_context *context)
     }
     if (context->rx_reorder_slots)
     {
+#ifdef AIC8800_WIFI_DEBUG_STATS
         LOG_I("RX reorder: pending=%u queued=%u delivered=%u timeout=%u duplicate=%u drops=%u",
               (unsigned int)context->rx_reorder_pending,
               (unsigned int)context->rx_reorder_queued,
@@ -3385,6 +3394,7 @@ static void aic_rx_reorder_deinit(struct aic8800_context *context)
               (unsigned int)context->rx_reorder_timeouts,
               (unsigned int)context->rx_reorder_duplicates,
               (unsigned int)context->rx_reorder_drops);
+#endif
         rt_free(context->rx_reorder_slots);
         context->rx_reorder_slots = RT_NULL;
     }
@@ -6128,7 +6138,7 @@ static rt_err_t aic_set_station_authorized(
         }
         result = aic_set_control_port(context, context->ap_station_index,
                                       authorized);
-        context->station_control_port_set_count++;
+        AIC8800_STAT(context->station_control_port_set_count++);
         if (result == RT_EOK)
         {
             context->station_control_port_open = authorized;
@@ -6146,7 +6156,7 @@ static rt_err_t aic_set_station_authorized(
         }
         else
         {
-            context->station_control_port_error_count++;
+            AIC8800_STAT(context->station_control_port_error_count++);
             LOG_E("station controlled port update failed: %d (STA=%u)",
                   result, context->ap_station_index);
         }
@@ -6434,8 +6444,10 @@ static rt_err_t aic_transmit_frame(struct aic8800_context *context,
     rt_err_t result;
     rt_uint8_t station_index = AIC8800_INVALID_INDEX;
     rt_bool_t high_priority;
+#ifdef AIC8800_WIFI_DEBUG_STATS
     rt_bool_t icmp = RT_FALSE;
-    rt_uint16_t ethertype = 0;
+    rt_uint16_t ethertype;
+#endif
     struct aic8800_ap_station *station;
 
     if (!context || !vif || !data || !length ||
@@ -6458,11 +6470,13 @@ static rt_err_t aic_transmit_frame(struct aic8800_context *context,
 #else
     (void)filter_tcp_ack;
 #endif
+#ifdef AIC8800_WIFI_DEBUG_STATS
     if (!management)
     {
         ethertype = ((rt_uint16_t)data[12] << 8) | data[13];
         icmp = ethertype == 0x0800U && length >= 24U && data[23] == 1U;
     }
+#endif
     payload_length = management ? length : length - 14U;
     raw_length = AIC8800_USB_HEADER_SIZE + AIC_TX_DESCRIPTOR_SIZE +
                  payload_length;
@@ -6488,10 +6502,12 @@ static rt_err_t aic_transmit_frame(struct aic8800_context *context,
         return lock_result;
     }
     frame = context->tx_frame;
+#ifdef AIC8800_WIFI_DEBUG_STATS
     if (icmp)
     {
         aic_validate_icmp_frame(context, data, length);
     }
+#endif
     rt_memset(frame, 0, AIC8800_USB_HEADER_SIZE + AIC_TX_DESCRIPTOR_SIZE);
     aic_put_le16(frame, (rt_uint16_t)total_length);
     frame[1] &= 0x0fU;
@@ -6553,15 +6569,17 @@ static rt_err_t aic_transmit_frame(struct aic8800_context *context,
                      data[13] == (rt_uint8_t)AIC_ETHERTYPE_EAPOL);
     if (!management)
     {
-        context->ethernet_tx_count++;
+        AIC8800_STAT(context->ethernet_tx_count++);
+#ifdef AIC8800_WIFI_DEBUG_STATS
         if (ethertype == 0x0806U)
         {
-            context->arp_tx_count++;
+            AIC8800_STAT(context->arp_tx_count++);
         }
         else if (icmp)
         {
-            context->icmp_tx_count++;
+            AIC8800_STAT(context->icmp_tx_count++);
         }
+#endif
     }
     result = rt_wlan_offload_bus_transmit_priority(
         &context->bus, high_priority ? RT_WLAN_OFFLOAD_BUS_PRIORITY_HIGH :
@@ -6569,7 +6587,7 @@ static rt_err_t aic_transmit_frame(struct aic8800_context *context,
         frame, total_length);
     if (!management && result != RT_EOK)
     {
-        context->ethernet_tx_error_count++;
+        AIC8800_STAT(context->ethernet_tx_error_count++);
     }
     rt_mutex_release(context->frame_mutex);
     return result;
@@ -6696,6 +6714,7 @@ static void aic_log_station_rate(
           (unsigned int)response->tx_failed, (unsigned int)rate);
 }
 
+#ifdef AIC8800_WIFI_DEBUG_STATS
 static void aic_print_rc_rate(rt_uint16_t rate_config)
 {
     rt_uint32_t format = (rate_config >> 11) & 0x07U;
@@ -6797,6 +6816,7 @@ void aic8800_core_print_rc_stats(struct aic8800_context *context)
                    (unsigned int)rate->detail.sample.sample_skipped);
     }
 }
+#endif
 
 static rt_err_t aic_get_rssi(struct rt_wlan_offload_vif *vif, int *rssi)
 {
