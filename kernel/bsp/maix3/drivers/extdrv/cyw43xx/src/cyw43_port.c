@@ -480,14 +480,14 @@ static rt_int32_t cyw43_probe(struct rt_mmcsd_card* card)
     wifi_sta.itf = CYW43_ITF_STA;
     wifi_ap.dev = &cyw43_state;
     wifi_ap.itf = CYW43_ITF_AP;
-    result = rt_wlan_dev_register_auto(&wlan_sta, RT_WLAN_STATION,
+    result = rt_wlan_dev_register_auto(&wlan_sta, "cyw43438", RT_WLAN_STATION,
                                        RT_WLAN_TRANSPORT_SDIO, &ops,
                                        &wifi_sta);
     if (result != RT_EOK)
         goto fail;
     sta_registered = RT_TRUE;
 
-    result = rt_wlan_dev_register_auto(&wlan_ap, RT_WLAN_AP,
+    result = rt_wlan_dev_register_auto(&wlan_ap, "cyw43438", RT_WLAN_AP,
                                        RT_WLAN_TRANSPORT_SDIO, &ops,
                                        &wifi_ap);
     if (result != RT_EOK)

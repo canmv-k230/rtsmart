@@ -806,7 +806,7 @@ rt_err_t rt_hw_wifi_init(const char *spi_device_name)
     rw007_spi.rw007_cmd_event = rt_event_create("wifi_cmd", RT_IPC_FLAG_FIFO);
 
     /* register wlan device for ap */
-    ret = rt_wlan_dev_register_auto(&wlan_ap, RT_WLAN_AP,
+    ret = rt_wlan_dev_register_auto(&wlan_ap, "rw007", RT_WLAN_AP,
                                     RT_WLAN_TRANSPORT_SPI, &ops, &wifi_ap);
     if (ret != RT_EOK)
     {
@@ -814,7 +814,7 @@ rt_err_t rt_hw_wifi_init(const char *spi_device_name)
     }
 
     /* register wlan device for sta */
-    ret = rt_wlan_dev_register_auto(&wlan_sta, RT_WLAN_STATION,
+    ret = rt_wlan_dev_register_auto(&wlan_sta, "rw007", RT_WLAN_STATION,
                                     RT_WLAN_TRANSPORT_SPI, &ops, &wifi_sta);
     if (ret != RT_EOK)
     {

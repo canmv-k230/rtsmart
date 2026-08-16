@@ -543,6 +543,8 @@ struct rt_wlan_offload_radio_config
 {
     /* Metadata arrays remain owned by the driver until unregister returns. */
     rt_uint32_t api_version;
+    /* Model name copied into each WLAN interface at registration. */
+    const char *model_name;
     /* Deprecated: STA/AP names are assigned by the WLAN core. */
     const char *station_name;
     const char *ap_name;

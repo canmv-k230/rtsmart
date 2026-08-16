@@ -161,8 +161,8 @@ static int wifi_devices(int argc, char *argv[])
 
     selected_sta = rt_wlan_get_device(RT_WLAN_STATION);
     selected_ap = rt_wlan_get_device(RT_WLAN_AP);
-    rt_kprintf("device               netif                role bus     state selected\n");
-    rt_kprintf("-------------------- -------------------- ---- ------- ----- --------\n");
+    rt_kprintf("device               model                netif                role bus     state selected\n");
+    rt_kprintf("-------------------- -------------------- -------------------- ---- ------- ----- --------\n");
     for (index = 0; index < count; index++)
     {
         netif_name = devices[index].netif_name[0] ?
@@ -173,8 +173,11 @@ static int wifi_devices(int argc, char *argv[])
                    (selected_ap != RT_NULL &&
                     rt_strcmp(devices[index].device_name,
                               selected_ap->device.parent.name) == 0);
-        rt_kprintf("%-20.20s %-20.20s %-4.4s %-7.7s %-5.5s %s\n",
-                   devices[index].device_name, netif_name,
+        rt_kprintf("%-20.20s %-20.20s %-20.20s %-4.4s %-7.7s %-5.5s %s\n",
+                   devices[index].device_name,
+                   devices[index].model_name[0] ?
+                       devices[index].model_name : "-",
+                   netif_name,
                    wifi_mode_name(devices[index].registered_mode),
                    wifi_transport_name(devices[index].transport),
                    wifi_mode_name(devices[index].mode),

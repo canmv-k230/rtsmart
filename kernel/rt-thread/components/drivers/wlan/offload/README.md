@@ -147,7 +147,8 @@ Protocols supporting parallel commands must encode the manager token on the
 wire and return it with the confirmation.
 
 At registration, drivers set `rt_wlan_offload_radio_config.api_version` to
-`RT_WLAN_OFFLOAD_API_VERSION`. Firmware start should query the device protocol
+`RT_WLAN_OFFLOAD_API_VERSION` and provide a stable `model_name` for WLAN
+device diagnostics. Firmware start should query the device protocol
 version, feature bits, and resource limits, reject incompatible firmware, then
 publish the negotiated values with `rt_wlan_offload_update_firmware_info()`.
 `firmware_generation` changes on each successful firmware start/online cycle,
@@ -343,7 +344,7 @@ Each vendor instance follows this order:
 2. Initialize exactly one SPI, SDIO, or USB `rt_wlan_offload_bus`.
 3. Install bus RX/event callbacks which feed the vendor core.
 4. Fill static radio metadata and `rt_wlan_offload_ops`, including
-   `api_version = RT_WLAN_OFFLOAD_API_VERSION`.
+   `api_version = RT_WLAN_OFFLOAD_API_VERSION` and a non-empty `model_name`.
 5. Set `control_device` when exposing a userspace control device.
    External-supplicant radios must set it. Then call
    `rt_wlan_offload_register_radio()`.

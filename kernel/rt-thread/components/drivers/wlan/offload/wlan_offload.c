@@ -2256,6 +2256,7 @@ rt_err_t rt_wlan_offload_register_radio(struct rt_wlan_offload_radio *radio,
     rt_err_t result;
 
     if (!radio || !config || config->api_version != RT_WLAN_OFFLOAD_API_VERSION ||
+        !config->model_name || !config->model_name[0] ||
         !config->ops || !config->ops->transmit ||
         !config->ops->change_interface ||
         !(config->capabilities & (RT_WLAN_OFFLOAD_CAP_STA | RT_WLAN_OFFLOAD_CAP_AP)) ||
@@ -2352,7 +2353,7 @@ rt_err_t rt_wlan_offload_register_radio(struct rt_wlan_offload_radio *radio,
         rt_memcpy(vif->address, radio->permanent_address,
                   sizeof(vif->address));
         result = rt_wlan_dev_register_auto(
-            &vif->wlan, RT_WLAN_STATION,
+            &vif->wlan, config->model_name, RT_WLAN_STATION,
             wlan_offload_wlan_transport(config->bus),
             &wlan_offload_wlan_ops, vif);
         if (result != RT_EOK)
@@ -2374,7 +2375,7 @@ rt_err_t rt_wlan_offload_register_radio(struct rt_wlan_offload_radio *radio,
         rt_memcpy(vif->address, radio->permanent_address,
                   sizeof(vif->address));
         result = rt_wlan_dev_register_auto(
-            &vif->wlan, RT_WLAN_AP,
+            &vif->wlan, config->model_name, RT_WLAN_AP,
             wlan_offload_wlan_transport(config->bus),
             &wlan_offload_wlan_ops, vif);
         if (result != RT_EOK)

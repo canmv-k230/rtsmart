@@ -383,6 +383,11 @@ rt_err_t ehf_attach_bus(struct rt_wlan_offload_bus *bus)
     rt_wlan_offload_bus_set_callbacks(bus, ehf_bus_receive, ehf_bus_event, context);
     rt_memset(&radio_config, 0, sizeof(radio_config));
     radio_config.api_version = RT_WLAN_OFFLOAD_API_VERSION;
+#ifdef ESP_HOSTED_WIFI_FG
+    radio_config.model_name = "esp-hosted-fg";
+#else
+    radio_config.model_name = "esp-hosted-ng";
+#endif
 #ifdef ESP_HOSTED_WIFI_CONTROL
     radio_config.control_device = RT_TRUE;
 #endif

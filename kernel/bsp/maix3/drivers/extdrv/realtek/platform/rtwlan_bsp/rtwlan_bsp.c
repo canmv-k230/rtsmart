@@ -480,6 +480,7 @@ static const struct rt_wlan_dev_ops ops = {
 
 static rt_int32_t realtek_probe(struct rt_mmcsd_card* card)
 {
+    const char *model_name;
     rt_int32_t ret;
 
     if (card == NULL || card->sdio_function[0] == NULL ||
@@ -510,22 +511,22 @@ static rt_int32_t realtek_probe(struct rt_mmcsd_card* card)
     wifi_sdio_func->vendor = rtt_sdio_func->manufacturer;
     wifi_sdio_func->device = rtt_sdio_func->product;
     wifi_sdio_func->num_info = 0;
+    model_name = PRODUCT_RTL8189FTV == wifi_sdio_func->device ?
+                 "rtl8189ftv" : "rtl8733bs";
 
     if (wifi_on(RTW_MODE_STA) < 0) {
-        LOG_E("%s initialization failed",
-              (PRODUCT_RTL8189FTV == wifi_sdio_func->device) ?
-              "rtl8189FTV" : "rtl8733BS");
+        LOG_E("%s initialization failed", model_name);
         ret = -RT_EIO;
         goto fail_disable_sdio;
     }
 
-    ret = rt_wlan_dev_register_auto(&wlan_sta, RT_WLAN_STATION,
+    ret = rt_wlan_dev_register_auto(&wlan_sta, model_name, RT_WLAN_STATION,
                                     RT_WLAN_TRANSPORT_SDIO, &ops, NULL);
     if (ret != RT_EOK)
         goto fail_wifi;
     wlan_sta_registered = RT_TRUE;
 
-    ret = rt_wlan_dev_register_auto(&wlan_ap, RT_WLAN_AP,
+    ret = rt_wlan_dev_register_auto(&wlan_ap, model_name, RT_WLAN_AP,
                                     RT_WLAN_TRANSPORT_SDIO, &ops, NULL);
     if (ret != RT_EOK)
         goto fail_wifi;

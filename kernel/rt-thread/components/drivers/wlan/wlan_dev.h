@@ -536,6 +536,7 @@ struct rt_wlan_dev_event_desc
 struct rt_wlan_device
 {
     struct rt_device device;
+    char model_name[RT_NAME_MAX];
     rt_wlan_mode_t mode;
     rt_wlan_mode_t registered_mode;
     rt_wlan_transport_t transport;
@@ -555,6 +556,7 @@ struct rt_wlan_device
 struct rt_wlan_device_info
 {
     char device_name[RT_NAME_MAX];
+    char model_name[RT_NAME_MAX];
     char netif_name[RT_NAME_MAX];
     rt_wlan_mode_t registered_mode;
     rt_wlan_mode_t mode;
@@ -699,9 +701,10 @@ rt_err_t rt_wlan_dev_report_data(struct rt_wlan_device *device, void *buff, int 
  */
 rt_err_t rt_wlan_dev_register(struct rt_wlan_device *wlan, const char *name, 
     const struct rt_wlan_dev_ops *ops, rt_uint32_t flag, void *user_data);
-/* Assign Linux-style radio names and publish transport metadata. */
+/* Assign Linux-style radio names and publish model/transport metadata. */
 rt_err_t rt_wlan_dev_register_auto(struct rt_wlan_device *wlan,
-    rt_wlan_mode_t mode, rt_wlan_transport_t transport,
+    const char *model_name, rt_wlan_mode_t mode,
+    rt_wlan_transport_t transport,
     const struct rt_wlan_dev_ops *ops, void *user_data);
 rt_err_t rt_wlan_dev_unregister(struct rt_wlan_device *wlan);
 /* Accepts either a WLAN device name or its associated network interface. */

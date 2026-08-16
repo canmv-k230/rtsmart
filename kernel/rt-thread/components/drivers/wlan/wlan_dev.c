@@ -1016,7 +1016,8 @@ const static struct rt_device_ops wlan_ops =
 #endif
 
 static rt_err_t _rt_wlan_dev_register(struct rt_wlan_device *wlan,
-        const char *name, rt_wlan_mode_t registered_mode,
+        const char *name, const char *model_name,
+        rt_wlan_mode_t registered_mode,
         rt_wlan_transport_t transport, const struct rt_wlan_dev_ops *ops,
         rt_uint32_t flag, void *user_data)
 {
@@ -1031,7 +1032,9 @@ static rt_err_t _rt_wlan_dev_register(struct rt_wlan_device *wlan,
          registered_mode != RT_WLAN_AP) ||
         transport < RT_WLAN_TRANSPORT_UNKNOWN ||
         transport > RT_WLAN_TRANSPORT_SPI ||
-        (flag & RT_WLAN_FLAG_STA_ONLY && flag & RT_WLAN_FLAG_AP_ONLY))
+        (flag & RT_WLAN_FLAG_STA_ONLY && flag & RT_WLAN_FLAG_AP_ONLY) ||
+        (model_name && (!model_name[0] ||
+                        rt_strlen(model_name) >= RT_NAME_MAX)))
     {
         LOG_E("F:%s L:%d parameter Wrongful", __FUNCTION__, __LINE__);
         return -RT_EINVAL;
@@ -1039,6 +1042,11 @@ static rt_err_t _rt_wlan_dev_register(struct rt_wlan_device *wlan,
 
     rt_memset(wlan, 0, sizeof(struct rt_wlan_device));
     rt_list_init(&wlan->registration_list);
+    if (model_name)
+    {
+        rt_strncpy(wlan->model_name, model_name,
+                   sizeof(wlan->model_name) - 1);
+    }
 
 #ifdef RT_USING_DEVICE_OPS
     wlan->device.ops = &wlan_ops;
@@ -1165,13 +1173,14 @@ rt_err_t rt_wlan_dev_register(struct rt_wlan_device *wlan, const char *name,
         registered_mode = RT_WLAN_AP;
     }
 
-    return _rt_wlan_dev_register(wlan, name, registered_mode,
+    return _rt_wlan_dev_register(wlan, name, RT_NULL, registered_mode,
                                  RT_WLAN_TRANSPORT_UNKNOWN, ops, flag,
                                  user_data);
 }
 
 rt_err_t rt_wlan_dev_register_auto(struct rt_wlan_device *wlan,
-        rt_wlan_mode_t mode, rt_wlan_transport_t transport,
+        const char *model_name, rt_wlan_mode_t mode,
+        rt_wlan_transport_t transport,
         const struct rt_wlan_dev_ops *ops, void *user_data)
 {
     const char *name;
@@ -1192,8 +1201,8 @@ rt_err_t rt_wlan_dev_register_auto(struct rt_wlan_device *wlan,
         return -RT_EINVAL;
     }
 
-    return _rt_wlan_dev_register(wlan, name, mode, transport, ops, flag,
-                                 user_data);
+    return _rt_wlan_dev_register(wlan, name, model_name, mode, transport, ops,
+                                 flag, user_data);
 }
 
 struct rt_wlan_device *rt_wlan_dev_find(const char *name)
@@ -1255,6 +1264,8 @@ rt_size_t rt_wlan_dev_get_info(struct rt_wlan_device_info *info,
             rt_memset(entry, 0, sizeof(*entry));
             rt_strncpy(entry->device_name, wlan->device.parent.name,
                        sizeof(entry->device_name) - 1);
+            rt_strncpy(entry->model_name, wlan->model_name,
+                       sizeof(entry->model_name) - 1);
             entry->registered_mode = wlan->registered_mode;
             entry->mode = wlan->mode;
             entry->transport = wlan->transport;

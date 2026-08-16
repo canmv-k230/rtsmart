@@ -7354,6 +7354,30 @@ static void aic8800_core_cancel_work(struct aic8800_context *context)
     }
 }
 
+static const char *aic8800_model_name(
+    const struct aic8800_context *context)
+{
+    switch (context->product_id)
+    {
+    case AIC8800_USB_PID_AIC8801: return "aic8801";
+    case AIC8800_USB_PID_AIC8800DC: return "aic8800dc";
+    case AIC8800_USB_PID_AIC8800DW: return "aic8800dw";
+    case AIC8800_USB_PID_AIC8800D80: return "aic8800d80";
+    case AIC8800_USB_PID_AIC8800D81: return "aic8800d81";
+    case AIC8800_USB_PID_AIC8800D83: return "aic8800d83";
+    case AIC8800_USB_PID_AIC8800D84: return "aic8800d84";
+    case AIC8800_USB_PID_AIC8800D85: return "aic8800d85";
+    case AIC8800_USB_PID_AIC8800D86: return "aic8800d86";
+    case AIC8800_USB_PID_AIC8800D88: return "aic8800d88";
+    case AIC8800_USB_PID_AIC8800D40: return "aic8800d40";
+    case AIC8800_USB_PID_AIC8800D41: return "aic8800d41";
+    case AIC8800_USB_PID_AIC8800D80X2: return "aic8800d80x2";
+    case AIC8800_USB_PID_AIC8800D81X2: return "aic8800d81x2";
+    case AIC8800_USB_PID_AIC8800D89X2: return "aic8800d89x2";
+    default: return "aic8800";
+    }
+}
+
 static const char *aic8800_transport_name(
     const struct aic8800_context *context)
 {
@@ -7411,6 +7435,7 @@ rt_err_t aic8800_core_attach(struct aic8800_context *context)
 
     rt_memset(&radio_config, 0, sizeof(radio_config));
     radio_config.api_version = RT_WLAN_OFFLOAD_API_VERSION;
+    radio_config.model_name = aic8800_model_name(context);
     radio_config.control_device = RT_TRUE;
     radio_config.ops = &g_aic8800_wifi_ops;
     radio_config.bus = &context->bus;

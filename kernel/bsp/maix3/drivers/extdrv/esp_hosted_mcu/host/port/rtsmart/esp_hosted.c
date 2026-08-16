@@ -1016,7 +1016,7 @@ int rt_hw_esp_hosted_init(void)
     esp_hosted_rpc_api_init(&api_callbacks, &g_eh);
     esp_hosted_control_init(&control_callbacks, &g_eh);
 
-    result = rt_wlan_dev_register_auto(&g_eh.ap, RT_WLAN_AP,
+    result = rt_wlan_dev_register_auto(&g_eh.ap, "esp-hosted-mcu", RT_WLAN_AP,
                                        RT_WLAN_TRANSPORT_SPI,
                                        &g_eh_wlan_ops, &g_eh);
     if (result != RT_EOK)
@@ -1025,7 +1025,8 @@ int rt_hw_esp_hosted_init(void)
         goto fail;
     }
     ap_registered = RT_TRUE;
-    result = rt_wlan_dev_register_auto(&g_eh.sta, RT_WLAN_STATION,
+    result = rt_wlan_dev_register_auto(&g_eh.sta, "esp-hosted-mcu",
+                                       RT_WLAN_STATION,
                                        RT_WLAN_TRANSPORT_SPI,
                                        &g_eh_wlan_ops, &g_eh);
     if (result != RT_EOK)
