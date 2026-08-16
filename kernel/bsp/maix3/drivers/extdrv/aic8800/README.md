@@ -11,11 +11,12 @@ This directory contains the Apache-2.0 RT-Smart AIC8800 source implementation:
 
 `SConscript` builds the top-level `aic8800_*.c` files and the fixed-width
 protocol declarations in `port/aic8800_protocol.h`. All source files in this
-component are licensed under Apache-2.0.
+component are licensed under Apache-2.0. The firmware files are maintained in
+a separate repository checked out at `firmware/`.
 
 ## Firmware loading
 
-Disable `RT_USING_ESP_HOSTED_WIFI`, enable `RT_USING_AIC8800_WIFI`, then
+Enable `RT_USING_AIC8800_WIFI`, then
 enable `AIC8800_WIFI_TRANSPORT_USB`, `AIC8800_WIFI_TRANSPORT_SDIO`, or both.
 Each transport owns an independent device context and may attach at the same
 time. Radios are numbered in registration order. Their network interfaces use
@@ -133,9 +134,10 @@ firmware cannot overwrite each other:
     `-- aic8800D80/
 ```
 
-The packaged binaries are copied verbatim from the AIC firmware package's
-`fw/` directory. Their distribution terms are independent of this source code;
-confirm the vendor redistribution grant before publishing binary images.
+The firmware repository is distributed separately because its vendor licensing
+terms are independent of this source code. Review `firmware/README.md` and the
+applicable vendor terms before using or redistributing the files, including in
+binary images.
 
 With `AIC8800_WIFI_FORCE_FIRMWARE_DOWNLOAD=y`, an initially detected
 runtime PID is rebooted to its boot PID. The loader streams firmware in 1 KiB
@@ -191,47 +193,6 @@ matching files are installed. AIC8800FC devices initially expose a fake MSC
 interface at `a69c:5721`; the USB driver walks the standard mass-storage
 initialization and issues the bulk-only SCSI eject, then binds the device
 after it re-enumerates with its AIC runtime ID.
-
-`1111:1111` is deliberately not claimed by default. It is not an AIC identity:
-AIC's USB-IF vendor ID is `0xa69c`, and no INF in any vendor Windows driver
-package binds `1111:1111`. It is the placeholder that unprogrammed and no-name
-devices ship with, so claiming it would take the mass-storage interface away
-from unrelated devices and eject them.
-`AIC8800_WIFI_USB_MODESWITCH_PLACEHOLDER_ID` enables it for bring-up.
-
-Not every fake-storage module switches on an eject. The AIC 88M80 WiFi 6 +
-Bluetooth module reports `1111:1111` with USB strings `'AIC'` / `'88M80'` and
-SCSI INQUIRY `'LGX' 'WIFI6' rev '2.30'`, peripheral device type `0x00`. It
-accepts an eject with a good status and stays in mass-storage mode; worse, the
-eject removes its medium and its private command channel then refuses
-everything, so the eject has to be skipped entirely for this module.
-
-It switches on a private command instead. `tool/Usb_Driver.dll` in the vendor
-`Wifi6_install_bt` package sends these through `IOCTL_SCSI_PASS_THROUGH_DIRECT`
-as 16-byte CDBs, opcode `0xfd` with the sub-command in the last byte:
-
-| export | CDB | data |
-| --- | --- | --- |
-| `GetHippo` | `fd 00 .. 00 f3` | reads 5 bytes |
-| `Set_CS1_0` | `fd 00 .. 00 f2` | none |
-
-The routine in `AicWifiService.exe` that calls them opens the device, reads the
-five identification bytes, compares them against an expected string, and only
-then issues `Set_CS1_0`. It never ejects. The module answers `"88M80"`, matching
-its USB product string, and acts on `Set_CS1_0` once the bus is cycled - the
-vendor service follows up with `devcon rescan`, and this driver gets the same
-effect by failing the probe once so the hub re-resets the port. The module then
-enumerates as `a69c:8d80`, takes the normal D80 firmware download, and returns
-as `a69c:8d81` with Bluetooth on interfaces 0-1 and Wi-Fi on interface 2.
-
-Because `1111:1111` is a shared placeholder rather than an AIC identity, the
-driver treats the private command as the only proof of identity: a device at
-that ID which does not answer `0xf3` is left completely untouched rather than
-being ejected. It is still claimed, though - the USB host core resolves one
-class driver per interface and cannot hand a declined device to another - so
-`AIC8800_WIFI_USB_MODESWITCH_PLACEHOLDER_ID` exists to drop the ID entirely on
-systems where something else uses it. It defaults to on so the 88M80 works
-without configuration.
 
 AIC8800DC/DW WLAN startup uses the vendor v2 TX-power ABI, revision-specific
 2.4 GHz TX gain tables, 20/40 MHz RX gain tables, and DC calibration mask. The
@@ -473,5 +434,6 @@ AIC8800DC requires its Bluetooth patch stage before the HCI interface is usable.
 The RT-Smart source files are licensed under Apache-2.0; see
 `LICENSE.Apache-2.0`.
 
-The firmware binaries have separate, currently undocumented redistribution
-terms. Confirm the firmware grant before publishing images containing them.
+The `firmware/` directory is a separate repository and is not covered by this
+component's Apache-2.0 license. See `firmware/README.md` and the applicable
+vendor terms before using or redistributing those files.

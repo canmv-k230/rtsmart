@@ -57,4 +57,5 @@ kernel/bsp/maix3/sdk_version.h
 kernel/bsp/maix3/romfs
 kernel/bsp/maix3/romfs.c
 
-!kernel/bsp/maix3/drivers/extdrv/aic8800/firmware/**/*.bin
+# repo-managed firmware project
+kernel/bsp/maix3/drivers/extdrv/aic8800/firmware/
