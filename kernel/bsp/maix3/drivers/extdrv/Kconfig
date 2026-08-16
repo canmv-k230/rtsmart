@@ -5,6 +5,8 @@ menu "Wi-Fi Drivers"
     source "drivers/extdrv/cyw43xx/Kconfig"
     source "drivers/extdrv/realtek/Kconfig"
     source "drivers/extdrv/aic8800/Kconfig"
+    source "drivers/extdrv/esp_hosted/Kconfig"
+    source "drivers/extdrv/esp_hosted_mcu/Kconfig"
 
     config BSP_USING_WIFI_SDIO
         bool
@@ -12,6 +14,7 @@ menu "Wi-Fi Drivers"
         default y if RT_USING_REALTEK
         default y if RT_USING_RTL8189
         default y if AIC8800_WIFI_TRANSPORT_SDIO
+        default y if ESP_HOSTED_WIFI_TRANSPORT_SDIO
 
     if BSP_USING_WIFI_SDIO
 

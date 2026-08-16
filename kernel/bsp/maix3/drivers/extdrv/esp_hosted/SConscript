@@ -1,0 +1,28 @@
+from building import *
+
+cwd = GetCurrentDir()
+src = ['esp_hosted_wifi.c', 'esp_hosted_country.c']
+
+if GetDepend('ESP_HOSTED_WIFI_FG'):
+    src += ['esp_hosted_fg.c']
+    src += Glob('third_party/esp_hosted_fg/*.c')
+    src += Glob('third_party/protobuf-c/protobuf-c/*.c')
+else:
+    src += ['esp_hosted_ng.c']
+
+if GetDepend('ESP_HOSTED_WIFI_TRANSPORT_SPI'):
+    src += ['esp_hosted_transport_spi.c']
+else:
+    src += ['esp_hosted_transport_sdio.c']
+
+CPPPATH = [
+    cwd,
+    cwd + '/../../../../../rt-thread/components/drivers/wlan/offload',
+    cwd + '/third_party/esp_hosted_fg',
+    cwd + '/third_party/protobuf-c',
+]
+
+group = DefineGroup('esp_hosted', src,
+                    depend=['RT_USING_ESP_HOSTED_WIFI'], CPPPATH=CPPPATH)
+
+Return('group')

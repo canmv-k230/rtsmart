@@ -1,0 +1,286 @@
+menuconfig RT_USING_ESP_HOSTED_WIFI
+    bool "ESP-Hosted Wi-Fi offload driver (FG/NG)"
+    depends on RT_USING_WIFI
+    depends on (RT_USING_SPI && RT_USING_QSPI) || RT_USING_SDIO
+    select RT_WLAN_OFFLOAD
+    default n
+    help
+        Use an ESP running ESP-Hosted-FG or ESP-Hosted-NG as a Wi-Fi
+        coprocessor through the RT-Thread WLAN offload framework. The SDIO
+        transport may be enabled with other vendor drivers because binding
+        is selected by the card manufacturer and product IDs.
+
+if RT_USING_ESP_HOSTED_WIFI
+
+    menu "Protocol and WLAN Settings"
+
+    choice ESP_HOSTED_WIFI_PROTOCOL
+        prompt "ESP-Hosted firmware protocol"
+        default ESP_HOSTED_WIFI_FG
+
+        config ESP_HOSTED_WIFI_FG
+            bool "ESP-Hosted-FG (firmware connection offload)"
+            select RT_USING_TIMER_SOFT
+
+        config ESP_HOSTED_WIFI_NG
+            bool "ESP-Hosted-NG (host supplicant)"
+            depends on RT_USING_LWP && RT_USING_DFS && RT_USING_DFS_DEVFS
+            select ESP_HOSTED_WIFI_CONTROL
+            select RT_WLAN_OFFLOAD_SUPPLICANT
+            select RT_WLAN_OFFLOAD_EMBEDDED_HOSTAPD
+            help
+                NG exposes host-managed authentication, association, key,
+                EAPOL, management-frame, and AP-station operations. The
+                embedded WLAN supplicant and SoftAP authenticator support
+                RT-Thread WLAN management, while /dev/wlanctlN remains
+                available for a full userspace supplicant.
+    endchoice
+
+    config ESP_HOSTED_WIFI_CONTROL
+        bool "Expose WLAN offload userspace control device"
+        depends on RT_USING_LWP && RT_USING_DFS && RT_USING_DFS_DEVFS
+        select RT_WLAN_OFFLOAD_CONTROL
+        default y
+        help
+            Exposes a /dev/wlanctlN control node for libwlan_offload
+            diagnostics and userspace integrations. FG retains firmware WPA
+            offload and does not advertise the external-supplicant capability.
+
+    config ESP_HOSTED_WIFI_AUTO_START
+        bool "Initialize the station interface during driver probe"
+        depends on RT_WLAN_MANAGE_ENABLE
+        default y
+        help
+            Start the ESP link, enable station mode, and attach the default
+            RT-Thread network protocol when the transport driver registers.
+            The probe runs in a dedicated worker, so a missing or unresponsive
+            ESP does not delay the rest of RT-Smart initialization. Disable
+            this only when an application must control link startup explicitly
+            through the WLAN offload control device.
+
+    endmenu
+
+    menu "Common Transport Settings"
+
+    choice ESP_HOSTED_WIFI_TRANSPORT
+        prompt "Bus transport"
+        default ESP_HOSTED_WIFI_TRANSPORT_SPI if RT_USING_SPI && RT_USING_QSPI
+        default ESP_HOSTED_WIFI_TRANSPORT_SDIO
+
+        config ESP_HOSTED_WIFI_TRANSPORT_SPI
+            bool "SPI full-duplex"
+            depends on RT_USING_SPI && RT_USING_QSPI
+
+        config ESP_HOSTED_WIFI_TRANSPORT_SDIO
+            bool "SDIO"
+            depends on RT_USING_SDIO
+    endchoice
+
+    config ESP_HOSTED_WIFI_CHECKSUM
+        bool "Use transport checksums when advertised by firmware"
+        default y
+
+    config ESP_HOSTED_WIFI_5GHZ
+        bool "Advertise 5 GHz channels"
+        default n
+        help
+            Enable only for an ESP target and firmware build with 5 GHz Wi-Fi.
+
+    config ESP_HOSTED_WIFI_BOOT_TIMEOUT_MS
+        int "Firmware boot timeout (ms)"
+        range 1000 60000
+        default 15000
+        help
+            Maximum time for an ESP link probe to wait for the firmware boot
+            event. Automatic probes wait in their worker and never block the
+            RT-Smart initialization thread.
+
+    config ESP_HOSTED_WIFI_COMMAND_TIMEOUT_MS
+        int "Control command timeout (ms)"
+        range 1000 60000
+        default 10000
+
+    config ESP_HOSTED_WIFI_CONTROL_BUFFER_SIZE
+        int "Maximum fragmented FG control message (bytes)"
+        range 2048 65535
+        default 16384
+        depends on ESP_HOSTED_WIFI_FG
+
+    config ESP_HOSTED_WIFI_THREAD_STACK_SIZE
+        int "Transport worker stack size"
+        range 4096 32768
+        default 8192
+
+    config ESP_HOSTED_WIFI_THREAD_PRIORITY
+        int "Transport worker priority"
+        range 5 30
+        default 15
+
+    config ESP_HOSTED_WIFI_TX_QUEUE_DEPTH
+        int "Transport TX queue depth"
+        range 4 64
+        default 16
+
+    endmenu
+
+if ESP_HOSTED_WIFI_TRANSPORT_SPI
+
+    menu "SPI Transport Settings"
+
+    choice ESP_HOSTED_WIFI_SPI_BUS
+        prompt "SPI bus"
+        default ESP_HOSTED_WIFI_SPI_BUS_SPI0
+
+        config ESP_HOSTED_WIFI_SPI_BUS_SPI0
+            bool "spi0 (OSPI controller)"
+
+        config ESP_HOSTED_WIFI_SPI_BUS_SPI1
+            bool "spi1 (QSPI0)"
+
+        config ESP_HOSTED_WIFI_SPI_BUS_SPI2
+            bool "spi2 (QSPI1)"
+    endchoice
+
+    config ESP_HOSTED_WIFI_SPI_DEVICE_NAME
+        string "SPI device name"
+        default "esp-hosted-wifi"
+
+    config ESP_HOSTED_WIFI_SPI_MAX_HZ
+        int "SPI clock frequency (Hz)"
+        range 1000000 40000000
+        default 5000000
+
+    choice ESP_HOSTED_WIFI_SPI_MODE_CHOICE
+        prompt "SPI mode"
+        default ESP_HOSTED_WIFI_SPI_MODE_3
+
+        config ESP_HOSTED_WIFI_SPI_MODE_1
+            bool "Mode 1 (CPOL=0, CPHA=1)"
+
+        config ESP_HOSTED_WIFI_SPI_MODE_2
+            bool "Mode 2 (CPOL=1, CPHA=0)"
+
+        config ESP_HOSTED_WIFI_SPI_MODE_3
+            bool "Mode 3 (CPOL=1, CPHA=1)"
+    endchoice
+
+    config ESP_HOSTED_WIFI_SPI_MODE
+        int
+        default 1 if ESP_HOSTED_WIFI_SPI_MODE_1
+        default 2 if ESP_HOSTED_WIFI_SPI_MODE_2
+        default 3
+
+    config ESP_HOSTED_WIFI_SPI_CS_PIN
+        int "Chip-select GPIO"
+        range -1 63
+        default 14
+
+    config ESP_HOSTED_WIFI_SPI_CLK_PIN
+        int "SPI clock GPIO"
+        range 0 63
+        default 15
+
+    config ESP_HOSTED_WIFI_SPI_D0_PIN
+        int "SPI MOSI GPIO"
+        range 0 63
+        default 16
+
+    config ESP_HOSTED_WIFI_SPI_D1_PIN
+        int "SPI MISO GPIO"
+        range 0 63
+        default 17
+
+    config ESP_HOSTED_WIFI_HANDSHAKE_PIN
+        int "Handshake GPIO"
+        range 0 63
+        default 20
+
+    config ESP_HOSTED_WIFI_HANDSHAKE_ACTIVE_LOW
+        bool "Handshake is active low"
+        default n
+
+    config ESP_HOSTED_WIFI_DATA_READY_PIN
+        int "Data-ready GPIO"
+        range 0 63
+        default 21
+
+    config ESP_HOSTED_WIFI_DATA_READY_ACTIVE_LOW
+        bool "Data-ready is active low"
+        default n
+
+    config ESP_HOSTED_WIFI_RESET_PIN
+        int "ESP EN/reset GPIO (-1 disables host reset)"
+        range -1 63
+        default -1
+
+    config ESP_HOSTED_WIFI_RESET_ACTIVE_LOW
+        bool "Reset is asserted low"
+        default y
+
+    config ESP_HOSTED_WIFI_RESET_PULSE_MS
+        int "Reset pulse duration (ms)"
+        range 1 1000
+        default 10
+
+    endmenu
+
+endif
+
+if ESP_HOSTED_WIFI_TRANSPORT_SDIO
+
+    menu "SDIO Transport Settings"
+
+    config ESP_HOSTED_WIFI_SDIO_MANUFACTURER
+        hex "SDIO manufacturer ID"
+        range 0x0000 0xffff
+        default 0x6666
+
+    config ESP_HOSTED_WIFI_SDIO_PRODUCT
+        hex "SDIO product ID"
+        range 0x0000 0xffff
+        default 0x2222
+        help
+            Common IDs are 6666:2222, 6666:3333, 0092:6666, and
+            0092:7777. The RT-Thread SDIO matcher accepts one ID per driver.
+
+    config ESP_HOSTED_WIFI_SDIO_RX_BUFFER_SIZE
+        int "Maximum SDIO aggregate RX size"
+        range 2048 65536
+        default 16384
+
+    config ESP_HOSTED_WIFI_SDIO_TOKEN_SIZE
+        int "Fallback firmware TX credit size"
+        range 512 16384
+        default 15872
+        help
+            Used only when old firmware omits its RX-buffer-size boot TLV.
+
+    endmenu
+
+endif
+
+    menu "Logging"
+
+    choice ESP_HOSTED_WIFI_LOG_LEVEL
+        prompt "Module log level"
+        default ESP_HOSTED_WIFI_LOG_LEVEL_INFO
+        help
+            Select the minimum log level compiled into the ESP-Hosted Wi-Fi
+            driver. Debug includes transport frame and protocol trace output.
+
+        config ESP_HOSTED_WIFI_LOG_LEVEL_ERROR
+            bool "Errors only"
+
+        config ESP_HOSTED_WIFI_LOG_LEVEL_WARNING
+            bool "Warnings and errors"
+
+        config ESP_HOSTED_WIFI_LOG_LEVEL_INFO
+            bool "Information (default)"
+
+        config ESP_HOSTED_WIFI_LOG_LEVEL_DEBUG
+            bool "Debug and above"
+    endchoice
+
+    endmenu
+
+endif
