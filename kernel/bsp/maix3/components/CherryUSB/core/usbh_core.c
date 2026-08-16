@@ -87,6 +87,7 @@ static const struct usbh_class_driver *usbh_find_class_driver(uint8_t class, uin
                                                               uint16_t vid, uint16_t pid)
 {
     struct usbh_class_info *index = NULL;
+    struct usbh_class_info *best_match = NULL;
 
     for (index = usbh_class_info_table_begin; index < usbh_class_info_table_end; index++) {
         if ((index->match_flags & USB_CLASS_MATCH_VENDOR) && !(index->vid == vid)) {
@@ -104,9 +105,18 @@ static const struct usbh_class_driver *usbh_find_class_driver(uint8_t class, uin
         if ((index->match_flags & USB_CLASS_MATCH_INTF_PROTOCOL) && !(index->protocol == protocol)) {
             continue;
         }
-        return index->class_driver;
+
+        /* Prefer a match that constrains every field of the current match
+         * plus at least one more. This lets VID/PID-specific drivers override
+         * generic class drivers without relying on linker section order. */
+        if ((best_match == NULL) ||
+            ((index->match_flags != best_match->match_flags) &&
+             ((index->match_flags & best_match->match_flags) == best_match->match_flags))) {
+            best_match = index;
+        }
     }
-    return NULL;
+
+    return best_match ? best_match->class_driver : NULL;
 }
 
 static int parse_device_descriptor(struct usbh_hubport *hport, struct usb_device_descriptor *desc, uint16_t length)
