@@ -37,6 +37,8 @@
 
 #define SDHCI_SDMA_ENABLE
 #define CACHE_LINESIZE (64)
+/* SDHCI requires the SDMA system address to be word aligned. */
+#define SDHCI_SDMA_ALIGNMENT (4)
 
 #define BIT(x) (1 << x)
 #define DWC_MSHC_PTR_VENDOR1 0x500
@@ -563,7 +565,7 @@ static rt_err_t sdhci_transfer_blocking(struct sdhci_host* sdhci_host)
     }
     while (sdhci_data && (sdhci_get_present_status_flag(sdhci_host) & sdhci_data_inhibit_flag)) {
     }
-    sdhci_writel(sdhci_host, SDHCI_INT_ALL_MASK, SDHCI_INT_STATUS);
+    sdhci_writel(sdhci_host, SDHCI_INT_ACK_MASK, SDHCI_INT_STATUS);
 
     ret = sdhci_set_transfer_config(sdhci_host, sdhci_command, sdhci_data);
     if (ret != 0) {
@@ -581,7 +583,7 @@ static rt_err_t sdhci_transfer_blocking(struct sdhci_host* sdhci_host)
     }
     sdhci_writel(sdhci_host, sdhci_readl(sdhci_host, SDHCI_SIGNAL_ENABLE) &
         ~(SDHCI_INT_DATA_MASK | SDHCI_INT_CMD_MASK), SDHCI_SIGNAL_ENABLE);
-    sdhci_writel(sdhci_host, SDHCI_INT_ALL_MASK, SDHCI_INT_STATUS);
+    sdhci_writel(sdhci_host, SDHCI_INT_ACK_MASK, SDHCI_INT_STATUS);
     if (ret != RT_EOK)
         sdhic_error_recovery(sdhci_host);
     return ret;
@@ -615,6 +617,9 @@ static void sdhci_irq(int vector, void* param)
     }
     if (status & SDHCI_INT_CARD_INT)
         sdio_irq_wakeup(host->host);
+    /* sdio_irq_wakeup() masks the host interrupt before it wakes the SDIO
+     * thread. Clear the latched status now; if DAT[1] is still asserted when
+     * the thread re-enables it, the controller will report it again. */
     sdhci_clear_int_status_flag(host, status);
 }
 
@@ -706,15 +711,43 @@ static void kd_mmc_request(struct rt_mmcsd_host* host, struct rt_mmcsd_req* req)
             sdhci_data.txData = RT_NULL;
         }
 #ifdef SDHCI_SDMA_ENABLE
+        /* SDMA is not cache coherent here.
+         *
+         * Receive needs the caller's buffer to own whole cache lines: the
+         * invalidate before the transfer rounds the start down and covers the
+         * trailing partial line, so a neighbour sharing either end would lose
+         * whatever it had dirty in cache.  Stage those through an aligned
+         * bounce buffer.
+         *
+         * Transmit needs no such thing.  All it does is write the CPU's dirty
+         * lines back before the engine reads RAM, and writing back more than
+         * asked for is harmless - the extra lines simply keep the values they
+         * already had.  Only the engine's own address alignment matters, so a
+         * word-aligned buffer goes straight to DMA.  This is worth the
+         * distinction: virtually no Wi-Fi frame is a multiple of 64 bytes, so
+         * bouncing transmits cost an aligned allocation plus a full copy on
+         * every single frame. */
         uint32_t sz = sdhci_data.blockSize * sdhci_data.blockCount;
         uint32_t pad = 0;
         if (sz & (CACHE_LINESIZE - 1))
             pad = (sz + (CACHE_LINESIZE - 1)) & ~(CACHE_LINESIZE - 1);
         if (sdhci_data.rxData && (((uint64_t)(sdhci_data.rxData) & (CACHE_LINESIZE - 1)) || pad)) {
             sdhci_data.rxData = rt_malloc_align(pad ? pad : sz, CACHE_LINESIZE);
-        } else if (((uint64_t)(sdhci_data.txData) & (CACHE_LINESIZE - 1)) || pad) {
+        } else if (sdhci_data.txData &&
+                   ((uint64_t)(sdhci_data.txData) & (SDHCI_SDMA_ALIGNMENT - 1))) {
             sdhci_data.txData = rt_malloc_align(pad ? pad : sz, CACHE_LINESIZE);
-            rt_memcpy(sdhci_data.txData, data->buf, sz);
+            if (sdhci_data.txData)
+                rt_memcpy(sdhci_data.txData, data->buf, sz);
+        }
+        /* Refuse the request rather than handing the DMA engine a null address
+         * and copying through it. */
+        if ((data->flags == DATA_DIR_WRITE && !sdhci_data.txData) ||
+            (data->flags != DATA_DIR_WRITE && !sdhci_data.rxData)) {
+            LOG_E("no bounce buffer for a %u byte transfer", (unsigned int)sz);
+            cmd->err = -RT_ENOMEM;
+            mmcsd->sdhci_data = RT_NULL;
+            mmcsd_req_complete(host);
+            return;
         }
 #endif
         mmcsd->sdhci_data = &sdhci_data;
@@ -824,7 +857,7 @@ static rt_err_t sdhci_send_tuning_cmd(struct sdhci_host* host, rt_int32_t opcode
     block_size = (host->host->io_cfg.bus_width == MMCSD_BUS_WIDTH_8) ? 128 : 64;
 
     rt_event_control(&host->event, RT_IPC_CMD_RESET, 0);
-    sdhci_writel(host, SDHCI_INT_ALL_MASK, SDHCI_INT_STATUS);
+    sdhci_writel(host, SDHCI_INT_ACK_MASK, SDHCI_INT_STATUS);
     sdhci_writew(host, SDHCI_MAKE_BLKSZ(7, block_size), SDHCI_BLOCK_SIZE);
     sdhci_writew(host, 1, SDHCI_BLOCK_COUNT);
     sdhci_writew(host, SDHCI_TRNS_READ, SDHCI_TRANSFER_MODE);
@@ -929,7 +962,7 @@ static rt_int32_t sdhci_execute_tuning_cmd(struct rt_mmcsd_host* mmcsd_host, rt_
 
     sdhci_writel(host, old_int_enable, SDHCI_INT_ENABLE);
     sdhci_writel(host, old_signal_enable, SDHCI_SIGNAL_ENABLE);
-    sdhci_writel(host, SDHCI_INT_ALL_MASK, SDHCI_INT_STATUS);
+    sdhci_writel(host, SDHCI_INT_ACK_MASK, SDHCI_INT_STATUS);
 
     return ret;
 }
@@ -1049,12 +1082,23 @@ static void kd_enable_sdio_irq(struct rt_mmcsd_host* mmcsd_host, rt_int32_t en)
     struct sdhci_host* host = (struct sdhci_host*)mmcsd_host->private_data;
     uint32_t val;
 
-    val = sdhci_readw(host, SDHCI_INT_ENABLE);
+    /* A card interrupt only reaches the CPU when it is enabled in both the
+     * status-enable and the signal-enable register; sdhci_init() arms only the
+     * latter, so enabling one here would leave it permanently masked.  Both are
+     * 32-bit registers. */
+    val = sdhci_readl(host, SDHCI_INT_ENABLE);
     if (en)
         val |= SDHCI_INT_CARD_INT;
     else
         val &= ~SDHCI_INT_CARD_INT;
-    sdhci_writew(host, val, SDHCI_INT_ENABLE);
+    sdhci_writel(host, val, SDHCI_INT_ENABLE);
+
+    val = sdhci_readl(host, SDHCI_SIGNAL_ENABLE);
+    if (en)
+        val |= SDHCI_INT_CARD_INT;
+    else
+        val &= ~SDHCI_INT_CARD_INT;
+    sdhci_writel(host, val, SDHCI_SIGNAL_ENABLE);
 }
 
 static const struct rt_mmcsd_host_ops ops = {

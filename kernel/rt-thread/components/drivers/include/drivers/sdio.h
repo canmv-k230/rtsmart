@@ -49,6 +49,7 @@ extern "C" {
 #define SDIO_REG_CCCR_INT_PEND      0x05    /* Function Interrupt Pending */
 
 #define SDIO_REG_CCCR_IO_ABORT      0x06    /* function abort/card reset */
+#define SDIO_IO_ABORT_RES           0x08    /* reset the card's I/O portion */
 
 #define SDIO_REG_CCCR_BUS_IF        0x07    /* bus interface controls */
 
@@ -160,6 +161,13 @@ rt_int32_t sdio_io_rw_direct(struct rt_mmcsd_card *card,
                              rt_uint32_t           reg_addr,
                              rt_uint8_t           *pdata,
                              rt_uint8_t            raw);
+rt_int32_t sdio_io_rw_direct_host(struct rt_mmcsd_host *host,
+                                  rt_int32_t            rw,
+                                  rt_uint32_t           fn,
+                                  rt_uint32_t           reg_addr,
+                                  rt_uint8_t           *pdata,
+                                  rt_uint8_t            raw);
+void sdio_reset(struct rt_mmcsd_host *host);
 rt_int32_t sdio_io_rw_extended(struct rt_mmcsd_card *card,
                                rt_int32_t            rw,
                                rt_uint32_t           fn,

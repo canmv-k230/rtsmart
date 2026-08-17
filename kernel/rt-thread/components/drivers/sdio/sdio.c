@@ -23,6 +23,9 @@
 #ifndef RT_SDIO_STACK_SIZE
 #define RT_SDIO_STACK_SIZE 512
 #endif
+#ifndef RT_SDIO_IO_RESET_SETTLE_MS
+#define RT_SDIO_IO_RESET_SETTLE_MS 10
+#endif
 #ifndef RT_SDIO_THREAD_PRIORITY
 #define RT_SDIO_THREAD_PRIORITY  0x40
 #endif
@@ -119,10 +122,25 @@ rt_int32_t sdio_io_rw_direct(struct rt_mmcsd_card *card,
                              rt_uint8_t           *pdata,
                              rt_uint8_t            raw)
 {
+    RT_ASSERT(card != RT_NULL);
+
+    return sdio_io_rw_direct_host(card->host, rw, fn, reg_addr, pdata, raw);
+}
+
+/* CMD52 issued against a host that has no card bound yet.  Card enumeration
+ * needs this: an SDIO card left initialized by a previous boot has to be reset
+ * before it will answer CMD5, and at that point no rt_mmcsd_card exists. */
+rt_int32_t sdio_io_rw_direct_host(struct rt_mmcsd_host *host,
+                                  rt_int32_t            rw,
+                                  rt_uint32_t           fn,
+                                  rt_uint32_t           reg_addr,
+                                  rt_uint8_t           *pdata,
+                                  rt_uint8_t            raw)
+{
     struct rt_mmcsd_cmd cmd;
     rt_int32_t err;
 
-    RT_ASSERT(card != RT_NULL);
+    RT_ASSERT(host != RT_NULL);
     RT_ASSERT(fn <= SDIO_MAX_FUNCTIONS);
     RT_ASSERT(pdata != RT_NULL);
 
@@ -139,11 +157,11 @@ rt_int32_t sdio_io_rw_direct(struct rt_mmcsd_card *card,
     cmd.arg |= *pdata;
     cmd.flags = RESP_SPI_R5 | RESP_R5 | CMD_AC;
 
-    err = mmcsd_send_cmd(card->host, &cmd, 0);
+    err = mmcsd_send_cmd(host, &cmd, 0);
     if (err)
         return err;
 
-    if (!controller_is_spi(card->host)) 
+    if (!controller_is_spi(host)) 
     {
         if (cmd.resp[0] & R5_ERROR)
             return -RT_EIO;
@@ -155,13 +173,47 @@ rt_int32_t sdio_io_rw_direct(struct rt_mmcsd_card *card,
 
     if (!rw || raw) 
     {
-        if (controller_is_spi(card->host))
+        if (controller_is_spi(host))
             *pdata = (cmd.resp[0] >> 8) & 0xFF;
         else
             *pdata = cmd.resp[0] & 0xFF;
     }
 
     return 0;
+}
+
+/* SDIO Simplified Specification V2.0, 4.4 "Reset for SDIO".
+ *
+ * CMD0 resets only the memory portion of a card; the I/O portion is reset by
+ * writing the RES bit of the CCCR I/O Abort register.  Without this, a card that
+ * a previous boot left initialized keeps that state across a warm reset of the
+ * host and never answers the CMD5 that follows, so it is never enumerated -
+ * which is why such cards appear to work "the first time only".
+ *
+ * Failures are expected and ignored: an SD or MMC card answers CMD52 with a
+ * timeout, exactly like the CMD5 that mmcsd_detect() already sends to every
+ * card before falling back to SD and MMC probing.
+ */
+void sdio_reset(struct rt_mmcsd_host *host)
+{
+    rt_uint8_t abort = 0;
+
+    if (!host)
+        return;
+
+    /* Preserve the other bits when the card answers; assume the register reads
+     * back as zero when it does not. */
+    if (sdio_io_rw_direct_host(host, 0, 0, SDIO_REG_CCCR_IO_ABORT,
+                               &abort, 0) != 0)
+        abort = SDIO_IO_ABORT_RES;
+    else
+        abort |= SDIO_IO_ABORT_RES;
+
+    (void)sdio_io_rw_direct_host(host, 1, 0, SDIO_REG_CCCR_IO_ABORT,
+                                 &abort, 0);
+
+    /* A card may be unresponsive until its reset completes. */
+    rt_thread_mdelay(RT_SDIO_IO_RESET_SETTLE_MS);
 }
 
 rt_int32_t sdio_io_rw_extended(struct rt_mmcsd_card *card,

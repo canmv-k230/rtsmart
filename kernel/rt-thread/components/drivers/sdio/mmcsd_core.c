@@ -695,6 +695,11 @@ void mmcsd_detect(void *param)
             {
                 mmcsd_host_lock(host);
                 mmcsd_power_up(host);
+                /* Reset the I/O portion before CMD0, as Linux does in
+                 * mmc_rescan_try_freq().  CMD0 alone leaves an already
+                 * initialized SDIO card - one carried over a warm reset of the
+                 * host - in a state where it never answers CMD5. */
+                sdio_reset(host);
                 mmcsd_go_idle(host);
 
                 skip_sd_probe = !controller_is_spi(host) &&
