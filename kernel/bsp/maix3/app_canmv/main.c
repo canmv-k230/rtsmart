@@ -106,6 +106,11 @@ static int usbh_initialize_async(uint8_t busid, uint32_t reg_base)
 }
 #endif
 
+/* How long VBUS is held low at boot to force a USB device re-enumeration. */
+#ifndef CANMV_USB_PWR_CYCLE_MS
+#define CANMV_USB_PWR_CYCLE_MS 100
+#endif
+
 static const struct dfs_mount_tbl* const auto_mount_table[SYSCTL_BOOT_MAX] = {
     (const struct dfs_mount_tbl[]) {
         /* Nor Flash */
@@ -348,12 +353,27 @@ int main(void) {
   /* Strange BUG, ​​USB Host must be initialized first */
 #if defined (ENABLE_CHERRY_USB_HOST) && defined (ENABLE_CANMV_USB_HOST)
   usb_base = (void *)rt_ioremap((void *)usb_dev_addr[CHERRY_USB_HOST_USING_DEV], 0x10000);
-  usbh_initialize_async(0, (uint32_t)(long)usb_base);
 
 #ifdef CANMV_USB_PWR_PIN
+  /* Power-cycle the port so every boot looks like a cold one to the device.  A
+   * reset button press does not clear the GPIO output latch, so VBUS would
+   * otherwise stay up and an already enumerated device would keep its old USB
+   * address - it then ignores the GET_DESCRIPTOR sent to address 0 and
+   * enumeration fails with -USB_ERR_TIMEOUT.  The host thread runs at the
+   * lowest priority and cannot start before main() blocks, so dropping VBUS
+   * here still happens before the host stack looks at the port. */
   int usb_host_pin = CANMV_USB_PWR_PIN;
   if(0 <= usb_host_pin) {
     kd_pin_mode(usb_host_pin, GPIO_DM_OUTPUT);
+    kd_pin_write(usb_host_pin, !CANMV_USB_PWR_PIN_VALID_VAL);
+  }
+#endif
+
+  usbh_initialize_async(0, (uint32_t)(long)usb_base);
+
+#ifdef CANMV_USB_PWR_PIN
+  if(0 <= usb_host_pin) {
+    rt_thread_mdelay(CANMV_USB_PWR_CYCLE_MS);
     kd_pin_write(usb_host_pin, CANMV_USB_PWR_PIN_VALID_VAL);
   }
 #endif
