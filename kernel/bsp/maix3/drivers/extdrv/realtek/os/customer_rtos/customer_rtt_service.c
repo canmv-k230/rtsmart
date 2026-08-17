@@ -1,4 +1,5 @@
 #include <rtthread.h>
+#include <rthw.h>          /* rt_hw_interrupt_disable/enable */
 #include <autoconf.h>
 #include <osdep_service.h>
 #include <stdio.h>
@@ -204,24 +205,37 @@ static void rtt_mutex_put(_mutex* pmutex)
     rt_mutex_release(*pmutex);
 }
 
+/* Realtek's rtw_enter_critical is spin_lock_irqsave: the caller hands in an
+ * _irqL to save the interrupt state into, and expects interrupts masked on
+ * return.  rt_enter_critical() only locks the scheduler, which leaves an
+ * interrupt free to run and touch the very list being protected, and it also
+ * ignores pirqL so nesting cannot be unwound.  This is a single-core build, so
+ * masking interrupts gives real mutual exclusion and nests correctly because
+ * each call keeps its own saved level. */
 static void rtt_enter_critical(_lock* plock, _irqL* pirqL)
 {
-    rt_enter_critical();
+    /* Without somewhere to save the level there is no way to unwind, so do not
+     * mask at all rather than mask forever. */
+    if (!pirqL)
+        return;
+
+    *pirqL = (_irqL)rt_hw_interrupt_disable();
 }
 
 static void rtt_exit_critical(_lock* plock, _irqL* pirqL)
 {
-    rt_exit_critical();
+    if (pirqL)
+        rt_hw_interrupt_enable((rt_base_t)*pirqL);
 }
 
 static void rtt_enter_critical_from_isr(_lock* plock, _irqL* pirqL)
 {
-    rt_enter_critical();
+    rtt_enter_critical(plock, pirqL);
 }
 
 static void rtt_exit_critical_from_isr(_lock* plock, _irqL* pirqL)
 {
-    rt_exit_critical();
+    rtt_exit_critical(plock, pirqL);
 }
 
 static int rtt_enter_critical_mutex(_mutex* pmutex, _irqL* pirqL)
@@ -272,19 +286,18 @@ static void rtt_spinunlock(_lock* plock)
 #endif
 }
 
+/* Masking interrupts is already mutual exclusion on this single-core build, so
+ * the mutex that used to be nested inside is both redundant and unusable: a
+ * contended rt_mutex_take() suspends the caller, and suspending with interrupts
+ * masked (previously, with the scheduler locked) cannot reschedule - the thread
+ * carries on running while marked suspended. */
 static void rtt_spinlock_irqsave(_lock* plock, _irqL* irqL)
 {
     rtt_enter_critical(plock, irqL);
-#if USE_MUTEX_FOR_SPINLOCK
-    rtt_spinlock(plock);
-#endif
 }
 
 static void rtt_spinunlock_irqsave(_lock* plock, _irqL* irqL)
 {
-#if USE_MUTEX_FOR_SPINLOCK
-    rtt_spinunlock(plock);
-#endif
     rtt_exit_critical(plock, irqL);
 }
 

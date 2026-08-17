@@ -25,6 +25,31 @@ static rt_int32_t realtek_probe(struct rt_mmcsd_card* card);
 static rt_err_t wlan_get_mac(struct rt_wlan_device* wlan, rt_uint8_t mac[]);
 static void wlan_log_tx_power(const char* ifname);
 
+/* Settle time between stopping and restarting the chip when its efuse autoload
+ * has to be retried. */
+#ifndef REALTEK_AUTOLOAD_RETRY_DELAY_MS
+#define REALTEK_AUTOLOAD_RETRY_DELAY_MS 100
+#endif
+#ifndef REALTEK_COUNTRY_CODE
+#define REALTEK_COUNTRY_CODE "CN"
+#endif
+/* Largest received frame staged per interface: a full Ethernet frame with room
+ * for a VLAN tag, rounded up to a cache line. */
+#ifndef REALTEK_RX_FRAME_MAX
+#define REALTEK_RX_FRAME_MAX 1600
+#endif
+
+/* Full fallback addresses embedded in the prebuilt vendor libraries.  The
+ * shared 00:e0:4c prefix is also a valid Realtek OUI, so it is not enough to
+ * identify an efuse autoload failure. */
+#if defined(REALTEK_SDIO_RTL8189FTV)
+static const rt_uint8_t realtek_default_mac[ETH_ALEN] =
+    { 0x00, 0xe0, 0x4c, 0xb7, 0x43, 0x36 };
+#elif defined(REALTEK_SDIO_RTL8733BS)
+static const rt_uint8_t realtek_default_mac[ETH_ALEN] =
+    { 0x00, 0xe0, 0x4c, 0x87, 0x00, 0x00 };
+#endif
+
 struct sdio_func* wifi_sdio_func;
 struct rt_sdio_function* rtt_sdio_func;
 static struct rt_wlan_device wlan_sta, wlan_ap;
@@ -141,38 +166,55 @@ void wlan_event_indication(rtw_event_indicate_t event, char* buf, int buf_len)
     }
 }
 
+/* One staging buffer per interface instead of an allocation per frame.  Each
+ * index is fed by its own library receive path and rt_wlan_dev_report_data()
+ * has copied the frame out before this returns, so the buffer is free again by
+ * the next call for that index.  At line rate this was a malloc/free pair for
+ * every packet. */
+static rt_uint8_t ethernetif_rx_frame[2][REALTEK_RX_FRAME_MAX]
+    __attribute__((aligned(4)));
+
 void ethernetif_recv(int idx, int total_len)
 {
     struct eth_drv_sg sg_list;
-    void *buffer = NULL;
 
     if ((idx != 0 && idx != 1) || total_len <= 0 || !rltk_wlan_running(idx))
         return;
 
-    buffer = rt_malloc(total_len);
-    if(!buffer) {
-        LOG_E("RX buffer allocation failed: %d bytes", total_len);
+    if (total_len > REALTEK_RX_FRAME_MAX) {
+        /* Consume it anyway so the library does not keep re-offering it. */
+        LOG_W("dropping %d byte frame on wlan%d, limit is %d",
+              total_len, idx, REALTEK_RX_FRAME_MAX);
+        total_len = REALTEK_RX_FRAME_MAX;
+        sg_list.buf = (uintptr_t)ethernetif_rx_frame[idx];
+        sg_list.len = total_len;
+        rltk_wlan_recv(idx, &sg_list, 1);
         return;
     }
 
-    sg_list.buf = (uintptr_t)buffer;
+    sg_list.buf = (uintptr_t)ethernetif_rx_frame[idx];
     sg_list.len = total_len;
 
     rltk_wlan_recv(idx, &sg_list, 1);
     rt_wlan_dev_report_data(idx == 0 ? &wlan_sta : &wlan_ap,
                             (void*)sg_list.buf, total_len);
-
-    rt_free(buffer);
 }
 
+/* Nothing to do: the chip is powered, its firmware downloaded and both
+ * interfaces created in realtek_probe() before either device is registered. */
 static rt_err_t wlan_init(struct rt_wlan_device* wlan)
 {
-    return 0;
+    (void)wlan;
+    return RT_EOK;
 }
 
+/* The station and AP roles are separate rt_wlan devices here, each already bound
+ * to its own library interface index, so there is no mode to switch. */
 static rt_err_t wlan_mode(struct rt_wlan_device* wlan, rt_wlan_mode_t mode)
 {
-    return 0;
+    (void)wlan;
+    (void)mode;
+    return RT_EOK;
 }
 
 static rtw_result_t scan_result_handler(rtw_scan_handler_result_t* malloced_scan_result)
@@ -186,15 +228,19 @@ static rtw_result_t scan_result_handler(rtw_scan_handler_result_t* malloced_scan
         return RTW_SUCCESS;
     }
     rtw_scan_result_t* record = &malloced_scan_result->ap_details;
+    /* rtw_security_t and rtw_802_11_band_t are numerically identical to their
+     * rt_wlan counterparts, so both carry straight across. */
     wlan_info.security = record->security;
-    wlan_info.band = RT_802_11_BAND_2_4GHZ;
+    wlan_info.band = record->band;
+    /* rtw_scan_result_t carries no rate, so leave it unreported rather than
+     * inventing one; this is why the Mbps column of "wifi scan" reads 0. */
     wlan_info.datarate = 0;
     wlan_info.channel = record->channel;
     wlan_info.rssi = record->signal_strength;
     wlan_info.ssid.len = record->SSID.len;
     memcpy(wlan_info.ssid.val, record->SSID.val, sizeof(wlan_info.ssid.val));
     memcpy(wlan_info.bssid, record->BSSID.octet, sizeof(wlan_info.bssid));
-    wlan_info.hidden = 0;
+    wlan_info.hidden = 0;    /* Not reported by the library either. */
     buff.data = &wlan_info;
     buff.len = sizeof(struct rt_wlan_info);
     rt_wlan_dev_indicate_event_handle(wlan, RT_WLAN_DEV_EVT_SCAN_REPORT, &buff);
@@ -302,12 +348,19 @@ static rt_err_t wlan_ap_stop(struct rt_wlan_device* wlan)
 
 static rt_err_t wlan_ap_deauth(struct rt_wlan_device* wlan, rt_uint8_t mac[])
 {
-    return 0;
+    if (wlan != &wlan_ap || mac == NULL)
+        return -RT_EINVAL;
+    if (!wifi_is_up(RTW_AP_INTERFACE))
+        return -RT_EIO;
+
+    return wext_del_station(WLAN1_NAME, mac) < 0 ? -RT_EIO : RT_EOK;
 }
 
 static rt_err_t wlan_scan_stop(struct rt_wlan_device* wlan)
 {
-    return 0;
+    (void)wlan;
+    /* The library exposes no scan-abort entry point. */
+    return -RT_ENOSYS;
 }
 
 static int wlan_get_rssi(struct rt_wlan_device* wlan)
@@ -347,54 +400,121 @@ static void wlan_log_tx_power(const char* ifname)
           ifname, min[0], max[0], min[1], max[1], min[2], max[2]);
 }
 
+/* The prebuilt library has LPS compiled in (rtw_pm_set_lps and friends are
+ * defined in it), so power save is live whatever this project's autoconf.h says.
+ * Dozing between beacons costs tens of milliseconds per burst, so probe turns it
+ * off and this op is the only way back on. */
+static int wlan_powersave_level;
+
 static rt_err_t wlan_set_powersave(struct rt_wlan_device* wlan, int level)
 {
-    return 0;
+    int ret;
+
+    (void)wlan;
+    if (level > 0)
+        ret = wifi_enable_powersave();
+    else
+        ret = wifi_disable_powersave();
+    if (ret < 0)
+        return -RT_EIO;
+
+    wlan_powersave_level = level > 0 ? level : 0;
+    return RT_EOK;
 }
 
 static int wlan_get_powersave(struct rt_wlan_device* wlan)
 {
-    return 0;
+    (void)wlan;
+    return wlan_powersave_level;
 }
 
+/* Not wired up on purpose.  wifi_set_promisc() delivers captured frames through
+ * a callback rather than the normal receive path, so passing no callback would
+ * either fault inside the library or enable a capture that goes nowhere - worse
+ * than refusing.  Mapping it properly means forwarding that callback into
+ * rt_wlan, and the two disagree on the frame format, so leave it unimplemented
+ * until something needs it. */
 static rt_err_t wlan_cfg_promisc(struct rt_wlan_device* wlan, rt_bool_t start)
 {
-    return 0;
+    (void)wlan;
+    (void)start;
+    return -RT_ENOSYS;
 }
 
 static rt_err_t wlan_cfg_filter(struct rt_wlan_device* wlan, struct rt_wlan_filter* filter)
 {
-    return 0;
+    (void)wlan;
+    (void)filter;
+    return -RT_ENOSYS;
 }
 
 static rt_err_t wlan_cfg_mgnt_filter(struct rt_wlan_device* wlan, rt_bool_t start)
 {
-    return 0;
+    (void)wlan;
+    (void)start;
+    return -RT_ENOSYS;
+}
+
+static const char* wlan_ifname(struct rt_wlan_device* wlan)
+{
+    if (wlan == &wlan_sta)
+        return WLAN0_NAME;
+    if (wlan == &wlan_ap)
+        return WLAN1_NAME;
+    return NULL;
 }
 
 static rt_err_t wlan_set_channel(struct rt_wlan_device* wlan, int channel)
 {
-    return 0;
+    const char* ifname = wlan_ifname(wlan);
+
+    if (ifname == NULL || channel <= 0 || channel > UINT8_MAX)
+        return -RT_EINVAL;
+
+    return wext_set_channel(ifname, (uint8_t)channel) < 0 ?
+           -RT_EIO : RT_EOK;
 }
 
 static int wlan_get_channel(struct rt_wlan_device* wlan)
 {
-    return 0;
+    const char* ifname = wlan_ifname(wlan);
+    uint8_t channel = 0;
+
+    if (ifname == NULL)
+        return -RT_EINVAL;
+    if (wext_get_channel(ifname, &channel) < 0)
+        return -RT_EIO;
+
+    return channel;
 }
 
+/* The library takes a two-character country string, which does not map onto
+ * RT-Thread's ~250-entry rt_country_code_t without a translation table nobody
+ * needs yet.  The domain is set once at probe from REALTEK_COUNTRY_CODE. */
 static rt_err_t wlan_set_country(struct rt_wlan_device* wlan, rt_country_code_t country_code)
 {
-    return 0;
+    (void)wlan;
+    (void)country_code;
+    return -RT_ENOSYS;
 }
 
 static rt_country_code_t wlan_get_country(struct rt_wlan_device* wlan)
 {
-    return 0;
+    (void)wlan;
+    return RT_COUNTRY_UNKNOWN;
 }
 
+/* Deliberately unsupported.  The SDK's wext_set_mac_address() is inside an
+ * "#if 0" block, and the private command it would issue ("write_mac") lands on
+ * the library's EX_WRITE_MAC handler, which programs the address into efuse -
+ * one-time-programmable memory.  A routine rt_wlan_set_mac() call must not be
+ * able to burn a fuse, so refuse instead.  The address comes from efuse at
+ * power-on; see realtek_efuse_autoload_failed(). */
 static rt_err_t wlan_set_mac(struct rt_wlan_device* wlan, rt_uint8_t mac[])
 {
-    return 0;
+    (void)wlan;
+    (void)mac;
+    return -RT_ENOSYS;
 }
 
 static rt_err_t wlan_get_mac(struct rt_wlan_device* wlan, rt_uint8_t mac[])
@@ -448,7 +568,10 @@ static int wlan_send(struct rt_wlan_device* wlan, void* buff, int len)
 
 static int wlan_send_raw_frame(struct rt_wlan_device* wlan, void* buff, int len)
 {
-    return 0;
+    (void)wlan;
+    (void)buff;
+    (void)len;
+    return -RT_ENOSYS;
 }
 
 static const struct rt_wlan_dev_ops ops = {
@@ -477,6 +600,80 @@ static const struct rt_wlan_dev_ops ops = {
     .wlan_send = wlan_send,
     .wlan_send_raw_frame = wlan_send_raw_frame,
 };
+
+/* The chip loads its efuse into shadow registers during its own power-on
+ * sequence, and that sequence only re-runs once the supply has actually dropped:
+ * a warm reset, or a brief power cycle, can leave it skipped.  The driver then
+ * substitutes defaults for the MAC, the crystal trim and the TX power tables
+ * without reporting an error, after which the radio receives nothing at all and
+ * a scan returns zero networks.
+ *
+ * The substituted MAC is the only part of that visible from here. */
+static rt_bool_t realtek_efuse_autoload_failed(void)
+{
+    rt_uint8_t mac[ETH_ALEN] = {0};
+
+    if (wlan_get_mac(&wlan_sta, mac) != RT_EOK)
+        return RT_FALSE;    /* Cannot tell; assume the chip is fine. */
+
+    return rt_memcmp(mac, realtek_default_mac,
+                     sizeof(realtek_default_mac)) == 0;
+}
+
+/* Repeat the power-on sequence, which is usually enough to pick the efuse up.
+ * Returns an error only when the chip could not be brought back up at all; a
+ * radio still running on default calibration is reported and tolerated so the
+ * interface at least registers. */
+static rt_err_t realtek_recover_efuse_autoload(const char *model_name)
+{
+    if (!realtek_efuse_autoload_failed())
+        return RT_EOK;
+
+    LOG_W("%s efuse autoload did not run; retrying initialization", model_name);
+    if (wifi_off() < 0) {
+        LOG_E("%s could not be stopped for a retry", model_name);
+        return -RT_EIO;
+    }
+    rt_thread_mdelay(REALTEK_AUTOLOAD_RETRY_DELAY_MS);
+    if (wifi_on(RTW_MODE_STA) < 0) {
+        LOG_E("%s re-initialization failed", model_name);
+        return -RT_EIO;
+    }
+
+    if (realtek_efuse_autoload_failed()) {
+        /* Nothing further can be done from here: the part needs its reset or
+         * power-enable line driven, and this board wires neither
+         * (BSP_WIFI_SDIO_REG_ON_PIN is -1 and Set_WLAN_Power_On/Off() are
+         * empty).  Say plainly why the radio will not hear anything. */
+        LOG_E("%s is running on default calibration - scans will find nothing. "
+              "A full power-off is needed, or the module's reset line has to be "
+              "wired up and configured via BSP_WIFI_SDIO_REG_ON_PIN.",
+              model_name);
+    } else {
+        LOG_I("%s efuse autoload recovered on retry", model_name);
+    }
+    return RT_EOK;
+}
+
+/* Establish the regulatory domain explicitly rather than inheriting whatever
+ * default the driver picked.  The SDK offers a _WEAK wifi_set_country_code()
+ * hook for this, but wifi_conf.h declares it weak, so an override defined here
+ * would stay weak too and the linker would choose arbitrarily between the two;
+ * call this from probe instead. */
+static void realtek_apply_country(void)
+{
+    static char country_code[] = REALTEK_COUNTRY_CODE;
+    uint8_t plan = 0;
+
+    if (wext_set_country(WLAN0_NAME, (u8 *)country_code) < 0) {
+        LOG_W("failed to apply country code %s", country_code);
+        return;
+    }
+    if (wifi_get_channel_plan(&plan) == 0)
+        LOG_I("country %s applied, channel plan 0x%02x", country_code, plan);
+    else
+        LOG_I("country %s applied", country_code);
+}
 
 static rt_int32_t realtek_probe(struct rt_mmcsd_card* card)
 {
@@ -519,6 +716,18 @@ static rt_int32_t realtek_probe(struct rt_mmcsd_card* card)
         ret = -RT_EIO;
         goto fail_disable_sdio;
     }
+
+    ret = realtek_recover_efuse_autoload(model_name);
+    if (ret != RT_EOK)
+        goto fail_disable_sdio;
+
+    realtek_apply_country();
+
+    /* Start with power save off: the library dozes between beacons otherwise,
+     * which costs far more throughput than it saves here.  Applications can ask
+     * for it back through rt_wlan_set_powersave(). */
+    if (wifi_disable_powersave() < 0)
+        LOG_W("%s could not disable power save", model_name);
 
     ret = rt_wlan_dev_register_auto(&wlan_sta, model_name, RT_WLAN_STATION,
                                     RT_WLAN_TRANSPORT_SDIO, &ops, NULL);
