@@ -251,6 +251,20 @@ static void dwc2_init_non_isoc_dma_desc(struct dwc2_hsotg *hsotg,
         } while (chan->xfer_len > 0 &&
                  n_desc != MAX_DMA_DESC_NUM_GENERIC);
 
+        /* Descriptor DMA does not run dwc2_update_urb_state(), where the
+         * buffer-DMA path normally schedules URB_SEND_ZERO_PACKET.  Add the
+         * terminating zero-length descriptor here so a max-packet-sized bulk
+         * OUT request cannot run into the following request on the wire. */
+        if (!chan->ep_is_in && qh->ep_type == USB_ENDPOINT_XFER_BULK &&
+            (qtd->urb->flags & URB_SEND_ZERO_PACKET) &&
+            qtd->urb->length && chan->max_packet &&
+            !(qtd->urb->length % chan->max_packet) &&
+            !chan->xfer_len && n_desc != MAX_DMA_DESC_NUM_GENERIC) {
+            dwc2_fill_host_dma_desc(hsotg, chan, qtd, qh, n_desc);
+            qtd->n_desc++;
+            n_desc++;
+        }
+
         dev_vdbg(hsotg->dev, "n_desc=%d\n", n_desc);
         qtd->in_process = 1;
         if (qh->ep_type == USB_ENDPOINT_XFER_CONTROL)
@@ -1124,7 +1138,11 @@ static int dwc2_update_non_isoc_urb_state_ddma(struct dwc2_hsotg *hsotg,
         urb->actual_length += n_bytes - remain;
         dev_vdbg(hsotg->dev, "length=%d actual=%d\n", urb->length,
                  urb->actual_length);
-        if (remain || urb->actual_length >= urb->length) {
+        if (remain ||
+            (urb->actual_length >= urb->length &&
+             (!(urb->flags & URB_SEND_ZERO_PACKET) || chan->ep_is_in ||
+              !urb->length || !chan->max_packet ||
+              (urb->length % chan->max_packet) || !n_bytes))) {
             urb->status = 0;
             *xfer_done = 1;
         }
