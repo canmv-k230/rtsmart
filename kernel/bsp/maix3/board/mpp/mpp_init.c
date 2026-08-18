@@ -272,13 +272,6 @@ int __attribute__((weak)) nonai_2d_init(void)
 extern int nonai_2d_init(void);
 /****************************************************/
 
-/*************vg_lite_init*************/
-int __attribute__((weak)) vg_lite_init(void)
-{
-    rt_kprintf("no vg_lite_init library!\n");
-    return -1;
-}
-extern int vg_lite_init(void);
 /****************************************************/
 
 static int mpp_device_init(void)
@@ -302,7 +295,6 @@ static int mpp_device_init(void)
     dewarp_init();
     pm_core_init();
     nonai_2d_init();
-    vg_lite_init();
     return 0;
 }
 
