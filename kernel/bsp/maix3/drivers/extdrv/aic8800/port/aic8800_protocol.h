@@ -38,6 +38,13 @@
 #define AIC_MM_KEY_ADD_CFM        AIC_WIRE_MSG(AIC_WIRE_TASK_MM, 37)
 #define AIC_MM_KEY_DEL_REQ        AIC_WIRE_MSG(AIC_WIRE_TASK_MM, 38)
 #define AIC_MM_KEY_DEL_CFM        AIC_WIRE_MSG(AIC_WIRE_TASK_MM, 39)
+/* The firmware serves one channel context at a time and announces the
+ * transitions.  A VIF whose context is not the scheduled one must not be given
+ * traffic; see aic_channel_context_active(). */
+#define AIC_MM_CHANNEL_SWITCH_IND     AIC_WIRE_MSG(AIC_WIRE_TASK_MM, 68)
+#define AIC_MM_CHANNEL_PRE_SWITCH_IND AIC_WIRE_MSG(AIC_WIRE_TASK_MM, 69)
+/* An associated peer entering or leaving firmware-managed power save. */
+#define AIC_MM_PS_CHANGE_IND      AIC_WIRE_MSG(AIC_WIRE_TASK_MM, 73)
 #define AIC_MM_SET_RF_CONFIG_REQ  AIC_WIRE_MSG(AIC_WIRE_TASK_MM, 103)
 #define AIC_MM_SET_RF_CONFIG_CFM  AIC_WIRE_MSG(AIC_WIRE_TASK_MM, 104)
 #define AIC_MM_SET_RF_CALIB_REQ   AIC_WIRE_MSG(AIC_WIRE_TASK_MM, 105)
@@ -152,6 +159,9 @@
 #define AIC_ME_STA_ADD_CFM        AIC_WIRE_MSG(AIC_WIRE_TASK_ME, 8)
 #define AIC_ME_STA_DEL_REQ        AIC_WIRE_MSG(AIC_WIRE_TASK_ME, 9)
 #define AIC_ME_STA_DEL_CFM        AIC_WIRE_MSG(AIC_WIRE_TASK_ME, 10)
+/* Firmware-reported transmit credit offsets.  This generation's vendor driver
+ * leaves enforcement disabled, so the values are collected for diagnostics. */
+#define AIC_ME_TX_CREDITS_UPDATE_IND AIC_WIRE_MSG(AIC_WIRE_TASK_ME, 11)
 #define AIC_ME_RC_STATS_REQ       AIC_WIRE_MSG(AIC_WIRE_TASK_ME, 14)
 #define AIC_ME_RC_STATS_CFM       AIC_WIRE_MSG(AIC_WIRE_TASK_ME, 15)
 #define AIC_ME_SET_PS_MODE_REQ    AIC_WIRE_MSG(AIC_WIRE_TASK_ME, 19)
@@ -333,6 +343,25 @@ struct aic_wire_me_set_ps_mode_req
     rt_uint8_t state;
 };
 
+struct aic_wire_mm_ps_change_ind
+{
+    rt_uint8_t station_index;
+    rt_uint8_t power_save;      /* 0: awake, 1: sleeping */
+};
+
+struct aic_wire_mm_channel_switch_ind
+{
+    rt_uint8_t channel_index;
+    rt_uint8_t remain_on_channel;
+    rt_uint8_t vif_index;
+    rt_uint8_t remain_on_channel_tdls;
+};
+
+struct aic_wire_mm_channel_pre_switch_ind
+{
+    rt_uint8_t channel_index;
+};
+
 struct aic_wire_mm_get_fw_version_cfm
 {
     rt_uint8_t length;
@@ -450,6 +479,13 @@ struct aic_wire_me_config_req
 
 #define AIC_WIRE_RC_SAMPLE_COUNT 10U
 #define AIC_WIRE_RC_HE_SAMPLE_INDEX AIC_WIRE_RC_SAMPLE_COUNT
+
+struct aic_wire_me_tx_credits_update_ind
+{
+    rt_uint8_t station_index;
+    rt_uint8_t tid;
+    rt_int8_t credits;          /* Offset to apply, may be negative. */
+};
 
 struct aic_wire_me_rc_stats_req
 {
@@ -740,10 +776,18 @@ _Static_assert(sizeof(struct aic_wire_apm_start_req) == 52,
                "AIC AP-start ABI changed");
 _Static_assert(sizeof(struct aic_wire_apm_start_cfm) == 4,
                "AIC AP-start confirmation ABI changed");
+_Static_assert(sizeof(struct aic_wire_mm_ps_change_ind) == 2,
+               "AIC power-save indication ABI changed");
+_Static_assert(sizeof(struct aic_wire_mm_channel_switch_ind) == 4,
+               "AIC channel-switch indication ABI changed");
+_Static_assert(sizeof(struct aic_wire_mm_channel_pre_switch_ind) == 1,
+               "AIC channel-pre-switch indication ABI changed");
 _Static_assert(sizeof(struct aic_wire_apm_set_beacon_ie_req) == 516,
                "AIC beacon-upload ABI changed");
 _Static_assert(sizeof(struct aic_wire_me_config_req) == 112,
                "AIC ME configuration ABI changed");
+_Static_assert(sizeof(struct aic_wire_me_tx_credits_update_ind) == 3,
+               "AIC transmit credit indication ABI changed");
 _Static_assert(sizeof(struct aic_wire_me_rc_stats_req) == 1,
                "AIC RC statistics request ABI changed");
 _Static_assert(sizeof(struct aic_wire_rc_rate_stats) == 12,

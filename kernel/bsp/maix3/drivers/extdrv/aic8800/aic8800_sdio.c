@@ -654,6 +654,15 @@ done:
     return result;
 }
 
+static rt_bool_t aic8800_sdio_requeue_tx_record(
+    struct aic8800_context *context, struct aic8800_sdio_tx_record *record)
+{
+    return context && record && !context->sdio_tx_terminate &&
+           context->sdio_active && context->sdio_tx_queue &&
+           rt_mq_send(context->sdio_tx_queue, &record, sizeof(record)) ==
+               RT_EOK;
+}
+
 static rt_err_t aic8800_sdio_transmit_aggregate(
     struct aic8800_context *context,
     struct aic8800_sdio_tx_record *first,
@@ -664,6 +673,9 @@ static rt_err_t aic8800_sdio_transmit_aggregate(
     rt_size_t aggregate_length = 0;
     rt_uint8_t frame_limit = 0;
     rt_uint16_t frame_count = 0;
+    rt_size_t deferred_count = 0;
+    struct aic8800_tx_metadata
+        metadata[AIC8800_WIFI_SDIO_TX_AGGREGATE_FRAMES];
     rt_err_t result;
 
     *carry = RT_NULL;
@@ -677,12 +689,47 @@ static rt_err_t aic8800_sdio_transmit_aggregate(
     result = aic8800_sdio_wait_for_data_credits(context, &frame_limit);
     if (result != RT_EOK)
     {
+        aic8800_core_tx_complete(context, &record->metadata);
         rt_mp_free(record);
         *carry = prefetched;
         return result;
     }
     while (frame_count < frame_limit)
     {
+        enum aic8800_tx_record_state state =
+            aic8800_core_tx_metadata_state(context, &record->metadata);
+
+        if (state != AIC8800_TX_RECORD_READY)
+        {
+            if (state != AIC8800_TX_RECORD_DEFER ||
+                !aic8800_sdio_requeue_tx_record(context, record))
+            {
+                aic8800_core_tx_complete(context, &record->metadata);
+                rt_mp_free(record);
+            }
+            record = RT_NULL;
+            if (++deferred_count >= AIC8800_WIFI_SDIO_TX_QUEUE_DEPTH)
+            {
+                break;
+            }
+            if (prefetched)
+            {
+                record = prefetched;
+                prefetched = RT_NULL;
+            }
+            else if (rt_mq_recv(context->sdio_tx_queue, &record,
+                                sizeof(record), 0) != RT_EOK)
+            {
+                record = RT_NULL;
+                break;
+            }
+            if (!record)
+            {
+                result = -RT_EBUSY;
+                break;
+            }
+            continue;
+        }
         rt_size_t prepared = aic8800_sdio_prepare_record(
             context, context->sdio_tx_buffer + aggregate_length,
             context->sdio_tx_capacity - aggregate_length,
@@ -693,6 +740,7 @@ static rt_err_t aic8800_sdio_transmit_aggregate(
             result = -RT_EFULL;
             goto done;
         }
+        metadata[frame_count] = record->metadata;
         rt_mp_free(record);
         record = RT_NULL;
         aggregate_length += prepared;
@@ -712,15 +760,27 @@ static rt_err_t aic8800_sdio_transmit_aggregate(
             record = RT_NULL;
             break;
         }
+        if (!record)
+        {
+            result = -RT_EBUSY;
+            goto done;
+        }
         if (!context->sdio_active || context->sdio_tx_terminate)
         {
             result = -RT_EBUSY;
             goto done;
         }
     }
-    result = context->sdio_active && !context->sdio_tx_terminate ?
-             aic8800_sdio_write_buffer(
-                 context, aggregate_length, frame_count) : -RT_EBUSY;
+    if (!frame_count)
+    {
+        result = RT_EOK;
+    }
+    else
+    {
+        result = context->sdio_active && !context->sdio_tx_terminate ?
+                 aic8800_sdio_write_buffer(
+                     context, aggregate_length, frame_count) : -RT_EBUSY;
+    }
     if (result == RT_EOK)
     {
         if (context->sdio_tx_available_credits >= frame_count)
@@ -740,7 +800,12 @@ static rt_err_t aic8800_sdio_transmit_aggregate(
 done:
     if (record)
     {
+        aic8800_core_tx_complete(context, &record->metadata);
         rt_mp_free(record);
+    }
+    for (rt_size_t index = 0; index < frame_count; index++)
+    {
+        aic8800_core_tx_complete(context, &metadata[index]);
     }
     *carry = prefetched;
     rt_mutex_release(context->tx_mutex);
@@ -773,6 +838,7 @@ static void aic8800_sdio_tx_worker(void *parameter)
         {
             if (result == RT_EOK && record)
             {
+                aic8800_core_tx_complete(context, &record->metadata);
                 rt_mp_free(record);
             }
             break;
@@ -781,9 +847,27 @@ static void aic8800_sdio_tx_worker(void *parameter)
         {
             if (result == RT_EOK && record)
             {
+                aic8800_core_tx_complete(context, &record->metadata);
                 rt_mp_free(record);
             }
             continue;
+        }
+        {
+            enum aic8800_tx_record_state state =
+                aic8800_core_tx_metadata_state(context, &record->metadata);
+
+            if (state == AIC8800_TX_RECORD_DEFER &&
+                aic8800_sdio_requeue_tx_record(context, record))
+            {
+                rt_thread_mdelay(1);
+                continue;
+            }
+            if (state != AIC8800_TX_RECORD_READY)
+            {
+                aic8800_core_tx_complete(context, &record->metadata);
+                rt_mp_free(record);
+                continue;
+            }
         }
         result = aic8800_sdio_transmit_aggregate(context, record, &carry);
         if (result != RT_EOK && result != -RT_EBUSY)
@@ -800,6 +884,7 @@ static void aic8800_sdio_tx_worker(void *parameter)
     }
     if (carry)
     {
+        aic8800_core_tx_complete(context, &carry->metadata);
         rt_mp_free(carry);
     }
     rt_completion_done(&context->sdio_tx_thread_stopped);
@@ -819,6 +904,7 @@ static void aic8800_sdio_reset_tx_queue_locked(
     {
         if (record)
         {
+            aic8800_core_tx_complete(context, &record->metadata);
             rt_mp_free(record);
         }
     }
@@ -1187,6 +1273,7 @@ static rt_err_t aic8800_sdio_bus_start(struct rt_wlan_offload_bus *bus)
     context->invalid_rx_log_count = 0;
     context->sdio_consecutive_errors = 0;
     context->sdio_recovery_reported = RT_FALSE;
+    aic8800_core_tx_pending_reset(context);
     result = aic8800_sdio_set_irq_source(context, RT_FALSE);
     if (result != RT_EOK)
     {
@@ -1340,7 +1427,8 @@ static rt_err_t aic8800_sdio_bus_transmit_priority(
 
         record->length = (rt_uint16_t)length;
         record->priority = (rt_uint8_t)priority;
-        record->reserved = 0;
+        aic8800_core_tx_metadata_init(
+            context, data, length, &record->metadata);
         rt_memcpy(record->data, data, length);
         result = priority == RT_WLAN_OFFLOAD_BUS_PRIORITY_HIGH ?
                  rt_mq_urgent(context->sdio_tx_queue, &record,

@@ -87,7 +87,9 @@ static void aic8800_usb_tx_watchdog(void *parameter);
 static void aic8800_usb_tx_complete(void *parameter, int length);
 static void aic8800_usb_attach_work(struct rt_work *work, void *work_data);
 static rt_err_t aic8800_usb_transmit_data(
-    struct aic8800_context *context, const void *data, rt_size_t length);
+    struct aic8800_context *context, const void *data, rt_size_t length,
+    const struct aic8800_tx_metadata *metadata, rt_size_t metadata_count,
+    rt_bool_t *metadata_consumed);
 static rt_bool_t aic8800_usb_supports_tx_aggregation(
     const struct aic8800_context *context);
 static rt_err_t aic8800_usb_start_tx_queue(
@@ -114,9 +116,40 @@ static int aic8800_stat(int argc, char **argv)
                context->station_control_port_pending,
                (unsigned int)context->station_control_port_set_count,
                (unsigned int)context->station_control_port_error_count);
-    rt_kprintf("NET TX: frames=%u errors=%u arp=%u icmp=%u\n",
+    rt_kprintf("TX window: full=%u ps-drops=%u ap-sta=%u held=%d\n",
+               (unsigned int)context->tx_pending_full_count,
+               (unsigned int)context->tx_power_save_drop_count,
+               context->ap_stations[0].valid &&
+                   context->ap_stations[0].firmware_index <
+                       AIC8800_STATION_SLOTS ?
+                   context->tx_pending[
+                       context->ap_stations[0].firmware_index] : 0U,
+               context->ap_stations[0].valid &&
+                   context->ap_stations[0].firmware_index <
+                       AIC8800_STATION_SLOTS ?
+                   context->tx_pending_held[
+                       context->ap_stations[0].firmware_index] : 0);
+    rt_kprintf("TX credits (observed only): reported=%d updates=%u "
+               "sta=%d bcmc=%d\n",
+               context->tx_credits_tracked,
+               (unsigned int)context->tx_credit_update_count,
+               context->ap_station_index < AIC8800_STATION_SLOTS ?
+                   context->tx_credits[context->ap_station_index] : -1,
+               context->ap_broadcast_station_index <
+                   AIC8800_STATION_SLOTS ?
+                   context->tx_credits[
+                       context->ap_broadcast_station_index] : -1);
+    rt_kprintf("Channel ctx: station=%u ap=%u active=%u tracked=%d\n",
+               (unsigned int)context->station_channel_index,
+               (unsigned int)context->ap_channel_index,
+               (unsigned int)context->active_channel_index,
+               context->channel_context_tracked);
+    rt_kprintf("NET TX: frames=%u errors=%u no-station=%u off-channel=%u "
+               "arp=%u icmp=%u\n",
                (unsigned int)context->ethernet_tx_count,
                (unsigned int)context->ethernet_tx_error_count,
+               (unsigned int)context->tx_no_station_count,
+               (unsigned int)context->tx_off_channel_count,
                (unsigned int)context->arp_tx_count,
                (unsigned int)context->icmp_tx_count);
     rt_kprintf("NET RX: frames=%u errors=%u arp=%u icmp=%u\n",
@@ -206,6 +239,17 @@ static int aic8800_stat(int argc, char **argv)
     return 0;
 }
 MSH_CMD_EXPORT(aic8800_stat, show AIC8800 USB and network counters);
+#endif
+
+#if AIC8800_WIFI_TX_TRACE_FRAMES && defined(RT_USING_FINSH)
+static int aic8800_txtrace(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    aic8800_core_dump_tx_trace(&g_aic8800_context, "on demand");
+    return 0;
+}
+MSH_CMD_EXPORT(aic8800_txtrace, dump the recent AIC8800 transmit descriptors);
 #endif
 
 static struct aic8800_context *aic8800_context_from_bus(
@@ -468,11 +512,6 @@ static rt_uint32_t aic8800_usb_rx_retry_delay(
     return AIC8800_USB_RX_RETRY_LONG_MS;
 }
 
-static rt_bool_t aic8800_usb_log_retry(rt_uint32_t errors)
-{
-    return errors <= 4U || !(errors & (errors - 1U));
-}
-
 static int aic8800_usb_clear_halt(struct aic8800_context *context,
                                   rt_uint8_t endpoint)
 {
@@ -551,7 +590,7 @@ static void aic8800_usb_tx_recovery_work(struct rt_work *work,
 static rt_bool_t aic8800_usb_tx_slot_expired(
     const struct aic8800_tx_slot *slot, rt_tick_t now, rt_tick_t limit)
 {
-    if (!slot->in_use || !slot->submitted)
+    if (!slot->in_use || !slot->submitted || slot->cancelling)
     {
         return RT_FALSE;
     }
@@ -637,6 +676,12 @@ static void aic8800_usb_tx_watchdog_work(struct rt_work *work,
         level = rt_hw_interrupt_disable();
         expired = aic8800_usb_tx_slot_expired(slot, now, limit);
         stuck_since = slot->submit_tick;
+        if (expired)
+        {
+            /* Giveback retires in_use before usbh_kill_urb() drops
+             * urb->reject. Keep this slot unavailable across that window. */
+            slot->cancelling = RT_TRUE;
+        }
         rt_hw_interrupt_enable(level);
         if (!expired)
         {
@@ -653,11 +698,18 @@ static void aic8800_usb_tx_watchdog_work(struct rt_work *work,
               (unsigned int)worker->pending);
 #else
         LOG_W("bulk OUT ep 0x%02x request stuck for %u ms; cancelling "
-              "(pending=%u)",
+              "(pending=%u len=%u sta=%u mps-multiple=%d)",
               worker->endpoint ? worker->endpoint->bEndpointAddress : 0,
               (unsigned int)((rt_tick_t)(now - stuck_since) * 1000U /
                              RT_TICK_PER_SECOND),
-              (unsigned int)worker->pending);
+              (unsigned int)worker->pending,
+              (unsigned int)slot->length,
+              slot->metadata_count ?
+                  (unsigned int)slot->metadata[0].station_index :
+                  (unsigned int)AIC8800_INVALID_INDEX,
+              worker->endpoint &&
+                  !(slot->length % USB_GET_MAXPACKETSIZE(
+                        worker->endpoint->wMaxPacketSize)));
 #endif
         /* Never hold tx_mutex here.  usbh_kill_urb() halts the channel and
          * then blocks until giveback has run, and giveback runs on the host
@@ -666,9 +718,14 @@ static void aic8800_usb_tx_watchdog_work(struct rt_work *work,
         /* Reclaim only while this is still the same stuck request.  Giveback
          * may have landed while the cancel was in flight and a producer may
          * already own the slot again; forcing a completion then would retire
-         * a healthy transfer instead. */
+         * a healthy transfer instead.  A reacquired slot is marked in use
+         * before its tick is restamped, so the tick alone does not tell the
+         * two apart: require the submitted flag as well, exactly as
+         * aic8800_usb_tx_slot_expired() does. */
         level = rt_hw_interrupt_disable();
-        expired = slot->in_use && slot->submit_tick == stuck_since;
+        expired = slot->in_use && slot->submitted &&
+                  slot->submit_tick == stuck_since;
+        slot->cancelling = RT_FALSE;
         rt_hw_interrupt_enable(level);
         if (expired)
         {
@@ -691,6 +748,15 @@ static void aic8800_usb_tx_watchdog_work(struct rt_work *work,
     {
         return;
     }
+#if AIC8800_WIFI_TX_TRACE_FRAMES
+    /* First stuck request on this bus: dump what the firmware was last given.
+     * Once only, so a wedged endpoint cannot flood the console. */
+    if (!context->tx_trace_dumped)
+    {
+        context->tx_trace_dumped = RT_TRUE;
+        aic8800_core_dump_tx_trace(context, "bulk OUT stuck");
+    }
+#endif
     /* The endpoint carried a request the controller could not finish, so its
      * halt and data toggle are both suspect.  Clear them before the reclaimed
      * slot is handed to the next frame.  A cancelled request gives back as
@@ -1023,7 +1089,7 @@ static rt_bool_t aic8800_usb_recover_rx_slot(
                   worker->endpoint->bEndpointAddress, result);
         }
     }
-    if (aic8800_usb_log_retry(worker->consecutive_errors))
+    if (aic8800_log_throttle(worker->consecutive_errors))
     {
         LOG_W("bulk IN ep 0x%02x error %d; retrying (consecutive=%u)",
               worker->endpoint->bEndpointAddress, error,
@@ -1091,7 +1157,7 @@ static void aic8800_usb_note_rx_success(struct aic8800_rx_worker *worker)
         return;
     }
     worker->recovery_count++;
-    if (aic8800_usb_log_retry(worker->recovery_count))
+    if (aic8800_log_throttle(worker->recovery_count))
     {
         LOG_I("bulk IN ep 0x%02x recovered after %u error(s); last=%d recoveries=%u",
               worker->endpoint->bEndpointAddress,
@@ -1486,6 +1552,16 @@ static void aic8800_usb_tx_complete(void *parameter, int length)
     slot->in_use = RT_FALSE;
     rt_hw_interrupt_enable(level);
 
+    if (worker->context)
+    {
+        for (rt_size_t index = 0; index < slot->metadata_count; index++)
+        {
+            aic8800_core_tx_complete(
+                worker->context, &slot->metadata[index]);
+        }
+    }
+    slot->metadata_count = 0;
+
     if (worker->semaphore_initialized)
     {
         /* Read once: teardown may clear the field between the test and the
@@ -1502,7 +1578,7 @@ static void aic8800_usb_tx_complete(void *parameter, int length)
         rt_completion_done(&worker->stopped);
     }
     if (failed && worker->active &&
-        aic8800_usb_log_retry(worker->error_count))
+        aic8800_log_throttle(worker->error_count))
     {
         LOG_W("bulk OUT ep 0x%02x completion failed: %d (errors=%u)",
               worker->endpoint ? worker->endpoint->bEndpointAddress : 0,
@@ -1544,8 +1620,10 @@ static rt_err_t aic8800_usb_start_tx(struct aic8800_tx_worker *worker,
     {
         worker->slots[index].length = 0;
         worker->slots[index].submitted = RT_FALSE;
+        worker->slots[index].cancelling = RT_FALSE;
         worker->slots[index].submit_tick = 0;
         worker->slots[index].in_use = RT_FALSE;
+        worker->slots[index].metadata_count = 0;
     }
     rt_sem_control(worker->available, RT_IPC_CMD_RESET,
                    (void *)worker->slot_count);
@@ -1594,10 +1672,26 @@ static void aic8800_usb_stop_tx(struct aic8800_tx_worker *worker)
         for (rt_size_t index = 0; index < worker->slot_count; index++)
         {
             worker->slots[index].length = 0;
+            worker->slots[index].submitted = RT_FALSE;
+            worker->slots[index].cancelling = RT_FALSE;
             worker->slots[index].in_use = RT_FALSE;
         }
         worker->pending = 0;
         rt_hw_interrupt_enable(level);
+        if (worker->context)
+        {
+            for (rt_size_t index = 0; index < worker->slot_count; index++)
+            {
+                for (rt_size_t item = 0;
+                     item < worker->slots[index].metadata_count; item++)
+                {
+                    aic8800_core_tx_complete(
+                        worker->context,
+                        &worker->slots[index].metadata[item]);
+                }
+                worker->slots[index].metadata_count = 0;
+            }
+        }
     }
     if (worker->semaphore_initialized)
     {
@@ -1637,6 +1731,11 @@ static rt_err_t aic8800_usb_bus_start(struct rt_wlan_offload_bus *bus)
         return -RT_EIO;
     }
     context->invalid_rx_log_count = 0;
+    /* Anything the previous session had in flight is gone with it. */
+    aic8800_core_tx_pending_reset(context);
+#if AIC8800_WIFI_TX_TRACE_FRAMES
+    context->tx_trace_dumped = RT_FALSE;
+#endif
     result = aic8800_usb_start_tx(&context->tx_worker, context);
     if (result != RT_EOK)
     {
@@ -1833,7 +1932,8 @@ static struct aic8800_tx_slot *aic8800_usb_acquire_tx_slot(
             {
                 index -= worker->slot_count;
             }
-            if (!worker->slots[index].in_use)
+            if (!worker->slots[index].in_use &&
+                !worker->slots[index].cancelling)
             {
                 slot = &worker->slots[index];
                 slot->in_use = RT_TRUE;
@@ -1859,8 +1959,51 @@ static struct aic8800_tx_slot *aic8800_usb_acquire_tx_slot(
     return slot;
 }
 
+static void aic8800_usb_release_unsubmitted_tx_slot(
+    struct aic8800_tx_slot *slot)
+{
+    struct aic8800_tx_worker *worker;
+    rt_base_t level;
+
+    if (!slot || !slot->worker)
+    {
+        return;
+    }
+    worker = slot->worker;
+    level = rt_hw_interrupt_disable();
+    if (!slot->in_use)
+    {
+        rt_hw_interrupt_enable(level);
+        return;
+    }
+    if (worker->pending)
+    {
+        worker->pending--;
+    }
+    slot->length = 0;
+    slot->submitted = RT_FALSE;
+    slot->in_use = RT_FALSE;
+    slot->metadata_count = 0;
+    rt_hw_interrupt_enable(level);
+    if (worker->semaphore_initialized)
+    {
+        rt_sem_t available = worker->available;
+
+        if (available)
+        {
+            rt_sem_release(available);
+        }
+    }
+    if (!worker->active && !worker->pending)
+    {
+        rt_completion_done(&worker->stopped);
+    }
+}
+
 static rt_err_t aic8800_usb_transmit_data(
-    struct aic8800_context *context, const void *data, rt_size_t length)
+    struct aic8800_context *context, const void *data, rt_size_t length,
+    const struct aic8800_tx_metadata *metadata, rt_size_t metadata_count,
+    rt_bool_t *metadata_consumed)
 {
     struct aic8800_tx_worker *worker;
     struct aic8800_tx_slot *slot;
@@ -1868,7 +2011,13 @@ static rt_err_t aic8800_usb_transmit_data(
     rt_err_t lock_result;
     int submit_result;
 
+    if (metadata_consumed)
+    {
+        *metadata_consumed = RT_FALSE;
+    }
     if (!context || !data || !length ||
+        metadata_count > AIC8800_WIFI_USB_TX_AGGREGATE_FRAMES ||
+        (metadata_count && !metadata) ||
         length > AIC8800_WIFI_USB_TX_TRANSFER_SIZE)
     {
         return -RT_EINVAL;
@@ -1882,7 +2031,7 @@ static rt_err_t aic8800_usb_transmit_data(
     if (!slot)
     {
         if (result == -RT_EFULL &&
-            aic8800_usb_log_retry(worker->timeout_count))
+            aic8800_log_throttle(worker->timeout_count))
         {
 #ifdef AIC8800_WIFI_DEBUG_STATS
             LOG_W("bulk OUT queue full: waits=%u timeouts=%u pending=%u",
@@ -1900,6 +2049,7 @@ static rt_err_t aic8800_usb_transmit_data(
 
     rt_memcpy(slot->buffer, data, length);
     slot->length = length;
+    slot->metadata_count = 0;
     if (!context->tx_mutex_initialized)
     {
         aic8800_usb_tx_complete(slot, -USB_ERR_SHUTDOWN);
@@ -1919,6 +2069,22 @@ static rt_err_t aic8800_usb_transmit_data(
         aic8800_usb_tx_complete(slot, -USB_ERR_SHUTDOWN);
         return -RT_EIO;
     }
+    for (rt_size_t index = 0; index < metadata_count; index++)
+    {
+        if (aic8800_core_tx_metadata_state(context, &metadata[index]) !=
+            AIC8800_TX_RECORD_READY)
+        {
+            rt_mutex_release(context->tx_mutex);
+            aic8800_usb_release_unsubmitted_tx_slot(slot);
+            return -RT_EBUSY;
+        }
+    }
+    if (metadata_count)
+    {
+        rt_memcpy(slot->metadata, metadata,
+                  metadata_count * sizeof(slot->metadata[0]));
+        slot->metadata_count = (rt_uint8_t)metadata_count;
+    }
     usbh_bulk_urb_fill(&slot->urb, context->hport, worker->endpoint,
                        slot->buffer, length, 0,
                        aic8800_usb_tx_complete, slot);
@@ -1931,8 +2097,28 @@ static rt_err_t aic8800_usb_transmit_data(
     rt_mutex_release(context->tx_mutex);
     if (submit_result)
     {
-        aic8800_usb_tx_complete(slot, submit_result);
+        rt_bool_t caller_owns;
+        rt_base_t level = rt_hw_interrupt_disable();
+
+        caller_owns = slot->in_use;
+        if (caller_owns)
+        {
+            slot->metadata_count = 0;
+        }
+        rt_hw_interrupt_enable(level);
+        if (caller_owns)
+        {
+            aic8800_usb_tx_complete(slot, submit_result);
+        }
+        else if (metadata_consumed)
+        {
+            *metadata_consumed = RT_TRUE;
+        }
         return aic8800_usb_result(submit_result);
+    }
+    if (metadata_consumed)
+    {
+        *metadata_consumed = RT_TRUE;
     }
     return RT_EOK;
 }
@@ -1967,10 +2153,20 @@ static void aic8800_usb_reset_tx_queue(struct aic8800_context *context)
     {
         if (record)
         {
+            aic8800_core_tx_complete(context, &record->metadata);
             rt_mp_free(record);
         }
     }
     rt_mq_control(context->usb_tx_queue, RT_IPC_CMD_RESET, RT_NULL);
+}
+
+static rt_bool_t aic8800_usb_requeue_tx_record(
+    struct aic8800_context *context, struct aic8800_usb_tx_record *record)
+{
+    return context && record && !context->usb_tx_terminate &&
+           context->usb_tx_queue &&
+           rt_mq_send(context->usb_tx_queue, &record, sizeof(record)) ==
+               RT_EOK;
 }
 
 static rt_size_t aic8800_usb_append_tx_aggregate(
@@ -2003,17 +2199,12 @@ static rt_size_t aic8800_usb_append_tx_aggregate(
 }
 
 static rt_err_t aic8800_usb_submit_tx_transfer(
-    struct aic8800_context *context, const void *data, rt_size_t length)
+    struct aic8800_context *context, const void *data, rt_size_t length,
+    const struct aic8800_tx_metadata *metadata, rt_size_t metadata_count,
+    rt_bool_t *metadata_consumed)
 {
-    rt_err_t result;
-
-    do
-    {
-        result = aic8800_usb_transmit_data(context, data, length);
-    }
-    while (result == -RT_EFULL && !context->usb_tx_terminate &&
-           context->tx_worker.active);
-    return result;
+    return aic8800_usb_transmit_data(
+        context, data, length, metadata, metadata_count, metadata_consumed);
 }
 
 static void aic8800_usb_tx_queue_worker(void *parameter)
@@ -2025,11 +2216,15 @@ static void aic8800_usb_tx_queue_worker(void *parameter)
     {
         struct aic8800_usb_tx_record *records[
             AIC8800_WIFI_USB_TX_AGGREGATE_FRAMES];
+        struct aic8800_tx_metadata metadata[
+            AIC8800_WIFI_USB_TX_AGGREGATE_FRAMES];
         rt_size_t wire_lengths[AIC8800_WIFI_USB_TX_AGGREGATE_FRAMES];
         rt_size_t aggregate_length = 0;
         rt_size_t count = 0;
+        rt_size_t scanned = 0;
         rt_size_t max_records = context->usb_tx_aggregation_enabled ?
             AIC8800_WIFI_USB_TX_AGGREGATE_FRAMES : 1U;
+        rt_bool_t metadata_consumed = RT_FALSE;
         rt_err_t result;
 
         if (carry)
@@ -2050,16 +2245,42 @@ static void aic8800_usb_tx_queue_worker(void *parameter)
         {
             if (records[count])
             {
+                aic8800_core_tx_complete(
+                    context, &records[count]->metadata);
                 rt_mp_free(records[count]);
             }
             break;
+        }
+        if (!records[count])
+        {
+            continue;
+        }
+        {
+            enum aic8800_tx_record_state state =
+                aic8800_core_tx_metadata_state(
+                    context, &records[count]->metadata);
+
+            if (state == AIC8800_TX_RECORD_DEFER &&
+                aic8800_usb_requeue_tx_record(context, records[count]))
+            {
+                rt_thread_mdelay(1);
+                continue;
+            }
+            if (state != AIC8800_TX_RECORD_READY)
+            {
+                aic8800_core_tx_complete(
+                    context, &records[count]->metadata);
+                rt_mp_free(records[count]);
+                continue;
+            }
         }
         wire_lengths[count] = aic8800_usb_align4(
             AIC8800_USB_TX_AGGREGATE_PREFIX + records[count]->length);
         aggregate_length = wire_lengths[count];
         count++;
 
-        while (count < max_records)
+        while (count < max_records &&
+               scanned++ < AIC8800_WIFI_USB_TX_QUEUE_DEPTH)
         {
             struct aic8800_usb_tx_record *next = RT_NULL;
             rt_int32_t timeout = count == 1U ?
@@ -2080,6 +2301,23 @@ static void aic8800_usb_tx_queue_worker(void *parameter)
                 }
                 continue;
             }
+            {
+                enum aic8800_tx_record_state state =
+                    aic8800_core_tx_metadata_state(
+                        context, &next->metadata);
+
+                if (state == AIC8800_TX_RECORD_DEFER &&
+                    aic8800_usb_requeue_tx_record(context, next))
+                {
+                    continue;
+                }
+                if (state != AIC8800_TX_RECORD_READY)
+                {
+                    aic8800_core_tx_complete(context, &next->metadata);
+                    rt_mp_free(next);
+                    continue;
+                }
+            }
             wire_length = aic8800_usb_align4(
                 AIC8800_USB_TX_AGGREGATE_PREFIX + next->length);
             if (aggregate_length + wire_length >
@@ -2098,15 +2336,58 @@ static void aic8800_usb_tx_queue_worker(void *parameter)
         {
             for (rt_size_t index = 0; index < count; index++)
             {
+                aic8800_core_tx_complete(
+                    context, &records[index]->metadata);
                 rt_mp_free(records[index]);
             }
             break;
+        }
+        {
+            rt_size_t valid_count = 0;
+
+            for (rt_size_t index = 0; index < count; index++)
+            {
+                enum aic8800_tx_record_state state =
+                    aic8800_core_tx_metadata_state(
+                        context, &records[index]->metadata);
+
+                if (state == AIC8800_TX_RECORD_READY)
+                {
+                    records[valid_count++] = records[index];
+                }
+                else if (state == AIC8800_TX_RECORD_DEFER &&
+                         aic8800_usb_requeue_tx_record(
+                             context, records[index]))
+                {
+                    /* Ownership remains with the queue. */
+                }
+                else
+                {
+                    aic8800_core_tx_complete(
+                        context, &records[index]->metadata);
+                    rt_mp_free(records[index]);
+                }
+            }
+            count = valid_count;
+        }
+        if (!count)
+        {
+            continue;
+        }
+        aggregate_length = 0;
+        for (rt_size_t index = 0; index < count; index++)
+        {
+            wire_lengths[index] = aic8800_usb_align4(
+                AIC8800_USB_TX_AGGREGATE_PREFIX + records[index]->length);
+            aggregate_length += wire_lengths[index];
+            metadata[index] = records[index]->metadata;
         }
         if (!context->usb_tx_aggregation_enabled)
         {
             RT_ASSERT(count == 1U);
             result = aic8800_usb_submit_tx_transfer(
-                context, records[0]->data, records[0]->length);
+                context, records[0]->data, records[0]->length,
+                metadata, count, &metadata_consumed);
         }
         else
         {
@@ -2126,7 +2407,8 @@ static void aic8800_usb_tx_queue_worker(void *parameter)
                 offset += prepared;
             }
             result = aic8800_usb_submit_tx_transfer(
-                context, context->usb_tx_aggregate_buffer, offset);
+                context, context->usb_tx_aggregate_buffer, offset,
+                metadata, count, &metadata_consumed);
         }
         if (result == RT_EOK)
         {
@@ -2142,22 +2424,54 @@ static void aic8800_usb_tx_queue_worker(void *parameter)
             }
 #endif
         }
-        else if (!context->usb_tx_terminate)
+        else if (!context->usb_tx_terminate && result != -RT_EBUSY)
         {
             context->usb_tx_error_count++;
-            if (aic8800_usb_log_retry(context->usb_tx_error_count))
+            if (aic8800_log_throttle(context->usb_tx_error_count))
             {
                 LOG_W("USB transmit worker failed: %d (errors=%u)",
                       result, (unsigned int)context->usb_tx_error_count);
             }
+            /* This thread outranks the system workqueue, which is where URB
+             * cancellation and endpoint recovery run, and usbh_kill_urb()
+             * holds urb->reject across a block.  Draining the queue at full
+             * speed into a failing endpoint therefore keeps the watchdog and
+             * recovery work off the CPU forever, and every retry lands on a
+             * request still marked for cancellation.  Sleep so the recovery
+             * that would clear the fault can actually make progress. */
+            rt_thread_mdelay(AIC8800_WIFI_USB_TX_ERROR_BACKOFF_MS);
+        }
+        else if (!context->usb_tx_terminate)
+        {
+            rt_thread_mdelay(1);
+        }
+        if (result != RT_EOK && !metadata_consumed)
+        {
+            for (rt_size_t index = 0; index < count; index++)
+            {
+                if (aic8800_usb_requeue_tx_record(
+                        context, records[index]))
+                {
+                    records[index] = RT_NULL;
+                }
+                else
+                {
+                    aic8800_core_tx_complete(
+                        context, &records[index]->metadata);
+                }
+            }
         }
         for (rt_size_t index = 0; index < count; index++)
         {
-            rt_mp_free(records[index]);
+            if (records[index])
+            {
+                rt_mp_free(records[index]);
+            }
         }
     }
     if (carry)
     {
+        aic8800_core_tx_complete(context, &carry->metadata);
         rt_mp_free(carry);
     }
     rt_completion_done(&context->usb_tx_thread_stopped);
@@ -2271,6 +2585,8 @@ static rt_err_t aic8800_usb_queue_transmit(
         goto failed;
     }
     record->length = (rt_uint16_t)length;
+    aic8800_core_tx_metadata_init(
+        context, data, length, &record->metadata);
     rt_memcpy(record->data, data, length);
     result = urgent ?
              rt_mq_urgent(context->usb_tx_queue, &record, sizeof(record)) :
@@ -2290,7 +2606,7 @@ static rt_err_t aic8800_usb_queue_transmit(
 
 failed:
     context->usb_tx_queue_drop_count++;
-    if (aic8800_usb_log_retry(context->usb_tx_queue_drop_count))
+    if (aic8800_log_throttle(context->usb_tx_queue_drop_count))
     {
 #ifdef AIC8800_WIFI_DEBUG_STATS
         LOG_W("USB transmit queue full: result=%d drops=%u depth=%u high=%u",
@@ -2312,6 +2628,9 @@ static rt_err_t aic8800_usb_bus_transmit(struct rt_wlan_offload_bus *bus,
                                          const void *data, rt_size_t length)
 {
     struct aic8800_context *context = aic8800_context_from_bus(bus);
+    struct aic8800_tx_metadata metadata;
+    rt_bool_t metadata_consumed;
+    rt_err_t result;
 
     if (!context || length > bus->max_tx_size)
     {
@@ -2321,7 +2640,10 @@ static rt_err_t aic8800_usb_bus_transmit(struct rt_wlan_offload_bus *bus,
     {
         return aic8800_usb_queue_transmit(context, data, length, RT_FALSE);
     }
-    return aic8800_usb_transmit_data(context, data, length);
+    aic8800_core_tx_metadata_init(context, data, length, &metadata);
+    result = aic8800_usb_transmit_data(
+        context, data, length, &metadata, 1U, &metadata_consumed);
+    return result != RT_EOK && metadata_consumed ? RT_EOK : result;
 }
 
 static rt_err_t aic8800_usb_bus_transmit_priority(
@@ -2329,6 +2651,9 @@ static rt_err_t aic8800_usb_bus_transmit_priority(
     const void *data, rt_size_t length)
 {
     struct aic8800_context *context = aic8800_context_from_bus(bus);
+    struct aic8800_tx_metadata metadata;
+    rt_bool_t metadata_consumed;
+    rt_err_t result;
 
     if (!context || length > bus->max_tx_size)
     {
@@ -2341,23 +2666,19 @@ static rt_err_t aic8800_usb_bus_transmit_priority(
 
         return aic8800_usb_transmit_endpoint(context, endpoint, data, length);
     }
-    /* DC/DW firmware built with CONFIG_USB_TX_AGGR requires the aggregate
-     * envelope even for a one-record transfer. Put EAPOL and management
-     * records at the queue head so the worker adds that envelope without
-     * delaying handshake traffic behind ordinary data. */
-    if (context->usb_tx_aggregation_enabled &&
-        context->usb_tx_queue_enabled)
+    /* Keep every data/management record in the host queue.  High-priority
+     * records go to its head, while DC/DW aggregation is applied by the same
+     * worker before submission. */
+    if (context->usb_tx_queue_enabled)
     {
         return aic8800_usb_queue_transmit(
             context, data, length,
             priority == RT_WLAN_OFFLOAD_BUS_PRIORITY_HIGH);
     }
-    if (priority == RT_WLAN_OFFLOAD_BUS_PRIORITY_NORMAL &&
-        context->usb_tx_queue_enabled)
-    {
-        return aic8800_usb_queue_transmit(context, data, length, RT_FALSE);
-    }
-    return aic8800_usb_transmit_data(context, data, length);
+    aic8800_core_tx_metadata_init(context, data, length, &metadata);
+    result = aic8800_usb_transmit_data(
+        context, data, length, &metadata, 1U, &metadata_consumed);
+    return result != RT_EOK && metadata_consumed ? RT_EOK : result;
 }
 
 static const struct rt_wlan_offload_bus_ops g_aic8800_usb_bus_ops = {
@@ -2503,6 +2824,17 @@ static void aic8800_usb_free_tx_buffers(struct aic8800_tx_worker *worker)
     {
         for (rt_size_t index = 0; index < worker->slot_count; index++)
         {
+            if (worker->context)
+            {
+                for (rt_size_t item = 0;
+                     item < worker->slots[index].metadata_count; item++)
+                {
+                    aic8800_core_tx_complete(
+                        worker->context,
+                        &worker->slots[index].metadata[item]);
+                }
+            }
+            worker->slots[index].metadata_count = 0;
             if (worker->slots[index].buffer)
             {
                 rt_free_align(worker->slots[index].buffer);

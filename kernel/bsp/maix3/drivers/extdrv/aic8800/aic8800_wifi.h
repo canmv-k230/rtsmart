@@ -104,9 +104,31 @@
 #ifndef AIC8800_WIFI_USB_TX_THREAD_PRIORITY
 #define AIC8800_WIFI_USB_TX_THREAD_PRIORITY 14U
 #endif
+/* The transmit queue thread runs above RT_SYSTEM_WORKQUEUE_PRIORITY, which is
+ * where URB cancellation and endpoint recovery live.  Retrying a failing
+ * endpoint without sleeping therefore starves the recovery that would clear the
+ * fault, so back off for at least one tick between failures. */
+#ifndef AIC8800_WIFI_USB_TX_ERROR_BACKOFF_MS
+#define AIC8800_WIFI_USB_TX_ERROR_BACKOFF_MS 2U
+#endif
 #ifndef AIC8800_WIFI_TX_BUFFER_SIZE
 #define AIC8800_WIFI_TX_BUFFER_SIZE    2048U
 #endif
+/* Optional diagnostic ring dumped when the transmit watchdog sees a stuck
+ * request. Enable explicitly while investigating a transport failure. */
+#ifndef AIC8800_WIFI_TX_TRACE_FRAMES
+#define AIC8800_WIFI_TX_TRACE_FRAMES      0U
+#endif
+/* Covers every station index the firmware may hand out, including the per-VIF
+ * broadcast/multicast pseudo-stations, which sit above the real ones (33 has
+ * been observed for VIF 1). */
+#define AIC8800_STATION_SLOTS              40U
+/* Hard cap for records outstanding to one associated SoftAP client.  This is
+ * checked without sleeping because WLAN interfaces use lwIP direct transmit. */
+#define AIC8800_TX_PENDING_HIGH_WATER      64U
+/* Matches the vendor's NX_TXQ_INITIAL_CREDITS. */
+#define AIC8800_TX_INITIAL_CREDITS         64
+
 #if AIC8800_WIFI_USB_TX_AGGREGATE_FRAMES > 1U
 #define AIC8800_WIFI_USB_TX_TRANSFER_SIZE \
     AIC8800_WIFI_USB_TX_AGGREGATE_SIZE
@@ -219,6 +241,25 @@ static inline rt_bool_t aic8800_usb_is_timeout(int result)
 #endif
 
 struct aic8800_context;
+
+/* Host-only ownership carried beside queued wire records. */
+struct aic8800_tx_metadata
+{
+    rt_uint16_t station_generation;
+    rt_uint8_t station_index;
+    rt_uint8_t vif_index;
+    rt_bool_t data_frame;
+    rt_bool_t management;
+    rt_bool_t accounted;
+};
+
+enum aic8800_tx_record_state
+{
+    AIC8800_TX_RECORD_READY = 0,
+    AIC8800_TX_RECORD_DEFER,
+    AIC8800_TX_RECORD_DROP,
+};
+
 #ifdef AIC8800_WIFI_TRANSPORT_USB
 struct aic8800_rx_worker;
 struct aic8800_tx_worker;
@@ -235,7 +276,14 @@ struct aic8800_tx_slot
      * `submit_tick` frozen, which is the only evidence the watchdog has that
      * the request is stuck rather than merely slow. */
     volatile rt_bool_t submitted;
+    /* Set while usbh_kill_urb() owns urb->reject.  Giveback may make the slot
+     * otherwise look free before kill returns, so acquisition must also gate
+     * on this state. */
+    volatile rt_bool_t cancelling;
     volatile rt_tick_t submit_tick;
+    struct aic8800_tx_metadata
+        metadata[AIC8800_WIFI_USB_TX_AGGREGATE_FRAMES];
+    rt_uint8_t metadata_count;
 };
 
 struct aic8800_tx_worker
@@ -271,6 +319,7 @@ struct aic8800_tx_worker
 struct aic8800_usb_tx_record
 {
     rt_uint16_t length;
+    struct aic8800_tx_metadata metadata;
     rt_uint8_t data[AIC8800_WIFI_TX_BUFFER_SIZE];
 };
 
@@ -454,12 +503,29 @@ struct aic8800_ap_station
     rt_uint8_t firmware_index;
 };
 
+#if AIC8800_WIFI_TX_TRACE_FRAMES
+/* One recorded transmit descriptor.  Diagnostic only; see
+ * AIC8800_WIFI_TX_TRACE_FRAMES. */
+struct aic8800_tx_trace_entry
+{
+    rt_tick_t tick;
+    rt_uint16_t length;
+    rt_uint16_t ethertype;
+    rt_uint8_t destination[6];
+    rt_uint8_t vif_index;
+    rt_uint8_t station_index;
+    rt_uint8_t tid;
+    rt_uint8_t access_category;
+    rt_uint8_t management;
+};
+#endif
+
 #ifdef AIC8800_WIFI_TRANSPORT_SDIO
 struct aic8800_sdio_tx_record
 {
     rt_uint16_t length;
     rt_uint8_t priority;
-    rt_uint8_t reserved;
+    struct aic8800_tx_metadata metadata;
     rt_uint8_t data[AIC8800_WIFI_TX_BUFFER_SIZE];
 };
 
@@ -661,6 +727,16 @@ struct aic8800_context
     rt_uint8_t ap_station_index;
     rt_uint8_t ap_vif_index;
     rt_uint8_t ap_broadcast_station_index;
+    /* LMAC channel-context indices.  The firmware serves one context at a
+     * time and announces switches; a VIF whose context is not the scheduled
+     * one must not be handed traffic. */
+    rt_uint8_t station_channel_index;
+    rt_uint8_t ap_channel_index;
+    rt_uint8_t active_channel_index;
+    /* Set once the firmware announces a switch.  Until then it is serving a
+     * single context and never reports one, so transmit must not be gated. */
+    rt_bool_t channel_context_tracked;
+    rt_uint32_t tx_off_channel_count;
     struct rt_wlan_offload_channel_definition ap_channel;
     rt_uint8_t address[6];
     rt_uint8_t bssid[6];
@@ -732,6 +808,30 @@ struct aic8800_context
     rt_uint32_t rx_no_llc_count;
     rt_uint32_t rx_invalid_data_count;
 #endif
+    /* Frames handed over for a peer the firmware has no station entry for.
+     * Always built: it also gates the rate-limited drop log. */
+    rt_uint32_t tx_no_station_count;
+    /* Per-station firmware transmit credits.  Only enforced once the firmware
+     * has actually reported one, so a build that never sends them keeps
+     * working. */
+    rt_int16_t tx_credits[AIC8800_STATION_SLOTS];
+    /* Frames handed to the transport for a station and not yet completed. */
+    rt_uint16_t tx_pending[AIC8800_STATION_SLOTS];
+    rt_bool_t tx_pending_held[AIC8800_STATION_SLOTS];
+    rt_uint16_t sta_generation[AIC8800_STATION_SLOTS];
+    rt_bool_t sta_present[AIC8800_STATION_SLOTS];
+    /* Observed peer power-save state.  Ordinary downlink records are held out
+     * of the firmware data endpoint while a peer sleeps. */
+    rt_bool_t sta_power_save[AIC8800_STATION_SLOTS];
+    rt_uint32_t tx_pending_full_count;
+    rt_uint32_t tx_power_save_drop_count;
+    rt_bool_t tx_credits_tracked;
+    rt_uint32_t tx_credit_update_count;
+#if AIC8800_WIFI_TX_TRACE_FRAMES
+    struct aic8800_tx_trace_entry tx_trace[AIC8800_WIFI_TX_TRACE_FRAMES];
+    rt_uint32_t tx_trace_count;
+    rt_bool_t tx_trace_dumped;
+#endif
     rt_uint8_t invalid_rx_log_count;
     rt_uint8_t command_tx_log_count;
     rt_uint8_t command_rx_log_count;
@@ -742,6 +842,28 @@ struct aic8800_context
     struct aic8800_radio_config_state radio_config;
 };
 
+#if AIC8800_WIFI_TX_TRACE_FRAMES
+void aic8800_core_dump_tx_trace(struct aic8800_context *context,
+                                const char *reason);
+#endif
+/* Rate limit for repeating conditions: the first few, then powers of two. */
+rt_inline rt_bool_t aic8800_log_throttle(rt_uint32_t count)
+{
+    return count <= 4U || !(count & (count - 1U));
+}
+
+/* Called by the transport when a transmitted frame completes, so the
+ * per-station in-flight count can be released. */
+void aic8800_core_tx_metadata_init(
+    struct aic8800_context *context, const void *data, rt_size_t length,
+    struct aic8800_tx_metadata *metadata);
+enum aic8800_tx_record_state aic8800_core_tx_metadata_state(
+    struct aic8800_context *context,
+    const struct aic8800_tx_metadata *metadata);
+void aic8800_core_tx_complete(
+    struct aic8800_context *context,
+    const struct aic8800_tx_metadata *metadata);
+void aic8800_core_tx_pending_reset(struct aic8800_context *context);
 rt_err_t aic8800_core_attach(struct aic8800_context *context);
 rt_err_t aic8800_core_detach(struct aic8800_context *context);
 rt_err_t aic8800_core_receive(struct rt_wlan_offload_bus *bus, const void *data,
