@@ -194,6 +194,8 @@ int lwip_netdev_ping(struct netdev *netif, const char *host, size_t data_len,
     int s, ttl, recv_len, result = 0;
     int elapsed_time;
     rt_tick_t recv_start_tick;
+    struct netif *lwip_netif;
+    struct sockaddr_in local_addr;
 #if LWIP_VERSION_MAJOR >= 2U
     struct timeval recv_timeout = { timeout / RT_TICK_PER_SECOND, timeout % RT_TICK_PER_SECOND };
 #else
@@ -207,6 +209,12 @@ int lwip_netdev_ping(struct netdev *netif, const char *host, size_t data_len,
     RT_ASSERT(netif);
     RT_ASSERT(host);
     RT_ASSERT(ping_resp);
+
+    lwip_netif = (struct netif *)netif->user_data;
+    if (lwip_netif == RT_NULL)
+    {
+        return -RT_ERROR;
+    }
 
     rt_memset(&hint, 0x00, sizeof(hint));
     /* convert URL to IP */
@@ -227,6 +235,29 @@ int lwip_netdev_ping(struct netdev *netif, const char *host, size_t data_len,
     if ((s = lwip_socket(AF_INET, SOCK_RAW, IP_PROTO_ICMP)) < 0)
     {
         return -RT_ERROR;
+    }
+
+    if (ip4_addr_isany_val(*netif_ip4_addr(lwip_netif)))
+    {
+        result = -RT_ERROR;
+        goto __exit;
+    }
+    if (lwip_setsockopt(s, SOL_SOCKET, SO_BINDTODEVICE, netif->name,
+                        rt_strlen(netif->name) + 1) != 0)
+    {
+        result = -RT_ERROR;
+        goto __exit;
+    }
+    rt_memset(&local_addr, 0, sizeof(local_addr));
+    local_addr.sin_len = sizeof(local_addr);
+    local_addr.sin_family = AF_INET;
+    local_addr.sin_addr.s_addr = ip4_addr_get_u32(
+        netif_ip4_addr(lwip_netif));
+    if (lwip_bind(s, (const struct sockaddr *)&local_addr,
+                  sizeof(local_addr)) != 0)
+    {
+        result = -RT_ERROR;
+        goto __exit;
     }
 
     lwip_setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &recv_timeout, sizeof(recv_timeout));
@@ -772,7 +803,9 @@ rt_err_t eth_device_init_with_flag(struct eth_device *dev, const char *name, rt_
 #if LWIP_NETIF_HOSTNAME
     /* Initialize interface hostname */
     hostname = (char *)netif + sizeof(struct netif);
-    rt_sprintf(hostname, "canmv_%02x%02x", name[0], name[1]);
+    rt_snprintf(hostname, LWIP_HOSTNAME_LEN, "k230_%02x%02x",
+                netif->hwaddr[netif->hwaddr_len - 2],
+                netif->hwaddr[netif->hwaddr_len - 1]);
     netif->hostname = hostname;
 #endif /* LWIP_NETIF_HOSTNAME */
 
@@ -949,7 +982,9 @@ rt_err_t af_unix_eth_device_init_with_flag(struct eth_device *dev, const char *n
 #if LWIP_NETIF_HOSTNAME
     /* Initialize interface hostname */
     hostname = (char *)netif + sizeof(struct netif);
-    rt_sprintf(hostname, "canmv_%02x%02x", name[0], name[1]);
+    rt_snprintf(hostname, LWIP_HOSTNAME_LEN, "k230_%02x%02x",
+                netif->hwaddr[netif->hwaddr_len - 2],
+                netif->hwaddr[netif->hwaddr_len - 1]);
     netif->hostname = hostname;
 #endif /* LWIP_NETIF_HOSTNAME */
 

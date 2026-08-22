@@ -54,6 +54,82 @@
 #include <string.h>
 #include <stdio.h>
 
+struct sys_mbox
+{
+    rt_mailbox_t mailbox;
+    rt_uint32_t references;
+    rt_uint32_t waiters;
+    rt_bool_t closing;
+};
+
+#ifdef RT_USING_SMP
+static struct rt_spinlock g_sys_mbox_lock;
+#endif
+static char g_sys_mbox_closed;
+
+static rt_base_t sys_mbox_global_lock(void)
+{
+#ifdef RT_USING_SMP
+    return rt_spin_lock_irqsave(&g_sys_mbox_lock);
+#else
+    return rt_hw_interrupt_disable();
+#endif
+}
+
+static void sys_mbox_global_unlock(rt_base_t level)
+{
+#ifdef RT_USING_SMP
+    rt_spin_unlock_irqrestore(&g_sys_mbox_lock, level);
+#else
+    rt_hw_interrupt_enable(level);
+#endif
+}
+
+static struct sys_mbox *sys_mbox_acquire(sys_mbox_t *slot,
+                                          rt_bool_t waiter)
+{
+    struct sys_mbox *mbox;
+    rt_base_t level = sys_mbox_global_lock();
+
+    mbox = slot ? *slot : RT_NULL;
+    if (mbox && !mbox->closing)
+    {
+        mbox->references++;
+        if (waiter)
+        {
+            mbox->waiters++;
+        }
+    }
+    else
+    {
+        mbox = RT_NULL;
+    }
+    sys_mbox_global_unlock(level);
+    return mbox;
+}
+
+static void sys_mbox_release(struct sys_mbox *mbox, rt_bool_t waiter)
+{
+    rt_base_t level = sys_mbox_global_lock();
+
+    if (waiter)
+    {
+        mbox->waiters--;
+    }
+    mbox->references--;
+    sys_mbox_global_unlock(level);
+}
+
+static rt_bool_t sys_mbox_is_closing(struct sys_mbox *mbox)
+{
+    rt_bool_t closing;
+    rt_base_t level = sys_mbox_global_lock();
+
+    closing = mbox->closing;
+    sys_mbox_global_unlock(level);
+    return closing;
+}
+
 /*
  * Initialize the network interface device
  *
@@ -225,7 +301,9 @@ INIT_PREV_EXPORT(lwip_system_init);
 
 void sys_init(void)
 {
-    /* nothing on RT-Thread porting */
+#ifdef RT_USING_SMP
+    rt_spin_lock_init(&g_sys_mbox_lock);
+#endif
 }
 
 void lwip_sys_init(void)
@@ -432,35 +510,77 @@ void sys_mutex_set_invalid(sys_mutex_t *mutex)
 err_t sys_mbox_new(sys_mbox_t *mbox, int size)
 {
     static unsigned short counter = 0;
+    struct sys_mbox *new_mbox;
     char tname[RT_NAME_MAX];
-    sys_mbox_t tmpmbox;
 
     RT_DEBUG_NOT_IN_INTERRUPT;
 
-    rt_snprintf(tname, RT_NAME_MAX, "%s%d", SYS_LWIP_MBOX_NAME, counter);
-    counter ++;
-
-    tmpmbox = rt_mb_create(tname, size, RT_IPC_FLAG_FIFO);
-    if (tmpmbox != RT_NULL)
+    if (!mbox || size <= 0)
     {
-        *mbox = tmpmbox;
-
-        return ERR_OK;
+        return ERR_ARG;
     }
-
-    return ERR_MEM;
+    new_mbox = rt_calloc(1, sizeof(*new_mbox));
+    if (!new_mbox)
+    {
+        return ERR_MEM;
+    }
+    rt_snprintf(tname, RT_NAME_MAX, "%s%d", SYS_LWIP_MBOX_NAME, counter);
+    counter++;
+    new_mbox->mailbox = rt_mb_create(tname, size, RT_IPC_FLAG_FIFO);
+    if (!new_mbox->mailbox)
+    {
+        rt_free(new_mbox);
+        return ERR_MEM;
+    }
+    *mbox = new_mbox;
+    return ERR_OK;
 }
 
 /*
- * Deallocate a mailbox
+ * Deallocate a mailbox. Blocked users hold references and are woken before
+ * the RT-Thread mailbox and wrapper storage are released.
  */
 void sys_mbox_free(sys_mbox_t *mbox)
 {
+    struct sys_mbox *old_mbox;
+    rt_uint32_t references;
+    rt_uint32_t waiters;
+    rt_base_t level;
+
     RT_DEBUG_NOT_IN_INTERRUPT;
 
-    rt_mb_delete(*mbox);
+    level = sys_mbox_global_lock();
+    old_mbox = mbox ? *mbox : RT_NULL;
+    if (old_mbox)
+    {
+        *mbox = RT_NULL;
+        old_mbox->closing = RT_TRUE;
+    }
+    sys_mbox_global_unlock(level);
+    if (!old_mbox)
+    {
+        return;
+    }
 
-    return;
+    do
+    {
+        level = sys_mbox_global_lock();
+        references = old_mbox->references;
+        waiters = old_mbox->waiters;
+        sys_mbox_global_unlock(level);
+        if (waiters)
+        {
+            (void)rt_mb_send(old_mbox->mailbox,
+                             (rt_ubase_t)&g_sys_mbox_closed);
+        }
+        if (references)
+        {
+            rt_thread_mdelay(1);
+        }
+    } while (references);
+
+    rt_mb_delete(old_mbox->mailbox);
+    rt_free(old_mbox);
 }
 
 /** Post a message to an mbox - may not fail
@@ -470,11 +590,24 @@ void sys_mbox_free(sys_mbox_t *mbox)
  */
 void sys_mbox_post(sys_mbox_t *mbox, void *msg)
 {
+    struct sys_mbox *active_mbox;
+
     RT_DEBUG_NOT_IN_INTERRUPT;
 
-    rt_mb_send_wait(*mbox, (rt_ubase_t)msg, RT_WAITING_FOREVER);
-
-    return;
+    active_mbox = sys_mbox_acquire(mbox, RT_FALSE);
+    if (!active_mbox)
+    {
+        return;
+    }
+    while (rt_mb_send(active_mbox->mailbox, (rt_ubase_t)msg) != RT_EOK)
+    {
+        if (sys_mbox_is_closing(active_mbox))
+        {
+            break;
+        }
+        rt_thread_mdelay(1);
+    }
+    sys_mbox_release(active_mbox, RT_FALSE);
 }
 
 /*
@@ -484,10 +617,16 @@ void sys_mbox_post(sys_mbox_t *mbox, void *msg)
  */
 err_t sys_mbox_trypost(sys_mbox_t *mbox, void *msg)
 {
-    if (rt_mb_send(*mbox, (rt_ubase_t)msg) == RT_EOK)
-        return ERR_OK;
+    struct sys_mbox *active_mbox = sys_mbox_acquire(mbox, RT_FALSE);
+    rt_err_t result;
 
-    return ERR_MEM;
+    if (!active_mbox)
+    {
+        return ERR_MEM;
+    }
+    result = rt_mb_send(active_mbox->mailbox, (rt_ubase_t)msg);
+    sys_mbox_release(active_mbox, RT_FALSE);
+    return result == RT_EOK ? ERR_OK : ERR_MEM;
 }
 
 err_t
@@ -506,65 +645,78 @@ sys_mbox_trypost_fromisr(sys_mbox_t *q, void *msg)
  */
 u32_t sys_arch_mbox_fetch(sys_mbox_t *mbox, void **msg, u32_t timeout)
 {
-    rt_err_t ret;
+    struct sys_mbox *active_mbox;
+    rt_ubase_t received = 0;
+    rt_err_t result;
     s32_t t;
     u32_t tick;
 
     RT_DEBUG_NOT_IN_INTERRUPT;
 
-    /* get the begin tick */
-    tick = rt_tick_get();
-
-    if(timeout == 0)
-        t = RT_WAITING_FOREVER;
-    else
-    {
-        /* convirt msecond to os tick */
-        if (timeout < (1000/RT_TICK_PER_SECOND))
-            t = 1;
-        else
-            t = timeout / (1000/RT_TICK_PER_SECOND);
-    }
-
-    ret = rt_mb_recv(*mbox, (rt_ubase_t *)msg, t);
-    if(ret != RT_EOK)
+    active_mbox = sys_mbox_acquire(mbox, RT_TRUE);
+    if (!active_mbox)
     {
         return SYS_ARCH_TIMEOUT;
     }
+    tick = rt_tick_get();
 
-    /* get elapse msecond */
+    if (timeout == 0)
+    {
+        t = RT_WAITING_FOREVER;
+    }
+    else if (timeout < (1000 / RT_TICK_PER_SECOND))
+    {
+        t = 1;
+    }
+    else
+    {
+        t = timeout / (1000 / RT_TICK_PER_SECOND);
+    }
+
+    result = rt_mb_recv(active_mbox->mailbox, &received, t);
+    sys_mbox_release(active_mbox, RT_TRUE);
+    if (result != RT_EOK || received == (rt_ubase_t)&g_sys_mbox_closed)
+    {
+        return SYS_ARCH_TIMEOUT;
+    }
+    if (msg)
+    {
+        *msg = (void *)received;
+    }
+
     tick = rt_tick_get() - tick;
-
-    /* convert tick to msecond */
     tick = tick * (1000 / RT_TICK_PER_SECOND);
-    if (tick == 0)
-        tick = 1;
-
-    return tick;
+    return tick ? tick : 1;
 }
 
 /** Wait for a new message to arrive in the mbox
  * @param mbox mbox to get a message from
  * @param msg pointer where the message is stored
- * @param timeout maximum time (in milliseconds) to wait for a message
  * @return 0 (milliseconds) if a message has been received
  *         or SYS_MBOX_EMPTY if the mailbox is empty
  */
 u32_t sys_arch_mbox_tryfetch(sys_mbox_t *mbox, void **msg)
 {
-    int ret;
+    struct sys_mbox *active_mbox;
+    rt_ubase_t received = 0;
+    rt_err_t result;
 
-    ret = rt_mb_recv(*mbox, (rt_ubase_t *)msg, 0);
-
-    if(ret == -RT_ETIMEOUT)
-        return SYS_ARCH_TIMEOUT;
-    else
+    active_mbox = sys_mbox_acquire(mbox, RT_FALSE);
+    if (!active_mbox)
     {
-        if (ret == RT_EOK)
-            ret = 1;
+        return SYS_MBOX_EMPTY;
     }
-
-    return ret;
+    result = rt_mb_recv(active_mbox->mailbox, &received, 0);
+    sys_mbox_release(active_mbox, RT_FALSE);
+    if (result != RT_EOK || received == (rt_ubase_t)&g_sys_mbox_closed)
+    {
+        return SYS_MBOX_EMPTY;
+    }
+    if (msg)
+    {
+        *msg = (void *)received;
+    }
+    return 0;
 }
 
 #ifndef sys_mbox_valid
@@ -573,7 +725,12 @@ u32_t sys_arch_mbox_tryfetch(sys_mbox_t *mbox, void **msg)
  */
 rt_ubase_t sys_mbox_valid(sys_mbox_t *mbox)
 {
-    return (rt_ubase_t)(*mbox);
+    rt_ubase_t valid;
+    rt_base_t level = sys_mbox_global_lock();
+
+    valid = mbox && *mbox && !(*mbox)->closing;
+    sys_mbox_global_unlock(level);
+    return valid;
 }
 #endif
 
@@ -582,7 +739,13 @@ rt_ubase_t sys_mbox_valid(sys_mbox_t *mbox)
  */
 void sys_mbox_set_invalid(sys_mbox_t *mbox)
 {
-    *mbox = RT_NULL;
+    rt_base_t level = sys_mbox_global_lock();
+
+    if (mbox)
+    {
+        *mbox = RT_NULL;
+    }
+    sys_mbox_global_unlock(level);
 }
 #endif
 

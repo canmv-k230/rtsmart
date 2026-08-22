@@ -240,6 +240,12 @@ int lwip_netdev_ping(struct netdev *netif, const char *host, size_t data_len,
         result = -RT_ERROR;
         goto __exit;
     }
+    if (lwip_setsockopt(s, SOL_SOCKET, SO_BINDTODEVICE, netif->name,
+                        rt_strlen(netif->name) + 1) != 0)
+    {
+        result = -RT_ERROR;
+        goto __exit;
+    }
     rt_memset(&local_addr, 0, sizeof(local_addr));
     local_addr.sin_len = sizeof(local_addr);
     local_addr.sin_family = AF_INET;
@@ -843,7 +849,9 @@ rt_err_t eth_device_init_with_flag(struct eth_device *dev, const char *name, rt_
 #if LWIP_NETIF_HOSTNAME
     /* Initialize interface hostname */
     hostname = (char *)netif + sizeof(struct netif);
-    rt_sprintf(hostname, "canmv_%02x%02x", name[0], name[1]);
+    rt_snprintf(hostname, LWIP_HOSTNAME_LEN, "k230_%02x%02x",
+                netif->hwaddr[netif->hwaddr_len - 2],
+                netif->hwaddr[netif->hwaddr_len - 1]);
     netif->hostname = hostname;
 #endif /* LWIP_NETIF_HOSTNAME */
 
@@ -1118,7 +1126,9 @@ rt_err_t af_unix_eth_device_init_with_flag(struct eth_device *dev, const char *n
 #if LWIP_NETIF_HOSTNAME
     /* Initialize interface hostname */
     hostname = (char *)netif + sizeof(struct netif);
-    rt_sprintf(hostname, "canmv_%02x%02x", name[0], name[1]);
+    rt_snprintf(hostname, LWIP_HOSTNAME_LEN, "k230_%02x%02x",
+                netif->hwaddr[netif->hwaddr_len - 2],
+                netif->hwaddr[netif->hwaddr_len - 1]);
     netif->hostname = hostname;
 #endif /* LWIP_NETIF_HOSTNAME */
 

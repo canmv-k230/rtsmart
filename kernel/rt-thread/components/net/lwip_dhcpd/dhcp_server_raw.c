@@ -40,6 +40,7 @@
 
 #include <lwip/opt.h>
 #include <lwip/sockets.h>
+#include <lwip/sys.h>
 #include <lwip/inet_chksum.h>
 #include <netif/etharp.h>
 #include <netif/ethernetif.h>
@@ -91,10 +92,10 @@
 /** Mac address length  */
 #define DHCP_MAX_HLEN               6
 /** dhcp default live time */
-#define DHCP_DEFAULT_LIVE_TIME      0x80510100
+#define DHCP_DEFAULT_LIVE_TIME      86400U
 
 /** Minimum length for request before packet is parsed */
-#define DHCP_MIN_REQUEST_LEN        44
+#define DHCP_MIN_REQUEST_LEN        (DHCP_OPTIONS_OFS + 3U)
 
 #define LWIP_NETIF_LOCK(...)
 #define LWIP_NETIF_UNLOCK(...)
@@ -134,7 +135,7 @@ struct dhcp_client_node
     struct dhcp_client_node *next;
     u8_t chaddr[DHCP_MAX_HLEN];
     ip4_addr_t ipaddr;
-    u32_t lease_end;
+    u32_t lease_deadline_ms;
 };
 
 /**
@@ -176,6 +177,32 @@ static void dhcpd_set_netif_addr(struct netif *netif, const char *ip_addr,
 * The dhcp server struct list.
 */
 static struct dhcp_server *lw_dhcp_server;
+
+static u32_t dhcp_client_lease_deadline(void)
+{
+    return sys_now() + DHCP_DEFAULT_LIVE_TIME * 1000U;
+}
+
+static void dhcp_client_expire(struct dhcp_server *dhcpserver)
+{
+    struct dhcp_client_node **link = &dhcpserver->node_list;
+    u32_t now = sys_now();
+
+    while (*link != NULL)
+    {
+        struct dhcp_client_node *node = *link;
+
+        if ((s32_t)(now - node->lease_deadline_ms) >= 0)
+        {
+            *link = node->next;
+            mem_free(node);
+        }
+        else
+        {
+            link = &node->next;
+        }
+    }
+}
 
 /**
 * Find a dhcp client node by mac address
@@ -237,27 +264,15 @@ static struct dhcp_client_node *
 dhcp_client_find(struct dhcp_server *dhcpserver, struct dhcp_msg *msg,
                  u8_t *opt_buf, u16_t len)
 {
-    u8_t *opt;
-    //u32_t ipaddr;
-    struct dhcp_client_node *node;
+    LWIP_UNUSED_ARG(opt_buf);
+    LWIP_UNUSED_ARG(len);
 
-    node = dhcp_client_find_by_mac(dhcpserver, msg->chaddr, msg->hlen);
-    if (node != NULL)
-    {
-        return node;
-    }
-
-    opt = dhcp_server_option_find(opt_buf, len, DHCP_OPTION_REQUESTED_IP);
-    if (opt != NULL)
-    {
-        node = dhcp_client_find_by_ip(dhcpserver, (ip4_addr_t *)(&opt[2]));
-        if (node != NULL)
-        {
-            return node;
-        }
-    }
-
-    return NULL;
+    /*
+     * A lease belongs to a client MAC, not to whichever client requests its
+     * address. Returning an IP match here allowed a second client to reuse
+     * another station's lease.
+     */
+    return dhcp_client_find_by_mac(dhcpserver, msg->chaddr, msg->hlen);
 }
 
 /**
@@ -272,6 +287,8 @@ static struct dhcp_client_node *
 dhcp_client_alloc(struct dhcp_server *dhcpserver, struct dhcp_msg *msg,
                   u8_t *opt_buf, u16_t len)
 {
+    ip4_addr_t first;
+    ip4_addr_t requested;
     u8_t *opt;
     u32_t ipaddr;
     struct dhcp_client_node *node;
@@ -282,38 +299,55 @@ dhcp_client_alloc(struct dhcp_server *dhcpserver, struct dhcp_msg *msg,
         return node;
     }
 
+    /*
+     * Honor a requested address only when it is inside our pool and unowned.
+     * In particular, never return the lease node of a different MAC.
+     */
     opt = dhcp_server_option_find(opt_buf, len, DHCP_OPTION_REQUESTED_IP);
-    if (opt != NULL)
+    if (opt != NULL && opt[1] == sizeof(requested.addr))
     {
-        node = dhcp_client_find_by_ip(dhcpserver, (ip4_addr_t *)(&opt[2]));
-        if (node != NULL)
+        SMEMCPY(&requested.addr, &opt[2], sizeof(requested.addr));
+        if (ntohl(requested.addr) >= ntohl(dhcpserver->start.addr) &&
+            ntohl(requested.addr) <= ntohl(dhcpserver->end.addr) &&
+            dhcp_client_find_by_ip(dhcpserver, &requested) == NULL)
         {
-            return node;
+            dhcpserver->current = requested;
         }
     }
 
-dhcp_alloc_again:
-    node = dhcp_client_find_by_ip(dhcpserver, &dhcpserver->current);
-    if (node != NULL)
+    first = dhcpserver->current;
+    while (dhcp_client_find_by_ip(dhcpserver, &dhcpserver->current) != NULL)
     {
-        ipaddr = (ntohl(dhcpserver->current.addr) + 1);
+        ipaddr = ntohl(dhcpserver->current.addr) + 1U;
         if (ipaddr > ntohl(dhcpserver->end.addr))
         {
             ipaddr = ntohl(dhcpserver->start.addr);
         }
         dhcpserver->current.addr = htonl(ipaddr);
-        goto dhcp_alloc_again;
+        if (ip4_addr_cmp(&dhcpserver->current, &first))
+        {
+            return NULL;
+        }
     }
-    node = (struct dhcp_client_node *)mem_malloc(sizeof(struct dhcp_client_node));
+
+    node = (struct dhcp_client_node *)mem_malloc(sizeof(*node));
     if (node == NULL)
     {
         return NULL;
     }
-    SMEMCPY(node->chaddr, msg->chaddr, msg->hlen);
+    memset(node, 0, sizeof(*node));
+    SMEMCPY(node->chaddr, msg->chaddr, DHCP_MAX_HLEN);
     node->ipaddr = dhcpserver->current;
-
+    node->lease_deadline_ms = dhcp_client_lease_deadline();
     node->next = dhcpserver->node_list;
     dhcpserver->node_list = node;
+
+    ipaddr = ntohl(dhcpserver->current.addr) + 1U;
+    if (ipaddr > ntohl(dhcpserver->end.addr))
+    {
+        ipaddr = ntohl(dhcpserver->start.addr);
+    }
+    dhcpserver->current.addr = htonl(ipaddr);
 
     return node;
 }
@@ -330,13 +364,30 @@ static u8_t *
 dhcp_server_option_find(u8_t *buf, u16_t len, u8_t option)
 {
     u8_t *end = buf + len;
-    while ((buf < end) && (*buf != DHCP_OPTION_END))
+
+    while (buf < end && *buf != DHCP_OPTION_END)
     {
+        u8_t option_len;
+
+        if (*buf == DHCP_OPTION_PAD)
+        {
+            buf++;
+            continue;
+        }
+        if ((size_t)(end - buf) < 2U)
+        {
+            break;
+        }
+        option_len = buf[1];
+        if ((size_t)(end - buf - 2) < option_len)
+        {
+            break;
+        }
         if (*buf == option)
         {
             return buf;
         }
-        buf += (buf[1] + 2);
+        buf += option_len + 2U;
     }
     return NULL;
 }
@@ -356,6 +407,7 @@ dhcp_server_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t
     struct dhcp_client_node *node;
     u8_t msg_type;
     u16_t length;
+    u16_t request_len;
     ip_addr_t addr = *recv_addr;
     u32_t tmp;
 
@@ -370,7 +422,8 @@ dhcp_server_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t
     LWIP_UNUSED_ARG(addr);
     LWIP_UNUSED_ARG(port);
 
-    if (p->len < DHCP_MIN_REQUEST_LEN)
+    request_len = p->tot_len;
+    if (request_len < DHCP_MIN_REQUEST_LEN)
     {
         LWIP_DEBUGF(DHCP_DEBUG | LWIP_DBG_TRACE | LWIP_DBG_LEVEL_WARNING, ("DHCP request message or pbuf too short\n"));
         pbuf_free(p);
@@ -387,6 +440,7 @@ dhcp_server_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t
     if (q->tot_len < p->tot_len)
     {
         LWIP_DEBUGF(DHCP_DEBUG | LWIP_DBG_TRACE | LWIP_DBG_LEVEL_WARNING, ("pbuf_alloc dhcp_msg too small %d:%d\n", q->tot_len, p->tot_len));
+        pbuf_free(q);
         pbuf_free(p);
         return;
     }
@@ -407,15 +461,16 @@ dhcp_server_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t
         goto free_pbuf_and_return;
     }
 
-    if (msg->hlen > DHCP_MAX_HLEN)
+    if (msg->htype != 1U || msg->hlen != DHCP_MAX_HLEN)
     {
         goto free_pbuf_and_return;
     }
 
+    dhcp_client_expire(dhcp_server);
     opt_buf = (u8_t *)msg + DHCP_OPTIONS_OFS;
-    length = q->tot_len - DHCP_OPTIONS_OFS;
+    length = request_len - DHCP_OPTIONS_OFS;
     opt = dhcp_server_option_find(opt_buf, length, DHCP_OPTION_MESSAGE_TYPE);
-    if (opt)
+    if (opt != NULL && opt[1] == 1U)
     {
         msg_type = *(opt + 2);
         if (msg_type == DHCP_DISCOVER)
@@ -425,7 +480,7 @@ dhcp_server_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t
             {
                 goto free_pbuf_and_return;
             }
-            node->lease_end = DHCP_DEFAULT_LIVE_TIME;
+            node->lease_deadline_ms = dhcp_client_lease_deadline();
             /* create dhcp offer and send */
             msg->op = DHCP_BOOTREPLY;
             msg->hops = 0;
@@ -494,11 +549,30 @@ dhcp_server_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t
             {
                 if (msg_type == DHCP_REQUEST)
                 {
+                    opt = dhcp_server_option_find(
+                        opt_buf, length, DHCP_OPTION_SERVER_ID);
+                    if (opt != NULL &&
+                        (opt[1] != sizeof(ip4_addr_t) ||
+                         memcmp(&opt[2], netif_ip4_addr(dhcp_server->netif),
+                                sizeof(ip4_addr_t)) != 0))
+                    {
+                        goto free_pbuf_and_return;
+                    }
+
                     node = dhcp_client_find(dhcp_server, msg, opt_buf, length);
+                    opt = dhcp_server_option_find(
+                        opt_buf, length, DHCP_OPTION_REQUESTED_IP);
+                    if (node != NULL && opt != NULL &&
+                        (opt[1] != sizeof(node->ipaddr.addr) ||
+                         memcmp(&opt[2], &node->ipaddr.addr,
+                                sizeof(node->ipaddr.addr)) != 0))
+                    {
+                        node = NULL;
+                    }
                     if (node != NULL)
                     {
                         /* Send ack */
-                        node->lease_end = DHCP_DEFAULT_LIVE_TIME;
+                        node->lease_deadline_ms = dhcp_client_lease_deadline();
                         /* create dhcp offer and send */
                         msg->op = DHCP_BOOTREPLY;
                         msg->hops = 0;

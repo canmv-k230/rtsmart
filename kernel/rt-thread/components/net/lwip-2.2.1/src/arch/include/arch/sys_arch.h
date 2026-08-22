@@ -56,7 +56,8 @@ typedef u32_t sys_prot_t;
 
 typedef rt_sem_t sys_sem_t;
 typedef rt_mutex_t sys_mutex_t;
-typedef rt_mailbox_t  sys_mbox_t;
+struct sys_mbox;
+typedef struct sys_mbox *sys_mbox_t;
 typedef rt_thread_t sys_thread_t;
 
 // err_t sys_mbox_trypost_fromisr(sys_mbox_t *q, void *msg);
