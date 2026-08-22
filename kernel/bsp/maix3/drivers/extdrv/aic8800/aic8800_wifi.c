@@ -1337,20 +1337,9 @@ static rt_err_t aic_submit_scan_wire(struct aic8800_context *context,
                                      const struct aic_wire_scanu_start_req
                                          *request)
 {
-    rt_uint8_t confirmation[3];
-    rt_size_t confirmation_length = 0;
-    rt_err_t result;
-
-    rt_memset(confirmation, 0, sizeof(confirmation));
-    result = aic_execute(context, AIC_SCANU_START_REQ,
-                         AIC_SCANU_START_ACCEPTED, request,
-                         AIC_SCAN_REQUEST_SIZE, confirmation,
-                         sizeof(confirmation), &confirmation_length);
-    if (result != RT_EOK)
-    {
-        return result;
-    }
-    return aic_confirmation_status(confirmation, confirmation_length);
+    return aic_execute(context, AIC_SCANU_START_REQ,
+                       AIC_SCANU_START_ACCEPTED, request,
+                       AIC_SCAN_REQUEST_SIZE, RT_NULL, 0, RT_NULL);
 }
 
 static rt_err_t aic_confirmation_status(const rt_uint8_t *confirmation,
