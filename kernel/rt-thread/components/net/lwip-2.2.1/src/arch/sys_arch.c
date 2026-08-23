@@ -545,6 +545,8 @@ void sys_mbox_free(sys_mbox_t *mbox)
     struct sys_mbox *old_mbox;
     rt_uint32_t references;
     rt_uint32_t waiters;
+    rt_tick_t last_warning;
+    rt_tick_t now;
     rt_base_t level;
 
     RT_DEBUG_NOT_IN_INTERRUPT;
@@ -562,6 +564,7 @@ void sys_mbox_free(sys_mbox_t *mbox)
         return;
     }
 
+    last_warning = rt_tick_get();
     do
     {
         level = sys_mbox_global_lock();
@@ -570,11 +573,19 @@ void sys_mbox_free(sys_mbox_t *mbox)
         sys_mbox_global_unlock(level);
         if (waiters)
         {
+            /* A successful send wakes one receiver; retry while it is full. */
             (void)rt_mb_send(old_mbox->mailbox,
                              (rt_ubase_t)&g_sys_mbox_closed);
         }
         if (references)
         {
+            now = rt_tick_get();
+            if (now - last_warning >= RT_TICK_PER_SECOND)
+            {
+                rt_kprintf("lwIP: sys_mbox_free waiting for %u reference(s), "
+                           "%u waiter(s)\n", references, waiters);
+                last_warning = now;
+            }
             rt_thread_mdelay(1);
         }
     } while (references);
@@ -583,8 +594,10 @@ void sys_mbox_free(sys_mbox_t *mbox)
     rt_free(old_mbox);
 }
 
-/** Post a message to an mbox - may not fail
+/** Post a message to a valid mbox - may not fail
  * -> blocks if full, only used from tasks not from ISR
+ * Concurrent teardown cancels the post so sys_mbox_free() can complete;
+ * callers must stop producers before freeing a mailbox.
  * @param mbox mbox to posts the message
  * @param msg message to post (ATTENTION: can be NULL)
  */
@@ -599,13 +612,16 @@ void sys_mbox_post(sys_mbox_t *mbox, void *msg)
     {
         return;
     }
-    while (rt_mb_send(active_mbox->mailbox, (rt_ubase_t)msg) != RT_EOK)
+    /*
+     * Wait on the mailbox sender queue, but periodically check whether
+     * teardown has started so sys_mbox_free() cannot deadlock.
+     */
+    while (rt_mb_send_wait(active_mbox->mailbox, (rt_ubase_t)msg, 1) != RT_EOK)
     {
         if (sys_mbox_is_closing(active_mbox))
         {
             break;
         }
-        rt_thread_mdelay(1);
     }
     sys_mbox_release(active_mbox, RT_FALSE);
 }

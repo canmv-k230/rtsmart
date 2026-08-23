@@ -780,13 +780,48 @@ static err_t eth_netif_device_init(struct netif *netif)
     return ERR_IF;
 }
 
+#if LWIP_NETIF_HOSTNAME
+#define LWIP_HOSTNAME_LEN 16
+
+static rt_bool_t ethernetif_hwaddr_is_zero(const struct netif *netif)
+{
+    rt_uint8_t index;
+
+    for (index = 0; index < netif->hwaddr_len; index++)
+    {
+        if (netif->hwaddr[index] != 0U)
+        {
+            return RT_FALSE;
+        }
+    }
+    return RT_TRUE;
+}
+
+static void ethernetif_set_hostname(struct netif *netif, const char *name,
+                                    char *hostname)
+{
+    if (netif->hwaddr_len < 2U || ethernetif_hwaddr_is_zero(netif))
+    {
+        /* Fall back when the driver cannot provide a hardware address. */
+        rt_snprintf(hostname, LWIP_HOSTNAME_LEN, "k230_%02x%02x",
+                    (rt_uint8_t)name[0], (rt_uint8_t)name[1]);
+    }
+    else
+    {
+        rt_snprintf(hostname, LWIP_HOSTNAME_LEN, "k230_%02x%02x",
+                    netif->hwaddr[netif->hwaddr_len - 2],
+                    netif->hwaddr[netif->hwaddr_len - 1]);
+    }
+    netif->hostname = hostname;
+}
+#endif /* LWIP_NETIF_HOSTNAME */
+
 /* Keep old drivers compatible in RT-Thread */
 rt_err_t eth_device_init_with_flag(struct eth_device *dev, const char *name, rt_uint16_t flags)
 {
     struct netif* netif;
     rt_err_t result;
 #if LWIP_NETIF_HOSTNAME
-#define LWIP_HOSTNAME_LEN 16
     char *hostname = RT_NULL;
     netif = (struct netif*) rt_calloc (1, sizeof(struct netif) + LWIP_HOSTNAME_LEN);
 #else
@@ -849,10 +884,7 @@ rt_err_t eth_device_init_with_flag(struct eth_device *dev, const char *name, rt_
 #if LWIP_NETIF_HOSTNAME
     /* Initialize interface hostname */
     hostname = (char *)netif + sizeof(struct netif);
-    rt_snprintf(hostname, LWIP_HOSTNAME_LEN, "k230_%02x%02x",
-                netif->hwaddr[netif->hwaddr_len - 2],
-                netif->hwaddr[netif->hwaddr_len - 1]);
-    netif->hostname = hostname;
+    ethernetif_set_hostname(netif, name, hostname);
 #endif /* LWIP_NETIF_HOSTNAME */
 
     /* if tcp thread has been started up, we add this netif to the system */
@@ -1063,7 +1095,6 @@ rt_err_t af_unix_eth_device_init_with_flag(struct eth_device *dev, const char *n
     struct netif* netif;
     rt_err_t result;
 #if LWIP_NETIF_HOSTNAME
-#define LWIP_HOSTNAME_LEN 16
     char *hostname = RT_NULL;
     netif = (struct netif*) rt_calloc (1, sizeof(struct netif) + LWIP_HOSTNAME_LEN);
 #else
@@ -1126,10 +1157,7 @@ rt_err_t af_unix_eth_device_init_with_flag(struct eth_device *dev, const char *n
 #if LWIP_NETIF_HOSTNAME
     /* Initialize interface hostname */
     hostname = (char *)netif + sizeof(struct netif);
-    rt_snprintf(hostname, LWIP_HOSTNAME_LEN, "k230_%02x%02x",
-                netif->hwaddr[netif->hwaddr_len - 2],
-                netif->hwaddr[netif->hwaddr_len - 1]);
-    netif->hostname = hostname;
+    ethernetif_set_hostname(netif, name, hostname);
 #endif /* LWIP_NETIF_HOSTNAME */
 
     /* if tcp thread has been started up, we add this netif to the system */
