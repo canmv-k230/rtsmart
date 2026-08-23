@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 #include <rtthread.h>
+#include <drivers/mmcsd_core.h>
 
 #ifdef MOUNT_SECOND_CARD
 #include <dfs_fs.h>
@@ -154,14 +155,21 @@ static void board_sdio_cd_process(int present)
     result = kd_sdhci_wait_card(
         board_sdio_cd_host,
         rt_tick_from_millisecond(BOARD_SDIO_CD_MOUNT_TIMEOUT_MS));
-    if (result != MMCSD_HOST_PLUGED && result != MMCSD_HOST_UNPLUGED)
+    if (result == MMCSD_HOST_PLUGED)
+    {
+        current = RT_TRUE;
+    }
+    else if (result == MMCSD_HOST_UNPLUGED || result == -RT_EBUSY)
+    {
+        /* -RT_EBUSY means this host has not completed its first scan. */
+        current = RT_FALSE;
+    }
+    else
     {
         LOG_E("failed to read SDIO%d card state: %d",
               board_sdio_cd_host, result);
         return;
     }
-
-    current = result == MMCSD_HOST_PLUGED;
 
     if (!present)
     {
@@ -429,6 +437,9 @@ INIT_DEVICE_EXPORT_SEQ(board_sdio_storage_init, 210);
 
 #define BOARD_SDIO_WIFI_THREAD_STACK_SIZE 8192U
 #define BOARD_SDIO_WIFI_THREAD_PRIORITY   (RT_MMCSD_THREAD_PRIORITY + 1)
+#define BOARD_SDIO_WIFI_PROBE_ATTEMPTS    3U
+#define BOARD_SDIO_WIFI_PROBE_TIMEOUT_MS  3000U
+#define BOARD_SDIO_WIFI_RETRY_DELAY_MS    100U
 
 int board_sdio_wifi_prepare(void)
 {
@@ -466,6 +477,9 @@ int board_sdio_wifi_prepare(void)
 
 static void board_sdio_wifi_probe(void *parameter)
 {
+    rt_uint32_t attempt;
+    int result;
+
     (void)parameter;
 
     if (board_sdio_wifi_prepare() != RT_EOK)
@@ -474,7 +488,37 @@ static void board_sdio_wifi_probe(void *parameter)
         return;
     }
 
-    kd_sdhci_change(BSP_WIFI_SDIO_HOST);
+    for (attempt = 1; attempt <= BOARD_SDIO_WIFI_PROBE_ATTEMPTS; attempt++)
+    {
+        kd_sdhci_change(BSP_WIFI_SDIO_HOST);
+        result = kd_sdhci_wait_card(
+            BSP_WIFI_SDIO_HOST,
+            rt_tick_from_millisecond(BOARD_SDIO_WIFI_PROBE_TIMEOUT_MS));
+        if (result == MMCSD_HOST_PLUGED)
+        {
+            LOG_I("SDIO Wi-Fi card detected on host %d",
+                  BSP_WIFI_SDIO_HOST);
+            return;
+        }
+        if (result == -RT_EBUSY)
+        {
+            LOG_E("SDIO Wi-Fi driver probe failed on host %d; "
+                  "card retained because teardown is incomplete",
+                  BSP_WIFI_SDIO_HOST);
+            return;
+        }
+        if (attempt < BOARD_SDIO_WIFI_PROBE_ATTEMPTS)
+        {
+            LOG_W("SDIO Wi-Fi probe %u/%u failed on host %d: %d",
+                  (unsigned int)attempt,
+                  (unsigned int)BOARD_SDIO_WIFI_PROBE_ATTEMPTS,
+                  BSP_WIFI_SDIO_HOST, result);
+            rt_thread_mdelay(BOARD_SDIO_WIFI_RETRY_DELAY_MS);
+        }
+    }
+    LOG_E("no SDIO Wi-Fi card detected on host %d after %u attempts",
+          BSP_WIFI_SDIO_HOST,
+          (unsigned int)BOARD_SDIO_WIFI_PROBE_ATTEMPTS);
 }
 
 static int board_sdio_wifi_init(void)

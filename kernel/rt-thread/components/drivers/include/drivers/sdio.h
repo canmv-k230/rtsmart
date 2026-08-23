@@ -147,6 +147,8 @@ struct rt_sdio_device_id
 struct rt_sdio_driver
 {
     char *name;
+    /* Return -RT_EBUSY only when failed teardown still owns card references;
+     * the SDIO core retains the card in that case. */
     rt_int32_t (*probe)(struct rt_mmcsd_card *card);
     rt_int32_t (*remove)(struct rt_mmcsd_card *card);
     struct rt_sdio_device_id *id;

@@ -287,7 +287,11 @@ rt_inline rt_uint32_t sdio_max_block_size(struct rt_sdio_function *func)
 {
     rt_uint32_t size = MIN(func->card->host->max_seg_size,
                            func->card->host->max_blk_size);
-    size = MIN(size, func->max_blk_size);
+
+    /* Some cards occasionally return an invalid zero FUNCE block size.
+     * Do not let that turn a CMD53 byte transfer into a zero-length loop. */
+    if (func->max_blk_size)
+        size = MIN(size, func->max_blk_size);
     if (func->cur_blk_size)
         size = MIN(size, func->cur_blk_size);
     return MIN(size, 512u); /* maximum size for byte mode */
@@ -307,13 +311,15 @@ rt_int32_t sdio_io_rw_extended_block(struct rt_sdio_function *func,
     left_size = len;
 
     /* Do the bulk of the transfer using block mode (if supported). */
-    if (func->card->cccr.multi_block && (len > sdio_max_block_size(func)))
+    if (func->card->cccr.multi_block &&
+        func->cur_blk_size &&
+        (len > sdio_max_block_size(func)))
     {
         max_blks = MIN(func->card->host->max_blk_count,
                        func->card->host->max_seg_size / func->cur_blk_size);
         max_blks = MIN(max_blks, 511u);
 
-        while (left_size > func->cur_blk_size)
+        while (max_blks && left_size > func->cur_blk_size)
         {
             blks = left_size / func->cur_blk_size;
             if (blks > max_blks)
@@ -335,6 +341,8 @@ rt_int32_t sdio_io_rw_extended_block(struct rt_sdio_function *func,
     while (left_size > 0)
     {
         len = MIN(left_size, sdio_max_block_size(func));
+        if (!len)
+            return -RT_EINVAL;
 
         ret = sdio_io_rw_extended(func->card, rw, func->num, 
                   addr, op_code, buf, 1, len);
@@ -568,7 +576,9 @@ static rt_int32_t cistpl_funce_func(struct rt_sdio_function *func,
 
 static rt_int32_t sdio_read_cis(struct rt_sdio_function *func)
 {
-    rt_int32_t ret;
+    rt_int32_t ret = RT_EOK;
+    rt_int32_t tuple_ret;
+    rt_bool_t keep_tuple;
     struct rt_sdio_function_tuple *curr, **prev;
     rt_uint32_t i, cisptr = 0;
     rt_uint8_t data;
@@ -594,16 +604,16 @@ static rt_int32_t sdio_read_cis(struct rt_sdio_function *func)
         tpl_code = sdio_io_readb(func0, cisptr++, &ret);
         if (ret)
             break;
-        tpl_link = sdio_io_readb(func0, cisptr++, &ret);
-        if (ret)
+        if (tpl_code == CISTPL_END)
             break;
-
-        if ((tpl_code == CISTPL_END) || (tpl_link == 0xff))
-            break;
-
         if (tpl_code == CISTPL_NULL)
             continue;
 
+        tpl_link = sdio_io_readb(func0, cisptr++, &ret);
+        if (ret)
+            break;
+        if (tpl_link == 0xff)
+            break;
 
         curr = rt_malloc(sizeof(struct rt_sdio_function_tuple) + tpl_link);
         if (!curr)
@@ -622,6 +632,7 @@ static rt_int32_t sdio_read_cis(struct rt_sdio_function *func)
             break;
         }
 
+        keep_tuple = RT_FALSE;
         switch (tpl_code)
         {
         case CISTPL_MANFID:
@@ -647,11 +658,11 @@ static rt_int32_t sdio_read_cis(struct rt_sdio_function *func)
             break;
         case CISTPL_FUNCE:
             if (func->num != 0)
-                ret = cistpl_funce_func(func, curr->data, tpl_link);
+                tuple_ret = cistpl_funce_func(func, curr->data, tpl_link);
             else
-                ret = cistpl_funce_func0(card, curr->data, tpl_link);
+                tuple_ret = cistpl_funce_func0(card, curr->data, tpl_link);
 
-            if (ret)
+            if (tuple_ret)
             {
                 LOG_D("bad CISTPL_FUNCE size %u "
                        "type %u", tpl_link, curr->data[0]);
@@ -671,11 +682,14 @@ static rt_int32_t sdio_read_cis(struct rt_sdio_function *func)
             curr->size = tpl_link;
             *prev = curr;
             prev = &curr->next;
+            keep_tuple = RT_TRUE;
             LOG_D( "function %d, CIS tuple code %#x, length %d",
                 func->num, tpl_code, tpl_link);
             break;
         }
 
+        if (!keep_tuple)
+            rt_free(curr);
         cisptr += tpl_link;
     } while (1);
 
@@ -758,9 +772,34 @@ static rt_int32_t sdio_initialize_function(struct rt_mmcsd_card *card,
     if (ret)
         goto err1;
 
-    ret = sdio_read_cis(func);
+    for (rt_uint32_t attempt = 0; attempt < 3; attempt++)
+    {
+        ret = sdio_read_cis(func);
+        if (ret == RT_EOK && func->max_blk_size)
+            break;
+        if (attempt == 2)
+            break;
+
+        LOG_W("function %u CIS read invalid (error %d, max block %u), retrying",
+              func_num, ret, func->max_blk_size);
+        sdio_free_cis(func);
+        func->manufacturer = 0;
+        func->product = 0;
+        func->max_blk_size = 0;
+        func->enable_timeout_val = 0;
+        rt_thread_mdelay(1);
+    }
     if (ret)
         goto err1;
+    /* A function whose CIS never yielded a maximum block size cannot be driven
+     * in block mode, so refuse it here instead of letting every later transfer
+     * silently degrade to byte mode. */
+    if (!func->max_blk_size)
+    {
+        LOG_E("function %u CIS reports zero max block size", func_num);
+        ret = -RT_EIO;
+        goto err1;
+    }
 
     /*
      * product/manufacturer id is optional for function CIS, so
@@ -843,6 +882,8 @@ static rt_int32_t sdio_register_card(struct rt_mmcsd_card *card)
     struct rt_sdio_function *function;
     rt_list_t *l;
     rt_uint8_t function_num;
+    rt_int32_t probe_result;
+    rt_bool_t driver_bound = RT_FALSE;
 
     sc = rt_malloc(sizeof(struct sdio_card));
     if (sc == RT_NULL)
@@ -881,7 +922,36 @@ static rt_int32_t sdio_register_card(struct rt_mmcsd_card *card)
         sd = (struct sdio_driver *)rt_list_entry(l, struct sdio_driver, list);
         if (sdio_match_card(card, sd->drv->id))
         {
-            sd->drv->probe(card);
+            probe_result = sd->drv->probe(card);
+            if (probe_result != RT_EOK)
+            {
+                LOG_E("SDIO driver %s probe failed on %s: %d",
+                      sd->drv->name,
+                      card->host ? card->host->name : "unknown",
+                      probe_result);
+
+                /* A busy probe may still own live card references because its
+                 * teardown could not complete. Keep the backing card alive, but
+                 * propagate the failure so detection cannot report success. */
+                if (probe_result == -RT_EBUSY)
+                {
+                    LOG_E("retaining SDIO card on %s after incomplete teardown",
+                          card->host ? card->host->name : "unknown");
+                    return probe_result;
+                }
+
+                /* A later probe must not invalidate drivers already bound. */
+                if (driver_bound)
+                {
+                    LOG_E("keeping SDIO card on %s after later probe failure",
+                          card->host ? card->host->name : "unknown");
+                    return RT_EOK;
+                }
+                rt_list_remove(&sc->list);
+                rt_free(sc);
+                return probe_result;
+            }
+            driver_bound = RT_TRUE;
         }
     }
 
@@ -985,6 +1055,10 @@ static rt_int32_t sdio_init_card(struct rt_mmcsd_host *host, rt_uint32_t ocr)
 
     /* register sdio card */
     err = sdio_register_card(card);
+    if (err == -RT_EBUSY)
+    {
+        return err;
+    }
     if (err)
     {
         goto err3;
@@ -1002,9 +1076,6 @@ err3:
                 sdio_free_cis(host->card->sdio_function[i]);
                 rt_free(host->card->sdio_function[i]);
                 host->card->sdio_function[i] = RT_NULL;
-                rt_free(host->card);
-                host->card = RT_NULL;
-                break;
             }
         }
     }
@@ -1019,6 +1090,7 @@ err1:
     if (host->card)
     {
         rt_free(host->card);
+        host->card = RT_NULL;
     }
 err:
     LOG_E("error %d while initialising SDIO card", err);
@@ -1054,6 +1126,8 @@ rt_int32_t init_sdio(struct rt_mmcsd_host *host, rt_uint32_t ocr)
     }
 
     err = sdio_init_card(host, current_ocr);
+    if (err == -RT_EBUSY)
+        goto err;
     if (err)
         goto remove_card;
 
@@ -1349,9 +1423,13 @@ rt_int32_t sdio_set_block_size(struct rt_sdio_function *func,
 
     if (blksize > func->card->host->max_blk_size)
         return -RT_ERROR;
+    if (func->max_blk_size && blksize > func->max_blk_size)
+        return -RT_ERROR;
 
     if (blksize == 0) 
     {
+        if (!func->max_blk_size)
+            return -RT_EINVAL;
         blksize = MIN(func->max_blk_size, func->card->host->max_blk_size);
         blksize = MIN(blksize, 512u);
     }

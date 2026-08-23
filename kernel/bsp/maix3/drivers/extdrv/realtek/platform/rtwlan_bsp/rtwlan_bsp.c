@@ -632,7 +632,9 @@ static rt_err_t realtek_recover_efuse_autoload(const char *model_name)
     LOG_W("%s efuse autoload did not run; retrying initialization", model_name);
     if (wifi_off() < 0) {
         LOG_E("%s could not be stopped for a retry", model_name);
-        return -RT_EIO;
+        /* Vendor threads may still reference the SDIO function. Tell the core
+         * to retain the card instead of freeing it after this probe fails. */
+        return -RT_EBUSY;
     }
     rt_thread_mdelay(REALTEK_AUTOLOAD_RETRY_DELAY_MS);
     if (wifi_on(RTW_MODE_STA) < 0) {
@@ -703,6 +705,12 @@ static rt_int32_t realtek_probe(struct rt_mmcsd_card* card)
 
     wifi_sdio_func->max_blksize = rtt_sdio_func->max_blk_size;
     wifi_sdio_func->cur_blksize = rtt_sdio_func->cur_blk_size;
+    if (!wifi_sdio_func->max_blksize)
+    {
+        wifi_sdio_func->max_blksize = wifi_sdio_func->cur_blksize;
+        LOG_W("function CIS reported zero max block size; using configured size %u",
+              wifi_sdio_func->max_blksize);
+    }
     wifi_sdio_func->enable_timeout = rtt_sdio_func->enable_timeout_val;
     wifi_sdio_func->num = rtt_sdio_func->num;
     wifi_sdio_func->vendor = rtt_sdio_func->manufacturer;
@@ -718,6 +726,8 @@ static rt_int32_t realtek_probe(struct rt_mmcsd_card* card)
     }
 
     ret = realtek_recover_efuse_autoload(model_name);
+    if (ret == -RT_EBUSY)
+        return ret;
     if (ret != RT_EOK)
         goto fail_disable_sdio;
 
@@ -754,7 +764,9 @@ static rt_int32_t realtek_probe(struct rt_mmcsd_card* card)
 fail_wifi:
     if (wifi_off() < 0) {
         LOG_E("cleanup failed after probe error %d", ret);
-        return -RT_EIO;
+        /* Keep the backing card and function alive while the vendor driver is
+         * still running; sdio_register_card() recognizes this condition. */
+        return -RT_EBUSY;
     }
     if (wlan_ap_registered) {
         if (wlan_ap.mode != RT_WLAN_NONE)

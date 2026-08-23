@@ -629,7 +629,11 @@ int mmcsd_wait_host_ready(struct rt_mmcsd_host *host, rt_int32_t timeout)
         if (result != RT_EOK)
             return result;
     }
-    else if (host->card)
+    if (host->card_detect_status < 0)
+    {
+        return host->card_detect_status;
+    }
+    if (host->card)
     {
         return MMCSD_HOST_PLUGED;
     }
@@ -638,10 +642,10 @@ int mmcsd_wait_host_ready(struct rt_mmcsd_host *host, rt_int32_t timeout)
 RTM_EXPORT(mmcsd_wait_host_ready);
 
 static void mmcsd_detect_complete(struct rt_mmcsd_host *host,
+                                  rt_int32_t status,
                                   rt_bool_t notify_hotplug)
 {
-    host->card_detect_status = host->card ? MMCSD_HOST_PLUGED :
-                                            MMCSD_HOST_UNPLUGED;
+    host->card_detect_status = status;
     host->card_detect_pending = RT_FALSE;
     rt_completion_done(&host->card_detect_completion);
     if (notify_hotplug)
@@ -713,10 +717,16 @@ void mmcsd_detect(void *param)
                 err = sdio_io_send_op_cond(host, 0, &ocr);
                 if (!err)
                 {
-                    if (init_sdio(host, ocr))
+                    err = init_sdio(host, ocr);
+                    if (err && err != -RT_EBUSY)
                         mmcsd_power_off(host);
                     mmcsd_host_unlock(host);
-                    mmcsd_detect_complete(host, RT_FALSE);
+                    mmcsd_detect_complete(
+                        host,
+                        err == -RT_EBUSY ? err :
+                            (host->card ? MMCSD_HOST_PLUGED :
+                                          MMCSD_HOST_UNPLUGED),
+                        RT_FALSE);
                     continue;
                 }
 
@@ -729,7 +739,11 @@ void mmcsd_detect(void *param)
                     if (init_sd(host, ocr))
                         mmcsd_power_off(host);
                     mmcsd_host_unlock(host);
-                    mmcsd_detect_complete(host, RT_TRUE);
+                    mmcsd_detect_complete(
+                        host,
+                        host->card ? MMCSD_HOST_PLUGED :
+                                     MMCSD_HOST_UNPLUGED,
+                        RT_TRUE);
                     continue;
                 }
 
@@ -743,11 +757,19 @@ probe_mmc:
                     if (init_mmc(host, ocr))
                         mmcsd_power_off(host);
                     mmcsd_host_unlock(host);
-                    mmcsd_detect_complete(host, RT_TRUE);
+                    mmcsd_detect_complete(
+                        host,
+                        host->card ? MMCSD_HOST_PLUGED :
+                                     MMCSD_HOST_UNPLUGED,
+                        RT_TRUE);
                     continue;
                 }
                 mmcsd_host_unlock(host);
-                mmcsd_detect_complete(host, RT_FALSE);
+                mmcsd_detect_complete(
+                    host,
+                    host->card ? MMCSD_HOST_PLUGED :
+                                 MMCSD_HOST_UNPLUGED,
+                    RT_FALSE);
             }
             else
             {
@@ -769,7 +791,11 @@ probe_mmc:
                 {
                     LOG_E("failed to remove block devices on %s", host->name);
                 }
-                mmcsd_detect_complete(host, RT_TRUE);
+                mmcsd_detect_complete(
+                    host,
+                    host->card ? MMCSD_HOST_PLUGED :
+                                 MMCSD_HOST_UNPLUGED,
+                    RT_TRUE);
             }
         }
     }
