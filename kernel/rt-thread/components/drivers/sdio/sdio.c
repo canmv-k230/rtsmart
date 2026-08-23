@@ -155,7 +155,11 @@ rt_int32_t sdio_io_rw_direct_host(struct rt_mmcsd_host *host,
     cmd.arg |= raw ? SDIO_ARG_CMD52_RAW_FLAG : 0x00000000;
     cmd.arg |= reg_addr << SDIO_ARG_CMD52_REG_SHIFT;
     cmd.arg |= *pdata;
-    cmd.flags = RESP_SPI_R5 | RESP_R5 | CMD_AC;
+    /* SDIO names both forms R5; SDHCI calls the I/O Abort form R5b
+     * so the controller waits for DAT[0] to leave the busy state. */
+    cmd.flags = RESP_SPI_R5 |
+        ((rw && fn == 0 && reg_addr == SDIO_REG_CCCR_IO_ABORT) ?
+            RESP_R5B : RESP_R5) | CMD_AC;
 
     err = mmcsd_send_cmd(host, &cmd, 0);
     if (err)
@@ -1147,6 +1151,7 @@ static void sdio_irq_thread(void *param)
 {
     rt_int32_t i, ret;
     rt_uint8_t pending;
+    rt_uint8_t int_en;
     struct rt_mmcsd_card *card;
     struct rt_mmcsd_host *host = (struct rt_mmcsd_host *)param;
     RT_ASSERT(host != RT_NULL);
@@ -1166,25 +1171,40 @@ static void sdio_irq_thread(void *param)
                 goto out;
             }
 
-            for (i = 1; i <= 7; i++) 
+            for (i = 1; i <= 7; i++)
             {
-                if (pending & (1 << i)) 
+                if (pending & (1 << i))
                 {
                     struct rt_sdio_function *func = card->sdio_function[i];
-                    if (!func) 
-                    {
-                        mmcsd_dbg("pending IRQ for "
-                            "non-existant function %d\n", func->num);
-                        goto out;
-                    } 
-                    else if (func->irq_handler) 
+                    if (func && func->irq_handler)
                     {
                         func->irq_handler(func);
-                    } 
-                    else 
+                        continue;
+                    }
+                    /* Nobody owns this function's interrupt: as long as the
+                     * bit stays enabled the card re-asserts DAT[1] the moment
+                     * this thread re-enables the host interrupt, spinning the
+                     * thread forever.  Mask it in the CCCR; sdio_attach_irq()
+                     * re-enables the bit when a handler is registered.  Say so
+                     * out loud - silently retiring a card interrupt for the
+                     * rest of the session is not a debug-level event. */
+                    LOG_W("SDIO: masking IRQ of function %d: %s", i,
+                        func ? "no handler registered" : "no such function");
+                    int_en = sdio_io_readb(card->sdio_function[0],
+                        SDIO_REG_CCCR_INT_EN, &ret);
+                    if (ret != RT_EOK)
                     {
-                        mmcsd_dbg("pending IRQ with no register handler\n");
-                        goto out;
+                        LOG_W("SDIO: failed to read INT_EN while masking "
+                              "function %d: %d", i, ret);
+                        continue;
+                    }
+                    int_en &= ~(1 << i);
+                    ret = sdio_io_writeb(card->sdio_function[0],
+                        SDIO_REG_CCCR_INT_EN, int_en);
+                    if (ret != RT_EOK)
+                    {
+                        LOG_W("SDIO: failed to mask IRQ of function %d: %d",
+                            i, ret);
                     }
                 }
             }
@@ -1201,23 +1221,37 @@ static void sdio_irq_thread(void *param)
 static rt_int32_t sdio_irq_thread_create(struct rt_mmcsd_card *card)
 {
     struct rt_mmcsd_host *host = card->host;
+    rt_err_t ret;
 
-    /* init semaphore and create sdio irq processing thread */
     if (!host->sdio_irq_num)
     {
-        host->sdio_irq_num++;
         host->sdio_irq_sem = rt_sem_create("sdio_irq", 0, RT_IPC_FLAG_FIFO);
-        RT_ASSERT(host->sdio_irq_sem != RT_NULL);
-
-        host->sdio_irq_thread = rt_thread_create("sdio_irq", sdio_irq_thread, host, 
-                             RT_SDIO_STACK_SIZE, RT_SDIO_THREAD_PRIORITY, 20);
-        if (host->sdio_irq_thread != RT_NULL) 
+        if (host->sdio_irq_sem == RT_NULL)
         {
-            rt_thread_startup(host->sdio_irq_thread);
+            return -RT_ENOMEM;
+        }
+
+        host->sdio_irq_thread = rt_thread_create(
+            "sdio_irq", sdio_irq_thread, host, RT_SDIO_STACK_SIZE,
+            RT_SDIO_THREAD_PRIORITY, 20);
+        if (host->sdio_irq_thread == RT_NULL)
+        {
+            rt_sem_delete(host->sdio_irq_sem);
+            host->sdio_irq_sem = RT_NULL;
+            return -RT_ENOMEM;
+        }
+        ret = rt_thread_startup(host->sdio_irq_thread);
+        if (ret != RT_EOK)
+        {
+            rt_thread_delete(host->sdio_irq_thread);
+            rt_sem_delete(host->sdio_irq_sem);
+            host->sdio_irq_thread = RT_NULL;
+            host->sdio_irq_sem = RT_NULL;
+            return ret;
         }
     }
-
-    return 0;
+    host->sdio_irq_num++;
+    return RT_EOK;
 }
 
 static rt_int32_t sdio_irq_thread_delete(struct rt_mmcsd_card *card)
@@ -1231,10 +1265,18 @@ static rt_int32_t sdio_irq_thread_delete(struct rt_mmcsd_card *card)
     {
         if (host->flags & MMCSD_SUP_SDIO_IRQ)
             host->ops->enable_sdio_irq(host, 0);
-        rt_sem_delete(host->sdio_irq_sem);
-        host->sdio_irq_sem = RT_NULL;
+        /* sdio_irq_thread() runs CMD52 with the host lock held.  Take it here
+         * so the thread cannot be destroyed mid-command, which would strand
+         * host->bus_lock and wedge every later request on this host.  The lock
+         * is recursive, so a caller already holding it is fine.  The thread
+         * must go before the semaphore it waits on, or it wakes on freed
+         * memory and spins. */
+        mmcsd_host_lock(host);
         rt_thread_delete(host->sdio_irq_thread);
         host->sdio_irq_thread = RT_NULL;
+        rt_sem_delete(host->sdio_irq_sem);
+        host->sdio_irq_sem = RT_NULL;
+        mmcsd_host_unlock(host);
     }
 
     return 0;
@@ -1244,41 +1286,61 @@ rt_int32_t sdio_attach_irq(struct rt_sdio_function *func,
                            rt_sdio_irq_handler_t   *handler)
 {
     rt_int32_t ret;
+    rt_int32_t restore_ret;
     rt_uint8_t reg;
+    rt_uint8_t old_reg;
     struct rt_sdio_function *func0;
+    struct rt_mmcsd_host *host;
 
     RT_ASSERT(func != RT_NULL);
     RT_ASSERT(func->card != RT_NULL);
 
     func0 = func->card->sdio_function[0];
+    host = func->card->host;
 
     mmcsd_dbg("SDIO: enabling IRQ for function %d\n", func->num);
 
-    if (func->irq_handler) 
+    mmcsd_host_lock(host);
+    if (func->irq_handler)
     {
         mmcsd_dbg("SDIO: IRQ for already in use.\n");
-
-        return -RT_EBUSY;
+        ret = -RT_EBUSY;
+        goto out;
     }
 
     reg = sdio_io_readb(func0, SDIO_REG_CCCR_INT_EN, &ret);
     if (ret)
-        return ret;
+        goto out;
+    old_reg = reg;
 
     reg |= 1 << func->num;
-
     reg |= 1; /* Master interrupt enable */
+
+    /* Publish the handler before enabling it in the CCCR.  The host lock also
+     * serializes this RMW with orphan masking in sdio_irq_thread(). */
+    func->irq_handler = handler;
 
     ret = sdio_io_writeb(func0, SDIO_REG_CCCR_INT_EN, reg);
     if (ret)
-        return ret;
-
-    func->irq_handler = handler;
+    {
+        func->irq_handler = RT_NULL;
+        goto out;
+    }
 
     ret = sdio_irq_thread_create(func->card);
     if (ret)
+    {
         func->irq_handler = RT_NULL;
+        restore_ret = sdio_io_writeb(func0, SDIO_REG_CCCR_INT_EN, old_reg);
+        if (restore_ret != RT_EOK)
+        {
+            LOG_W("SDIO: failed to restore INT_EN after IRQ attach "
+                  "failure: %d", restore_ret);
+        }
+    }
 
+out:
+    mmcsd_host_unlock(host);
     return ret;
 }
 
@@ -1287,23 +1349,23 @@ rt_int32_t sdio_detach_irq(struct rt_sdio_function *func)
     rt_int32_t ret;
     rt_uint8_t reg;
     struct rt_sdio_function *func0;
+    struct rt_mmcsd_host *host;
 
     RT_ASSERT(func != RT_NULL);
     RT_ASSERT(func->card != RT_NULL);
 
     func0 = func->card->sdio_function[0];
+    host = func->card->host;
 
     mmcsd_dbg("SDIO: disabling IRQ for function %d\n", func->num);
 
-    if (func->irq_handler) 
-    {
-        func->irq_handler = RT_NULL;
-        sdio_irq_thread_delete(func->card);
-    }
-
+    mmcsd_host_lock(host);
+    /* Disable in the CCCR before dropping the handler, the mirror image of
+     * sdio_attach_irq().  Holding the host lock serializes this RMW with the
+     * IRQ thread and with concurrent attach/detach operations. */
     reg = sdio_io_readb(func0, SDIO_REG_CCCR_INT_EN, &ret);
     if (ret)
-        return ret;
+        goto out;
 
     reg &= ~(1 << func->num);
 
@@ -1313,9 +1375,17 @@ rt_int32_t sdio_detach_irq(struct rt_sdio_function *func)
 
     ret = sdio_io_writeb(func0, SDIO_REG_CCCR_INT_EN, reg);
     if (ret)
-        return ret;
+        goto out;
 
-    return 0;
+    if (func->irq_handler)
+    {
+        func->irq_handler = RT_NULL;
+        sdio_irq_thread_delete(func->card);
+    }
+
+out:
+    mmcsd_host_unlock(host);
+    return ret;
 }
 
 void sdio_irq_wakeup(struct rt_mmcsd_host *host)

@@ -26,6 +26,7 @@
 static rt_list_t blk_devices = RT_LIST_OBJECT_INIT(blk_devices);
 
 #define BLK_MIN(a, b) ((a) < (b) ? (a) : (b))
+#define MMCSD_ERASE_TIMEOUT_MS 30000U
 
 static rt_uint32_t mmcsd_geometry_block_size(const struct rt_mmcsd_card *card)
 {
@@ -59,7 +60,10 @@ static int __send_status(struct rt_mmcsd_card *card, rt_uint32_t *status, unsign
     int err;
     struct rt_mmcsd_cmd cmd;
 
-    cmd.busy_timeout = 0;
+    /* mmcsd_send_cmd() only clears resp[], data, retries and err, so anything
+     * else a host driver reads - busy_timeout, for one - is stack garbage
+     * unless it is zeroed here. */
+    rt_memset(&cmd, 0, sizeof(cmd));
     cmd.cmd_code = SEND_STATUS;
     cmd.arg = card->rca << 16;
     cmd.flags = RESP_R1 | CMD_AC;
@@ -127,6 +131,8 @@ static rt_err_t mmcsd_send_erase_cmd(struct rt_mmcsd_card *card,
     cmd.cmd_code = cmd_code;
     cmd.arg = arg;
     cmd.flags = flags;
+    if ((flags & RESP_MASK) == RESP_R1B)
+        cmd.busy_timeout = MMCSD_ERASE_TIMEOUT_MS;
 
     err = mmcsd_send_cmd(card->host, &cmd, 0);
     if (err)
@@ -210,7 +216,7 @@ static rt_err_t mmcsd_erase_range(struct rt_mmcsd_card *card,
     if (err)
         return err;
 
-    return card_busy_detect(card, 30000, RT_NULL);
+    return card_busy_detect(card, MMCSD_ERASE_TIMEOUT_MS, RT_NULL);
 }
 
 rt_int32_t mmcsd_num_wr_blocks(struct rt_mmcsd_card *card)

@@ -71,7 +71,8 @@ struct rt_mmcsd_cmd
 #define RESP_R4     (5 << 0)
 #define RESP_R6     (6 << 0)
 #define RESP_R7     (7 << 0)
-#define RESP_R5     (8 << 0)    /*SDIO command response type*/
+#define RESP_R5     (8 << 0)    /* SDIO response */
+#define RESP_R5B    (9 << 0)    /* CMD52 I/O Abort: R5 with busy */
     /*command types
      *bits:4~5
      */

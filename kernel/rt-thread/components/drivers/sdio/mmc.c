@@ -291,6 +291,7 @@ static int mmc_switch(struct rt_mmcsd_card *card, rt_uint8_t set,
     cmd.arg = (MMC_SWITCH_MODE_WRITE_BYTE << 24) |
               (index << 16) | (value << 8) | set;
     cmd.flags = RESP_R1B | CMD_AC;
+    cmd.busy_timeout = MMC_CMD6_TIMEOUT_MS;
 
     err = mmcsd_send_cmd(host, &cmd, 3);
     if (err)

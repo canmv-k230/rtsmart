@@ -7,8 +7,16 @@
 #ifndef __DRV_SDHCI__
 #define __DRV_SDHCI__
 
+#include <rthw.h>
+
 #define false 0
 #define true 1
+/* Nothing in this header's include chain provides GENMASK; the masks below
+ * only expand when used, so a missing definition surfaces as a link error,
+ * not a compile error. */
+#ifndef GENMASK
+#define GENMASK(h, l) (((~0U) << (l)) & (~0U >> (31 - (h))))
+#endif
 #define SDEMMC0_BASE 0x91580000
 #define SDEMMC1_BASE 0x91581000
 #define IRQN_SD0 142
@@ -24,6 +32,8 @@
 
 #define SDHCI_BLOCK_SIZE 0x04
 #define SDHCI_MAKE_BLKSZ(dma, blksz) (((dma & 0x7) << 12) | (blksz & 0xFFF))
+#define SDHCI_DEFAULT_BOUNDARY_ARG 7U
+#define SDHCI_DEFAULT_BOUNDARY_SIZE (512U * 1024U)
 
 #define SDHCI_BLOCK_COUNT 0x06
 
@@ -115,6 +125,7 @@
 #define SDHCI_CLOCK_INT_EN 0x0001
 
 #define SDHCI_TIMEOUT_CONTROL 0x2E
+#define SDHCI_TIMEOUT_MAX 0x0E
 
 #define SDHCI_SOFTWARE_RESET 0x2F
 #define SDHCI_RESET_ALL 0x01
@@ -195,6 +206,7 @@
 #define SDHCI_TIMEOUT_CLK_UNIT 0x00000080
 #define SDHCI_CLOCK_BASE_MASK GENMASK(13, 8)
 #define SDHCI_CLOCK_V3_BASE_MASK GENMASK(15, 8)
+#define SDHCI_CLOCK_BASE_SHIFT 8
 #define SDHCI_MAX_BLOCK_MASK 0x00030000
 #define SDHCI_MAX_BLOCK_SHIFT 16
 #define SDHCI_CAN_DO_8BIT 0x00040000
@@ -220,6 +232,7 @@
 #define SDHCI_USE_SDR50_TUNING 0x00002000
 #define SDHCI_RETUNING_MODE_MASK GENMASK(15, 14)
 #define SDHCI_CLOCK_MUL_MASK GENMASK(23, 16)
+#define SDHCI_CLOCK_MUL_SHIFT 16
 #define SDHCI_CAN_DO_ADMA3 0x08000000
 #define SDHCI_SUPPORT_HS400 0x80000000 /* Non-standard */
 
@@ -434,7 +447,7 @@ enum sdhci_card_response_type
     card_response_type_r3 = 4U,   /*!< Response type: R3 */
     card_response_type_r4 = 5U,   /*!< Response type: R4 */
     card_response_type_r5 = 6U,   /*!< Response type: R5 */
-    card_response_type_r5b = 7U,  /*!< Response type: R5b */
+    card_response_type_r5b = 7U,  /*!< Response type: R5 with busy */
     card_response_type_r6 = 8U,   /*!< Response type: R6 */
     card_response_type_r7 = 9U,   /*!< Response type: R7 */
 };
@@ -456,6 +469,7 @@ struct sdhci_data
 
     size_t blockSize;       /*!< Block size */
     uint32_t blockCount;    /*!< Block count */
+    uint32_t timeoutMs;     /*!< Software completion timeout */
     uint32_t *rxData;       /*!< Buffer to save data read */
     const uint32_t *txData; /*!< Data buffer to write */
 };
@@ -474,6 +488,7 @@ struct sdhci_command
     uint32_t response[4U];                   /*!< Response for this command */
     uint32_t responseErrorFlags;             /*!< response error flag, the flag which need to check
                                                  the command reponse*/
+    uint32_t timeoutMs;                      /*!< Software completion timeout */
     uint16_t flags;                          /*!< Cmd flags */
     uint16_t flags2;                           /*xfer mode*/
 };
@@ -486,8 +501,23 @@ struct sdhci_host
     struct sdhci_command *sdhci_command;
     void *usdhc_adma2_table;
     struct rt_event event;
+    uint32_t sdma_start_addr;
+    uint32_t sdma_next_boundary;
+    /* Set once the SDMA engine has been handed an address and cleared when the
+     * transfer is over, so sdhci_irq() only advances the boundary of a
+     * transfer that is still running.  Written by the requesting thread and
+     * read by the handler; a single byte, so no locking. */
+    volatile uint8_t sdma_active;
+    uint32_t error_int_status;
+    uint32_t error_dma_address;
+    uint32_t error_present_state;
+    uint16_t error_block_count;
     uint16_t error_code;
     uint32_t max_clk;
+    void *sdma_bounce;
+    uint32_t clock_upper_bound;
+    rt_err_t clock_error;
+    uint8_t clk_mul;
     uint8_t index;
     uint8_t is_emmc_card;
     uint8_t io_fixed_1v8;
@@ -495,6 +525,12 @@ struct sdhci_host
     uint8_t mshc_ctrl_r;
     uint32_t rx_delay_line;
     uint32_t tx_delay_line;
+    /* The read-modify-writes of SDHCI_INT_ENABLE and SDHCI_SIGNAL_ENABLE are
+     * serialized against sdhci_irq() by a local interrupt disable, not a lock:
+     * sdhci_irq() reaches kd_enable_sdio_irq() through sdio_irq_wakeup(), so a
+     * real spinlock taken on both sides would deadlock against itself.  Adding
+     * SMP support here means making sdhci_irq() hand the mask update to the
+     * SDIO thread instead. */
 };
 
 void kd_sdhci_change(int id);

@@ -3229,7 +3229,7 @@ double sysctl_clk_get_leaf_div(sysctl_clk_node_e leaf)
             return 1;
 
         case SYSCTL_CLK_SD_CCLK_SRC:
-            return 1.0/(double)(((sysctl_clk->hs_sdclk_cfg >> 6) & 0x7) + 1);      /* maxinum = 1/2, 1/2, 1/3 --- 1/8 */
+            return 1.0/(double)(((sysctl_clk->hs_sdclk_cfg >> 12) & 0x7) + 1);      /* maxinum = 1/2, 1/2, 1/3 --- 1/8 */
         case SYSCTL_CLK_SD_0_CCLK_GATE:
         case SYSCTL_CLK_SD_1_CCLK_GATE:
             return 1;
