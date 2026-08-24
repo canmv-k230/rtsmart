@@ -1,11 +1,11 @@
 menuconfig RT_USING_CYW43XX
-    bool "CYW43xx SDIO Wi-Fi"
-    depends on RT_USING_WIFI && RT_USING_SDIO
+    bool "CYW43xx SDIO Wi-Fi (Recommend use brcmfmac)"
+    depends on RT_USING_WIFI && RT_USING_SDIO && !RT_USING_BRCMFMAC
     default n
     help
-        Enable the CYW43xx SDIO Wi-Fi driver. It may be built together with
-        other SDIO Wi-Fi drivers; the SDIO manufacturer and product IDs
-        select the driver at runtime.
+        Enable the legacy CYW43xx SDIO Wi-Fi driver. It is mutually
+        exclusive with the native brcmfmac port because both drivers claim
+        the same Broadcom SDIO device IDs.
 
     if RT_USING_CYW43XX
         menu "Thread Settings"

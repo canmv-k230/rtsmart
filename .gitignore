@@ -59,3 +59,4 @@ kernel/bsp/maix3/romfs.c
 
 # repo-managed firmware project
 kernel/bsp/maix3/drivers/extdrv/aic8800/firmware/
+!kernel/bsp/maix3/drivers/extdrv/brcmfmac/firmware/*.bin

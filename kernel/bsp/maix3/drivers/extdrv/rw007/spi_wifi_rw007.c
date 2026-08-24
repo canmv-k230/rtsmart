@@ -703,7 +703,7 @@ static int wlan_send(struct rt_wlan_device *wlan, void *buff, int len)
     rt_mb_send(&hspi->spi_tx_mb, (rt_ubase_t)data_packet);
     rt_event_send(&spi_wifi_data_event, RW007_MASTER_DATA);
 
-    return len;
+    return RT_EOK;
 }
 
 const static struct rt_wlan_dev_ops ops =

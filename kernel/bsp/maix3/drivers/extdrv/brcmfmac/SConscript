@@ -1,0 +1,48 @@
+import os
+
+from building import *
+
+cwd = GetCurrentDir()
+src = [
+    'brcmfmac_proto.c',
+    'brcmfmac_chip.c',
+    'brcmfmac_sdio.c',
+    'brcmfmac_wifi.c',
+]
+
+CPPPATH = [
+    cwd,
+    cwd + '/../../../../../rt-thread/components/drivers/wlan/offload',
+]
+if GetDepend('RT_USING_PUFS'):
+    CPPPATH += [
+        cwd + '/../../interdrv/cipher/puf_fw/pufs_rt',
+        cwd + '/../../interdrv/cipher/puf_fw/pufs_common',
+    ]
+
+group = DefineGroup('brcmfmac', src, depend=['RT_USING_BRCMFMAC'],
+                    CPPPATH=CPPPATH)
+
+if GetDepend('RT_USING_BRCMFMAC'):
+    firmware_stage = os.getenv('RTSMART_FIRMWARE_STAGE_DIR')
+    if not firmware_stage:
+        raise RuntimeError('RTSMART_FIRMWARE_STAGE_DIR is not set')
+
+    destination = os.path.join(firmware_stage, 'brcmfmac')
+    firmware_targets = []
+    for directory, subdirectories, filenames in os.walk(
+            os.path.join(cwd, 'firmware')):
+        subdirectories.sort()
+        filenames.sort()
+        relative = os.path.relpath(directory, os.path.join(cwd, 'firmware'))
+        target_directory = destination if relative == '.' else \
+            os.path.join(destination, relative)
+        for filename in filenames:
+            source = os.path.join(directory, filename)
+            target = os.path.join(target_directory, filename)
+            firmware_targets += Env.InstallAs(target, source)
+
+    Env.Depends(File('#/rtthread.elf'), firmware_targets)
+    Env.Alias('brcmfmac-firmware', firmware_targets)
+
+Return('group')

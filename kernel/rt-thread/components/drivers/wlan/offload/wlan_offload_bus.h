@@ -56,6 +56,12 @@ enum rt_wlan_offload_bus_priority
 
 struct rt_wlan_offload_bus;
 
+struct rt_wlan_offload_bus_iovec
+{
+    const void *data;
+    rt_size_t length;
+};
+
 /* Return -RT_EEMPTY for padding/no frame and another error for malformed RX. */
 typedef rt_err_t (*rt_wlan_offload_bus_rx_handler_t)(struct rt_wlan_offload_bus *bus,
                                                 const void *data,
@@ -76,6 +82,9 @@ struct rt_wlan_offload_bus_ops
     rt_err_t (*transmit_priority)(struct rt_wlan_offload_bus *bus,
                                  enum rt_wlan_offload_bus_priority priority,
                                  const void *data, rt_size_t length);
+    rt_err_t (*transmitv)(struct rt_wlan_offload_bus *bus,
+                          const struct rt_wlan_offload_bus_iovec *vectors,
+                          rt_size_t vector_count);
     rt_err_t (*reset)(struct rt_wlan_offload_bus *bus);
     rt_err_t (*suspend)(struct rt_wlan_offload_bus *bus);
     rt_err_t (*resume)(struct rt_wlan_offload_bus *bus);
@@ -124,6 +133,9 @@ rt_err_t rt_wlan_offload_bus_transmit(struct rt_wlan_offload_bus *bus,
 rt_err_t rt_wlan_offload_bus_transmit_priority(
     struct rt_wlan_offload_bus *bus, enum rt_wlan_offload_bus_priority priority,
     const void *data, rt_size_t length);
+rt_err_t rt_wlan_offload_bus_transmitv(
+    struct rt_wlan_offload_bus *bus, enum rt_wlan_offload_bus_priority priority,
+    const struct rt_wlan_offload_bus_iovec *vectors, rt_size_t vector_count);
 rt_err_t rt_wlan_offload_bus_reset(struct rt_wlan_offload_bus *bus);
 rt_err_t rt_wlan_offload_bus_suspend(struct rt_wlan_offload_bus *bus);
 rt_err_t rt_wlan_offload_bus_resume(struct rt_wlan_offload_bus *bus);

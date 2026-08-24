@@ -252,6 +252,62 @@ rt_err_t rt_wlan_offload_bus_transmit_priority(
     return result;
 }
 
+rt_err_t rt_wlan_offload_bus_transmitv(
+    struct rt_wlan_offload_bus *bus, enum rt_wlan_offload_bus_priority priority,
+    const struct rt_wlan_offload_bus_iovec *vectors, rt_size_t vector_count)
+{
+    rt_size_t total_length = 0;
+    rt_size_t index;
+    rt_err_t result;
+
+    if (!bus || !vectors || !vector_count ||
+        (int)priority < RT_WLAN_OFFLOAD_BUS_PRIORITY_LOW ||
+        priority > RT_WLAN_OFFLOAD_BUS_PRIORITY_CONTROL)
+    {
+        return -RT_EINVAL;
+    }
+    for (index = 0; index < vector_count; index++)
+    {
+        if (!vectors[index].data || !vectors[index].length ||
+            total_length > (rt_size_t)-1 - vectors[index].length)
+        {
+            return -RT_EINVAL;
+        }
+        total_length += vectors[index].length;
+    }
+
+    result = rt_mutex_take(&bus->tx_lock, RT_WAITING_FOREVER);
+    if (result != RT_EOK)
+    {
+        return result;
+    }
+    result = wlan_offload_bus_lock(bus);
+    if (result != RT_EOK)
+    {
+        rt_mutex_release(&bus->tx_lock);
+        return result;
+    }
+    if (bus->state != RT_WLAN_OFFLOAD_BUS_STARTED)
+    {
+        result = -RT_EBUSY;
+    }
+    else if ((bus->max_tx_size && total_length > bus->max_tx_size) ||
+             !bus->ops->transmitv)
+    {
+        result = bus->ops->transmitv ? -RT_EINVAL : -RT_ENOSYS;
+    }
+    else
+    {
+        rt_mutex_release(&bus->state_lock);
+        result = bus->ops->transmitv(bus, vectors, vector_count);
+        rt_mutex_release(&bus->tx_lock);
+        return result;
+    }
+    rt_mutex_release(&bus->state_lock);
+    rt_mutex_release(&bus->tx_lock);
+    return result;
+}
+
 rt_err_t rt_wlan_offload_bus_reset(struct rt_wlan_offload_bus *bus)
 {
     rt_err_t result;

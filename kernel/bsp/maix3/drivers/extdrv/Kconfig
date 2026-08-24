@@ -3,6 +3,7 @@ menu "External Drivers"
 menu "Wi-Fi Drivers"
     source "drivers/extdrv/rw007/Kconfig"
     source "drivers/extdrv/cyw43xx/Kconfig"
+    source "drivers/extdrv/brcmfmac/Kconfig"
     source "drivers/extdrv/realtek/Kconfig"
     source "drivers/extdrv/aic8800/Kconfig"
     source "drivers/extdrv/esp_hosted/Kconfig"
@@ -11,6 +12,7 @@ menu "Wi-Fi Drivers"
     config BSP_USING_WIFI_SDIO
         bool
         default y if RT_USING_CYW43XX
+        default y if RT_USING_BRCMFMAC
         default y if RT_USING_REALTEK
         default y if RT_USING_RTL8189
         default y if AIC8800_WIFI_TRANSPORT_SDIO

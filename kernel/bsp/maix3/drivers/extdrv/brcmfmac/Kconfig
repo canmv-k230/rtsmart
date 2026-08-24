@@ -1,0 +1,171 @@
+menuconfig RT_USING_BRCMFMAC
+    bool "Broadcom FullMAC (brcmfmac) SDIO Wi-Fi"
+    depends on RT_USING_WIFI && RT_USING_SDIO
+    depends on RT_USING_DFS
+    select RT_WLAN_OFFLOAD
+    select RT_WLAN_OFFLOAD_CONTROL
+    select RT_USING_TIMER_SOFT
+    default n
+    help
+        Enable the native RT-Smart port of Linux brcmfmac for Broadcom and
+        Cypress FullMAC SDIO devices. The first supported target is the
+        BCM43430A1 device (02d0:a9a6), with a chip/firmware mapping
+        table for additional Broadcom and Cypress FullMAC SDIO devices.
+        Firmware owns authentication, association, WPA/WPA2 key exchange, and
+        AP operation; RT-Thread WLAN management and lwIP are connected through
+        the WLAN offload framework.
+
+if RT_USING_BRCMFMAC
+
+config BRCMFMAC_FIRMWARE_PATH
+    string "Installed firmware directory"
+    default "/bin/firmware/brcmfmac"
+
+config BRCMFMAC_COUNTRY_CODE
+    string "Regulatory country code"
+    default "CN"
+
+config BRCMFMAC_COUNTRY_REVISION
+    int "Regulatory country revision"
+    range 0 999
+    default 0
+    help
+        Use revision 0 for BCM43430, matching both Linux brcmfmac ISO 3166
+        fallback and the K230 SDK bcmdhd configuration.
+
+config BRCMFMAC_BCM43430A1_NVRAM
+    string "BCM43430A1 board NVRAM file"
+    default "nvram.txt"
+    help
+        Select the NVRAM matching the installed BCM43430A1 module.
+        The K230 CanMV default uses the nvram.txt calibration shipped with
+        its Linux SDK. nvram_ap6212.txt remains available for boards whose
+        module and RF layout match that AP6212A V1.0.2 calibration.
+
+config BRCMFMAC_INIT_THREAD_STACK_SIZE
+    int "Initialization worker stack size"
+    range 8192 32768
+    default 12288
+
+config BRCMFMAC_INIT_THREAD_PRIORITY
+    int "Initialization worker priority"
+    range 5 30
+    default 14
+    help
+        Keep this at lower urgency (numerically greater) than the RX and TX
+        worker priorities.
+        Firmware responses must run ahead of the initialization worker that
+        waits for them.
+
+config BRCMFMAC_RX_THREAD_PRIORITY
+    int "Receive thread priority"
+    range 1 31
+    default 11
+    help
+        Keep this numerically greater than the lwIP TCP/IP thread priority so
+        packet delivery cannot fill the TCP/IP mailbox before lwIP runs.
+
+config BRCMFMAC_RX_THREAD_STACK_SIZE
+    int "Receive thread stack size"
+    range 4096 32768
+    default 8192
+
+config BRCMFMAC_TX_THREAD_PRIORITY
+    int "Transmit thread priority"
+    range 1 31
+    default 12
+
+config BRCMFMAC_TX_THREAD_STACK_SIZE
+    int "Transmit thread stack size"
+    range 2048 16384
+    default 4096
+
+config BRCMFMAC_TX_QUEUE_DEPTH
+    int "Transmit queue depth"
+    range 16 2048
+    default 256
+    help
+        Linux brcmfmac uses a 2048-packet queue. The smaller RT-Smart default
+        still leaves enough buffering to keep a full SDPCM credit window busy
+        without consuming several megabytes of kernel heap.
+
+config BRCMFMAC_TX_QUEUE_WAIT_MS
+    int "Transmit queue backpressure timeout (ms)"
+    range 0 5000
+    default 1000
+    help
+        Time to wait for the TX worker when the bounded queue is full. The
+        wait provides the queue stop/wake backpressure used by Linux brcmfmac,
+        pacing the direct lwIP transmit path to the firmware credit rate. If
+        the timeout expires, the frame is consumed as a normal link-layer drop
+        because returning a temporary error causes a tight sender retry loop.
+
+config BRCMFMAC_TX_GLOM_FRAMES
+    int "Maximum frames per SDIO transmit aggregate"
+    range 1 32
+    default 32
+    help
+        Queue and combine Ethernet frames into the host-to-firmware SDPCM
+        format used by Linux brcmfmac. This reduces CMD53 setup overhead.
+
+config BRCMFMAC_TX_GLOM_WAIT_MS
+    int "Transmit aggregation wait (ms)"
+    range 0 10
+    default 1
+
+config BRCMFMAC_TX_RETRIES
+    int "SDIO control transmit retries after bus errors"
+    range 0 5
+    default 2
+    help
+        Abort and terminate a failed function-2 control frame, then retry it
+        with the same SDPCM sequence number. Linux does not retry failed data
+        aggregates because firmware may already have consumed complete
+        subframes before the SDIO error.
+
+config BRCMFMAC_SDIO_WATCHDOG_MS
+    int "SDIO watchdog interval (ms)"
+    range 1 20
+    default 10
+    help
+        Run software timeout handling at this interval. Like Linux brcmfmac,
+        idle watchdog ticks do not poll SDIO interrupt status; a TX credit wait
+        explicitly requests a status scan when firmware progress is needed.
+
+config BRCMFMAC_TX_CREDIT_TIMEOUT_MS
+    int "Transmit credit stall warning interval (ms)"
+    range 500 30000
+    default 2000
+    help
+        Report prolonged SDPCM data-credit stalls at this interval. Data stays
+        queued, as in Linux brcmfmac; only command timeouts and actual SDIO
+        failures are treated as transport faults.
+
+config BRCMFMAC_TX_CREDIT_POLL_MS
+    int "Transmit credit wait interval (ms)"
+    range 1 20
+    default 2
+    help
+        Recheck the SDPCM credit window at this interval while waiting for a
+        firmware update. The receive watchdog scans device interrupt status
+        when a card interrupt is lost or delayed.
+
+config BRCMFMAC_CONTROL_TIMEOUT_MS
+    int "Firmware command timeout (ms)"
+    range 1000 30000
+    default 5000
+
+config BRCMFMAC_CONNECT_TIMEOUT_MS
+    int "Firmware connection event timeout (ms)"
+    range 1000 9000
+    default 9000
+    help
+        Fail an in-progress connection when firmware does not report a result.
+        This must remain below RT-Thread WLAN management's 10 second wait so
+        the failure event clears both driver and offload request state.
+
+config BRCMFMAC_VERIFY_FIRMWARE
+    bool "Verify firmware download"
+    default n
+
+endif

@@ -1365,7 +1365,7 @@ rt_int32_t sdio_detach_irq(struct rt_sdio_function *func)
      * IRQ thread and with concurrent attach/detach operations. */
     reg = sdio_io_readb(func0, SDIO_REG_CCCR_INT_EN, &ret);
     if (ret)
-        goto out;
+        goto detach;
 
     reg &= ~(1 << func->num);
 
@@ -1375,15 +1375,18 @@ rt_int32_t sdio_detach_irq(struct rt_sdio_function *func)
 
     ret = sdio_io_writeb(func0, SDIO_REG_CCCR_INT_EN, reg);
     if (ret)
-        goto out;
+        goto detach;
 
+detach:
+    /* Once teardown begins, retaining a software callback is less safe than a
+     * stale device-side enable bit. The host caller masks its controller IRQ,
+     * and orphan handling masks any source seen after a partial detach. */
     if (func->irq_handler)
     {
         func->irq_handler = RT_NULL;
         sdio_irq_thread_delete(func->card);
     }
 
-out:
     mmcsd_host_unlock(host);
     return ret;
 }
@@ -1615,7 +1618,14 @@ rt_int32_t sdio_unregister_driver(struct rt_sdio_driver *driver)
         card = sdio_match_driver(driver->id);
         if (card != RT_NULL)
         {
-            driver->remove(card);
+            rt_int32_t result = driver->remove(card);
+
+            if (result != RT_EOK)
+            {
+                LOG_E("SDIO driver %s removal incomplete: %d",
+                      driver->name, result);
+                return result;
+            }
             rt_list_remove(&sd->list);
             rt_free(sd);
         }
