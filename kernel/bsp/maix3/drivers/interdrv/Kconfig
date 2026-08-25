@@ -367,6 +367,13 @@ menu "InterDriver"
                     bool "SDIO0 device is 1.8V"
                     default n
 
+                config RT_SDIO0_HS200
+                    bool "Enable SDIO0 eMMC HS200"
+                    depends on RT_SDIO0_EMMC && RT_SDIO0_1V8
+                    default n
+                    help
+                        Advertise HS200 support for validated 1.8V eMMC boards.
+
                 choice
                     bool "SDIO0 Bus Max Width"
                     default SDIO0_BUS_WIDTH_4BIT

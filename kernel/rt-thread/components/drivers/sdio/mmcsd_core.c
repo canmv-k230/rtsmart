@@ -413,9 +413,17 @@ void mmcsd_set_chip_select(struct rt_mmcsd_host *host, rt_int32_t mode)
  */
 void mmcsd_set_clock(struct rt_mmcsd_host *host, rt_uint32_t clk)
 {
-    if (clk < host->freq_min)
+    if (clk != 0 && clk < host->freq_min)
     {
-        LOG_W("clock too low!");
+        LOG_W("%s clock %u Hz below minimum %u Hz, clamping",
+              host->name, clk, host->freq_min);
+        clk = host->freq_min;
+    }
+    else if (host->freq_max != 0 && clk > host->freq_max)
+    {
+        LOG_W("%s clock %u Hz exceeds maximum %u Hz, clamping",
+              host->name, clk, host->freq_max);
+        clk = host->freq_max;
     }
 
     host->io_cfg.clock = clk;

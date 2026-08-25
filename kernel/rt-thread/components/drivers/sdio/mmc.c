@@ -646,7 +646,6 @@ static rt_err_t mmc_set_card_addr(struct rt_mmcsd_host *host, rt_uint32_t rca)
 static int mmc_select_hs200(struct rt_mmcsd_card *card)
 {
     int ret;
-    rt_uint32_t status = 0;
 
     ret = mmc_switch(card, EXT_CSD_CMD_SET_NORMAL,
                      EXT_CSD_HS_TIMING, EXT_CSD_TIMING_HS200);
@@ -656,13 +655,8 @@ static int mmc_select_hs200(struct rt_mmcsd_card *card)
     mmcsd_set_timing(card->host, MMCSD_TIMING_MMC_HS200);
     mmcsd_set_clock(card->host, 200000000);
 
-    ret = mmc_send_status(card, &status);
-    if (ret || !(status & R1_READY_FOR_DATA))
-    {
-        LOG_W("eMMC HS200 switch status failed, err=%d, status=0x%08x.", ret, status);
-        return ret ? ret : -RT_ERROR;
-    }
-
+    /* Commands at 200 MHz are unreliable until tuning completes. mmc_switch()
+     * already verified readiness at the previous timing, so tune immediately. */
     ret = mmcsd_excute_tuning(card);
 
     return ret;

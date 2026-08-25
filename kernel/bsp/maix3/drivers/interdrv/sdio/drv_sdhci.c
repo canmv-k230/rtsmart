@@ -30,7 +30,7 @@
 #ifdef RT_SDIO_DEBUG
 #define DBG_LVL DBG_LOG
 #else
-#define DBG_LVL DBG_WARNING
+#define DBG_LVL DBG_INFO
 #endif /* RT_SDIO_DEBUG */
 #include <rtdbg.h>
 
@@ -71,7 +71,10 @@
 #define SDHCI0_BASE_CLOCK 200000000U
 #define SDHCI1_BASE_CLOCK 100000000U
 #define SDHCI_CARD_MIN_CLOCK 400000U
-#define SDHCI_CARD_MAX_CLOCK 50000000U
+#define SDHCI0_CARD_MAX_CLOCK 200000000U
+#define SDHCI1_CARD_MAX_CLOCK 50000000U
+
+#define DWC_MSHC_MAX_DELAY 255U
 #define CARD_IS_EMMC 0
 #define EMMC_RST_N 2
 #define EMMC_RST_N_OE 3
@@ -224,35 +227,44 @@ static void dwcmshc_phy_3_3v_init(struct sdhci_host* host)
     sdhci_writew(host, DWC_MSHC_PHY_PAD_SD_DAT, DWC_MSHC_RSTNPAD_CNFG);
 }
 
-static void dwcmshc_phy_delay_config(struct sdhci_host* host)
+static rt_err_t dwcmshc_set_tx_delay(struct sdhci_host* host,
+                                     rt_uint32_t delay)
 {
+    uint16_t clk;
     uint8_t sdclkdl_cnfg;
     uint8_t sdclkdl_dc;
 
-    sdhci_writeb(host, 1, DWC_MSHC_COMMDL_CNFG);
-    if (host->tx_delay_line > 256) {
-        LOG_E("host%d: tx_delay_line err\n", host->index);
-    } else if (host->tx_delay_line > 128) {
+    if (delay > DWC_MSHC_MAX_DELAY) {
+        LOG_E("host%d invalid tx delay %u", host->index, delay);
+        return -RT_EINVAL;
+    }
+
+    clk = sdhci_readw(host, SDHCI_CLOCK_CONTROL);
+    sdhci_writew(host, clk & ~SDHCI_CLOCK_CARD_EN, SDHCI_CLOCK_CONTROL);
+
+    if (delay >= 128U) {
         sdclkdl_cnfg = 0x1;
-        sdclkdl_dc = host->tx_delay_line - 128;
+        sdclkdl_dc = delay - 128U;
     } else {
         sdclkdl_cnfg = 0x0;
-        sdclkdl_dc = host->tx_delay_line;
+        sdclkdl_dc = delay;
     }
+
     sdhci_writeb(host, sdclkdl_cnfg | BIT(4), DWC_MSHC_SDCLKDL_CNFG);
     sdhci_writeb(host, sdclkdl_dc & 0x7f, DWC_MSHC_SDCLKDL_DC);
     sdhci_writeb(host, sdclkdl_cnfg, DWC_MSHC_SDCLKDL_CNFG);
+    sdhci_writew(host, clk, SDHCI_CLOCK_CONTROL);
+    host->tx_delay_line = delay;
+    cpu_ticks_delay_us(1);
+
+    return RT_EOK;
+}
+
+static void dwcmshc_phy_delay_config(struct sdhci_host* host)
+{
+    sdhci_writeb(host, 1, DWC_MSHC_COMMDL_CNFG);
+    (void)dwcmshc_set_tx_delay(host, host->tx_delay_line);
     sdhci_writeb(host, host->rx_delay_line, DWC_MSHC_SMPLDL_CNFG);
-#if 0 // tuning is not stable, need further investigation
-    sdhci_writeb(host, 0xc, DWC_MSHC_ATDL_CNFG);
-    sdhci_writel(host, sdhci_readl(host, SDHCI_VENDER_AT_CTRL_REG) |
-        SDHCI_TUNE_AT_EN | SDHCI_TUNE_SWIN_TH_EN | SDHCI_TUNE_CLK_STOP_EN_MASK |
-        (SDHCI_TUNE_PRE_CHANGE_DLY_VAL << SDHCI_TUNE_PRE_CHANGE_DLY_LSB) |
-        (SDHCI_TUNE_POST_CHANGE_DLY_VAL << SDHCI_TUNE_POST_CHANGE_DLY_LSB) |
-        (SDHCI_TUNE_SWIN_TH_VAL << SDHCI_TUNE_SWIN_TH_VAL_LSB),
-        SDHCI_VENDER_AT_CTRL_REG);
-    sdhci_writel(host, 0x0, SDHCI_VENDER_AT_STAT_REG);
-#endif
 }
 
 static int dwcmshc_phy_init(struct sdhci_host* host)
@@ -1288,10 +1300,9 @@ static rt_err_t kd_mmc_clock_freq_change(struct sdhci_host* host, uint32_t clock
     /* This DWC core latches a new divider only after leaving programmable
      * clock mode.  Keep the internal clock running, but gate the card clock
      * and clear the generator select before changing the divider. */
-    sdhci_writew(host,
-        sdhci_readw(host, SDHCI_CLOCK_CONTROL) &
-            ~(SDHCI_CLOCK_CARD_EN | SDHCI_PROG_CLOCK_MODE),
-        SDHCI_CLOCK_CONTROL);
+    val = sdhci_readw(host, SDHCI_CLOCK_CONTROL);
+    val &= ~(SDHCI_CLOCK_CARD_EN | SDHCI_PROG_CLOCK_MODE);
+    sdhci_writew(host, val, SDHCI_CLOCK_CONTROL);
     host->clock_upper_bound = 0;
     if (clock == 0)
         return RT_EOK;
@@ -1301,18 +1312,24 @@ static rt_err_t kd_mmc_clock_freq_change(struct sdhci_host* host, uint32_t clock
         source_clk *= (rt_uint64_t)host->clk_mul + 1U;
 
     /* K230 needs the programmable-mode select bit even when the capability
-     * multiplier is zero.  In that non-standard combination the core's
-     * divider semantics are not documented, so use the N + 1 encoding.  It
-     * gives the requested upper bound if programmable semantics apply; if the
-     * core instead keeps the standard 2N interpretation, the resulting clock
-     * is no faster. */
+     * multiplier is zero.  The multiplier still determines the divider
+     * encoding: N + 1 when programmable mode is advertised, otherwise the
+     * standard SDHCI 2N encoding used by the K230 U-Boot driver. */
     div = (uint32_t)((source_clk + clock - 1U) / clock);
-    if (div > 1024U)
-        div = 1024U;
-    encoded_div = div - 1U;
+    if (host->clk_mul) {
+        if (div > 1024U)
+            div = 1024U;
+        encoded_div = div - 1U;
+    } else {
+        if (div > 1U && (div & 1U))
+            div++;
+        if (div > SDHCI_MAX_DIV_SPEC_300)
+            div = SDHCI_MAX_DIV_SPEC_300;
+        encoded_div = div >> 1;
+    }
     host->clock_upper_bound = (uint32_t)(source_clk / div);
 
-    val |= SDHCI_PROG_CLOCK_MODE;
+    val = SDHCI_PROG_CLOCK_MODE;
     val |= (encoded_div & SDHCI_DIV_MASK) << SDHCI_DIVIDER_SHIFT;
     val |= ((encoded_div & SDHCI_DIV_HI_MASK) >> SDHCI_DIV_MASK_LEN)
         << SDHCI_DIVIDER_HI_SHIFT;
@@ -1327,10 +1344,11 @@ static rt_err_t kd_mmc_clock_freq_change(struct sdhci_host* host, uint32_t clock
     }
     val |= SDHCI_CLOCK_CARD_EN;
     sdhci_writew(host, val, SDHCI_CLOCK_CONTROL);
-    LOG_I("host%d clock source=%u requested=%u actual_max=%u "
-          "mode=programmable divider=%s div=%u control=0x%04x",
-        host->index, host->max_clk, clock, host->clock_upper_bound,
-        host->clk_mul ? "N+1" : "N+1-safe", div, val);
+    LOG_D("host%d clock source=%llu requested=%u actual=%u mode=%s "
+          "div=%u encoded_div=%u control=0x%04x",
+        host->index, (unsigned long long)source_clk, clock,
+        host->clock_upper_bound, host->clk_mul ? "N+1" : "2N", div,
+        encoded_div, sdhci_readw(host, SDHCI_CLOCK_CONTROL));
     return RT_EOK;
 }
 
@@ -1397,6 +1415,7 @@ static void kd_set_iocfg(struct rt_mmcsd_host* host, struct rt_mmcsd_io_cfg* io_
     struct sdhci_host* mmcsd;
     unsigned int sdhci_clk;
     unsigned int bus_width;
+    uint32_t old_clock;
     rt_err_t ret;
     uint8_t ctrl;
     RT_ASSERT(host != RT_NULL);
@@ -1407,8 +1426,10 @@ static void kd_set_iocfg(struct rt_mmcsd_host* host, struct rt_mmcsd_io_cfg* io_
     sdhci_clk = io_cfg->clock;
     bus_width = io_cfg->bus_width;
 
-    LOG_D("%s: sdhci_clk=%d, bus_width:%d, timing:%d\n",
+    LOG_D("%s: sdhci_clk=%u, bus_width:%u, timing:%u",
         __func__, sdhci_clk, bus_width, io_cfg->timing);
+
+    old_clock = mmcsd->clock_upper_bound;
 
     /* Gate the card clock while the bus width, timing and divider change.
      * Requesting 0 Hz cannot fail, so there is nothing to check here. */
@@ -1441,6 +1462,9 @@ static void kd_set_iocfg(struct rt_mmcsd_host* host, struct rt_mmcsd_io_cfg* io_
         if (ret != RT_EOK)
             LOG_E("host%d failed to apply %u Hz clock", mmcsd->index,
                 sdhci_clk);
+        else if (old_clock != mmcsd->clock_upper_bound)
+            LOG_D("SDIO%d bus frequency: requested=%u Hz, actual=%u Hz",
+                mmcsd->index, sdhci_clk, mmcsd->clock_upper_bound);
     }
 }
 
@@ -1580,20 +1604,21 @@ static rt_err_t kd_sdhci_init_host0(void *hi_sys_virt_addr)
 
     mmcsd->ops = &ops;
     mmcsd->freq_min = SDHCI_CARD_MIN_CLOCK;
-    mmcsd->freq_max = SDHCI_CARD_MAX_CLOCK;
+    mmcsd->freq_max = SDHCI0_CARD_MAX_CLOCK;
     strncpy(mmcsd->name, "sd0", sizeof(mmcsd->name) - 1);
     mmcsd->flags = SDIO0_BUS_WIDTH_FLAGS | MMCSD_MUTBLKWRITE |
                    MMCSD_SUP_HIGHSPEED | MMCSD_SUP_SDIO_IRQ;
     if (sdhci->is_emmc_card) {
         mmcsd->flags |= MMCSD_SUP_NONREMOVABLE;
-#if 0
+#if 0 // K230 ddr52 or ddr25 seems not stable.
         if (sdhci->io_fixed_1v8)
             mmcsd->flags |= MMCSD_SUP_DDR_1V8;
         else
             mmcsd->flags |= MMCSD_SUP_DDR_3V3;
+#endif
 
-        if (sdhci->io_fixed_1v8)
-            mmcsd->flags |= MMCSD_SUP_HS200_1V8;
+#ifdef RT_SDIO0_HS200
+        mmcsd->flags |= MMCSD_SUP_HS200_1V8;
 #endif
     }
     mmcsd->valid_ocr = sdhci->io_fixed_1v8 ?
@@ -1677,7 +1702,7 @@ static rt_err_t kd_sdhci_init_host1(void *hi_sys_virt_addr)
     strncpy(mmcsd->name, "sd1", sizeof(mmcsd->name) - 1);
     mmcsd->ops = &ops;
     mmcsd->freq_min = SDHCI_CARD_MIN_CLOCK;
-    mmcsd->freq_max = SDHCI_CARD_MAX_CLOCK;
+    mmcsd->freq_max = SDHCI1_CARD_MAX_CLOCK;
     mmcsd->valid_ocr = VDD_32_33 | VDD_33_34;
     mmcsd->flags = MMCSD_BUSWIDTH_4 | MMCSD_MUTBLKWRITE |
                    MMCSD_SUP_HIGHSPEED | MMCSD_SUP_SDIO_IRQ;

@@ -11,10 +11,11 @@
 #endif
 
 #include "drv_gpio.h"
-#include "drv_sdhci.h"
 #include "sysctl_boot.h"
 
 #if defined(RT_USING_SDIO0) || defined(RT_USING_SDIO1)
+
+#include "drv_sdhci.h"
 
 #define DBG_TAG "board.sdio"
 #define DBG_LVL DBG_INFO
