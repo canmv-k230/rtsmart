@@ -286,27 +286,72 @@ rt_inline int _serial_poll_rx(struct rt_serial_device *serial, rt_uint8_t *data,
     return size - length;
 }
 
+#define RT_SERIAL_POLL_TX_RETRY_COUNT 3
+
+rt_inline int _serial_poll_putc(struct rt_serial_device *serial, char ch)
+{
+    int result;
+    int retries = RT_SERIAL_POLL_TX_RETRY_COUNT;
+
+    do
+    {
+        result = serial->ops->putc(serial, ch);
+    }
+    while (result < 0 && retries-- > 0);
+
+    /*
+    * Do not log failures from a stream-mode console because logging
+    * would re-enter the same UART transmit path. Failures on other
+    * UART devices remain visible through the console.
+    */
+    if (result < 0 && !(serial->parent.open_flag & RT_DEVICE_FLAG_STREAM))
+    {
+        LOG_E("%s putc fail", serial->parent.parent.name);
+    }
+
+    return result;
+}
+
 rt_inline int _serial_poll_tx(struct rt_serial_device *serial, const rt_uint8_t *data, int length)
 {
     int size;
     RT_ASSERT(serial != RT_NULL);
 
     size = length;
-    while (length)
+    if (serial->parent.open_flag & RT_DEVICE_FLAG_STREAM)
     {
-        /*
-         * to be polite with serial console add a line feed
-         * to the carriage return character
-         */
-        if (*data == '\n' && (serial->parent.open_flag & RT_DEVICE_FLAG_STREAM))
+        while (length)
         {
-            serial->ops->putc(serial, '\r');
+            /* Insert CR before LF in stream mode. */
+            if (*data == '\n')
+            {
+                if (_serial_poll_putc(serial, '\r') < 0)
+                {
+                    break;
+                }
+            }
+
+            if (_serial_poll_putc(serial, *data) < 0)
+            {
+                break;
+            }
+
+            ++ data;
+            -- length;
         }
+    }
+    else
+    {
+        while (length)
+        {
+            if (_serial_poll_putc(serial, *data) < 0)
+            {
+                break;
+            }
 
-        serial->ops->putc(serial, *data);
-
-        ++ data;
-        -- length;
+            ++ data;
+            -- length;
+        }
     }
 
     return size - length;

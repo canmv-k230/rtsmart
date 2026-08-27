@@ -476,9 +476,9 @@ static int drv_uart_putc(struct rt_serial_device* serial, char c)
                 break;
             }
 
-            // Timeout occurred
-            rt_kprintf("urt%d ptc tmo\n", inst->uart.index);
-
+            /* Do not log through the UART from its putc callback. If this is
+             * the console UART, rt_kprintf() re-enters this function and can
+             * recurse until the stack is exhausted while TX remains stuck. */
             return -RT_ETIMEOUT;
         }
     }
