@@ -36,6 +36,12 @@ struct cfg_save_info_head
     rt_uint32_t crc;
 };
 
+struct rt_wlan_cfg_info_v1
+{
+    struct rt_wlan_info info;
+    struct rt_wlan_key key;
+};
+
 struct rt_wlan_cfg_des
 {
     rt_uint32_t num;
@@ -135,7 +141,10 @@ rt_err_t rt_wlan_cfg_cache_refresh(void)
     int len = 0, i, j;
     struct cfg_save_info_head *head;
     void *data;
-    struct rt_wlan_cfg_info *t_info, *cfg_info;
+    struct rt_wlan_cfg_info *t_info;
+    struct rt_wlan_cfg_info loaded_info;
+    rt_size_t entry_size;
+    rt_size_t payload_size;
     rt_uint32_t crc;
     rt_bool_t equal_flag;
 
@@ -151,7 +160,7 @@ rt_err_t rt_wlan_cfg_cache_refresh(void)
 
     WLAN_CFG_LOCK();
     /* get data len */
-    if ((len = cfg_ops->get_len()) <= 0)
+    if ((len = cfg_ops->get_len()) < (int)sizeof(struct cfg_save_info_head))
     {
         WLAN_CFG_UNLOCK();
         return -RT_ERROR;
@@ -172,15 +181,30 @@ rt_err_t rt_wlan_cfg_cache_refresh(void)
     }
     /* get config */
     data = ((rt_uint8_t *)head) + sizeof(struct cfg_save_info_head);
-    crc = rt_wlan_cal_crc((rt_uint8_t *)data, len - sizeof(struct cfg_save_info_head));
-    LOG_D("head->magic:0x%08x  RT_WLAN_CFG_MAGIC:0x%08x", head->magic, RT_WLAN_CFG_MAGIC);
+    payload_size = len - sizeof(struct cfg_save_info_head);
+    crc = rt_wlan_cal_crc((rt_uint8_t *)data, payload_size);
+    if (head->magic == RT_WLAN_CFG_MAGIC)
+    {
+        entry_size = sizeof(struct rt_wlan_cfg_info);
+    }
+    else if (head->magic == RT_WLAN_CFG_MAGIC_V1)
+    {
+        entry_size = sizeof(struct rt_wlan_cfg_info_v1);
+    }
+    else
+    {
+        entry_size = 0;
+    }
+    LOG_D("head->magic:0x%08x RT_WLAN_CFG_MAGIC:0x%08x", head->magic, RT_WLAN_CFG_MAGIC);
     LOG_D("head->len:%d len:%d", head->len, len);
-    LOG_D("head->num:%d num:%d", head->num, (len - sizeof(struct cfg_save_info_head)) / sizeof(struct rt_wlan_cfg_info));
+    LOG_D("head->num:%d num:%d", head->num,
+          entry_size ? payload_size / entry_size : 0);
     LOG_D("hred->crc:0x%04x crc:0x%04x", head->crc, crc);
     /* check */
-    if ((head->magic != RT_WLAN_CFG_MAGIC) ||
+    if ((entry_size == 0) ||
             (head->len != len) ||
-            (head->num != (len - sizeof(struct cfg_save_info_head)) / sizeof(struct rt_wlan_cfg_info)) ||
+            (payload_size % entry_size != 0) ||
+            (head->num != payload_size / entry_size) ||
             (head->crc != crc))
     {
         rt_free(head);
@@ -189,16 +213,36 @@ rt_err_t rt_wlan_cfg_cache_refresh(void)
     }
 
     /* remove duplicate config */
-    cfg_info = (struct rt_wlan_cfg_info *)data;
     for (i = 0; i < head->num; i++)
     {
+        rt_memset(&loaded_info, 0, sizeof(loaded_info));
+        if (head->magic == RT_WLAN_CFG_MAGIC_V1)
+        {
+            const struct rt_wlan_cfg_info_v1 *old_info =
+                &((const struct rt_wlan_cfg_info_v1 *)data)[i];
+
+            loaded_info.info = old_info->info;
+            loaded_info.key = old_info->key;
+            loaded_info.band_locked = RT_FALSE;
+        }
+        else
+        {
+            loaded_info = ((const struct rt_wlan_cfg_info *)data)[i];
+        }
+        if (loaded_info.band_locked &&
+            loaded_info.info.band != RT_802_11_BAND_2_4GHZ &&
+            loaded_info.info.band != RT_802_11_BAND_5GHZ)
+        {
+            loaded_info.band_locked = RT_FALSE;
+        }
+
         equal_flag = RT_FALSE;
         for (j = 0; j < cfg_cache->num; j++)
         {
-            if ((cfg_cache->cfg_info[j].info.ssid.len == cfg_info[i].info.ssid.len) &&
-                    (rt_memcmp(&cfg_cache->cfg_info[j].info.ssid.val[0], &cfg_info[i].info.ssid.val[0],
+            if ((cfg_cache->cfg_info[j].info.ssid.len == loaded_info.info.ssid.len) &&
+                    (rt_memcmp(&cfg_cache->cfg_info[j].info.ssid.val[0], &loaded_info.info.ssid.val[0],
                                cfg_cache->cfg_info[j].info.ssid.len) == 0) &&
-                    (rt_memcmp(&cfg_cache->cfg_info[j].info.bssid[0], &cfg_info[i].info.bssid[0], RT_WLAN_BSSID_MAX_LENGTH) == 0))
+                    (rt_memcmp(&cfg_cache->cfg_info[j].info.bssid[0], &loaded_info.info.bssid[0], RT_WLAN_BSSID_MAX_LENGTH) == 0))
             {
                 equal_flag = RT_TRUE;
                 break;
@@ -220,7 +264,7 @@ rt_err_t rt_wlan_cfg_cache_refresh(void)
                 return -RT_ERROR;
             }
             cfg_cache->cfg_info = t_info;
-            cfg_cache->cfg_info[cfg_cache->num] = cfg_info[i];
+            cfg_cache->cfg_info[cfg_cache->num] = loaded_info;
             cfg_cache->num ++;
         }
     }
@@ -261,7 +305,10 @@ rt_err_t rt_wlan_cfg_save(struct rt_wlan_cfg_info *cfg_info)
     rt_wlan_cfg_init();
 
     /* parameter check */
-    if ((cfg_info == RT_NULL) || (cfg_info->info.ssid.len == 0))
+    if ((cfg_info == RT_NULL) || (cfg_info->info.ssid.len == 0) ||
+        (cfg_info->band_locked &&
+         cfg_info->info.band != RT_802_11_BAND_2_4GHZ &&
+         cfg_info->info.band != RT_802_11_BAND_5GHZ))
     {
         return -RT_EINVAL;
     }
@@ -280,7 +327,8 @@ rt_err_t rt_wlan_cfg_save(struct rt_wlan_cfg_info *cfg_info)
     }
 
     if ((idx == 0) && (cfg_cache->cfg_info[i].key.len == cfg_info->key.len) &&
-            (rt_memcmp(&cfg_cache->cfg_info[i].key.val[0], &cfg_info->key.val[0], cfg_info->key.len) == 0))
+            (rt_memcmp(&cfg_cache->cfg_info[i].key.val[0], &cfg_info->key.val[0], cfg_info->key.len) == 0) &&
+            (cfg_cache->cfg_info[i].band_locked == cfg_info->band_locked))
     {
         WLAN_CFG_UNLOCK();
         return RT_EOK;
@@ -399,8 +447,8 @@ void rt_wlan_cfg_dump(void)
 
     rt_wlan_cfg_init();
 
-    rt_kprintf("             SSID                           PASSWORD                   MAC                   security                  chn\n");
-    rt_kprintf("------------------------------- ------------------------------- -----------------  ----------------------------  ---\n");
+    rt_kprintf("             SSID                           PASSWORD                   MAC                   security                  chn band\n");
+    rt_kprintf("------------------------------- ------------------------------- -----------------  ----------------------------  --- ----\n");
     for (index = 0; index < cfg_cache->num; index ++)
     {
         info = &cfg_cache->cfg_info[index].info;
@@ -426,7 +474,10 @@ void rt_wlan_cfg_dump(void)
                   );
         security = rt_wlan_security_name(info->security);
         rt_kprintf("%-28.28s  ", security);
-        rt_kprintf("%3d    \n", info->channel);
+        rt_kprintf("%3d %4s\n", info->channel,
+                   cfg_cache->cfg_info[index].band_locked ?
+                   (info->band == RT_802_11_BAND_5GHZ ? "5g" : "2g") :
+                   "auto");
     }
 }
 

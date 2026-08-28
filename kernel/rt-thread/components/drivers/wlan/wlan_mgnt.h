@@ -95,6 +95,11 @@ rt_err_t rt_wlan_mgnt_unregister_device(struct rt_wlan_device *device);
  * wifi station mode interface
  */
 rt_err_t rt_wlan_connect(const char *ssid, const char *password);
+rt_err_t rt_wlan_connect_by_band(const char *ssid, const char *password,
+                                 rt_802_11_band_t band);
+/* info->band is validated as scan metadata but does not constrain the current
+ * connection or automatic reconnect. Use rt_wlan_connect_by_band() to enforce
+ * a band, and initialize manually constructed info with INVALID_INFO(). */
 rt_err_t rt_wlan_connect_adv(struct rt_wlan_info *info, const char *password);
 rt_err_t rt_wlan_disconnect(void);
 rt_bool_t rt_wlan_is_connected(void);

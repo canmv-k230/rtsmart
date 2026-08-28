@@ -570,6 +570,7 @@ struct rt_sta_info
     rt_wlan_key_t key;
     rt_uint8_t bssid[6];
     rt_uint16_t channel;
+    rt_802_11_band_t band;
     rt_wlan_security_t security;
 };
 

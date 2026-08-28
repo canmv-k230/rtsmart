@@ -21,12 +21,14 @@ extern "C" {
 #define RT_WLAN_CFG_INFO_MAX    (3) /* min is 1 */
 #endif
 
-#define RT_WLAN_CFG_MAGIC       (0x426f6d62)
+#define RT_WLAN_CFG_MAGIC_V1    (0x426f6d62)
+#define RT_WLAN_CFG_MAGIC       (0x426f6d63)
 
 struct rt_wlan_cfg_info
 {
     struct rt_wlan_info info;
     struct rt_wlan_key key;
+    rt_bool_t band_locked;
 };
 
 typedef int (*rt_wlan_wr)(void *buff, int len);

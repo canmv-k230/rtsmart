@@ -73,6 +73,7 @@ struct rt_wlan_mgnt_des
     struct rt_wlan_device *device;
     struct rt_wlan_info info;
     struct rt_wlan_key key;
+    rt_bool_t band_locked;
     rt_uint8_t state;
     rt_uint8_t flags;
 };
@@ -130,6 +131,23 @@ static struct rt_wlan_info *scan_filter;
 static struct rt_timer reconnect_time;
 #endif
 
+static rt_err_t rt_wlan_save_sta_config(void)
+{
+#ifdef RT_WLAN_CFG_ENABLE
+    struct rt_wlan_cfg_info cfg_info;
+
+    rt_memset(&cfg_info, 0, sizeof(cfg_info));
+    rt_enter_critical();
+    cfg_info.info = _sta_mgnt.info;
+    cfg_info.key = _sta_mgnt.key;
+    cfg_info.band_locked = _sta_mgnt.band_locked;
+    rt_exit_critical();
+    return rt_wlan_cfg_save(&cfg_info);
+#else
+    return RT_EOK;
+#endif
+}
+
 rt_inline int _sta_is_null(void)
 {
     if (_sta_mgnt.device == RT_NULL)
@@ -181,6 +199,11 @@ static rt_bool_t rt_wlan_info_isequ(struct rt_wlan_info *info1, struct rt_wlan_i
     {
         is_equ &= rt_memcmp(&info1->bssid[0], &info2->bssid[0], RT_WLAN_BSSID_MAX_LENGTH) == 0;
     }
+    if (is_equ && (info1->band != RT_802_11_BAND_UNKNOWN) &&
+        (info2->band != RT_802_11_BAND_UNKNOWN))
+    {
+        is_equ &= info1->band == info2->band;
+    }
     if (is_equ && info1->datarate && info2->datarate)
     {
         is_equ &= info1->datarate == info2->datarate;
@@ -226,20 +249,14 @@ static void rt_wlan_mgnt_work(void *parameter)
     {
     case RT_WLAN_EVT_STA_CONNECTED:
     {
-        struct rt_wlan_cfg_info cfg_info;
-
-        rt_memset(&cfg_info, 0, sizeof(cfg_info));
         /* save config */
         if (rt_wlan_is_connected() == RT_TRUE)
         {
-            rt_enter_critical();
-            cfg_info.info = _sta_mgnt.info;
-            cfg_info.key = _sta_mgnt.key;
-            rt_exit_critical();
             RT_WLAN_LOG_D("run save config! ssid:%s len%d", _sta_mgnt.info.ssid.val, _sta_mgnt.info.ssid.len);
-#ifdef RT_WLAN_CFG_ENABLE
-            rt_wlan_cfg_save(&cfg_info);
-#endif
+            if (rt_wlan_save_sta_config() != RT_EOK)
+            {
+                RT_WLAN_LOG_W("save config failed");
+            }
         }
         break;
     }
@@ -546,7 +563,10 @@ static void rt_wlan_auto_connect_run(struct rt_work *work, void *parameter)
         cfg_info.key.val[cfg_info.key.len] = '\0';
         password = (char *)(&cfg_info.key.val[0]);
     }
-    rt_wlan_connect((char *)cfg_info.info.ssid.val, password);
+    rt_wlan_connect_by_band(
+        (char *)cfg_info.info.ssid.val, password,
+        cfg_info.band_locked ? cfg_info.info.band :
+                               RT_802_11_BAND_UNKNOWN);
 exit:
     if (mgnt_locked)
     {
@@ -1168,11 +1188,13 @@ rt_wlan_mode_t rt_wlan_get_mode(const char *dev_name)
     return mode;
 }
 
-rt_bool_t rt_wlan_find_best_by_cache(const char *ssid, struct rt_wlan_info *info)
+static rt_bool_t rt_wlan_find_best_by_cache_band(
+    const char *ssid, rt_802_11_band_t band, struct rt_wlan_info *info)
 {
     int i, ssid_len;
     struct rt_wlan_info *info_best;
     struct rt_wlan_scan_result *result;
+    rt_bool_t found = RT_FALSE;
 
     ssid_len = rt_strlen(ssid);
     result = &scan_result;
@@ -1183,7 +1205,9 @@ rt_bool_t rt_wlan_find_best_by_cache(const char *ssid, struct rt_wlan_info *info
     {
         /* SSID is equal. */
         if ((result->info[i].ssid.len == ssid_len) &&
-                (rt_memcmp((char *)&result->info[i].ssid.val[0], ssid, ssid_len) == 0))
+                (rt_memcmp((char *)&result->info[i].ssid.val[0], ssid, ssid_len) == 0) &&
+                (band == RT_802_11_BAND_UNKNOWN ||
+                 result->info[i].band == band))
         {
             if (info_best == RT_NULL)
             {
@@ -1237,16 +1261,35 @@ rt_bool_t rt_wlan_find_best_by_cache(const char *ssid, struct rt_wlan_info *info
             }
         }
     }
+    if (info_best != RT_NULL)
+    {
+        *info = *info_best;
+        found = RT_TRUE;
+    }
     SRESULT_UNLOCK();
 
-    if (info_best == RT_NULL)
-        return RT_FALSE;
-
-    *info = *info_best;
-    return RT_TRUE;
+    return found;
 }
 
-rt_err_t rt_wlan_connect(const char *ssid, const char *password)
+rt_bool_t rt_wlan_find_best_by_cache(const char *ssid, struct rt_wlan_info *info)
+{
+    return rt_wlan_find_best_by_cache_band(
+        ssid, RT_802_11_BAND_UNKNOWN, info);
+}
+
+static rt_bool_t rt_wlan_band_is_valid(rt_802_11_band_t band)
+{
+    return band == RT_802_11_BAND_UNKNOWN ||
+           band == RT_802_11_BAND_2_4GHZ ||
+           band == RT_802_11_BAND_5GHZ;
+}
+
+static rt_err_t rt_wlan_connect_adv_internal(struct rt_wlan_info *info,
+                                              const char *password,
+                                              rt_bool_t band_locked);
+
+rt_err_t rt_wlan_connect_by_band(const char *ssid, const char *password,
+                                 rt_802_11_band_t band)
 {
     rt_err_t err = RT_EOK;
     int ssid_len = 0;
@@ -1255,6 +1298,11 @@ rt_err_t rt_wlan_connect(const char *ssid, const char *password)
     struct rt_wlan_complete_des *complete;
     rt_uint32_t set = 0, recved = 0;
     rt_uint32_t scan_retry = RT_WLAN_SCAN_RETRY_CNT;
+
+    if (!rt_wlan_band_is_valid(band))
+    {
+        return -RT_EINVAL;
+    }
 
     /* sta dev Can't be NULL */
     if (_sta_is_null() &&
@@ -1277,8 +1325,21 @@ rt_err_t rt_wlan_connect(const char *ssid, const char *password)
     }
 
     if ((rt_wlan_is_connected() == RT_TRUE) &&
-            (rt_strcmp((char *)&_sta_mgnt.info.ssid.val[0], ssid) == 0))
+            (rt_strcmp((char *)&_sta_mgnt.info.ssid.val[0], ssid) == 0) &&
+            (band == RT_802_11_BAND_UNKNOWN ||
+             _sta_mgnt.info.band == band))
     {
+        rt_bool_t band_locked = band != RT_802_11_BAND_UNKNOWN;
+        rt_bool_t policy_changed;
+
+        rt_enter_critical();
+        policy_changed = _sta_mgnt.band_locked != band_locked;
+        _sta_mgnt.band_locked = band_locked;
+        rt_exit_critical();
+        if (policy_changed && rt_wlan_save_sta_config() != RT_EOK)
+        {
+            RT_WLAN_LOG_W("save band policy failed");
+        }
         RT_WLAN_LOG_I("wifi is connect ssid:%s", ssid);
         return RT_EOK;
     }
@@ -1286,8 +1347,10 @@ rt_err_t rt_wlan_connect(const char *ssid, const char *password)
     INVALID_INFO(&info);
     INVALID_INFO(&scan_info);
     SSID_SET(&scan_info, ssid);
+    scan_info.band = band;
     MGNT_LOCK();
-    while (scan_retry-- && rt_wlan_find_best_by_cache(ssid, &info) != RT_TRUE)
+    while (scan_retry-- &&
+           rt_wlan_find_best_by_cache_band(ssid, band, &info) != RT_TRUE)
     {
         /* Match the reference cfg80211 path: include the requested SSID so
          * firmware sends a directed probe instead of relying on beacons and
@@ -1298,13 +1361,17 @@ rt_err_t rt_wlan_connect(const char *ssid, const char *password)
 
     if (info.ssid.len <= 0)
     {
-        RT_WLAN_LOG_W("not find ap! ssid:%s", ssid);
+        RT_WLAN_LOG_W("not find ap! ssid:%s band:%d", ssid, band);
         MGNT_UNLOCK();
         return -RT_ERROR;
     }
 
-    RT_WLAN_LOG_D("find best info ssid:%s mac: %02x %02x %02x %02x %02x %02x",
-                  info.ssid.val, info.bssid[0], info.bssid[1], info.bssid[2], info.bssid[3], info.bssid[4], info.bssid[5]);
+    RT_WLAN_LOG_I("selected BSS %02x:%02x:%02x:%02x:%02x:%02x band=%s channel=%d RSSI=%d rate=%u Mbps",
+                  info.bssid[0], info.bssid[1], info.bssid[2],
+                  info.bssid[3], info.bssid[4], info.bssid[5],
+                  info.band == RT_802_11_BAND_5GHZ ? "5g" : "2g",
+                  info.channel, info.rssi,
+                  (unsigned int)(info.datarate / 1000000U));
 
     /* create event wait complete */
     complete = rt_wlan_complete_create("join");
@@ -1314,7 +1381,8 @@ rt_err_t rt_wlan_connect(const char *ssid, const char *password)
         return -RT_ENOMEM;
     }
     /* run connect adv */
-    err = rt_wlan_connect_adv(&info, password);
+    err = rt_wlan_connect_adv_internal(
+        &info, password, band != RT_802_11_BAND_UNKNOWN);
     if (err != RT_EOK)
     {
         rt_wlan_complete_delete(complete);
@@ -1340,10 +1408,19 @@ rt_err_t rt_wlan_connect(const char *ssid, const char *password)
     return err;
 }
 
-rt_err_t rt_wlan_connect_adv(struct rt_wlan_info *info, const char *password)
+rt_err_t rt_wlan_connect(const char *ssid, const char *password)
+{
+    return rt_wlan_connect_by_band(
+        ssid, password, RT_802_11_BAND_UNKNOWN);
+}
+
+static rt_err_t rt_wlan_connect_adv_internal(struct rt_wlan_info *info,
+                                              const char *password,
+                                              rt_bool_t band_locked)
 {
     int password_len = 0;
     rt_err_t err = RT_EOK;
+    struct rt_wlan_info connect_info;
 
     if (_sta_is_null() &&
         rt_wlan_select_device(RT_WLAN_STATION,
@@ -1354,6 +1431,12 @@ rt_err_t rt_wlan_connect_adv(struct rt_wlan_info *info, const char *password)
     if (info == RT_NULL)
     {
         RT_WLAN_LOG_E("info is null!");
+        return -RT_EINVAL;
+    }
+    if (!rt_wlan_band_is_valid(info->band) ||
+        (band_locked && info->band == RT_802_11_BAND_UNKNOWN))
+    {
+        RT_WLAN_LOG_E("invalid band:%d", info->band);
         return -RT_EINVAL;
     }
     RT_WLAN_LOG_D("%s is run ssid:%s password:%s", __FUNCTION__, info->ssid.val, password);
@@ -1382,8 +1465,19 @@ rt_err_t rt_wlan_connect_adv(struct rt_wlan_info *info, const char *password)
                 (rt_memcmp(&_sta_mgnt.info.bssid[0], &info->bssid[0], RT_WLAN_BSSID_MAX_LENGTH) == 0) &&
                 (rt_memcmp(&_sta_mgnt.key.val[0], password, password_len) == 0))
         {
+            rt_bool_t policy_changed;
+
+            rt_enter_critical();
+            policy_changed = _sta_mgnt.band_locked != band_locked;
+            _sta_mgnt.band_locked = band_locked;
+            rt_exit_critical();
             RT_WLAN_LOG_I("wifi Already Connected");
             MGNT_UNLOCK();
+
+            if (policy_changed && rt_wlan_save_sta_config() != RT_EOK)
+            {
+                RT_WLAN_LOG_W("save band policy failed");
+            }
 
             /* send event */
             COMPLETE_LOCK();
@@ -1415,15 +1509,23 @@ rt_err_t rt_wlan_connect_adv(struct rt_wlan_info *info, const char *password)
     rt_memcpy(&_sta_mgnt.key.val, password, password_len);
     _sta_mgnt.key.len = password_len;
     _sta_mgnt.key.val[password_len] = '\0';
+    _sta_mgnt.band_locked = band_locked;
     rt_exit_critical();
     /* run wifi connect */
     _sta_mgnt.state |= RT_WLAN_STATE_CONNECTING;
-    err = rt_wlan_dev_connect(_sta_mgnt.device, info, password, password_len);
+    connect_info = *info;
+    if (!band_locked)
+    {
+        connect_info.band = RT_802_11_BAND_UNKNOWN;
+    }
+    err = rt_wlan_dev_connect(_sta_mgnt.device, &connect_info, password,
+                              password_len);
     if (err != RT_EOK)
     {
         rt_enter_critical();
         rt_memset(&_sta_mgnt.info, 0, sizeof(struct rt_wlan_ssid));
         rt_memset(&_sta_mgnt.key, 0, sizeof(struct rt_wlan_key));
+        _sta_mgnt.band_locked = RT_FALSE;
         rt_exit_critical();
         _sta_mgnt.state &= ~RT_WLAN_STATE_CONNECTING;
         MGNT_UNLOCK();
@@ -1432,6 +1534,11 @@ rt_err_t rt_wlan_connect_adv(struct rt_wlan_info *info, const char *password)
 
     MGNT_UNLOCK();
     return err;
+}
+
+rt_err_t rt_wlan_connect_adv(struct rt_wlan_info *info, const char *password)
+{
+    return rt_wlan_connect_adv_internal(info, password, RT_FALSE);
 }
 
 rt_err_t rt_wlan_disconnect(void)

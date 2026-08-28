@@ -27,10 +27,21 @@ static int wifi_devices(int argc, char *argv[]);
 static int wifi_scan(int argc, char *argv[]);
 static int wifi_status(int argc, char *argv[]);
 static int wifi_join(int argc, char *argv[]);
+static int wifi_join_with_band(int argc, char *argv[],
+                               rt_bool_t band_selected,
+                               rt_802_11_band_t selected_band);
 static int wifi_ap(int argc, char *argv[]);
+static int wifi_ap_with_radio(int argc, char *argv[],
+                              rt_bool_t band_selected,
+                              rt_802_11_band_t selected_band,
+                              rt_bool_t channel_selected,
+                              int selected_channel);
 static int wifi_list_sta(int argc, char *argv[]);
 static int wifi_disconnect(int argc, char *argv[]);
 static int wifi_ap_stop(int argc, char *argv[]);
+static rt_bool_t wifi_parse_band(const char *name,
+                                 rt_802_11_band_t *band,
+                                 int *default_channel);
 
 #ifdef RT_WLAN_CMD_DEBUG
 /* just for debug  */
@@ -82,8 +93,8 @@ static int wifi_help(int argc, char *argv[])
     rt_kprintf("wifi help\n");
     rt_kprintf("wifi devices\n");
     rt_kprintf("wifi [-i DEVICE] scan [SSID]\n");
-    rt_kprintf("wifi [-i DEVICE] join [SSID] [PASSWORD]\n");
-    rt_kprintf("wifi [-i DEVICE] ap SSID [PASSWORD] [2g|5g] [CHANNEL]\n");
+    rt_kprintf("wifi [-i DEVICE] [-b 2g|5g] join SSID [PASSWORD]\n");
+    rt_kprintf("wifi [-i DEVICE] [-b 2g|5g] [-c CHANNEL] ap SSID [PASSWORD]\n");
     rt_kprintf("wifi [-i DEVICE] list_sta\n");
     rt_kprintf("wifi [-i DEVICE] disc\n");
     rt_kprintf("wifi [-i DEVICE] ap_stop\n");
@@ -389,9 +400,19 @@ static int wifi_scan(int argc, char *argv[])
 
 static int wifi_join(int argc, char *argv[])
 {
+    return wifi_join_with_band(argc, argv, RT_FALSE,
+                               RT_802_11_BAND_UNKNOWN);
+}
+
+static int wifi_join_with_band(int argc, char *argv[],
+                               rt_bool_t band_selected,
+                               rt_802_11_band_t selected_band)
+{
     const char *ssid = RT_NULL;
     const char *key = RT_NULL;
     struct rt_wlan_cfg_info cfg_info;
+    rt_802_11_band_t band = band_selected ? selected_band :
+                                             RT_802_11_BAND_UNKNOWN;
     rt_err_t result;
 
     rt_memset(&cfg_info, 0, sizeof(cfg_info));
@@ -404,6 +425,8 @@ static int wifi_join(int argc, char *argv[])
             ssid = (char *)(&cfg_info.info.ssid.val[0]);
             if (cfg_info.key.len)
                 key = (char *)(&cfg_info.key.val[0]);
+            if (!band_selected && cfg_info.band_locked)
+                band = cfg_info.info.band;
         }
         else
 #endif
@@ -419,14 +442,13 @@ static int wifi_join(int argc, char *argv[])
     else if (argc == 4)
     {
         ssid = argv[2];
-        /* password */
         key = argv[3];
     }
     else
     {
         return -1;
     }
-    result = rt_wlan_connect(ssid, key);
+    result = rt_wlan_connect_by_band(ssid, key, band);
     if (result != RT_EOK)
     {
         rt_kprintf("wifi join failed: %d\n", result);
@@ -434,9 +456,9 @@ static int wifi_join(int argc, char *argv[])
     return result;
 }
 
-static rt_bool_t wifi_ap_parse_band(const char *name,
-                                    rt_802_11_band_t *band,
-                                    int *default_channel)
+static rt_bool_t wifi_parse_band(const char *name,
+                                 rt_802_11_band_t *band,
+                                 int *default_channel)
 {
     if (rt_strcmp(name, "2g") == 0 ||
         rt_strcmp(name, "2.4") == 0 ||
@@ -486,68 +508,39 @@ static rt_bool_t wifi_ap_parse_channel(const char *text, int *channel)
 
 static int wifi_ap(int argc, char *argv[])
 {
+    return wifi_ap_with_radio(argc, argv, RT_FALSE,
+                              RT_802_11_BAND_2_4GHZ, RT_FALSE, 6);
+}
+
+static int wifi_ap_with_radio(int argc, char *argv[],
+                              rt_bool_t band_selected,
+                              rt_802_11_band_t selected_band,
+                              rt_bool_t channel_selected,
+                              int selected_channel)
+{
     const char *ssid = RT_NULL;
     const char *key = RT_NULL;
-    rt_802_11_band_t band = RT_802_11_BAND_2_4GHZ;
-    int channel = 6;
-    rt_bool_t channel_selected = RT_FALSE;
+    rt_802_11_band_t band = selected_band;
+    int channel = selected_channel;
     int result;
 
-    if (argc < 3 || argc > 6)
+    if (argc < 3 || argc > 4)
     {
         return -1;
     }
     ssid = argv[2];
-
     if (argc == 4)
     {
-        if (wifi_ap_parse_band(argv[3], &band, &channel))
-        {
-            channel_selected = RT_TRUE;
-        }
-        else
-        {
-            key = argv[3];
-        }
-    }
-    else if (argc == 5)
-    {
-        channel_selected = RT_TRUE;
-        if (wifi_ap_parse_band(argv[3], &band, &channel))
-        {
-            if (!wifi_ap_parse_channel(argv[4], &channel))
-            {
-                rt_kprintf("invalid channel\n");
-                return -RT_EINVAL;
-            }
-        }
-        else
-        {
-            key = argv[3];
-            if (!wifi_ap_parse_band(argv[4], &band, &channel))
-            {
-                rt_kprintf("invalid band: use 2g or 5g\n");
-                return -RT_EINVAL;
-            }
-        }
-    }
-    else if (argc == 6)
-    {
-        channel_selected = RT_TRUE;
         key = argv[3];
-        if (!wifi_ap_parse_band(argv[4], &band, &channel))
-        {
-            rt_kprintf("invalid band: use 2g or 5g\n");
-            return -RT_EINVAL;
-        }
-        if (!wifi_ap_parse_channel(argv[5], &channel))
-        {
-            rt_kprintf("invalid channel\n");
-            return -RT_EINVAL;
-        }
     }
 
-    if (channel_selected)
+    if (channel_selected && !band_selected)
+    {
+        band = channel <= 14 ? RT_802_11_BAND_2_4GHZ :
+                               RT_802_11_BAND_5GHZ;
+    }
+
+    if (band_selected || channel_selected)
     {
         result = rt_wlan_start_ap_with_channel(ssid, key, band, channel);
     }
@@ -632,6 +625,7 @@ static int wifi_debug_save_cfg(int argc, char *argv[])
 
     rt_memset(&cfg_info, 0, sizeof(cfg_info));
     INVALID_INFO(&cfg_info.info);
+    cfg_info.band_locked = RT_FALSE;
     if (argc == 2)
     {
         ssid = argv[1];
@@ -816,6 +810,11 @@ static int wifi_msh(int argc, char *argv[])
     int i, command_index = 1, command_argc, result = 0;
     const char *selector = RT_NULL;
     const struct wifi_cmd_des *run_cmd = RT_NULL;
+    rt_802_11_band_t selected_band = RT_802_11_BAND_UNKNOWN;
+    rt_bool_t band_selected = RT_FALSE;
+    rt_bool_t channel_selected = RT_FALSE;
+    int selected_channel = 0;
+    int default_channel = 0;
     char *command_argv[argc];
 
     if (argc == 1)
@@ -824,15 +823,76 @@ static int wifi_msh(int argc, char *argv[])
         return 0;
     }
 
-    if (rt_strcmp(argv[1], "-i") == 0)
+    if (rt_strcmp(argv[command_index], "-i") == 0)
     {
-        if (argc < 4)
+        if (command_index + 1 >= argc)
         {
-            wifi_help(argc, argv);
+            rt_kprintf("wifi: missing device after -i\n");
             return 0;
         }
-        selector = argv[2];
-        command_index = 3;
+        selector = argv[command_index + 1];
+        command_index += 2;
+    }
+
+    while (command_index < argc)
+    {
+        if (rt_strcmp(argv[command_index], "-b") == 0 ||
+            rt_strcmp(argv[command_index], "--band") == 0)
+        {
+            if (band_selected)
+            {
+                rt_kprintf("wifi: band specified more than once\n");
+                return 0;
+            }
+            if (command_index + 1 >= argc)
+            {
+                rt_kprintf("wifi: missing band value after -b/--band\n");
+                return 0;
+            }
+            if (!wifi_parse_band(argv[command_index + 1], &selected_band,
+                                 &default_channel))
+            {
+                rt_kprintf("wifi: invalid band value, use 2g or 5g\n");
+                return 0;
+            }
+            if (!channel_selected)
+            {
+                selected_channel = default_channel;
+            }
+            band_selected = RT_TRUE;
+            command_index += 2;
+            continue;
+        }
+        if (rt_strcmp(argv[command_index], "-c") == 0 ||
+            rt_strcmp(argv[command_index], "--channel") == 0)
+        {
+            if (channel_selected)
+            {
+                rt_kprintf("wifi: channel specified more than once\n");
+                return 0;
+            }
+            if (command_index + 1 >= argc)
+            {
+                rt_kprintf("wifi: missing channel value after -c/--channel\n");
+                return 0;
+            }
+            if (!wifi_ap_parse_channel(argv[command_index + 1],
+                                       &selected_channel))
+            {
+                rt_kprintf("wifi: invalid channel\n");
+                return 0;
+            }
+            channel_selected = RT_TRUE;
+            command_index += 2;
+            continue;
+        }
+        break;
+    }
+
+    if (command_index >= argc)
+    {
+        wifi_help(argc, argv);
+        return 0;
     }
 
     /* find fun */
@@ -852,6 +912,17 @@ static int wifi_msh(int argc, char *argv[])
         return 0;
     }
 
+    if (band_selected && run_cmd->fun != wifi_join && run_cmd->fun != wifi_ap)
+    {
+        rt_kprintf("wifi: -b/--band is only valid with join or ap\n");
+        return 0;
+    }
+    if (channel_selected && run_cmd->fun != wifi_ap)
+    {
+        rt_kprintf("wifi: -c/--channel is only valid with ap\n");
+        return 0;
+    }
+
     if (selector != RT_NULL)
     {
         result = wifi_select_command_device(selector, run_cmd->mode);
@@ -862,24 +933,28 @@ static int wifi_msh(int argc, char *argv[])
             return 0;
         }
 
-        command_argv[0] = argv[0];
-        command_argc = 1;
-        for (i = command_index; i < argc; i++)
-        {
-            command_argv[command_argc++] = argv[i];
-        }
     }
-    else
+
+    command_argv[0] = argv[0];
+    command_argc = 1;
+    for (i = command_index; i < argc; i++)
     {
-        command_argc = argc;
-        for (i = 0; i < argc; i++)
-        {
-            command_argv[i] = argv[i];
-        }
+        command_argv[command_argc++] = argv[i];
     }
 
     /* run fun */
-    if (run_cmd->fun != RT_NULL)
+    if (run_cmd->fun == wifi_join)
+    {
+        result = wifi_join_with_band(command_argc, command_argv,
+                                     band_selected, selected_band);
+    }
+    else if (run_cmd->fun == wifi_ap)
+    {
+        result = wifi_ap_with_radio(command_argc, command_argv,
+                                    band_selected, selected_band,
+                                    channel_selected, selected_channel);
+    }
+    else if (run_cmd->fun != RT_NULL)
     {
         result = run_cmd->fun(command_argc, command_argv);
     }

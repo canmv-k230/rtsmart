@@ -1600,6 +1600,7 @@ static rt_err_t wlan_offload_wlan_connect(struct rt_wlan_device *wlan,
 {
     struct rt_wlan_offload_vif *vif = wlan_offload_vif_from_wlan(wlan);
     struct rt_wlan_offload_connect_request request;
+    enum rt_wlan_offload_band_id band;
 #ifdef RT_WLAN_OFFLOAD_EMBEDDED_WPA2
     rt_uint8_t bss_ies[RT_WLAN_OFFLOAD_BSS_SECURITY_IE_MAX_LENGTH];
     rt_size_t bss_ies_length = 0;
@@ -1615,8 +1616,25 @@ static rt_err_t wlan_offload_wlan_connect(struct rt_wlan_device *wlan,
     request.ssid = sta_info->ssid;
     request.key = sta_info->key;
     rt_memcpy(request.bssid, sta_info->bssid, sizeof(request.bssid));
-    result = wlan_offload_resolve_channel(vif->radio, sta_info->channel,
-                                     RT_TRUE, &request.channel);
+    if (sta_info->band == RT_802_11_BAND_2_4GHZ)
+    {
+        band = RT_WLAN_OFFLOAD_BAND_2GHZ;
+    }
+    else if (sta_info->band == RT_802_11_BAND_5GHZ)
+    {
+        band = RT_WLAN_OFFLOAD_BAND_5GHZ;
+    }
+    else if (sta_info->band == RT_802_11_BAND_UNKNOWN)
+    {
+        band = RT_WLAN_OFFLOAD_BAND_MAX;
+    }
+    else
+    {
+        return -RT_EINVAL;
+    }
+    result = wlan_offload_resolve_channel_for_band(
+        vif->radio, band, sta_info->channel, RT_TRUE, RT_TRUE,
+        &request.channel);
     if (result != RT_EOK)
     {
         return result;

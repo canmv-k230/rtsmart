@@ -249,6 +249,7 @@ rt_err_t rt_wlan_dev_connect(struct rt_wlan_device *device, struct rt_wlan_info 
         sta_info.key.len = password_len;
     }
     sta_info.channel = info->channel;
+    sta_info.band = info->band;
     sta_info.security = info->security;
 
     result = rt_device_control(RT_DEVICE(device), RT_WLAN_CMD_JOIN, &sta_info);
