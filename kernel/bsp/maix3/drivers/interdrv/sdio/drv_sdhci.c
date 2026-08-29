@@ -40,7 +40,16 @@
 #define CACHE_LINESIZE (64)
 /* SDHCI requires the SDMA system address to be word aligned. */
 #define SDHCI_SDMA_ALIGNMENT (4)
-#define SDHCI_SMALL_BOUNCE_SIZE 512U
+#ifndef BSP_SDIO_CARD_MAX_SEG_SIZE_KB
+#define BSP_SDIO_CARD_MAX_SEG_SIZE_KB 256
+#endif
+#ifndef BSP_SDIO_EMMC_MAX_SEG_SIZE_KB
+#define BSP_SDIO_EMMC_MAX_SEG_SIZE_KB 1024
+#endif
+#define SDHCI_CARD_MAX_SEG_SIZE \
+    (BSP_SDIO_CARD_MAX_SEG_SIZE_KB * 1024U)
+#define SDHCI_EMMC_MAX_SEG_SIZE \
+    (BSP_SDIO_EMMC_MAX_SEG_SIZE_KB * 1024U)
 
 #define BIT(x) (1 << x)
 #define DWC_MSHC_PTR_VENDOR1 0x500
@@ -839,10 +848,6 @@ static void kd_mmc_request(struct rt_mmcsd_host* host, struct rt_mmcsd_req* req)
     rt_err_t error;
     struct sdhci_data sdhci_data = { 0 };
     struct sdhci_command sdhci_command = { 0 };
-#ifdef SDHCI_SDMA_ENABLE
-    void *allocated_bounce = RT_NULL;
-#endif
-
     RT_ASSERT(host != RT_NULL);
     RT_ASSERT(req != RT_NULL);
 
@@ -1000,43 +1005,37 @@ static void kd_mmc_request(struct rt_mmcsd_host* host, struct rt_mmcsd_req* req)
          * already had.  Only the engine's own address alignment matters, so a
          * word-aligned buffer goes straight to DMA.  This is worth the
          * distinction: virtually no Wi-Fi frame is a multiple of 64 bytes, so
-         * bouncing transmits cost an aligned allocation plus a full copy on
-         * every single frame. */
+         * bouncing transmits would add a full copy to every single frame. */
         uint32_t sz = sdhci_data.blockSize * sdhci_data.blockCount;
         uint32_t pad = 0;
         if (sz & (CACHE_LINESIZE - 1))
             pad = (sz + (CACHE_LINESIZE - 1)) & ~(CACHE_LINESIZE - 1);
         if (sdhci_data.rxData &&
             (((uint64_t)sdhci_data.rxData & (CACHE_LINESIZE - 1)) || pad)) {
-            if (sz <= SDHCI_SMALL_BOUNCE_SIZE) {
+            if (sz <= host->max_seg_size) {
                 sdhci_data.rxData = mmcsd->sdma_bounce;
             } else {
-                allocated_bounce = rt_malloc_align(pad ? pad : sz,
-                                                    CACHE_LINESIZE);
-                sdhci_data.rxData = allocated_bounce;
+                sdhci_data.rxData = RT_NULL;
             }
         } else if (sdhci_data.txData &&
                    ((uint64_t)sdhci_data.txData &
                     (SDHCI_SDMA_ALIGNMENT - 1))) {
-            void *tx_bounce;
-
-            if (sz <= SDHCI_SMALL_BOUNCE_SIZE) {
-                tx_bounce = mmcsd->sdma_bounce;
+            if (sz <= host->max_seg_size) {
+                rt_memcpy(mmcsd->sdma_bounce, data->buf, sz);
+                sdhci_data.txData = mmcsd->sdma_bounce;
             } else {
-                allocated_bounce = rt_malloc_align(pad ? pad : sz,
-                                                    CACHE_LINESIZE);
-                tx_bounce = allocated_bounce;
+                sdhci_data.txData = RT_NULL;
             }
-            if (tx_bounce)
-                rt_memcpy(tx_bounce, data->buf, sz);
-            sdhci_data.txData = tx_bounce;
         }
-        /* Refuse the request rather than handing the DMA engine a null address
-         * and copying through it. */
+        /* The advertised segment limit keeps normal requests within the
+         * persistent buffer. Refuse callers that bypass that contract rather
+         * than falling back to a fragmentation-prone runtime allocation. */
         if ((data->flags == DATA_DIR_WRITE && !sdhci_data.txData) ||
             (data->flags != DATA_DIR_WRITE && !sdhci_data.rxData)) {
-            LOG_E("no bounce buffer for a %u byte transfer", (unsigned int)sz);
-            cmd->err = -RT_ENOMEM;
+            LOG_E("%u byte transfer exceeds the %u byte bounce buffer",
+                  (unsigned int)sz, (unsigned int)host->max_seg_size);
+            cmd->err = -RT_EINVAL;
+            data->err = -RT_EINVAL;
             mmcsd->sdhci_data = RT_NULL;
             mmcsd_req_complete(host);
             return;
@@ -1052,8 +1051,6 @@ static void kd_mmc_request(struct rt_mmcsd_host* host, struct rt_mmcsd_req* req)
         rt_memcpy(data->buf, sdhci_data.rxData,
                   sdhci_data.blockSize * sdhci_data.blockCount);
     }
-    if (allocated_bounce)
-        rt_free_align(allocated_bounce);
 #endif
     if (error != RT_EOK) {
         LOG_D(" ***USDHC_TransferBlocking error: %d*** --> \n", error);
@@ -1589,7 +1586,9 @@ static rt_err_t kd_sdhci_init_host0(void *hi_sys_virt_addr)
     if (ret != RT_EOK)
         goto unmap_sdhci;
 
-    sdhci->sdma_bounce = rt_malloc_align(SDHCI_SMALL_BOUNCE_SIZE,
+    sdhci->sdma_bounce = rt_malloc_align(sdhci->is_emmc_card ?
+                                          SDHCI_EMMC_MAX_SEG_SIZE :
+                                          SDHCI_CARD_MAX_SEG_SIZE,
                                           CACHE_LINESIZE);
     if (!sdhci->sdma_bounce) {
         ret = -RT_ENOMEM;
@@ -1624,7 +1623,8 @@ static rt_err_t kd_sdhci_init_host0(void *hi_sys_virt_addr)
     mmcsd->valid_ocr = sdhci->io_fixed_1v8 ?
                        VDD_165_195 : VDD_32_33 | VDD_33_34;
     mmcsd->max_seg_size = sdhci->is_emmc_card ?
-                          4096U * 512U : 512U * 512U;
+                          SDHCI_EMMC_MAX_SEG_SIZE :
+                          SDHCI_CARD_MAX_SEG_SIZE;
     mmcsd->max_dma_segs = 1;
     mmcsd->max_blk_size = 512;
     mmcsd->max_blk_count = 4096;
@@ -1686,7 +1686,7 @@ static rt_err_t kd_sdhci_init_host1(void *hi_sys_virt_addr)
     if (ret != RT_EOK)
         goto unmap_sdhci;
 
-    sdhci->sdma_bounce = rt_malloc_align(SDHCI_SMALL_BOUNCE_SIZE,
+    sdhci->sdma_bounce = rt_malloc_align(SDHCI_CARD_MAX_SEG_SIZE,
                                           CACHE_LINESIZE);
     if (!sdhci->sdma_bounce) {
         ret = -RT_ENOMEM;
@@ -1706,7 +1706,7 @@ static rt_err_t kd_sdhci_init_host1(void *hi_sys_virt_addr)
     mmcsd->valid_ocr = VDD_32_33 | VDD_33_34;
     mmcsd->flags = MMCSD_BUSWIDTH_4 | MMCSD_MUTBLKWRITE |
                    MMCSD_SUP_HIGHSPEED | MMCSD_SUP_SDIO_IRQ;
-    mmcsd->max_seg_size = 512U * 512U;
+    mmcsd->max_seg_size = SDHCI_CARD_MAX_SEG_SIZE;
     mmcsd->max_dma_segs = 1;
     mmcsd->max_blk_size = 512;
     mmcsd->max_blk_count = 4096;

@@ -393,6 +393,26 @@ menu "InterDriver"
             config RT_USING_SDIO1
                 bool "Enable SDIO1"
                 default n
+
+            config BSP_SDIO_CARD_MAX_SEG_SIZE_KB
+                int "SD/SDIO maximum segment size (KiB)"
+                depends on RT_USING_SDIO1 || (RT_USING_SDIO0 && !RT_SDIO0_EMMC)
+                default 256
+                range 1 2048
+                help
+                    Maximum amount of data submitted in one SD/SDIO request.
+                    The SDHCI driver allocates an equally sized persistent SDMA
+                    bounce buffer for every non-eMMC host.
+
+            config BSP_SDIO_EMMC_MAX_SEG_SIZE_KB
+                int "eMMC maximum segment size (KiB)"
+                depends on RT_USING_SDIO0 && RT_SDIO0_EMMC
+                default 1024
+                range 1 2048
+                help
+                    Maximum amount of data submitted in one eMMC request. The
+                    SDHCI driver allocates an equally sized persistent SDMA
+                    bounce buffer for the eMMC host.
         endif
 
     menuconfig RT_USING_SPI
