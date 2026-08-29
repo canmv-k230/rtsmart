@@ -93,6 +93,12 @@ void ulog_voutput(rt_uint32_t level, const char *tag, rt_bool_t newline, const c
 void ulog_output(rt_uint32_t level, const char *tag, rt_bool_t newline, const char *format, ...);
 void ulog_raw(const char *format, ...);
 
+/*
+ * Microseconds since boot stamped onto each log line. Weakly defined against
+ * the scheduler tick; override it in the BSP to use a free-running counter.
+ */
+rt_uint64_t ulog_timestamp_us(void);
+
 #ifdef __cplusplus
 }
 #endif

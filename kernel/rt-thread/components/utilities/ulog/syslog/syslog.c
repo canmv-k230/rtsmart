@@ -28,6 +28,7 @@
 #ifdef ULOG_USING_SYSLOG
 
 #include <sys/time.h>
+#include <time.h>
 
 #ifndef ULOG_SYSLOG_IDENT_MAX_LEN
 #define ULOG_SYSLOG_IDENT_MAX_LEN      ULOG_FILTER_TAG_MAX_LEN
@@ -74,13 +75,12 @@ void openlog(const char *ident, int option, int facility)
         /* default facility is LOG_USER */
         local_facility = LOG_USER;
     }
-    /* output all level log */
-    setlogmask(LOG_UPTO(LOG_DEBUG));
-
     is_open = RT_TRUE;
 
     rt_hw_interrupt_enable(level);
 
+    /* This may allocate and take a mutex, so it must run with interrupts enabled. */
+    setlogmask(LOG_UPTO(LOG_DEBUG));
 }
 
 /**
@@ -260,6 +260,7 @@ RT_WEAK rt_size_t syslog_formater(char *log_buf, int level, const char *tag, rt_
         log_len += ulog_strcpy(log_len, log_buf + log_len, ULOG_NEWLINE_SIGN);
     }
 
+    log_buf[log_len] = '\0';
     return log_len;
 }
 

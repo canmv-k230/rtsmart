@@ -343,3 +343,17 @@ void reboot_to_upgrade(void)
     rt_hw_cpu_reset();
 }
 MSH_CMD_EXPORT_ALIAS(reboot_to_upgrade, reboot_to_upgrade, reboot to upgrade mode);
+
+#ifdef RT_USING_ULOG
+#include <ulog.h>
+
+/* Stamp logs from the RISC-V time CSR instead of the scheduler tick.  cpu_ticks_us()
+ * is a single free-running counter read, so it keeps advancing while interrupts are
+ * disabled or the scheduler is locked and stays usable from any context.  The tick
+ * ulog stamps with by default stalls in exactly those windows, which is where a
+ * timestamped log is most often being read, and resolves no finer than a tick. */
+rt_uint64_t ulog_timestamp_us(void)
+{
+    return cpu_ticks_us();
+}
+#endif /* RT_USING_ULOG */

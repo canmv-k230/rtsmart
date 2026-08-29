@@ -23,7 +23,7 @@ config RT_USING_ULOG
         if !ULOG_USING_SYSLOG
             choice
                 prompt "The static output log level."
-                default ULOG_OUTPUT_LVL_D
+                default ULOG_OUTPUT_LVL_I
                 help
                     When the log level is less than this option and it will stop output.
                     These log will not compile into ROM when using LOG_X api.
@@ -87,9 +87,14 @@ config RT_USING_ULOG
 
         config ULOG_USING_ISR_LOG
             bool "Enable ISR log."
-            default n
+            select ULOG_USING_ASYNC_OUTPUT
+            default y
             help
-                The log output API can using in ISR (Interrupt Service Routines) also.
+                Allow the log output API in interrupt service routines. Messages
+                are queued for asynchronous backend I/O, but formatting still runs
+                in the ISR. Keep ISR messages short and avoid them in
+                latency-critical paths. A nested ISR log is dropped instead of
+                extending the interrupt-disabled window.
 
         config ULOG_ASSERT_ENABLE
             bool "Enable assert check."
@@ -111,7 +116,7 @@ config RT_USING_ULOG
         if ULOG_USING_ASYNC_OUTPUT
             config ULOG_ASYNC_OUTPUT_BUF_SIZE
                 int "The async output buffer size."
-                default 2048
+                default 32768
 
             config ULOG_ASYNC_OUTPUT_BY_THREAD
                 bool "Enable async output by thread."
@@ -123,7 +128,7 @@ config RT_USING_ULOG
 
                     config ULOG_ASYNC_OUTPUT_THREAD_STACK
                         int "The async output thread stack size."
-                        default 1024
+                        default 4096
 
                     config ULOG_ASYNC_OUTPUT_THREAD_PRIORITY
                         int "The async output thread stack priority."
@@ -137,10 +142,11 @@ config RT_USING_ULOG
             config ULOG_OUTPUT_FLOAT
                 bool "Enable float number support. It will using more thread stack."
                 select RT_USING_LIBC
-                default n
+                default y
                 help
                     The default formater is using rt_vsnprint and it not supported float number.
                     When enable this option then it will enable libc. The formater will change to vsnprint on libc.
+                    ISR logs always use the non-floating RT-Thread formatter to avoid libc in interrupt context.
 
             if !ULOG_USING_SYSLOG
                 config ULOG_USING_COLOR
@@ -153,11 +159,9 @@ config RT_USING_ULOG
             config ULOG_OUTPUT_TIME
                 bool "Enable time information."
                 default y
-
-            config ULOG_TIME_USING_TIMESTAMP
-                bool "Enable timestamp format for time."
-                default n
-                depends on ULOG_OUTPUT_TIME
+                help
+                    Prefix each line with seconds and microseconds since boot,
+                    in the Linux kernel ring buffer form "[    5.123456]".
 
             config ULOG_OUTPUT_LEVEL
                 bool "Enable level information."
@@ -169,7 +173,7 @@ config RT_USING_ULOG
 
             config ULOG_OUTPUT_THREAD_NAME
                 bool "Enable thread information."
-                default n
+                default y
         endmenu
 
         config ULOG_BACKEND_USING_CONSOLE
