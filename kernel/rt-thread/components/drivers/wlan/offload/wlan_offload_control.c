@@ -29,7 +29,8 @@ _Static_assert(RTWO_CTRL_VERSION == 2 && RTWO_CTRL_CMD_GET_INFO == 1 &&
                RTWO_CTRL_EVENT_INFO == 0x8000 &&
                RTWO_CTRL_EVENT_FIRMWARE_ERROR == 0x800d &&
                RTWO_CTRL_EVENT_EXTERNAL_AUTH_REQUIRED == 0x800e &&
-               RTWO_CTRL_EVENT_NAMES == 0x800f,
+               RTWO_CTRL_EVENT_NAMES == 0x800f &&
+               RTWO_CTRL_EVENT_TKIP_MIC_FAILURE == 0x8010,
                "wlan_offload wire identifiers changed");
 _Static_assert(sizeof(struct rtwo_ctrl_header) == 20,
                "wlan_offload wire header ABI changed");
@@ -1298,6 +1299,23 @@ management:
                                 event->request_id, event->status, event->iftype,
                                 0, auth, sizeof(*auth));
         rt_free(auth);
+        return;
+    }
+    case RT_WLAN_OFFLOAD_EVENT_TKIP_MIC_FAILURE:
+    {
+        struct rtwo_ctrl_tkip_mic_failure failure;
+
+        rt_memset(&failure, 0, sizeof(failure));
+        rt_memcpy(failure.source, event->data.mic_failure.source,
+                  sizeof(failure.source));
+        rt_memcpy(failure.tsc, event->data.mic_failure.tsc,
+                  sizeof(failure.tsc));
+        failure.key_index = event->data.mic_failure.key_index;
+        failure.group = event->data.mic_failure.group;
+        wlan_offload_control_enqueue(
+            control, RTWO_CTRL_EVENT_TKIP_MIC_FAILURE,
+            event->request_id, event->status, event->iftype, 0,
+            &failure, sizeof(failure));
         return;
     }
     default:

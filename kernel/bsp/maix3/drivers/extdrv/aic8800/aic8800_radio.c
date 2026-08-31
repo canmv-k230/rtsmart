@@ -33,7 +33,7 @@
 #define AIC_PHY_BANDWIDTH_80_MHZ          2U
 #define AIC_PHY_FEATURE_BANDWIDTH_MASK     0x03000000UL
 #define AIC_PHY_FEATURE_BANDWIDTH_SHIFT    24U
-#define AIC_VHT_CAP_MAX_MPDU_11454         2U
+#define AIC_VHT_CAP_MAX_MPDU_7991          1U
 #define AIC_VHT_CAP_RX_LDPC              (1UL << 4)
 #define AIC_VHT_CAP_SHORT_GI_80          (1UL << 5)
 #define AIC_VHT_CAP_RX_STBC_1            (1UL << 8)
@@ -51,7 +51,7 @@ static const rt_uint8_t g_aic_he_mac_capability[6] = {
 
 static const rt_uint8_t g_aic_he_phy_capability[11] = {
     0x06, 0xe0, 0x2b, 0x58, 0x0d, 0xc0,
-    0xcf, 0x04, 0x02, 0x30, 0x00,
+    0xcf, 0x00, 0x02, 0x30, 0x00,
 };
 
 static const rt_uint8_t g_aic_he_ppe_thresholds[25] = {
@@ -293,14 +293,13 @@ static rt_bool_t aic_radio_parse_powerlimit_line(
 {
     char *cursor = line;
     char *channel_token;
-    char *first_value;
-    char *second_value;
+    char *values[6];
     rt_int32_t channel_number;
     rt_int8_t power;
     rt_bool_t available;
+    rt_size_t value_count = 0;
+    rt_size_t value_index = 0;
     rt_size_t index;
-    rt_bool_t use_second_column = config->country_code[0] == 'U' &&
-                                  config->country_code[1] == 'S';
 
     while (*cursor == ' ' || *cursor == '\t' || *cursor == '\r')
     {
@@ -318,14 +317,32 @@ static rt_bool_t aic_radio_parse_powerlimit_line(
     {
         return RT_FALSE;
     }
-    first_value = aic_radio_next_token(&cursor);
-    second_value = aic_radio_next_token(&cursor);
-    if (!first_value || !second_value)
+    while (value_count < sizeof(values) / sizeof(values[0]))
+    {
+        char *value = aic_radio_next_token(&cursor);
+
+        if (!value)
+        {
+            break;
+        }
+        values[value_count++] = value;
+    }
+    if (!value_count)
     {
         return RT_FALSE;
     }
-    if (!aic_radio_parse_power_token(use_second_column ? second_value :
-                                     first_value, &power, &available))
+    if (config->country_code[0] == 'U' && config->country_code[1] == 'S')
+    {
+        value_index = 1;
+    }
+    else if (!(config->country_code[0] == 'C' &&
+               config->country_code[1] == 'N') && value_count >= 6U)
+    {
+        value_index = 5;
+    }
+    if (value_index >= value_count ||
+        !aic_radio_parse_power_token(values[value_index], &power,
+                                     &available))
     {
         return RT_FALSE;
     }
@@ -363,6 +380,30 @@ static rt_bool_t aic_radio_parse_powerlimit_line(
     return RT_FALSE;
 }
 
+static void aic_radio_powerlimit_select_table(const char *line,
+                                               rt_bool_t *selected)
+{
+    const char *cursor = line;
+
+    while (*cursor == ' ' || *cursor == '\t' || *cursor == '\r')
+    {
+        cursor++;
+    }
+    if (cursor[0] != '#' || cursor[1] != '#' ||
+        (!strstr(cursor, "2.4G") && !strstr(cursor, "5G")))
+    {
+        return;
+    }
+    if (strstr(cursor, "40M") || strstr(cursor, "80M"))
+    {
+        *selected = RT_FALSE;
+    }
+    else
+    {
+        *selected = RT_TRUE;
+    }
+}
+
 static void aic_radio_load_powerlimit(
     struct aic8800_context *context, struct aic8800_radio_config_state *config,
     const char *directory, const char *filename)
@@ -371,6 +412,7 @@ static void aic_radio_load_powerlimit(
     char line[192];
     rt_size_t line_length = 0;
     rt_size_t parsed_lines = 0;
+    rt_bool_t selected_table = RT_TRUE;
     int descriptor;
     char character;
     ssize_t length;
@@ -390,7 +432,9 @@ static void aic_radio_load_powerlimit(
         if (character == '\n')
         {
             line[line_length] = '\0';
-            if (aic_radio_parse_powerlimit_line(config, line))
+            aic_radio_powerlimit_select_table(line, &selected_table);
+            if (selected_table &&
+                aic_radio_parse_powerlimit_line(config, line))
             {
                 parsed_lines++;
             }
@@ -408,7 +452,9 @@ static void aic_radio_load_powerlimit(
     if (line_length)
     {
         line[line_length] = '\0';
-        if (aic_radio_parse_powerlimit_line(config, line))
+        aic_radio_powerlimit_select_table(line, &selected_table);
+        if (selected_table &&
+            aic_radio_parse_powerlimit_line(config, line))
         {
             parsed_lines++;
         }
@@ -534,14 +580,14 @@ static rt_int8_t aic_radio_clamp_power(rt_int32_t value)
     return (rt_int8_t)value;
 }
 
-static rt_int8_t aic_radio_add_power(rt_int8_t value, rt_int8_t offset)
+static rt_int8_t aic_radio_apply_power_loss(rt_int8_t value, rt_int8_t loss)
 {
     /* -128 is the vendor sentinel for an unavailable rate. */
     if (value == -128)
     {
         return value;
     }
-    return aic_radio_clamp_power((rt_int32_t)value + offset);
+    return aic_radio_clamp_power((rt_int32_t)value - loss);
 }
 
 static rt_bool_t aic_radio_set_power_key(
@@ -864,67 +910,86 @@ static void aic_radio_apply_loss(struct aic8800_radio_config_state *config)
 {
     rt_size_t index;
 
-    if (!config->loss_enabled || !config->loss_value)
+    if (config->loss_enabled_2ghz && config->loss_value_2ghz)
     {
-        return;
-    }
-    for (index = 0; index < sizeof(config->tx_power_v3.legacy_2ghz); index++)
-    {
-        config->tx_power_v2.legacy_2ghz[index] = aic_radio_add_power(
-            config->tx_power_v2.legacy_2ghz[index], config->loss_value);
-        config->tx_power_v3.legacy_2ghz[index] = aic_radio_add_power(
-            config->tx_power_v3.legacy_2ghz[index], config->loss_value);
-        config->tx_power_v4.legacy_2ghz[index] = aic_radio_add_power(
-            config->tx_power_v4.legacy_2ghz[index], config->loss_value);
-    }
-    for (index = 0; index < sizeof(config->tx_power_v3.ht_vht_2ghz); index++)
-    {
-        config->tx_power_v2.ht_vht_2ghz[index] = aic_radio_add_power(
-            config->tx_power_v2.ht_vht_2ghz[index], config->loss_value);
-        config->tx_power_v3.ht_vht_2ghz[index] = aic_radio_add_power(
-            config->tx_power_v3.ht_vht_2ghz[index], config->loss_value);
-        config->tx_power_v4.ht_vht_2ghz[index] = aic_radio_add_power(
-            config->tx_power_v4.ht_vht_2ghz[index], config->loss_value);
-    }
-    for (index = 0; index < sizeof(config->tx_power_v3.he_2ghz); index++)
-    {
-        config->tx_power_v2.he_2ghz[index] = aic_radio_add_power(
-            config->tx_power_v2.he_2ghz[index], config->loss_value);
-        config->tx_power_v3.he_2ghz[index] = aic_radio_add_power(
-            config->tx_power_v3.he_2ghz[index], config->loss_value);
-        config->tx_power_v4.he_2ghz[index] = aic_radio_add_power(
-            config->tx_power_v4.he_2ghz[index], config->loss_value);
-    }
-    for (index = 0; index < sizeof(config->tx_power_v3.legacy_5ghz); index++)
-    {
-        if (config->tx_power_v3.legacy_5ghz[index] != -128)
+        for (index = 0;
+             index < sizeof(config->tx_power_v3.legacy_2ghz); index++)
         {
-            config->tx_power_v3.legacy_5ghz[index] = aic_radio_add_power(
-                config->tx_power_v3.legacy_5ghz[index], config->loss_value);
+            config->tx_power_v2.legacy_2ghz[index] =
+                aic_radio_apply_power_loss(
+                    config->tx_power_v2.legacy_2ghz[index],
+                    config->loss_value_2ghz);
+            config->tx_power_v3.legacy_2ghz[index] =
+                aic_radio_apply_power_loss(
+                    config->tx_power_v3.legacy_2ghz[index],
+                    config->loss_value_2ghz);
+            config->tx_power_v4.legacy_2ghz[index] =
+                aic_radio_apply_power_loss(
+                    config->tx_power_v4.legacy_2ghz[index],
+                    config->loss_value_2ghz);
         }
-        if (index < sizeof(config->tx_power_v4.legacy_5ghz))
+        for (index = 0;
+             index < sizeof(config->tx_power_v3.ht_vht_2ghz); index++)
         {
-            if (config->tx_power_v4.legacy_5ghz[index] != -128)
+            config->tx_power_v2.ht_vht_2ghz[index] =
+                aic_radio_apply_power_loss(
+                    config->tx_power_v2.ht_vht_2ghz[index],
+                    config->loss_value_2ghz);
+            config->tx_power_v3.ht_vht_2ghz[index] =
+                aic_radio_apply_power_loss(
+                    config->tx_power_v3.ht_vht_2ghz[index],
+                    config->loss_value_2ghz);
+            config->tx_power_v4.ht_vht_2ghz[index] =
+                aic_radio_apply_power_loss(
+                    config->tx_power_v4.ht_vht_2ghz[index],
+                    config->loss_value_2ghz);
+        }
+        for (index = 0; index < sizeof(config->tx_power_v3.he_2ghz); index++)
+        {
+            config->tx_power_v2.he_2ghz[index] = aic_radio_apply_power_loss(
+                config->tx_power_v2.he_2ghz[index], config->loss_value_2ghz);
+            config->tx_power_v3.he_2ghz[index] = aic_radio_apply_power_loss(
+                config->tx_power_v3.he_2ghz[index], config->loss_value_2ghz);
+            config->tx_power_v4.he_2ghz[index] = aic_radio_apply_power_loss(
+                config->tx_power_v4.he_2ghz[index], config->loss_value_2ghz);
+        }
+    }
+    if (config->loss_enabled_5ghz && config->loss_value_5ghz)
+    {
+        for (index = 0;
+             index < sizeof(config->tx_power_v3.legacy_5ghz); index++)
+        {
+            config->tx_power_v3.legacy_5ghz[index] =
+                aic_radio_apply_power_loss(
+                    config->tx_power_v3.legacy_5ghz[index],
+                    config->loss_value_5ghz);
+            if (index < sizeof(config->tx_power_v4.legacy_5ghz))
             {
-                config->tx_power_v4.legacy_5ghz[index] = aic_radio_add_power(
-                    config->tx_power_v4.legacy_5ghz[index],
-                    config->loss_value);
+                config->tx_power_v4.legacy_5ghz[index] =
+                    aic_radio_apply_power_loss(
+                        config->tx_power_v4.legacy_5ghz[index],
+                        config->loss_value_5ghz);
             }
         }
-    }
-    for (index = 0; index < sizeof(config->tx_power_v3.ht_vht_5ghz); index++)
-    {
-        config->tx_power_v3.ht_vht_5ghz[index] = aic_radio_add_power(
-            config->tx_power_v3.ht_vht_5ghz[index], config->loss_value);
-        config->tx_power_v4.ht_vht_5ghz[index] = aic_radio_add_power(
-            config->tx_power_v4.ht_vht_5ghz[index], config->loss_value);
-    }
-    for (index = 0; index < sizeof(config->tx_power_v3.he_5ghz); index++)
-    {
-        config->tx_power_v3.he_5ghz[index] = aic_radio_add_power(
-            config->tx_power_v3.he_5ghz[index], config->loss_value);
-        config->tx_power_v4.he_5ghz[index] = aic_radio_add_power(
-            config->tx_power_v4.he_5ghz[index], config->loss_value);
+        for (index = 0;
+             index < sizeof(config->tx_power_v3.ht_vht_5ghz); index++)
+        {
+            config->tx_power_v3.ht_vht_5ghz[index] =
+                aic_radio_apply_power_loss(
+                    config->tx_power_v3.ht_vht_5ghz[index],
+                    config->loss_value_5ghz);
+            config->tx_power_v4.ht_vht_5ghz[index] =
+                aic_radio_apply_power_loss(
+                    config->tx_power_v4.ht_vht_5ghz[index],
+                    config->loss_value_5ghz);
+        }
+        for (index = 0; index < sizeof(config->tx_power_v3.he_5ghz); index++)
+        {
+            config->tx_power_v3.he_5ghz[index] = aic_radio_apply_power_loss(
+                config->tx_power_v3.he_5ghz[index], config->loss_value_5ghz);
+            config->tx_power_v4.he_5ghz[index] = aic_radio_apply_power_loss(
+                config->tx_power_v4.he_5ghz[index], config->loss_value_5ghz);
+        }
     }
 }
 
@@ -1021,11 +1086,29 @@ static void aic_radio_parse_line(struct aic8800_radio_config_state *config,
     }
     else if (!strcmp(key, "loss_enable"))
     {
-        config->loss_enabled = parsed != 0;
+        config->loss_enabled_2ghz = parsed != 0;
+        config->loss_enabled_5ghz = parsed != 0;
     }
     else if (!strcmp(key, "loss_value"))
     {
-        config->loss_value = power;
+        config->loss_value_2ghz = power;
+        config->loss_value_5ghz = power;
+    }
+    else if (!strcmp(key, "loss_enable_2g4"))
+    {
+        config->loss_enabled_2ghz = parsed != 0;
+    }
+    else if (!strcmp(key, "loss_value_2g4"))
+    {
+        config->loss_value_2ghz = power;
+    }
+    else if (!strcmp(key, "loss_enable_5g"))
+    {
+        config->loss_enabled_5ghz = parsed != 0;
+    }
+    else if (!strcmp(key, "loss_value_5g"))
+    {
+        config->loss_value_5ghz = power;
     }
     else if (!strcmp(key, "ofst_enable"))
     {
@@ -1075,8 +1158,10 @@ rt_err_t aic8800_radio_load_config(struct aic8800_context *context)
     config->tx_power_v2 = g_aic_tx_power_v2;
     config->tx_power_v3 = g_aic_tx_power_v3;
     config->tx_power_v4 = g_aic_tx_power_v4;
-    config->loss_enabled = RT_TRUE;
-    config->loss_value = 0;
+    config->loss_enabled_2ghz = RT_TRUE;
+    config->loss_value_2ghz = 0;
+    config->loss_enabled_5ghz = RT_TRUE;
+    config->loss_value_5ghz = 0;
     aic_radio_set_country_code(config->country_code,
                                AIC8800_WIFI_COUNTRY_CODE);
     aic_radio_init_powerlimit(config);
@@ -1255,6 +1340,22 @@ rt_int8_t aic8800_radio_channel_power(
     return default_power;
 }
 
+/* The reference driver lets the per-rate userconfig targets limit firmware
+ * power while still reporting country limits to the host. */
+rt_int8_t aic8800_radio_channel_fw_power(
+    const struct aic8800_context *context, enum rt_wlan_offload_band_id band,
+    rt_uint16_t channel, rt_int8_t default_power)
+{
+#ifdef AIC8800_WIFI_COUNTRY_TX_POWER_LIMIT
+    return aic8800_radio_channel_power(context, band, channel, default_power);
+#else
+    (void)context;
+    (void)band;
+    (void)channel;
+    return default_power;
+#endif
+}
+
 rt_err_t aic8800_radio_set_regulatory(struct aic8800_context *context,
                                        rt_country_code_t country)
 {
@@ -1350,7 +1451,7 @@ static rt_err_t aic_wire_send(struct aic8800_context *context,
 
 /* Linux sends the complete transport-specific union: SDIO ends at v3/2x,
  * while USB includes the later v4/2x-v2 members. */
-static rt_size_t aic_wire_tx_power_v3_request_length(
+static rt_size_t aic_wire_tx_power_request_length(
     const struct aic8800_context *context)
 {
     return context->transport == AIC8800_TRANSPORT_SDIO ?
@@ -1431,7 +1532,8 @@ static rt_err_t aic_wire_send_tx_power_v2(
     }
     return aic_wire_send(context, AIC_MM_SET_TXPWR_REQ,
                          AIC_MM_SET_TXPWR_CFM,
-                         &request.configuration, sizeof(request));
+                         &request.configuration,
+                         aic_wire_tx_power_request_length(context));
 }
 
 static rt_err_t aic_wire_send_tx_power_v3(
@@ -1448,7 +1550,7 @@ static rt_err_t aic_wire_send_tx_power_v3(
     return aic_wire_send(context, AIC_MM_SET_TXPWR_REQ,
                          AIC_MM_SET_TXPWR_CFM,
                          &request.configuration,
-                         aic_wire_tx_power_v3_request_length(context));
+                         aic_wire_tx_power_request_length(context));
 }
 
 static rt_err_t aic_wire_send_tx_power_v4(
@@ -1696,7 +1798,7 @@ rt_err_t aic8800_radio_initialize(struct aic8800_context *context)
     return result;
 }
 
-static rt_bool_t aic8800_radio_supports_80mhz(
+rt_bool_t aic8800_radio_supports_80mhz(
     const struct aic8800_context *context)
 {
     if (!context)
@@ -1709,6 +1811,12 @@ static rt_bool_t aic8800_radio_supports_80mhz(
         return RT_FALSE;
     }
 #endif
+    /* An earlier association proved the MM_VERSION width below overstates what
+     * this modem does.  See bandwidth_80_rejected. */
+    if (context->bandwidth_80_rejected)
+    {
+        return RT_FALSE;
+    }
     /* MM_VERSION reports the modem's actual maximum channel width. The
      * vendor driver has the same MDM_CHBW check, although its downstream
      * dynamic-parameter path bypasses it and assumes D81 means 80 MHz. */
@@ -1777,7 +1885,7 @@ void aic8800_radio_prepare(struct aic8800_context *context,
     {
         /* One spatial stream, MCS 0-9 up to the configured width.  The
          * remaining VHT spatial streams are unsupported. */
-        request->vht.capability = AIC_VHT_CAP_MAX_MPDU_11454 |
+        request->vht.capability = AIC_VHT_CAP_MAX_MPDU_7991 |
                                    AIC_VHT_CAP_RX_LDPC |
                                    AIC_VHT_CAP_RX_STBC_1 |
                                    AIC_VHT_CAP_MAX_AMPDU_EXPONENT;

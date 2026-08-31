@@ -52,11 +52,7 @@
 #define AIC_DC_ROM_ENTRY           0x00150000U
 #define AIC_DC_PATCH_ADDRESS       0x00180000U
 #define AIC_DC_PATCH_DESCRIBE_SIZE        128U
-/* rf_misc_ram_t::bit_mask, the calibration-result presence flags. */
-#define AIC_DC_MISC_RAM_INIT_WORDS          3U
 #define AIC_DC_MCU_PATCH_ENABLE    0x40100020U
-/* The only other USB vendor the vendor driver calibrates U02 silicon for. */
-#define AIC_DC_CALIB_VENDOR_ID         0x2604U
 #define AIC_DC_TABLE_CHUNK_SIZE           512U
 #define AIC_DC_PATCH_VAR_MAGIC      0x47564150U
 #define AIC_DC_USER_TX_POWER_FLAG  (1U << 1)
@@ -341,6 +337,10 @@ rt_err_t aic8800_firmware_wait_available(struct aic8800_context *context,
     else if (family == AIC_FW_FAMILY_D80)
     {
         probe_name = "fw_patch_table_8800d80_u02.bin";
+    }
+    else if (family == AIC_FW_FAMILY_DC)
+    {
+        probe_name = "fmacfw_patch_8800dc_u02.bin";
     }
     else
     {
@@ -1809,6 +1809,10 @@ static rt_err_t aic_firmware_config_patch_d80(
                               sizeof(patch_pairs) / sizeof(patch_pairs[0]);
     rt_err_t result;
 
+    /* K230 uses the conservative USB RX aggregation setting from the vendor's
+     * DWC2-oriented platform configuration.  A count of ten causes protocol
+     * errors on some D80 H modules while the firmware is delivering data and
+     * message records concurrently. */
     patch_pairs[1].value = context->transport == AIC8800_TRANSPORT_SDIO ?
                            0x0100000a : 0x00010001;
 
@@ -2306,6 +2310,12 @@ static rt_err_t aic_firmware_probe_dc_revision(
     }
     context->chip_id = (rt_uint8_t)(value >> 16);
     context->chip_mcu_id = ((value >> 25) & 1U) ? 0U : 1U;
+    if (context->transport == AIC8800_TRANSPORT_SDIO)
+    {
+        context->product_id = ((value >> 26) & 1U) ?
+                              AIC8800_USB_PID_AIC8800DC :
+                              AIC8800_USB_PID_AIC8800DW;
+    }
 
     result = aic_firmware_mem_read(context, 0x00000020U, &value);
     if (result != RT_EOK)
@@ -2329,31 +2339,12 @@ static rt_bool_t aic_firmware_dc_is_h(
            (context->chip_id & AIC_CHIP_ID_H_MASK) == AIC_CHIP_ID_H_MASK;
 }
 
-/* The ROM patch is not interchangeable between DC modules.  The vendor
- * Windows driver keys its choice on the USB vendor and product ID, not on the
- * silicon revision, and a69c:88dc takes a build that the firmware shipped for
- * the Linux reference does not contain: 28124 bytes with its patch RAM
- * description at 0x00186e00, against 30264 bytes at 0x00187c00 here.  Loading
- * the wrong one leaves the ROM entry unusable and the chip stops answering
- * USB entirely, EP0 included, so even a port reset cannot recover it. */
-static rt_bool_t aic_firmware_dc_is_fc(
-    const struct aic8800_context *context)
-{
-    return context &&
-           context->vendor_id == AIC8800_USB_VENDOR_ID &&
-           context->product_id == AIC8800_USB_PID_AIC8800DC;
-}
-
 static const char *aic_firmware_dc_patch_name(
     const struct aic8800_context *context)
 {
     if (aic_firmware_dc_is_h(context))
     {
         return "fmacfw_patch_8800dc_h_u02.bin";
-    }
-    if (aic_firmware_dc_is_fc(context))
-    {
-        return "fmacfw_patch_8800dc_fc_u02.bin";
     }
     return "fmacfw_patch_8800dc_u02.bin";
 }
@@ -2364,10 +2355,6 @@ static const char *aic_firmware_dc_patch_table_name(
     if (aic_firmware_dc_is_h(context))
     {
         return "fmacfw_patch_tbl_8800dc_h_u02.bin";
-    }
-    if (aic_firmware_dc_is_fc(context))
-    {
-        return "fmacfw_patch_tbl_8800dc_fc_u02.bin";
     }
     return "fmacfw_patch_tbl_8800dc_u02.bin";
 }
@@ -2464,6 +2451,16 @@ static rt_err_t aic_firmware_dc_system_config(
         {0x40500010U, 0x00000004U},
         {0x40500010U, 0x00000006U},
     };
+#ifdef AIC8800_WIFI_TRANSPORT_SDIO
+    static const struct aic_firmware_pair sdio_config_u02[] =
+    {
+        {0x40030000U, 0x00036da4U},
+        {0x0011e800U, 0xe7fe4070U},
+        {0x40030084U, 0x0011e800U},
+        {0x40030080U, 0x00000001U},
+        {0x4010001cU, 0x00000000U},
+    };
+#endif
     static const struct aic_firmware_mask_pair masked_config[] =
     {
         {0x7000216cU, 0x0000000cU, 0x00000004U},
@@ -2477,6 +2474,7 @@ static rt_err_t aic_firmware_dc_system_config(
         {0x700010a0U, 0x00000800U, 0x00000800U},
         {0x70001034U, 0x1c100000U, 0x08000000U},
         {0x70001038U, 0x00000100U, 0x00000100U},
+        {0x70001084U, 0x00006000U, 0x00000000U},
         {0x70001094U, 0x0000000cU, 0x00000000U},
         {0x700021d0U, 0x00000060U, 0x00000060U},
         {0x70001000U, 0x00500001U, 0x00100001U},
@@ -2497,6 +2495,7 @@ static rt_err_t aic_firmware_dc_system_config(
         {0x700021ccU, 0x000000f0U, 0x00000000U},
         {0x700010a0U, 0x00000800U, 0x00000800U},
         {0x70001038U, 0x00000100U, 0x00000100U},
+        {0x70001084U, 0x00006000U, 0x00000000U},
         {0x70001094U, 0x0000000cU, 0x00000000U},
         {0x700021d0U, 0x00000060U, 0x00000060U},
         {0x70001000U, 0x00500001U, 0x00100001U},
@@ -2543,6 +2542,20 @@ static rt_err_t aic_firmware_dc_system_config(
         LOG_E("DC system configuration failed: %d", result);
         return result;
     }
+#ifdef AIC8800_WIFI_TRANSPORT_SDIO
+    if (context->transport == AIC8800_TRANSPORT_SDIO &&
+        context->chip_mcu_id == 0U)
+    {
+        result = aic_firmware_write_pairs(
+            context, sdio_config_u02,
+            sizeof(sdio_config_u02) / sizeof(sdio_config_u02[0]));
+        if (result != RT_EOK)
+        {
+            LOG_E("DC SDIO system configuration failed: %d", result);
+            return result;
+        }
+    }
+#endif
     if (aic_firmware_dc_is_h(context))
     {
         selected_config = masked_config_h;
@@ -2682,15 +2695,25 @@ exit:
 static rt_err_t aic_firmware_dc_patch_config(
     struct aic8800_context *context)
 {
-    static const struct aic_firmware_pair wifi_settings[] =
+    static const struct aic_firmware_pair usb_wifi_settings[] =
     {
         {0x00000090U, 0x0013fc00U},
-#if AIC8800_WIFI_USB_TX_AGGREGATE_FRAMES > 1U
+#if defined(AIC8800_WIFI_USB_TX_AGGREGATION) && \
+    AIC8800_WIFI_USB_TX_AGGREGATE_FRAMES > 1U
         {0x00000100U, 0x03021714U},
         {0x00000120U, 0x140a0100U},
 #endif
         {0x000000b0U, 0xad180100U},
     };
+#ifdef AIC8800_WIFI_TRANSPORT_SDIO
+    static const struct aic_firmware_pair sdio_wifi_settings[] =
+    {
+        {0x00000124U, 0x01001e01U},
+    };
+#endif
+    const struct aic_firmware_pair *wifi_settings = usb_wifi_settings;
+    rt_size_t wifi_settings_count =
+        sizeof(usb_wifi_settings) / sizeof(usb_wifi_settings[0]);
     rt_uint32_t wifi_address;
     rt_uint32_t ldpc_address;
     rt_uint32_t agc_address;
@@ -2730,9 +2753,15 @@ static rt_err_t aic_firmware_dc_patch_config(
     LOG_D("DC config: wifi=%08x ldpc=%08x agc=%08x txgain=%08x",
           wifi_address, ldpc_address, agc_address, txgain_address);
 
-    for (index = 0;
-         index < sizeof(wifi_settings) / sizeof(wifi_settings[0]);
-         index++)
+#ifdef AIC8800_WIFI_TRANSPORT_SDIO
+    if (context->transport == AIC8800_TRANSPORT_SDIO)
+    {
+        wifi_settings = sdio_wifi_settings;
+        wifi_settings_count =
+            sizeof(sdio_wifi_settings) / sizeof(sdio_wifi_settings[0]);
+    }
+#endif
+    for (index = 0; index < wifi_settings_count; index++)
     {
         result = aic_firmware_mem_write(
             context, wifi_address + wifi_settings[index].address,
@@ -2795,37 +2824,6 @@ static rt_err_t aic_firmware_dc_misc_ram_address(
         return -RT_EIO;
     }
     *address = misc_address;
-    return RT_EOK;
-}
-
-/* Clear the calibration bit mask so the started ROM patch knows no DPD or
- * LOFT result is present.  This is what the vendor driver does whenever it
- * is not built to calibrate at probe time. */
-static rt_err_t aic_firmware_dc_misc_ram_init(
-    struct aic8800_context *context)
-{
-    rt_uint32_t misc_address;
-    rt_size_t index;
-    rt_err_t result;
-
-    result = aic_firmware_dc_misc_ram_address(context, &misc_address);
-    if (result != RT_EOK)
-    {
-        LOG_E("DC RF misc RAM address unavailable: %d", result);
-        return result;
-    }
-    for (index = 0; index < AIC_DC_MISC_RAM_INIT_WORDS; index++)
-    {
-        result = aic_firmware_mem_write(
-            context, misc_address + (rt_uint32_t)index * 4U, 0U);
-        if (result != RT_EOK)
-        {
-            LOG_E("DC RF misc RAM clear at 0x%08x failed: %d",
-                  misc_address + (rt_uint32_t)index * 4U, result);
-            return result;
-        }
-    }
-    LOG_I("DC RF misc RAM cleared; running without DPD calibration");
     return RT_EOK;
 }
 
@@ -2909,35 +2907,16 @@ static rt_err_t aic_firmware_dc_calibrate(
     return RT_EOK;
 }
 
-/* The ROM patch only needs the calibration flags to describe the state it is
- * about to run in, so a calibration that did not produce one is recoverable:
- * clear the flags and start the patch without pre-distortion.
- *
- * The vendor Windows driver only calibrates U02 silicon for two USB vendors,
- * and returns without touching the radio for every other one - AIC's own
- * a69c included.  Honour that even when the build enables calibration, since
- * entering the helper with firmware it was not built against hangs the chip. */
 static rt_err_t aic_firmware_dc_prepare_calibration(
     struct aic8800_context *context)
 {
-    if (context->vendor_id == AIC8800_USB_VENDOR_ID_V2 ||
-        context->vendor_id == AIC_DC_CALIB_VENDOR_ID)
-    {
-        rt_err_t result = aic_firmware_dc_calibrate(context);
+    rt_err_t result = aic_firmware_dc_calibrate(context);
 
-        if (result == RT_EOK)
-        {
-            return RT_EOK;
-        }
-        LOG_W("DC DPD calibration unavailable (%d); continuing without it",
-              result);
-    }
-    else
+    if (result != RT_EOK)
     {
-        LOG_D("DC DPD calibration not applicable to vendor %04x",
-              context->vendor_id);
+        LOG_E("DC DPD calibration failed: %d", result);
     }
-    return aic_firmware_dc_misc_ram_init(context);
+    return result;
 }
 
 static rt_err_t aic_firmware_prepare_dc_runtime(
@@ -2948,14 +2927,21 @@ static rt_err_t aic_firmware_prepare_dc_runtime(
     rt_uint32_t entry_word;
     rt_err_t result;
 
-    result = aic_firmware_dc_usb_config(context);
-    if (result == RT_EOK)
+    if (context->transport == AIC8800_TRANSPORT_SDIO)
     {
         result = aic_firmware_probe_dc_revision(context);
     }
-    if (result == RT_EOK)
+    else
     {
-        result = aic_firmware_dc_mcu_patch_enable(context);
+        result = aic_firmware_dc_usb_config(context);
+        if (result == RT_EOK)
+        {
+            result = aic_firmware_probe_dc_revision(context);
+        }
+        if (result == RT_EOK)
+        {
+            result = aic_firmware_dc_mcu_patch_enable(context);
+        }
     }
     if (result != RT_EOK)
     {
@@ -3018,8 +3004,7 @@ static rt_err_t aic_firmware_prepare_dc_runtime(
         LOG_E("DC U02 runtime preparation failed: %d", result);
         return result;
     }
-    LOG_I("DC%s%s U02 ROM patch ready", high_id ? " H" : "",
-          aic_firmware_dc_is_fc(context) ? " FC" : "");
+    LOG_I("DC%s U02 ROM patch ready", high_id ? " H" : "");
     return RT_EOK;
 }
 
@@ -3041,7 +3026,8 @@ rt_err_t aic8800_firmware_probe(struct aic8800_context *context,
 
     if (family == AIC_FW_FAMILY_DC)
     {
-        if (context->transport != AIC8800_TRANSPORT_USB || !runtime)
+        if ((context->transport != AIC8800_TRANSPORT_USB &&
+             context->transport != AIC8800_TRANSPORT_SDIO) || !runtime)
         {
             return -RT_ENOSYS;
         }

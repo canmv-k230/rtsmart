@@ -18,6 +18,12 @@ struct wlan_offload_sha1
     uint8_t buffer[64];
 };
 
+struct wlan_offload_hmac_sha1
+{
+    struct wlan_offload_sha1 inner;
+    struct wlan_offload_sha1 outer;
+};
+
 struct wlan_offload_md5
 {
     uint32_t state[4];
@@ -219,13 +225,11 @@ static void sha1_finish(struct wlan_offload_sha1 *context, uint8_t digest[20])
     rt_wlan_offload_crypto_zero(context, sizeof(*context));
 }
 
-void rt_wlan_offload_hmac_sha1(const uint8_t *key, size_t key_length,
-                          const uint8_t *data, size_t data_length,
-                          uint8_t digest[20])
+static void hmac_sha1_prepare(struct wlan_offload_hmac_sha1 *prepared,
+                              const uint8_t *key, size_t key_length)
 {
     struct wlan_offload_sha1 context;
     uint8_t key_block[64];
-    uint8_t inner[20];
     size_t index;
 
     memset(key_block, 0, sizeof(key_block));
@@ -243,20 +247,41 @@ void rt_wlan_offload_hmac_sha1(const uint8_t *key, size_t key_length,
     {
         key_block[index] ^= 0x36;
     }
-    sha1_init(&context);
-    sha1_update(&context, key_block, sizeof(key_block));
-    sha1_update(&context, data, data_length);
-    sha1_finish(&context, inner);
+    sha1_init(&prepared->inner);
+    sha1_update(&prepared->inner, key_block, sizeof(key_block));
     for (index = 0; index < sizeof(key_block); index++)
     {
         key_block[index] ^= 0x36 ^ 0x5c;
     }
-    sha1_init(&context);
-    sha1_update(&context, key_block, sizeof(key_block));
-    sha1_update(&context, inner, sizeof(inner));
-    sha1_finish(&context, digest);
-    rt_wlan_offload_crypto_zero(inner, sizeof(inner));
+    sha1_init(&prepared->outer);
+    sha1_update(&prepared->outer, key_block, sizeof(key_block));
     rt_wlan_offload_crypto_zero(key_block, sizeof(key_block));
+}
+
+static void hmac_sha1_digest(
+    const struct wlan_offload_hmac_sha1 *prepared,
+    const uint8_t *data, size_t data_length, uint8_t digest[20])
+{
+    struct wlan_offload_sha1 inner_context = prepared->inner;
+    struct wlan_offload_sha1 outer_context = prepared->outer;
+    uint8_t inner[20];
+
+    sha1_update(&inner_context, data, data_length);
+    sha1_finish(&inner_context, inner);
+    sha1_update(&outer_context, inner, sizeof(inner));
+    sha1_finish(&outer_context, digest);
+    rt_wlan_offload_crypto_zero(inner, sizeof(inner));
+}
+
+void rt_wlan_offload_hmac_sha1(const uint8_t *key, size_t key_length,
+                          const uint8_t *data, size_t data_length,
+                          uint8_t digest[20])
+{
+    struct wlan_offload_hmac_sha1 prepared;
+
+    hmac_sha1_prepare(&prepared, key, key_length);
+    hmac_sha1_digest(&prepared, data, data_length, digest);
+    rt_wlan_offload_crypto_zero(&prepared, sizeof(prepared));
 }
 
 #define MD5_F(x, y, z) (((x) & (y)) | (~(x) & (z)))
@@ -698,6 +723,7 @@ int rt_wlan_offload_pbkdf2_sha1(const uint8_t *passphrase, size_t passphrase_len
                            const uint8_t *ssid, size_t ssid_length,
                            uint8_t pmk[32])
 {
+    struct wlan_offload_hmac_sha1 prepared;
     uint8_t salt[36];
     uint8_t digest[20];
     uint8_t accumulator[20];
@@ -711,17 +737,16 @@ int rt_wlan_offload_pbkdf2_sha1(const uint8_t *passphrase, size_t passphrase_len
     {
         return -1;
     }
+    hmac_sha1_prepare(&prepared, passphrase, passphrase_length);
     memcpy(salt, ssid, ssid_length);
     for (block = 1; generated < 32; block++)
     {
         crypto_put_be32(salt + ssid_length, block);
-        rt_wlan_offload_hmac_sha1(passphrase, passphrase_length, salt,
-                             ssid_length + 4U, digest);
+        hmac_sha1_digest(&prepared, salt, ssid_length + 4U, digest);
         memcpy(accumulator, digest, sizeof(accumulator));
         for (iteration = 1; iteration < 4096; iteration++)
         {
-            rt_wlan_offload_hmac_sha1(passphrase, passphrase_length, digest,
-                                 sizeof(digest), digest);
+            hmac_sha1_digest(&prepared, digest, sizeof(digest), digest);
             for (index = 0; index < sizeof(accumulator); index++)
             {
                 accumulator[index] ^= digest[index];
@@ -738,6 +763,7 @@ int rt_wlan_offload_pbkdf2_sha1(const uint8_t *passphrase, size_t passphrase_len
     rt_wlan_offload_crypto_zero(salt, sizeof(salt));
     rt_wlan_offload_crypto_zero(digest, sizeof(digest));
     rt_wlan_offload_crypto_zero(accumulator, sizeof(accumulator));
+    rt_wlan_offload_crypto_zero(&prepared, sizeof(prepared));
     return 0;
 }
 

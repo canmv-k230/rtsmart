@@ -9,6 +9,9 @@
 #ifdef AIC8800_WIFI_AUTO_START
 #include <wlan_mgnt.h>
 #endif
+#ifdef AIC8800_WIFI_DEBUG_STATS
+#include <finsh.h>
+#endif
 
 #define DBG_TAG "aic8800.wifi"
 #define DBG_LVL AIC8800_DBG_LVL
@@ -17,14 +20,38 @@
 #define AIC_RX_FLAG_AMSDU                  (1UL << 0)
 #define AIC_RX_FLAG_80211_MPDU             (1UL << 1)
 #define AIC_RX_FLAG_NEEDS_REORDER           (1UL << 5)
+#define AIC_TX_FLAG_MORE_DATA              (1U << 2)
 #define AIC_TX_FLAG_MANAGEMENT             (1U << 3)
+#define AIC_TX_FLAG_EOSP                   (1U << 9)
 #define AIC_TX_STATUS_DESCRIPTOR_REQUEST    (1UL << 31)
 #define AIC_TX_STATUS_ACKNOWLEDGED           (1UL << 3)
+#define AIC_ETHERTYPE_ARP                     0x0806U
 #define AIC_ETHERTYPE_EAPOL                   0x888eU
+#define AIC_ETHERTYPE_IPV4                    0x0800U
+#define AIC_ETHERTYPE_IPV6                    0x86ddU
+#define AIC_ETHERTYPE_VLAN                    0x8100U
+#define AIC_ETHERTYPE_VLAN_PROVIDER           0x88a8U
+#define AIC_IP_PROTOCOL_TCP                         6U
+#define AIC_IP_PROTOCOL_UDP                        17U
+#define AIC_IPV6_NEXT_HEADER_ICMP                  58U
+#define AIC_TCP_FLAG_SYN                         0x02U
+#define AIC_TCP_FLAG_RST                         0x04U
+#define AIC_DHCP_SERVER_PORT                       67U
+#define AIC_DHCP_CLIENT_PORT                       68U
+#define AIC_DHCPV6_CLIENT_PORT                    546U
+#define AIC_DHCPV6_SERVER_PORT                    547U
+#define AIC_TX_ACCESS_CATEGORY_BACKGROUND          0U
 #define AIC_TX_ACCESS_CATEGORY_BEST_EFFORT        1U
+#define AIC_TX_ACCESS_CATEGORY_VIDEO              2U
 #define AIC_TX_ACCESS_CATEGORY_VOICE              3U
 #define AIC_TX_TID_BEST_EFFORT                    0U
 #define AIC_TX_TID_NON_QOS                     0xffU
+#define AIC_PS_ID_LEGACY                         0U
+#define AIC_PS_ID_UAPSD                          1U
+#define AIC_UAPSD_TIDS_VO          ((1U << 6) | (1U << 7))
+#define AIC_UAPSD_TIDS_VI          ((1U << 4) | (1U << 5))
+#define AIC_UAPSD_TIDS_BK          ((1U << 1) | (1U << 2))
+#define AIC_UAPSD_TIDS_BE          ((1U << 0) | (1U << 3))
 
 #define AIC_CONNECTION_CONTROL_PORT_HOST   (1UL << 0)
 #define AIC_CONNECTION_CONTROL_PORT_NO_ENC (1UL << 1)
@@ -34,6 +61,9 @@
 #define AIC_UAPSD_QUEUE_VO                  (1U << 0)
 #define AIC_UAPSD_TIMEOUT_MS                300U
 #define AIC_LP_CLOCK_ACCURACY_PPM           20U
+#define AIC_DC_RUNTIME_RX_GAIN_ADDRESS      0x4033b300U
+#define AIC_DC_RUNTIME_RX_GAIN_MASK         0xffU
+#define AIC_DC_RUNTIME_RX_GAIN_VALUE        0x0eU
 
 #define AIC_SCAN_CHANNEL_COUNT     AIC_WIRE_SCAN_CHANNEL_COUNT
 #define AIC_SCAN_SSID_COUNT        AIC_WIRE_SCAN_SSID_COUNT
@@ -41,6 +71,14 @@
 #define AIC_SCAN_REQUEST_SIZE      sizeof(struct aic_wire_scanu_start_req)
 #define AIC_SCAN_FOLLOWUP_RETRY_MS                         20U
 #define AIC_SCAN_FOLLOWUP_MAX_RETRIES                      50U
+#define AIC_SCAN_RESULT_DRAIN_RETRY_MS                     10U
+#define AIC_SCAN_RESULT_DRAIN_MAX_RETRIES                  20U
+/* Associations below 80 MHz on an 80 MHz-or-wider AP before the driver stops
+ * believing the modem's 80 MHz claim.  See aic_update_connected_channel(). */
+#define AIC_BANDWIDTH_80_FAILURES                           2U
+#define AIC_CHANNEL_DEFAULT_POWER_DBM                      20
+#define AIC_TRAFFIC_IND_RETRY_MS                           20U
+#define AIC_PS_SP_INTERRUPTED                             0xffU
 #define AIC_CONNECT_REQUEST_SIZE   sizeof(struct aic_wire_sm_connect_req)
 #define AIC_ME_CONFIG_SIZE         sizeof(struct aic_wire_me_config_req)
 #define AIC_ME_CHANNEL_CONFIG_SIZE \
@@ -59,6 +97,8 @@
 /* sm_connect_ind: status(2) bssid(6) roamed(1) vif_idx(1) ap_idx(1) ch_idx(1) */
 #define AIC_SM_CONNECT_IND_STATION_OFFSET     10U
 #define AIC_SM_CONNECT_IND_CHANNEL_INDEX_OFFSET 11U
+#define AIC_SM_CONNECT_IND_QOS_OFFSET         12U
+#define AIC_SM_CONNECT_IND_ACM_OFFSET         13U
 #define AIC_SM_CONNECT_IND_REQ_IE_LEN_OFFSET  14U
 #define AIC_SM_CONNECT_IND_RSP_IE_LEN_OFFSET  16U
 #define AIC_SM_CONNECT_IND_IE_BUFFER_OFFSET   20U
@@ -66,10 +106,18 @@
 #define AIC_WLAN_EID_HT_OPERATION             61U
 #define AIC_WLAN_EID_VHT_OPERATION           192U
 
-static void aic_scan_followup_work(struct rt_work *work, void *work_data);
+static void aic_scan_work(struct rt_work *work, void *work_data);
 static void aic_ap_rechannel_work(struct rt_work *work, void *work_data);
+static void aic_traffic_work(struct rt_work *work, void *work_data);
+static void aic_station_loss_work(struct rt_work *work, void *work_data);
+static void aic_set_traffic_status(struct aic8800_context *context,
+                                   rt_uint8_t station_index,
+                                   rt_uint8_t ps_id,
+                                   rt_bool_t available);
 static void aic_report_scan_done_status(struct aic8800_context *context,
-                                        rt_err_t status);
+                                        rt_err_t status,
+                                        rt_bool_t result_count_valid,
+                                        rt_uint16_t result_count);
 static rt_err_t aic_confirmation_status(const rt_uint8_t *confirmation,
                                         rt_size_t length);
 static rt_bool_t aic_device_supports_vht(
@@ -80,8 +128,20 @@ static rt_bool_t aic_channel_allowed(
     const struct aic8800_context *context, enum rt_wlan_offload_band_id band,
     rt_uint16_t channel);
 static void aic_refresh_channel_metadata(struct aic8800_context *context);
+static rt_err_t aic_send_me_config(struct aic8800_context *context);
+static rt_uint16_t aic8800_protocol_version(
+    const struct aic8800_context *context);
 static void aic_clear_hardware_keys(struct aic8800_context *context,
                                     rt_bool_t notify_firmware);
+static void aic_cancel_mgmt_confirmations(struct aic8800_context *context,
+                                          rt_err_t status);
+static rt_err_t aic_del_station(struct rt_wlan_offload_vif *vif,
+                                rt_uint32_t request_id,
+                                const rt_uint8_t mac[6], rt_uint16_t reason);
+static rt_err_t aic_del_station_internal(
+    struct rt_wlan_offload_vif *vif, rt_uint32_t request_id,
+    const rt_uint8_t mac[6], rt_uint16_t reason,
+    rt_bool_t firmware_station_lost);
 static rt_err_t aic_add_key(struct rt_wlan_offload_vif *vif,
                             rt_uint32_t request_id,
                             const struct rt_wlan_offload_key *key);
@@ -403,7 +463,7 @@ static const struct rt_wlan_offload_supported_band g_aic8800_band_2ghz = {
     .rate_count = sizeof(g_aic8800_rates_2ghz) /
                   sizeof(g_aic8800_rates_2ghz[0]),
     .max_spatial_streams = 1,
-    /* ME capabilities report max-bw=40 MHz on every supported part. */
+    /* 2.4 GHz operation is limited to HT20/HT40. */
     .max_channel_width = RT_WLAN_OFFLOAD_CHANNEL_WIDTH_40,
     .max_channel_width_set = RT_TRUE,
 };
@@ -417,7 +477,7 @@ static const struct rt_wlan_offload_supported_band g_aic8800_band_5ghz = {
     .rates = &g_aic8800_rates_2ghz[4],
     .rate_count = 8,
     .max_spatial_streams = 1,
-    /* ME capabilities report max-bw=40 MHz on every supported part. */
+    /* Conservative until MM_VERSION identifies an 80 MHz-capable product. */
     .max_channel_width = RT_WLAN_OFFLOAD_CHANNEL_WIDTH_40,
     .max_channel_width_set = RT_TRUE,
 };
@@ -671,15 +731,29 @@ static void aic_tx_credit_update(struct aic8800_context *context,
  * a client which reused the same firmware index. */
 static void aic_station_state_set(struct aic8800_context *context,
                                   rt_uint8_t station_index,
-                                  rt_bool_t present, rt_bool_t power_save)
+                                  rt_bool_t present, rt_bool_t power_save,
+                                  rt_uint16_t uapsd_tids,
+                                  rt_bool_t complete_station_add)
 {
     rt_base_t level;
+    rt_size_t ps_id;
 
     if (!context || station_index >= AIC8800_STATION_SLOTS)
     {
         return;
     }
     level = rt_hw_interrupt_disable();
+    if (complete_station_add)
+    {
+        if (context->station_add_pending)
+        {
+            power_save = power_save ||
+                         context->sta_add_power_save[station_index];
+        }
+        context->station_add_pending = RT_FALSE;
+        rt_memset(context->sta_add_power_save, 0,
+                  sizeof(context->sta_add_power_save));
+    }
     context->sta_generation[station_index]++;
     if (!context->sta_generation[station_index])
     {
@@ -687,8 +761,53 @@ static void aic_station_state_set(struct aic8800_context *context,
     }
     context->sta_present[station_index] = present;
     context->sta_power_save[station_index] = present && power_save;
+    context->sta_uapsd_tids[station_index] = present ? uapsd_tids : 0;
     context->tx_pending[station_index] = 0;
     context->tx_pending_held[station_index] = RT_FALSE;
+    for (ps_id = 0; ps_id < AIC8800_PS_ID_COUNT; ps_id++)
+    {
+        context->sta_buffered[station_index][ps_id] = 0;
+        context->sta_service_period_generation[station_index][ps_id]++;
+        if (!context->sta_service_period_generation[station_index][ps_id])
+        {
+            context->sta_service_period_generation[station_index][ps_id]++;
+        }
+        context->sta_service_period_remaining[station_index][ps_id] = 0;
+        context->sta_service_period_reserved[station_index][ps_id] = 0;
+        context->sta_traffic_available[station_index][ps_id] = RT_FALSE;
+        context->sta_traffic_reported[station_index][ps_id] = RT_FALSE;
+        context->sta_traffic_dirty[station_index][ps_id] = RT_FALSE;
+    }
+    rt_hw_interrupt_enable(level);
+}
+
+static void aic_station_add_begin(struct aic8800_context *context)
+{
+    rt_base_t level;
+
+    if (!context)
+    {
+        return;
+    }
+    level = rt_hw_interrupt_disable();
+    rt_memset(context->sta_add_power_save, 0,
+              sizeof(context->sta_add_power_save));
+    context->station_add_pending = RT_TRUE;
+    rt_hw_interrupt_enable(level);
+}
+
+static void aic_station_add_cancel(struct aic8800_context *context)
+{
+    rt_base_t level;
+
+    if (!context)
+    {
+        return;
+    }
+    level = rt_hw_interrupt_disable();
+    context->station_add_pending = RT_FALSE;
+    rt_memset(context->sta_add_power_save, 0,
+              sizeof(context->sta_add_power_save));
     rt_hw_interrupt_enable(level);
 }
 
@@ -744,6 +863,8 @@ void aic8800_core_tx_complete(
     const struct aic8800_tx_metadata *metadata)
 {
     rt_uint8_t station_index;
+    rt_uint8_t ps_id;
+    rt_bool_t traffic_empty = RT_FALSE;
     rt_base_t level;
 
     if (!context || !metadata || !metadata->accounted)
@@ -751,7 +872,9 @@ void aic8800_core_tx_complete(
         return;
     }
     station_index = metadata->station_index;
-    if (station_index >= AIC8800_STATION_SLOTS)
+    ps_id = metadata->ps_id;
+    if (station_index >= AIC8800_STATION_SLOTS ||
+        ps_id >= AIC8800_PS_ID_COUNT)
     {
         return;
     }
@@ -761,6 +884,21 @@ void aic8800_core_tx_complete(
         context->tx_pending[station_index])
     {
         context->tx_pending[station_index]--;
+        if (metadata->host_buffered &&
+            context->sta_buffered[station_index][ps_id])
+        {
+            context->sta_buffered[station_index][ps_id]--;
+            if (metadata->service_period_reserved &&
+                metadata->service_period_generation ==
+                    context->sta_service_period_generation[station_index]
+                                                          [ps_id] &&
+                context->sta_service_period_reserved[station_index][ps_id])
+            {
+                context->sta_service_period_reserved[station_index][ps_id]--;
+            }
+            traffic_empty =
+                context->sta_buffered[station_index][ps_id] == 0;
+        }
         if (context->tx_pending[station_index] <
             AIC8800_TX_PENDING_HIGH_WATER)
         {
@@ -768,6 +906,10 @@ void aic8800_core_tx_complete(
         }
     }
     rt_hw_interrupt_enable(level);
+    if (traffic_empty)
+    {
+        aic_set_traffic_status(context, station_index, ps_id, RT_FALSE);
+    }
 }
 
 void aic8800_core_tx_pending_reset(struct aic8800_context *context)
@@ -782,7 +924,23 @@ void aic8800_core_tx_pending_reset(struct aic8800_context *context)
     rt_memset(context->tx_pending, 0, sizeof(context->tx_pending));
     rt_memset(context->tx_pending_held, 0, sizeof(context->tx_pending_held));
     rt_memset(context->sta_present, 0, sizeof(context->sta_present));
+    context->station_add_pending = RT_FALSE;
+    rt_memset(context->sta_add_power_save, 0,
+              sizeof(context->sta_add_power_save));
     rt_memset(context->sta_power_save, 0, sizeof(context->sta_power_save));
+    rt_memset(context->sta_uapsd_tids, 0,
+              sizeof(context->sta_uapsd_tids));
+    rt_memset(context->sta_buffered, 0, sizeof(context->sta_buffered));
+    rt_memset(context->sta_service_period_remaining, 0,
+              sizeof(context->sta_service_period_remaining));
+    rt_memset(context->sta_service_period_reserved, 0,
+              sizeof(context->sta_service_period_reserved));
+    rt_memset(context->sta_traffic_available, 0,
+              sizeof(context->sta_traffic_available));
+    rt_memset(context->sta_traffic_reported, 0,
+              sizeof(context->sta_traffic_reported));
+    rt_memset(context->sta_traffic_dirty, 0,
+              sizeof(context->sta_traffic_dirty));
     for (rt_size_t index = 0; index < AIC8800_STATION_SLOTS; index++)
     {
         context->sta_generation[index]++;
@@ -790,24 +948,33 @@ void aic8800_core_tx_pending_reset(struct aic8800_context *context)
         {
             context->sta_generation[index]++;
         }
+        for (rt_size_t ps_id = 0; ps_id < AIC8800_PS_ID_COUNT; ps_id++)
+        {
+            context->sta_service_period_generation[index][ps_id]++;
+            if (!context->sta_service_period_generation[index][ps_id])
+            {
+                context->sta_service_period_generation[index][ps_id]++;
+            }
+        }
     }
     rt_hw_interrupt_enable(level);
 }
 
 static rt_err_t aic_tx_pending_acquire(struct aic8800_context *context,
                                        rt_uint8_t station_index,
-                                       rt_uint16_t generation)
+                                       rt_uint16_t generation,
+                                       rt_uint8_t ps_id)
 {
     rt_base_t level;
 
-    if (!context || station_index >= AIC8800_STATION_SLOTS || !generation)
+    if (!context || station_index >= AIC8800_STATION_SLOTS || !generation ||
+        ps_id >= AIC8800_PS_ID_COUNT)
     {
         return -RT_EINVAL;
     }
     level = rt_hw_interrupt_disable();
     if (!context->sta_present[station_index] ||
-        context->sta_generation[station_index] != generation ||
-        context->sta_power_save[station_index])
+        context->sta_generation[station_index] != generation)
     {
         rt_hw_interrupt_enable(level);
         return -RT_EBUSY;
@@ -828,6 +995,7 @@ static rt_err_t aic_tx_pending_acquire(struct aic8800_context *context,
         return -RT_EFULL;
     }
     context->tx_pending[station_index]++;
+    context->sta_buffered[station_index][ps_id]++;
     context->tx_pending_held[station_index] =
         context->tx_pending[station_index] >=
             AIC8800_TX_PENDING_HIGH_WATER;
@@ -893,6 +1061,7 @@ void aic8800_core_tx_metadata_init(
     rt_memset(metadata, 0, sizeof(*metadata));
     metadata->station_index = AIC8800_INVALID_INDEX;
     metadata->vif_index = AIC8800_INVALID_INDEX;
+    metadata->ps_id = AIC_PS_ID_LEGACY;
     if (!context || !record ||
         length < AIC8800_USB_HEADER_SIZE + AIC_TX_DESCRIPTOR_SIZE ||
         (record[2] & 0x7fU) != AIC_USB_TYPE_DATA_TX)
@@ -917,15 +1086,22 @@ void aic8800_core_tx_metadata_init(
     if (context->sta_present[descriptor->station_index])
     {
         metadata->accounted = RT_TRUE;
+        metadata->host_buffered = RT_TRUE;
         metadata->station_generation =
             context->sta_generation[descriptor->station_index];
+        if (descriptor->tid < 16U &&
+            (context->sta_uapsd_tids[descriptor->station_index] &
+             (1U << descriptor->tid)))
+        {
+            metadata->ps_id = AIC_PS_ID_UAPSD;
+        }
     }
     rt_hw_interrupt_enable(level);
 }
 
 enum aic8800_tx_record_state aic8800_core_tx_metadata_state(
     struct aic8800_context *context,
-    const struct aic8800_tx_metadata *metadata)
+    struct aic8800_tx_metadata *metadata)
 {
     rt_bool_t valid;
     rt_base_t level;
@@ -971,13 +1147,173 @@ enum aic8800_tx_record_state aic8800_core_tx_metadata_state(
     valid = context->sta_present[metadata->station_index] &&
             context->sta_generation[metadata->station_index] ==
                 metadata->station_generation;
+    if (metadata->ps_id >= AIC8800_PS_ID_COUNT)
+    {
+        valid = RT_FALSE;
+    }
     if (valid && context->sta_power_save[metadata->station_index])
     {
-        rt_hw_interrupt_enable(level);
-        return AIC8800_TX_RECORD_DEFER;
+        if (metadata->service_period_reserved &&
+            metadata->service_period_generation ==
+                context->sta_service_period_generation[
+                    metadata->station_index][metadata->ps_id])
+        {
+            rt_hw_interrupt_enable(level);
+            return AIC8800_TX_RECORD_READY;
+        }
+        metadata->service_period_reserved = RT_FALSE;
+        metadata->more_data = RT_FALSE;
+        metadata->eosp = RT_FALSE;
+        if (!context->sta_service_period_remaining[metadata->station_index]
+                                                   [metadata->ps_id])
+        {
+            rt_hw_interrupt_enable(level);
+            return AIC8800_TX_RECORD_DEFER;
+        }
+        context->sta_service_period_remaining[metadata->station_index]
+                                                     [metadata->ps_id]--;
+        context->sta_service_period_reserved[metadata->station_index]
+                                                    [metadata->ps_id]++;
+        metadata->service_period_generation =
+            context->sta_service_period_generation[metadata->station_index]
+                                                  [metadata->ps_id];
+        metadata->service_period_reserved = RT_TRUE;
+        metadata->eosp = metadata->ps_id == AIC_PS_ID_UAPSD &&
+            !context->sta_service_period_remaining[metadata->station_index]
+                                                   [metadata->ps_id];
+    }
+    else if (valid)
+    {
+        metadata->service_period_reserved = RT_FALSE;
+        metadata->more_data = RT_FALSE;
+        metadata->eosp = RT_FALSE;
     }
     rt_hw_interrupt_enable(level);
     return valid ? AIC8800_TX_RECORD_READY : AIC8800_TX_RECORD_DROP;
+}
+
+enum aic8800_tx_record_state aic8800_core_tx_metadata_apply(
+    struct aic8800_context *context, struct aic8800_tx_metadata *metadata,
+    void *data, rt_size_t length)
+{
+    rt_uint8_t *record = data;
+    struct aic_wire_tx_host_descriptor *descriptor;
+    rt_bool_t traffic_empty = RT_FALSE;
+    rt_bool_t power_save = RT_FALSE;
+    rt_bool_t service_period_active = RT_FALSE;
+    rt_uint16_t flags;
+    rt_base_t level;
+
+    if (!context || !metadata || !record)
+    {
+        return AIC8800_TX_RECORD_DROP;
+    }
+    if (length < AIC8800_USB_HEADER_SIZE + AIC_TX_DESCRIPTOR_SIZE ||
+        (record[2] & 0x7fU) != AIC_USB_TYPE_DATA_TX)
+    {
+        return AIC8800_TX_RECORD_READY;
+    }
+    if (metadata->accounted && metadata->host_buffered &&
+        metadata->station_index < AIC8800_STATION_SLOTS &&
+        metadata->ps_id < AIC8800_PS_ID_COUNT)
+    {
+        level = rt_hw_interrupt_disable();
+        if (!context->sta_present[metadata->station_index] ||
+            context->sta_generation[metadata->station_index] !=
+                metadata->station_generation ||
+            !context->sta_buffered[metadata->station_index][metadata->ps_id])
+        {
+            rt_hw_interrupt_enable(level);
+            return AIC8800_TX_RECORD_DROP;
+        }
+        power_save = context->sta_power_save[metadata->station_index];
+        service_period_active = metadata->service_period_reserved &&
+            metadata->service_period_generation ==
+                context->sta_service_period_generation[
+                    metadata->station_index][metadata->ps_id] &&
+            context->sta_service_period_reserved[
+                metadata->station_index][metadata->ps_id] != 0;
+        if (power_save && !service_period_active)
+        {
+            rt_hw_interrupt_enable(level);
+            return AIC8800_TX_RECORD_DEFER;
+        }
+        if (service_period_active)
+        {
+            context->sta_service_period_reserved[
+                metadata->station_index][metadata->ps_id]--;
+        }
+        context->sta_buffered[metadata->station_index][metadata->ps_id]--;
+        metadata->host_buffered = RT_FALSE;
+        metadata->more_data = power_save &&
+            context->sta_buffered[metadata->station_index]
+                                 [metadata->ps_id] != 0;
+        metadata->eosp = metadata->eosp && power_save &&
+                         service_period_active;
+        traffic_empty =
+            context->sta_buffered[metadata->station_index]
+                                 [metadata->ps_id] == 0;
+        rt_hw_interrupt_enable(level);
+    }
+
+    descriptor = (struct aic_wire_tx_host_descriptor *)(
+        record + AIC8800_USB_HEADER_SIZE);
+    flags = aic_get_le16(&descriptor->flags);
+    flags &= ~(AIC_TX_FLAG_MORE_DATA | AIC_TX_FLAG_EOSP);
+    if (metadata->more_data)
+    {
+        flags |= AIC_TX_FLAG_MORE_DATA;
+    }
+    if (metadata->eosp)
+    {
+        flags |= AIC_TX_FLAG_EOSP;
+    }
+    aic_put_le16(&descriptor->flags, flags);
+    if (traffic_empty)
+    {
+        aic_set_traffic_status(context, metadata->station_index,
+                               metadata->ps_id, RT_FALSE);
+    }
+    return AIC8800_TX_RECORD_READY;
+}
+
+void aic8800_core_tx_metadata_restore(
+    struct aic8800_context *context, struct aic8800_tx_metadata *metadata)
+{
+    rt_bool_t report = RT_FALSE;
+    rt_base_t level;
+
+    if (!context || !metadata || !metadata->accounted ||
+        metadata->host_buffered ||
+        metadata->station_index >= AIC8800_STATION_SLOTS ||
+        metadata->ps_id >= AIC8800_PS_ID_COUNT)
+    {
+        return;
+    }
+    level = rt_hw_interrupt_disable();
+    if (context->sta_present[metadata->station_index] &&
+        context->sta_generation[metadata->station_index] ==
+            metadata->station_generation)
+    {
+        context->sta_buffered[metadata->station_index][metadata->ps_id]++;
+        if (metadata->service_period_reserved &&
+            metadata->service_period_generation ==
+                context->sta_service_period_generation[
+                    metadata->station_index][metadata->ps_id])
+        {
+            context->sta_service_period_reserved[
+                metadata->station_index][metadata->ps_id]++;
+        }
+        metadata->host_buffered = RT_TRUE;
+        metadata->more_data = RT_FALSE;
+        report = context->sta_power_save[metadata->station_index];
+    }
+    rt_hw_interrupt_enable(level);
+    if (report)
+    {
+        aic_set_traffic_status(context, metadata->station_index,
+                               metadata->ps_id, RT_TRUE);
+    }
 }
 
 static void aic_channel_context_report(struct aic8800_context *context,
@@ -1006,17 +1342,14 @@ static void aic_channel_context_report(struct aic8800_context *context,
     }
 }
 
-static const rt_uint8_t *aic_connect_response_ie(
-    const rt_uint8_t *parameter, rt_size_t length, rt_uint8_t element_id,
-    rt_uint8_t *element_length)
+static const rt_uint8_t *aic_connect_response_ies(
+    const rt_uint8_t *parameter, rt_size_t length, rt_size_t *ies_length)
 {
-    const rt_uint8_t *ies;
-    rt_size_t ies_length;
-    rt_size_t offset = 0;
     rt_uint16_t request_length;
     rt_uint16_t response_length;
 
-    if (!parameter || length < AIC_SM_CONNECT_IND_IE_BUFFER_OFFSET)
+    if (!parameter || !ies_length ||
+        length < AIC_SM_CONNECT_IND_IE_BUFFER_OFFSET)
     {
         return RT_NULL;
     }
@@ -1031,9 +1364,17 @@ static const rt_uint8_t *aic_connect_response_ie(
     {
         return RT_NULL;
     }
-    ies = parameter + AIC_SM_CONNECT_IND_IE_BUFFER_OFFSET + request_length;
-    ies_length = response_length;
-    while (offset + 2U <= ies_length)
+    *ies_length = response_length;
+    return parameter + AIC_SM_CONNECT_IND_IE_BUFFER_OFFSET + request_length;
+}
+
+static const rt_uint8_t *aic_find_connect_ie(
+    const rt_uint8_t *ies, rt_size_t ies_length, rt_uint8_t element_id,
+    rt_uint8_t *element_length)
+{
+    rt_size_t offset = 0;
+
+    while (ies && offset + 2U <= ies_length)
     {
         rt_size_t current_length = ies[offset + 1U];
 
@@ -1054,8 +1395,28 @@ static const rt_uint8_t *aic_connect_response_ie(
     return RT_NULL;
 }
 
-static void aic_log_ap_channel_operation(const rt_uint8_t *parameter,
-                                         rt_size_t length)
+static const rt_uint8_t *aic_connect_response_ie(
+    const rt_uint8_t *parameter, rt_size_t length, rt_uint8_t element_id,
+    rt_uint8_t *element_length)
+{
+    const rt_uint8_t *ies;
+    rt_size_t ies_length = 0;
+
+    ies = aic_connect_response_ies(parameter, length, &ies_length);
+    return aic_find_connect_ie(ies, ies_length, element_id, element_length);
+}
+
+/* Returns the AP's operating bandwidth in MHz, or 0 when no HT or VHT
+ * operation element is present.
+ *
+ * VHT Operation signals 160 MHz and 80+80 MHz two different ways.  Besides the
+ * deprecated width codes 2 and 3, there is the backward-compatible form where
+ * the width code stays 1 and the second centre-frequency segment is non-zero:
+ * a segment separation of 8 channels means 160 MHz, and more than 16 means
+ * 80+80 MHz.  Reading the width code alone reports a 160 MHz AP as 80 MHz,
+ * which is what the field says but not what the AP is doing. */
+static rt_uint32_t aic_log_ap_channel_operation(const rt_uint8_t *parameter,
+                                                rt_size_t length)
 {
     const rt_uint8_t *ht;
     const rt_uint8_t *vht;
@@ -1066,6 +1427,7 @@ static void aic_log_ap_channel_operation(const rt_uint8_t *parameter,
     rt_uint8_t vht_width = 0;
     rt_uint8_t center0 = 0;
     rt_uint8_t center1 = 0;
+    rt_uint32_t bandwidth = 0;
 
     ht = aic_connect_response_ie(parameter, length,
                                  AIC_WLAN_EID_HT_OPERATION, &ht_length);
@@ -1075,19 +1437,63 @@ static void aic_log_ap_channel_operation(const rt_uint8_t *parameter,
     {
         secondary = ht[1] & 0x03U;
         ht_width = (ht[1] & 0x04U) ? 40U : 20U;
+        bandwidth = ht_width;
     }
     if (vht && vht_length >= 3U)
     {
         vht_width = vht[0];
         center0 = vht[1];
         center1 = vht[2];
+        switch (vht_width)
+        {
+        case 0U:
+            /* 20 or 40 MHz; the HT operation element above already said which. */
+            break;
+        case 1U:
+            if (center1)
+            {
+                int separation = (int)center1 - (int)center0;
+
+                if (separation < 0)
+                {
+                    separation = -separation;
+                }
+                bandwidth = separation == 8 || separation > 16 ? 160U : 80U;
+            }
+            else
+            {
+                bandwidth = 80U;
+            }
+            break;
+        case 2U:
+        case 3U:
+            bandwidth = 160U;
+            break;
+        default:
+            break;
+        }
     }
     if (ht || vht)
     {
-        LOG_I("AP operation: HT=%u MHz secondary=%u VHT-code=%u center0=%u center1=%u",
+        LOG_I("AP operation: HT=%u MHz secondary=%u VHT-code=%u center0=%u center1=%u operating=%u MHz",
               (unsigned int)ht_width, (unsigned int)secondary,
               (unsigned int)vht_width, (unsigned int)center0,
-              (unsigned int)center1);
+              (unsigned int)center1, (unsigned int)bandwidth);
+    }
+    return bandwidth;
+}
+
+/* Firmware channel width code to MHz.  80+80 MHz occupies 160 MHz of spectrum
+ * in two segments; report it as 160 so width comparisons stay meaningful. */
+static rt_uint32_t aic_channel_width_mhz(rt_uint8_t width)
+{
+    switch (width)
+    {
+    case 1U: return 40U;
+    case 2U: return 80U;
+    case 3U: return 160U;
+    case 4U: return 160U;
+    default: return 20U;
     }
 }
 
@@ -1102,6 +1508,8 @@ static void aic_update_connected_channel(
     rt_uint8_t band;
     rt_uint8_t width;
     rt_uint16_t channel_number;
+    rt_uint32_t negotiated;
+    rt_uint32_t offered;
 
     if (!context || !parameter || length < AIC_SM_CONNECT_IND_CHANNEL_END)
     {
@@ -1154,32 +1562,66 @@ static void aic_update_connected_channel(
     }
     context->current_channel = channel;
     context->current_channel_valid = RT_TRUE;
+    negotiated = aic_channel_width_mhz(width);
     LOG_I("association channel: primary=%u frequency=%u MHz width=%u MHz center1=%u center2=%u",
           (unsigned int)channel.primary_channel,
           (unsigned int)channel.primary_frequency_mhz,
-          (unsigned int)(20U << (width < 4U ? width : 0U)),
+          (unsigned int)negotiated,
           (unsigned int)channel.center_frequency1_mhz,
           (unsigned int)channel.center_frequency2_mhz);
-    aic_log_ap_channel_operation(parameter, length);
+    offered = aic_log_ap_channel_operation(parameter, length);
+
+    /* Tell an AIC8800D40 apart from an AIC8800D80 at run time.  Both enumerate
+     * as a69c:8d81, load the same firmware family and report an 80 MHz modem
+     * in MM_VERSION, so nothing at startup separates a part that does
+     * 20/40/80 MHz at 600.4 Mbps from one that does 20/40 MHz at 286.8 Mbps.
+     * The association itself does: the firmware picks the operating width from
+     * the AP's operation elements and its own modem, so settling for 40 MHz
+     * where the AP offered 80 or more is a modem that cannot do 80.
+     *
+     * Wait for a second such association before believing it.  The costs are
+     * asymmetric - capping a real D80 at 40 MHz throws away half its
+     * throughput, while letting a D40 advertise a width it never uses costs
+     * little - so the evidence has to be repeated, and any association that
+     * does reach 80 MHz proves the modem outright and clears the count. */
+    if (channel.band == RT_WLAN_OFFLOAD_BAND_5GHZ && offered >= 80U &&
+        !context->bandwidth_80_rejected &&
+        aic8800_radio_supports_80mhz(context))
+    {
+        if (negotiated >= 80U)
+        {
+            context->bandwidth_80_failures = 0;
+        }
+        else if (++context->bandwidth_80_failures >= AIC_BANDWIDTH_80_FAILURES)
+        {
+            LOG_W("modem claims 80 MHz but associated at %u MHz to a %u MHz AP "
+                  "%u times; advertising %u MHz from the next association",
+                  (unsigned int)negotiated, (unsigned int)offered,
+                  (unsigned int)context->bandwidth_80_failures,
+                  (unsigned int)negotiated);
+            context->bandwidth_80_rejected = RT_TRUE;
+            context->me_config_stale = RT_TRUE;
+            aic_refresh_channel_metadata(context);
+        }
+        else
+        {
+            LOG_I("associated at %u MHz to a %u MHz AP; another like this "
+                  "drops the 80 MHz claim",
+                  (unsigned int)negotiated, (unsigned int)offered);
+        }
+    }
 }
 
+/* mac_chan_flags: bit0 CHAN_NO_IR, bit1 CHAN_DISABLED, bit2 CHAN_RADAR.
+ *
+ * Only CHAN_DISABLED is derived from the regulatory table.  Vendor Linux builds
+ * with CONFIG_RADAR_OR_IR_DETECT=n, so its get_chan_flags() is a no-op and both
+ * ME_CHAN_CONFIG_REQ and SCANU_START_REQ always carry flags=0: the firmware owns
+ * DFS and no-initiate-radiation policy itself.  Advertising CHAN_NO_IR from the
+ * host turns those channels beacon-only, which loses APs during a scan. */
 static rt_uint8_t aic_channel_flags(rt_uint32_t flags)
 {
-    rt_uint8_t result = 0;
-
-    if (flags & RT_WLAN_OFFLOAD_CHANNEL_NO_IR)
-    {
-        result |= 1U;
-    }
-    if (flags & RT_WLAN_OFFLOAD_CHANNEL_DISABLED)
-    {
-        result |= 2U;
-    }
-    if (flags & RT_WLAN_OFFLOAD_CHANNEL_RADAR)
-    {
-        result |= 4U;
-    }
-    return result;
+    return (flags & RT_WLAN_OFFLOAD_CHANNEL_DISABLED) ? 2U : 0U;
 }
 
 static void aic_encode_channel(rt_uint8_t *destination,
@@ -1191,6 +1633,32 @@ static void aic_encode_channel(rt_uint8_t *destination,
     destination[3] = 0;
     destination[4] = (rt_uint8_t)power;
     destination[5] = 0;
+}
+
+static const struct rt_wlan_offload_channel *aic_channel_metadata(
+    const struct aic8800_context *context,
+    enum rt_wlan_offload_band_id band_id, rt_uint16_t channel_number)
+{
+    const struct rt_wlan_offload_supported_band *band;
+    rt_size_t index;
+
+    if (!context || band_id >= RT_WLAN_OFFLOAD_BAND_MAX)
+    {
+        return RT_NULL;
+    }
+    band = context->radio.bands[band_id];
+    if (!band)
+    {
+        return RT_NULL;
+    }
+    for (index = 0; index < band->channel_count; index++)
+    {
+        if (band->channels[index].number == channel_number)
+        {
+            return &band->channels[index];
+        }
+    }
+    return RT_NULL;
 }
 
 static rt_err_t aic_command_push(
@@ -1311,14 +1779,64 @@ rt_err_t aic8800_protocol_command(struct aic8800_context *context,
                                 rt_size_t response_capacity,
                                 rt_size_t *response_length)
 {
+    rt_err_t result;
+
     if (!context)
     {
         return -RT_EINVAL;
     }
-    return rt_wlan_offload_command_execute(
+    if (!context->command_gate_initialized)
+    {
+        return -RT_EIO;
+    }
+#ifdef AIC8800_WIFI_TRANSPORT_SDIO
+    if (context->transport == AIC8800_TRANSPORT_SDIO &&
+        rt_thread_self() == context->sdio_thread)
+    {
+        while (RT_TRUE)
+        {
+            result = rt_sem_take(&context->command_gate, RT_WAITING_NO);
+            if (result == RT_EOK)
+            {
+                break;
+            }
+            result = aic8800_sdio_pump_command(
+                context, &context->commands, 0,
+                AIC8800_WIFI_COMMAND_TIMEOUT_MS);
+            if (result != RT_EOK)
+            {
+                return result;
+            }
+            /* The completed command's owner must run before it can release
+             * the gate. A bounded wait avoids starving that lower-priority
+             * thread, while the next iteration still services a command if
+             * another waiter acquired the gate first. */
+            result = rt_sem_take(&context->command_gate, 1);
+            if (result == RT_EOK)
+            {
+                break;
+            }
+            if (result != -RT_ETIMEOUT)
+            {
+                return result;
+            }
+        }
+    }
+    else
+#endif
+    {
+        result = rt_sem_take(&context->command_gate, RT_WAITING_FOREVER);
+        if (result != RT_EOK)
+        {
+            return result;
+        }
+    }
+    result = rt_wlan_offload_command_execute(
         &context->commands, request_id, confirmation_id,
         request, request_length, response, response_capacity, response_length,
         rt_tick_from_millisecond(AIC8800_WIFI_COMMAND_TIMEOUT_MS), RT_NULL);
+    rt_sem_release(&context->command_gate);
+    return result;
 }
 
 static rt_err_t aic_execute(struct aic8800_context *context,
@@ -1331,6 +1849,184 @@ static rt_err_t aic_execute(struct aic8800_context *context,
     return aic8800_protocol_command(context, request_id, confirmation_id,
                                     request, request_length, response,
                                     response_capacity, response_length);
+}
+
+static rt_err_t aic_runtime_mem_mask_write(
+    struct aic8800_context *context, rt_uint32_t address, rt_uint32_t mask,
+    rt_uint32_t value)
+{
+    rt_uint8_t request[12];
+
+    aic_put_le32(request, address);
+    aic_put_le32(request + 4, mask);
+    aic_put_le32(request + 8, value);
+    return aic_execute(context, AIC_DBG_MEM_MASK_WRITE_REQ,
+                       AIC_DBG_MEM_MASK_WRITE_CFM, request, sizeof(request),
+                       RT_NULL, 0, RT_NULL);
+}
+
+static rt_err_t aic_configure_runtime_rx_gain(struct aic8800_context *context)
+{
+    if (!context)
+    {
+        return -RT_EINVAL;
+    }
+    if (context->product_id != AIC8800_USB_PID_AIC8800DC &&
+        context->product_id != AIC8800_USB_PID_AIC8800DW)
+    {
+        return RT_EOK;
+    }
+    return aic_runtime_mem_mask_write(
+        context, AIC_DC_RUNTIME_RX_GAIN_ADDRESS, AIC_DC_RUNTIME_RX_GAIN_MASK,
+        AIC_DC_RUNTIME_RX_GAIN_VALUE);
+}
+
+static rt_err_t aic_configure_coexistence(struct aic8800_context *context)
+{
+    struct aic_wire_mm_set_coex_req request;
+
+    if (!context)
+    {
+        return -RT_EINVAL;
+    }
+    rt_memset(&request, 0, sizeof(request));
+    request.bt_on = 1;
+    request.enable_nullcts = 1;
+    return aic_execute(context, AIC_MM_SET_COEX_REQ, AIC_MM_SET_COEX_CFM,
+                       &request, sizeof(request), RT_NULL, 0, RT_NULL);
+}
+
+static void aic_schedule_traffic_work(struct aic8800_context *context,
+                                      rt_tick_t delay)
+{
+    rt_bool_t submit = RT_FALSE;
+    rt_base_t level;
+
+    if (!context)
+    {
+        return;
+    }
+    level = rt_hw_interrupt_disable();
+    if (context->traffic_work_initialized &&
+        !context->traffic_work_queued && context->attached)
+    {
+        context->traffic_work_queued = RT_TRUE;
+        submit = RT_TRUE;
+    }
+    rt_hw_interrupt_enable(level);
+    if (submit && rt_work_submit(&context->traffic_work, delay) != RT_EOK)
+    {
+        level = rt_hw_interrupt_disable();
+        context->traffic_work_queued = RT_FALSE;
+        rt_hw_interrupt_enable(level);
+    }
+}
+
+static void aic_set_traffic_status(struct aic8800_context *context,
+                                   rt_uint8_t station_index,
+                                   rt_uint8_t ps_id,
+                                   rt_bool_t available)
+{
+    rt_bool_t dirty = RT_FALSE;
+    rt_base_t level;
+
+    if (!context || station_index >= AIC8800_STATION_SLOTS ||
+        ps_id >= AIC8800_PS_ID_COUNT)
+    {
+        return;
+    }
+    level = rt_hw_interrupt_disable();
+    if (!context->sta_present[station_index])
+    {
+        context->sta_traffic_available[station_index][ps_id] = RT_FALSE;
+        context->sta_traffic_reported[station_index][ps_id] = RT_FALSE;
+        context->sta_traffic_dirty[station_index][ps_id] = RT_FALSE;
+    }
+    else
+    {
+        context->sta_traffic_available[station_index][ps_id] = available;
+        dirty =
+            context->sta_traffic_reported[station_index][ps_id] != available;
+        context->sta_traffic_dirty[station_index][ps_id] = dirty;
+    }
+    rt_hw_interrupt_enable(level);
+    if (dirty)
+    {
+        aic_schedule_traffic_work(context, 0);
+    }
+}
+
+static void aic_traffic_work(struct rt_work *work, void *work_data)
+{
+    struct aic8800_context *context = work_data;
+    rt_bool_t retry = RT_FALSE;
+    rt_base_t level;
+    rt_size_t index;
+
+    (void)work;
+    if (!context)
+    {
+        return;
+    }
+    level = rt_hw_interrupt_disable();
+    context->traffic_work_queued = RT_FALSE;
+    rt_hw_interrupt_enable(level);
+
+    for (index = 0; index < AIC8800_STATION_SLOTS; index++)
+    {
+        for (rt_size_t ps_id = 0; ps_id < AIC8800_PS_ID_COUNT; ps_id++)
+        {
+            struct aic_wire_me_traffic_ind_req request;
+            rt_uint16_t generation;
+            rt_bool_t available;
+            rt_bool_t dirty;
+            rt_err_t result;
+
+            level = rt_hw_interrupt_disable();
+            dirty = context->sta_present[index] &&
+                    context->sta_traffic_dirty[index][ps_id];
+            generation = context->sta_generation[index];
+            available = context->sta_traffic_available[index][ps_id];
+            rt_hw_interrupt_enable(level);
+            if (!dirty)
+            {
+                continue;
+            }
+
+            request.station_index = (rt_uint8_t)index;
+            request.tx_available = available ? 1U : 0U;
+            request.uapsd = ps_id == AIC_PS_ID_UAPSD;
+            result = aic_execute(context, AIC_ME_TRAFFIC_IND_REQ,
+                                 AIC_ME_TRAFFIC_IND_CFM, &request,
+                                 sizeof(request), RT_NULL, 0, RT_NULL);
+
+            level = rt_hw_interrupt_disable();
+            if (!context->sta_present[index] ||
+                context->sta_generation[index] != generation)
+            {
+                context->sta_traffic_available[index][ps_id] = RT_FALSE;
+                context->sta_traffic_reported[index][ps_id] = RT_FALSE;
+                context->sta_traffic_dirty[index][ps_id] = RT_FALSE;
+            }
+            else
+            {
+                if (result == RT_EOK)
+                {
+                    context->sta_traffic_reported[index][ps_id] = available;
+                }
+                context->sta_traffic_dirty[index][ps_id] =
+                    context->sta_traffic_available[index][ps_id] !=
+                        context->sta_traffic_reported[index][ps_id];
+                retry = retry || context->sta_traffic_dirty[index][ps_id];
+            }
+            rt_hw_interrupt_enable(level);
+        }
+    }
+    if (retry && context->lmac_started)
+    {
+        aic_schedule_traffic_work(
+            context, rt_tick_from_millisecond(AIC_TRAFFIC_IND_RETRY_MS));
+    }
 }
 
 static rt_err_t aic_submit_scan_wire(struct aic8800_context *context,
@@ -1813,15 +2509,42 @@ static void aic_report_scan_result(struct aic8800_context *context,
     rt_size_t ies_length;
     rt_size_t offset;
 
-    if (!context || !parameter || !context->scan_request_id ||
-        !context->attached || context->radio.state != RT_WLAN_OFFLOAD_STARTED ||
-        length < 12)
+    if (!context || !parameter || length < 12)
     {
+        if (context && context->invalid_rx_log_count < 8U)
+        {
+            context->invalid_rx_log_count++;
+            LOG_W("ignored malformed scan result: length=%u",
+                  (unsigned int)length);
+        }
+        return;
+    }
+    /* A well-formed record can still arrive after SCANU_START_CFM cleared the
+     * request, or while the radio is down.  That is a lost result, not a
+     * protocol error: keep it out of the malformed counter so the warning above
+     * keeps pointing at real parsing problems. */
+    if (!context->scan_request_id || !context->attached ||
+        context->radio.state != RT_WLAN_OFFLOAD_STARTED)
+    {
+        context->scan_late_result_count++;
+        if (aic8800_log_throttle(context->scan_late_result_count))
+        {
+            LOG_D("dropped scan result with no scan outstanding: length=%u "
+                  "(total=%u)",
+                  (unsigned int)length,
+                  (unsigned int)context->scan_late_result_count);
+        }
         return;
     }
     frame_length = aic_get_le16(parameter);
     if (frame_length < 36 || frame_length > length - 12U)
     {
+        if (context->invalid_rx_log_count < 8U)
+        {
+            context->invalid_rx_log_count++;
+            LOG_W("ignored malformed scan result: length=%u frame=%u",
+                  (unsigned int)length, (unsigned int)frame_length);
+        }
         return;
     }
     frame = parameter + 12;
@@ -1874,7 +2597,9 @@ static void aic_report_scan_result(struct aic8800_context *context,
 }
 
 static void aic_report_scan_done_status(struct aic8800_context *context,
-                                        rt_err_t status)
+                                        rt_err_t status,
+                                        rt_bool_t result_count_valid,
+                                        rt_uint16_t result_count)
 {
     struct rt_wlan_offload_event event;
     rt_uint32_t request_id;
@@ -1890,6 +2615,9 @@ static void aic_report_scan_done_status(struct aic8800_context *context,
         return;
     }
     context->scan_request_id = 0;
+    context->scan_completion_pending = RT_FALSE;
+    context->scan_completion_retry_count = 0;
+    context->scan_result_count_valid = RT_FALSE;
     context->scan_followup_pending = RT_FALSE;
     context->scan_followup_retry_count = 0;
     context->scan_work_queued = RT_FALSE;
@@ -1902,8 +2630,18 @@ static void aic_report_scan_done_status(struct aic8800_context *context,
     event.iftype = RT_WLAN_OFFLOAD_IFTYPE_STATION;
     event.request_id = request_id;
     event.status = status;
-    LOG_I("scan complete: status=%d 2.4GHz=%u 5GHz=%u", status,
-          context->scan_results_2ghz, context->scan_results_5ghz);
+    if (result_count_valid)
+    {
+        LOG_I("scan complete: status=%d firmware=%u 2.4GHz=%u 5GHz=%u",
+              status, (unsigned int)result_count,
+              context->scan_results_2ghz, context->scan_results_5ghz);
+    }
+    else
+    {
+        LOG_I("scan complete: status=%d firmware=? 2.4GHz=%u 5GHz=%u",
+              status, context->scan_results_2ghz,
+              context->scan_results_5ghz);
+    }
     rt_wlan_offload_report_event(&context->radio, &event);
 }
 
@@ -1912,17 +2650,38 @@ static void aic_handle_scan_done(struct aic8800_context *context,
                                  rt_size_t length)
 {
     rt_err_t status;
+    rt_uint16_t result_count = 0;
+    rt_bool_t result_count_valid = RT_FALSE;
 
     if (!context)
     {
         return;
     }
+    if (!context->scan_request_id || context->scan_completion_pending)
+    {
+        return;
+    }
     if (!parameter || length < 2U)
     {
-        aic_report_scan_done_status(context, -RT_EIO);
+        aic_report_scan_done_status(context, -RT_EIO, RT_FALSE, 0);
         return;
     }
     status = parameter[1] ? -RT_ERROR : RT_EOK;
+    if (length >= 3U)
+    {
+        result_count = parameter[2];
+        result_count_valid = RT_TRUE;
+    }
+
+    if (result_count_valid && context->scan_result_count_valid)
+    {
+        context->scan_expected_results = (rt_uint16_t)(
+            context->scan_expected_results + result_count);
+    }
+    else
+    {
+        context->scan_result_count_valid = RT_FALSE;
+    }
 
     if (status == RT_EOK && context->scan_followup_pending)
     {
@@ -1936,12 +2695,34 @@ static void aic_handle_scan_done(struct aic8800_context *context,
         context->scan_work_queued = RT_FALSE;
         LOG_E("cannot queue 5 GHz scan: %d", status);
     }
-    aic_report_scan_done_status(context, status);
+    if (status != RT_EOK)
+    {
+        aic_report_scan_done_status(
+            context, status, context->scan_result_count_valid,
+            context->scan_expected_results);
+        return;
+    }
+    context->scan_completion_status = status;
+    context->scan_completion_retry_count = 0;
+    context->scan_completion_pending = RT_TRUE;
+    context->scan_work_queued = RT_TRUE;
+    status = rt_work_submit(
+        &context->scan_work,
+        rt_tick_from_millisecond(AIC_SCAN_RESULT_DRAIN_RETRY_MS));
+    if (status != RT_EOK)
+    {
+        context->scan_work_queued = RT_FALSE;
+        LOG_W("cannot defer scan completion for late results: %d", status);
+        aic_report_scan_done_status(
+            context, RT_EOK, context->scan_result_count_valid,
+            context->scan_expected_results);
+    }
 }
 
-static void aic_scan_followup_work(struct rt_work *work, void *work_data)
+static void aic_scan_work(struct rt_work *work, void *work_data)
 {
     struct aic8800_context *context = work_data;
+    rt_uint16_t received;
     rt_err_t retry_result;
     rt_err_t result;
 
@@ -1951,42 +2732,82 @@ static void aic_scan_followup_work(struct rt_work *work, void *work_data)
         return;
     }
     context->scan_work_queued = RT_FALSE;
-    if (!context->scan_request_id || !context->transport_connected ||
-        !context->attached || context->radio.state != RT_WLAN_OFFLOAD_STARTED ||
-        !context->scan_followup_pending)
+    if (!context->scan_request_id)
     {
         return;
     }
-    context->scan_followup_pending = RT_FALSE;
-    LOG_D("continuing scan on 5 GHz (%u channels)",
-          context->scan_followup.channel_count);
-    result = aic_submit_scan_wire(context, &context->scan_followup);
-    if (result == -RT_EFULL &&
-        context->scan_followup_retry_count <
-            AIC_SCAN_FOLLOWUP_MAX_RETRIES &&
-        context->scan_request_id && context->transport_connected &&
-        context->attached &&
+    if (context->scan_followup_pending)
+    {
+        if (!context->transport_connected || !context->attached ||
+            context->radio.state != RT_WLAN_OFFLOAD_STARTED)
+        {
+            return;
+        }
+        context->scan_followup_pending = RT_FALSE;
+        LOG_D("continuing scan on 5 GHz (%u channels)",
+              context->scan_followup.channel_count);
+        result = aic_submit_scan_wire(context, &context->scan_followup);
+        if (result == -RT_EFULL &&
+            context->scan_followup_retry_count <
+                AIC_SCAN_FOLLOWUP_MAX_RETRIES &&
+            context->scan_request_id && context->transport_connected &&
+            context->attached &&
+            context->radio.state == RT_WLAN_OFFLOAD_STARTED)
+        {
+            context->scan_followup_retry_count++;
+            context->scan_followup_pending = RT_TRUE;
+            context->scan_work_queued = RT_TRUE;
+            retry_result = rt_work_submit(
+                &context->scan_work,
+                rt_tick_from_millisecond(AIC_SCAN_FOLLOWUP_RETRY_MS));
+            if (retry_result == RT_EOK)
+            {
+                return;
+            }
+            context->scan_work_queued = RT_FALSE;
+            context->scan_followup_pending = RT_FALSE;
+            result = retry_result;
+        }
+        if (result != RT_EOK)
+        {
+            LOG_E("5 GHz scan start failed: %d", result);
+            aic_report_scan_done_status(context, result, RT_FALSE, 0);
+        }
+        return;
+    }
+    if (!context->scan_completion_pending)
+    {
+        return;
+    }
+    received = context->scan_results_2ghz + context->scan_results_5ghz;
+    if (context->scan_result_count_valid &&
+        received < context->scan_expected_results &&
+        context->scan_completion_retry_count <
+            AIC_SCAN_RESULT_DRAIN_MAX_RETRIES &&
+        context->transport_connected && context->attached &&
         context->radio.state == RT_WLAN_OFFLOAD_STARTED)
     {
-        context->scan_followup_retry_count++;
-        context->scan_followup_pending = RT_TRUE;
+        context->scan_completion_retry_count++;
         context->scan_work_queued = RT_TRUE;
-        retry_result = rt_work_submit(
+        result = rt_work_submit(
             &context->scan_work,
-            rt_tick_from_millisecond(AIC_SCAN_FOLLOWUP_RETRY_MS));
-        if (retry_result == RT_EOK)
+            rt_tick_from_millisecond(AIC_SCAN_RESULT_DRAIN_RETRY_MS));
+        if (result == RT_EOK)
         {
             return;
         }
         context->scan_work_queued = RT_FALSE;
-        context->scan_followup_pending = RT_FALSE;
-        result = retry_result;
+        LOG_W("cannot continue scan result drain: %d", result);
     }
-    if (result != RT_EOK)
+    if (context->scan_result_count_valid &&
+        received < context->scan_expected_results)
     {
-        LOG_E("5 GHz scan start failed: %d", result);
-        aic_report_scan_done_status(context, result);
+        LOG_W("scan result drain timed out: firmware=%u received=%u",
+              context->scan_expected_results, received);
     }
+    aic_report_scan_done_status(
+        context, context->scan_completion_status,
+        context->scan_result_count_valid, context->scan_expected_results);
 }
 
 static void aic_report_connect(struct aic8800_context *context,
@@ -1995,14 +2816,20 @@ static void aic_report_connect(struct aic8800_context *context,
 {
     struct rt_wlan_offload_event event;
     rt_uint16_t status;
+    rt_uint8_t old_bssid[6];
+    rt_bool_t was_connected;
+    rt_bool_t roamed;
 
     if (!context || !parameter ||
-        length <= AIC_SM_CONNECT_IND_CHANNEL_INDEX_OFFSET)
+        length <= AIC_SM_CONNECT_IND_ACM_OFFSET)
     {
         return;
     }
     aic_rx_reorder_reset(context);
     aic_tcp_ack_reset(context);
+    was_connected = context->station_connected;
+    roamed = parameter[8] != 0;
+    rt_memcpy(old_bssid, context->bssid, sizeof(old_bssid));
     status = aic_get_le16(parameter);
     context->station_connected = status == 0;
     context->station_control_port_open = RT_FALSE;
@@ -2015,6 +2842,9 @@ static void aic_report_connect(struct aic8800_context *context,
         rt_memcpy(context->bssid, parameter + 2, 6);
         context->ap_station_index =
             parameter[AIC_SM_CONNECT_IND_STATION_OFFSET];
+        context->station_qos =
+            parameter[AIC_SM_CONNECT_IND_QOS_OFFSET] ? RT_TRUE : RT_FALSE;
+        context->station_acm = parameter[AIC_SM_CONNECT_IND_ACM_OFFSET];
         aic_tx_credit_reset(context, context->ap_station_index);
         context->station_channel_index =
             parameter[AIC_SM_CONNECT_IND_CHANNEL_INDEX_OFFSET];
@@ -2025,7 +2855,13 @@ static void aic_report_connect(struct aic8800_context *context,
     else
     {
         LOG_W("association failed: IEEE status=%u", (unsigned int)status);
+        if (was_connected)
+        {
+            context->station_interface_recycle_pending = RT_TRUE;
+        }
         context->ap_station_index = AIC8800_INVALID_INDEX;
+        context->station_qos = RT_FALSE;
+        context->station_acm = 0;
         context->station_channel_index = AIC8800_INVALID_INDEX;
         context->current_channel_valid = RT_FALSE;
         context->rssi = 0;
@@ -2049,6 +2885,18 @@ static void aic_report_connect(struct aic8800_context *context,
      * request which this host actually submitted. */
     if (!context->connect_request_id)
     {
+        if (status && (roamed || was_connected) && context->attached &&
+            context->radio.state == RT_WLAN_OFFLOAD_STARTED)
+        {
+            rt_memset(&event, 0, sizeof(event));
+            event.type = RT_WLAN_OFFLOAD_EVENT_DISCONNECTED;
+            event.iftype = RT_WLAN_OFFLOAD_IFTYPE_STATION;
+            event.status = RT_EOK;
+            event.data.disconnected.reason = 0;
+            event.data.disconnected.locally_generated = RT_FALSE;
+            rt_memcpy(event.data.disconnected.bssid, old_bssid, 6);
+            (void)rt_wlan_offload_report_event(&context->radio, &event);
+        }
         return;
     }
     if (!context->attached || context->radio.state != RT_WLAN_OFFLOAD_STARTED)
@@ -2094,6 +2942,8 @@ static void aic_report_disconnect(struct aic8800_context *context,
     }
     context->station_control_port_open = RT_FALSE;
     context->ap_station_index = AIC8800_INVALID_INDEX;
+    context->station_qos = RT_FALSE;
+    context->station_acm = 0;
     context->station_channel_index = AIC8800_INVALID_INDEX;
     context->connect_request_id = 0;
     context->station_control_port_pending = RT_FALSE;
@@ -2125,6 +2975,239 @@ static void aic_report_disconnect(struct aic8800_context *context,
     rt_wlan_offload_report_event(&context->radio, &event);
 }
 
+static void aic_report_firmware_fault(struct aic8800_context *context,
+                                      rt_uint16_t id,
+                                      const rt_uint8_t *parameter,
+                                      rt_size_t length)
+{
+    struct rt_wlan_offload_event event;
+    const rt_uint8_t *info = RT_NULL;
+    rt_size_t info_length = 0;
+    rt_size_t log_length;
+
+    if (!context)
+    {
+        return;
+    }
+    if (parameter && length >= sizeof(rt_uint32_t))
+    {
+        info_length = aic_get_le32(parameter);
+        if (info_length > length - sizeof(rt_uint32_t))
+        {
+            info_length = length - sizeof(rt_uint32_t);
+        }
+        if (info_length > sizeof(((struct aic_wire_mm_firmware_fault_ind *)0)->info))
+        {
+            info_length =
+                sizeof(((struct aic_wire_mm_firmware_fault_ind *)0)->info);
+        }
+        info = parameter + sizeof(rt_uint32_t);
+    }
+    log_length = id == AIC_MM_FW_PANIC_IND && info_length > 36U ?
+                 36U : info_length;
+    LOG_E("firmware %s (message=0x%04x length=%u): %.*s",
+          id == AIC_MM_FW_PANIC_IND ? "panic" : "assert", id,
+          (unsigned int)info_length, (int)log_length,
+          info ? (const char *)info : "");
+
+    rt_wlan_offload_command_manager_fail(&context->commands, -RT_EIO);
+    aic_cancel_mgmt_confirmations(context, -RT_EIO);
+    if (!context->attached ||
+        context->radio.state == RT_WLAN_OFFLOAD_UNREGISTERED ||
+        context->radio.state == RT_WLAN_OFFLOAD_FAILED)
+    {
+        return;
+    }
+    rt_memset(&event, 0, sizeof(event));
+    event.type = RT_WLAN_OFFLOAD_EVENT_FIRMWARE_ERROR;
+    event.iftype = RT_WLAN_OFFLOAD_IFTYPE_MAX;
+    event.status = -RT_EIO;
+    event.data.firmware.reason = id;
+    event.data.firmware.dump = info;
+    event.data.firmware.dump_length = info_length;
+    (void)rt_wlan_offload_report_event(&context->radio, &event);
+}
+
+static void aic_report_tkip_mic_failure(
+    struct aic8800_context *context,
+    const struct aic_wire_me_tkip_mic_failure_ind *indication)
+{
+    struct rt_wlan_offload_event event;
+
+    if (!context || !indication || !context->attached ||
+        context->radio.state != RT_WLAN_OFFLOAD_STARTED)
+    {
+        return;
+    }
+    rt_memset(&event, 0, sizeof(event));
+    event.type = RT_WLAN_OFFLOAD_EVENT_TKIP_MIC_FAILURE;
+    if (indication->vif_index == context->vif_index)
+    {
+        event.iftype = RT_WLAN_OFFLOAD_IFTYPE_STATION;
+    }
+    else if (indication->vif_index == context->ap_vif_index)
+    {
+        event.iftype = RT_WLAN_OFFLOAD_IFTYPE_AP;
+    }
+    else
+    {
+        LOG_W("TKIP MIC failure for unknown VIF %u",
+              (unsigned int)indication->vif_index);
+        return;
+    }
+    event.status = RT_EOK;
+    rt_memcpy(event.data.mic_failure.source, indication->address, 6);
+    rt_memcpy(event.data.mic_failure.tsc, indication->tsc, 8);
+    event.data.mic_failure.key_index = indication->key_index;
+    event.data.mic_failure.group = indication->group_addressed != 0;
+    (void)rt_wlan_offload_report_event(&context->radio, &event);
+}
+
+static void aic_schedule_station_loss(
+    struct aic8800_context *context,
+    const struct aic_wire_mm_apm_staloss_ind *indication)
+{
+    rt_size_t free_index = AIC8800_AP_STATION_COUNT;
+    rt_bool_t submit = RT_FALSE;
+    rt_base_t level;
+
+    if (!context || !indication)
+    {
+        return;
+    }
+    level = rt_hw_interrupt_disable();
+    for (rt_size_t index = 0; index < AIC8800_AP_STATION_COUNT; index++)
+    {
+        if (context->station_loss[index].pending &&
+            rt_memcmp(context->station_loss[index].address,
+                      indication->address, 6) == 0)
+        {
+            free_index = index;
+            break;
+        }
+        if (!context->station_loss[index].pending &&
+            free_index == AIC8800_AP_STATION_COUNT)
+        {
+            free_index = index;
+        }
+    }
+    if (free_index < AIC8800_AP_STATION_COUNT)
+    {
+        struct aic8800_station_loss *loss =
+            &context->station_loss[free_index];
+
+        loss->pending = RT_TRUE;
+        loss->vif_index = indication->vif_index;
+        loss->station_index = indication->station_index;
+        rt_memcpy(loss->address, indication->address, 6);
+        if (context->station_loss_work_initialized &&
+            !context->station_loss_work_queued && context->attached)
+        {
+            context->station_loss_work_queued = RT_TRUE;
+            submit = RT_TRUE;
+        }
+    }
+    rt_hw_interrupt_enable(level);
+    if (submit && rt_work_submit(&context->station_loss_work, 0) != RT_EOK)
+    {
+        level = rt_hw_interrupt_disable();
+        context->station_loss_work_queued = RT_FALSE;
+        if (free_index < AIC8800_AP_STATION_COUNT)
+        {
+            context->station_loss[free_index].pending = RT_FALSE;
+        }
+        rt_hw_interrupt_enable(level);
+        LOG_E("cannot queue AP station-loss handling");
+    }
+    else if (free_index == AIC8800_AP_STATION_COUNT)
+    {
+        LOG_W("AP station-loss queue full");
+    }
+}
+
+static void aic_station_loss_work(struct rt_work *work, void *work_data)
+{
+    struct aic8800_context *context = work_data;
+
+    (void)work;
+    while (context)
+    {
+        struct aic8800_station_loss loss;
+        struct rt_wlan_offload_event event;
+        rt_uint16_t aid = 0;
+        rt_bool_t found = RT_FALSE;
+        rt_base_t level;
+        rt_err_t result;
+
+        rt_memset(&loss, 0, sizeof(loss));
+        level = rt_hw_interrupt_disable();
+        for (rt_size_t index = 0; index < AIC8800_AP_STATION_COUNT; index++)
+        {
+            if (context->station_loss[index].pending)
+            {
+                loss = context->station_loss[index];
+                context->station_loss[index].pending = RT_FALSE;
+                break;
+            }
+        }
+        if (!loss.pending)
+        {
+            context->station_loss_work_queued = RT_FALSE;
+            rt_hw_interrupt_enable(level);
+            return;
+        }
+        rt_hw_interrupt_enable(level);
+
+        if (!context->attached || !context->ap_started ||
+            loss.vif_index != context->ap_vif_index)
+        {
+            continue;
+        }
+        if (rt_mutex_take(context->frame_mutex, RT_WAITING_FOREVER) != RT_EOK)
+        {
+            continue;
+        }
+        for (rt_size_t index = 0; index < AIC8800_AP_STATION_COUNT; index++)
+        {
+            const struct aic8800_ap_station *station =
+                &context->ap_stations[index];
+
+            if (station->valid &&
+                station->firmware_index == loss.station_index &&
+                rt_memcmp(station->address, loss.address, 6) == 0)
+            {
+                aid = station->aid;
+                found = RT_TRUE;
+                break;
+            }
+        }
+        rt_mutex_release(context->frame_mutex);
+        if (!found)
+        {
+            LOG_D("ignored stale AP station-loss indication for index %u",
+                  (unsigned int)loss.station_index);
+            continue;
+        }
+        result = aic_del_station_internal(
+            &context->radio.vifs[RT_WLAN_OFFLOAD_VIF_AP_INDEX], 0,
+            loss.address, 4U, RT_TRUE);
+        if (result != RT_EOK)
+        {
+            LOG_W("firmware station-loss cleanup failed for "
+                  "%02x:%02x:%02x:%02x:%02x:%02x",
+                  loss.address[0], loss.address[1], loss.address[2],
+                  loss.address[3], loss.address[4], loss.address[5]);
+        }
+        rt_memset(&event, 0, sizeof(event));
+        event.type = RT_WLAN_OFFLOAD_EVENT_DEL_STATION;
+        event.iftype = RT_WLAN_OFFLOAD_IFTYPE_AP;
+        event.status = RT_EOK;
+        rt_memcpy(event.data.station.mac, loss.address, 6);
+        event.data.station.aid = aid;
+        (void)rt_wlan_offload_report_event(&context->radio, &event);
+    }
+}
+
 static rt_bool_t aic_command_is_confirmation(rt_uint16_t id)
 {
     switch (id)
@@ -2147,6 +3230,8 @@ static rt_bool_t aic_command_is_confirmation(rt_uint16_t id)
     case AIC_MM_GET_STA_INFO_CFM:
     case AIC_MM_GET_FW_VERSION_CFM:
     case AIC_MM_SET_TXPWR_ADJ_CFM:
+    case AIC_MM_SET_COEX_CFM:
+    case AIC_DBG_MEM_MASK_WRITE_CFM:
     case AIC_SCANU_START_CFM:
     case AIC_SCANU_START_ACCEPTED:
     case AIC_SCANU_VENDOR_IE_CFM:
@@ -2156,6 +3241,7 @@ static rt_bool_t aic_command_is_confirmation(rt_uint16_t id)
     case AIC_ME_CONTROL_PORT_CFM:
     case AIC_ME_STA_ADD_CFM:
     case AIC_ME_STA_DEL_CFM:
+    case AIC_ME_TRAFFIC_IND_CFM:
     case AIC_ME_RC_STATS_CFM:
     case AIC_ME_SET_PS_MODE_CFM:
     case AIC_SM_CONNECT_CFM:
@@ -2204,6 +3290,24 @@ static rt_err_t aic_handle_command(struct aic8800_context *context,
     case AIC_SCANU_START_CFM:
         aic_handle_scan_done(context, parameter, parameter_length);
         break;
+    case AIC_MM_APM_STALOSS_IND:
+        if (parameter_length >=
+            sizeof(struct aic_wire_mm_apm_staloss_ind))
+        {
+            aic_schedule_station_loss(
+                context,
+                (const struct aic_wire_mm_apm_staloss_ind *)parameter);
+        }
+        else
+        {
+            LOG_E("short AP station-loss indication: %u",
+                  (unsigned int)parameter_length);
+        }
+        break;
+    case AIC_MM_FW_PANIC_IND:
+    case AIC_MM_FW_ASSERT_IND:
+        aic_report_firmware_fault(context, id, parameter, parameter_length);
+        break;
     case AIC_MM_PS_CHANGE_IND:
         if (parameter_length >= sizeof(struct aic_wire_mm_ps_change_ind))
         {
@@ -2212,17 +3316,131 @@ static rt_err_t aic_handle_command(struct aic8800_context *context,
 
             if (indication->station_index < AIC8800_STATION_SLOTS)
             {
+                rt_bool_t buffered[AIC8800_PS_ID_COUNT] = {RT_FALSE};
                 rt_base_t level = rt_hw_interrupt_disable();
 
                 if (context->sta_present[indication->station_index])
                 {
+                    rt_bool_t power_save =
+                        indication->power_save ? RT_TRUE : RT_FALSE;
+
+                    if (context->sta_power_save[indication->station_index] !=
+                        power_save)
+                    {
+                        for (rt_size_t ps_id = 0;
+                             ps_id < AIC8800_PS_ID_COUNT; ps_id++)
+                        {
+                            context->sta_service_period_generation[
+                                indication->station_index][ps_id]++;
+                            if (!context->sta_service_period_generation[
+                                    indication->station_index][ps_id])
+                            {
+                                context->sta_service_period_generation[
+                                    indication->station_index][ps_id]++;
+                            }
+                            context->sta_service_period_remaining[
+                                indication->station_index][ps_id] = 0;
+                            context->sta_service_period_reserved[
+                                indication->station_index][ps_id] = 0;
+                        }
+                    }
                     context->sta_power_save[indication->station_index] =
+                        power_save;
+                    for (rt_size_t ps_id = 0;
+                         ps_id < AIC8800_PS_ID_COUNT; ps_id++)
+                    {
+                        buffered[ps_id] = context->sta_buffered[
+                            indication->station_index][ps_id] != 0;
+                    }
+                }
+                else if (context->station_add_pending)
+                {
+                    context->sta_add_power_save[indication->station_index] =
                         indication->power_save ? RT_TRUE : RT_FALSE;
                 }
                 rt_hw_interrupt_enable(level);
+                for (rt_size_t ps_id = 0;
+                     ps_id < AIC8800_PS_ID_COUNT; ps_id++)
+                {
+                    aic_set_traffic_status(
+                        context, indication->station_index, (rt_uint8_t)ps_id,
+                        indication->power_save && buffered[ps_id]);
+                }
                 LOG_D("station %u power save %s",
                       (unsigned int)indication->station_index,
                       indication->power_save ? "on" : "off");
+            }
+        }
+        break;
+    case AIC_MM_TRAFFIC_REQ_IND:
+        if (parameter_length >= sizeof(struct aic_wire_mm_traffic_req_ind))
+        {
+            const struct aic_wire_mm_traffic_req_ind *indication =
+                (const struct aic_wire_mm_traffic_req_ind *)parameter;
+
+            if (indication->station_index < AIC8800_STATION_SLOTS)
+            {
+                rt_uint16_t granted = 0;
+                rt_uint8_t ps_id = indication->uapsd ?
+                    AIC_PS_ID_UAPSD : AIC_PS_ID_LEGACY;
+                rt_bool_t interrupted = RT_FALSE;
+                rt_base_t level = rt_hw_interrupt_disable();
+
+                if (context->sta_present[indication->station_index] &&
+                    context->sta_power_save[indication->station_index])
+                {
+                    if (indication->uapsd &&
+                        indication->packet_count == AIC_PS_SP_INTERRUPTED)
+                    {
+                        context->sta_service_period_remaining[
+                            indication->station_index][ps_id] = 0;
+                        context->sta_service_period_reserved[
+                            indication->station_index][ps_id] = 0;
+                        context->sta_service_period_generation[
+                            indication->station_index][ps_id]++;
+                        if (!context->sta_service_period_generation[
+                                indication->station_index][ps_id])
+                        {
+                            context->sta_service_period_generation[
+                                indication->station_index][ps_id]++;
+                        }
+                        interrupted = RT_TRUE;
+                    }
+                    else if (!context->sta_service_period_remaining[
+                                  indication->station_index][ps_id] &&
+                             !context->sta_service_period_reserved[
+                                  indication->station_index][ps_id])
+                    {
+                        rt_uint16_t pending = context->sta_buffered[
+                            indication->station_index][ps_id];
+
+                        granted = indication->packet_count ?
+                            indication->packet_count : pending;
+                        if (granted > pending)
+                        {
+                            granted = pending;
+                        }
+                        if (granted)
+                        {
+                            context->sta_service_period_generation[
+                                indication->station_index][ps_id]++;
+                            if (!context->sta_service_period_generation[
+                                    indication->station_index][ps_id])
+                            {
+                                context->sta_service_period_generation[
+                                    indication->station_index][ps_id]++;
+                            }
+                            context->sta_service_period_remaining[
+                                indication->station_index][ps_id] = granted;
+                        }
+                    }
+                }
+                rt_hw_interrupt_enable(level);
+                LOG_D("station %u %s service period: requested=%u granted=%u",
+                      (unsigned int)indication->station_index,
+                      indication->uapsd ? "U-APSD" : "legacy",
+                      (unsigned int)indication->packet_count,
+                      interrupted ? 0U : (unsigned int)granted);
             }
         }
         break;
@@ -2272,6 +3490,20 @@ static rt_err_t aic_handle_command(struct aic8800_context *context,
             LOG_D("station %u tid %u credits %+d",
                   (unsigned int)indication->station_index,
                   (unsigned int)indication->tid, (int)indication->credits);
+        }
+        break;
+    case AIC_ME_TKIP_MIC_FAILURE_IND:
+        if (parameter_length >=
+            sizeof(struct aic_wire_me_tkip_mic_failure_ind))
+        {
+            aic_report_tkip_mic_failure(
+                context,
+                (const struct aic_wire_me_tkip_mic_failure_ind *)parameter);
+        }
+        else
+        {
+            LOG_E("short TKIP MIC failure indication: %u",
+                  (unsigned int)parameter_length);
         }
         break;
     case AIC_SM_CONNECT_IND:
@@ -4233,11 +5465,11 @@ static void aic_report_mgmt_confirmation(
 {
     struct rt_wlan_offload_event event;
 
-    if (!confirmation)
+    if (!context || !confirmation || !confirmation->frame)
     {
         return;
     }
-    if (!context || !context->attached ||
+    if (!context->attached ||
         context->radio.state != RT_WLAN_OFFLOAD_STARTED)
     {
         rt_free(confirmation->frame);
@@ -4578,10 +5810,10 @@ static rt_err_t aic_configure_channels(struct aic8800_context *context)
     rt_err_t result;
 
     rt_memset(channels, 0, sizeof(channels));
-    for (index = 0; index < g_aic8800_band_2ghz.channel_count; index++)
+    for (index = 0; index < context->band_2ghz.channel_count; index++)
     {
         const struct rt_wlan_offload_channel *channel =
-            &g_aic8800_channels_2ghz[index];
+            &context->channels_2ghz[index];
         rt_uint8_t *wire;
 
         if (!aic8800_radio_channel_allowed(context, channel->band,
@@ -4593,8 +5825,9 @@ static rt_err_t aic_configure_channels(struct aic8800_context *context)
         aic_put_le16(wire, channel->center_frequency_mhz);
         wire[2] = 0;
         wire[3] = aic_channel_flags(channel->flags);
-        wire[4] = (rt_uint8_t)aic8800_radio_channel_power(
-            context, channel->band, channel->number, channel->max_power_dbm);
+        wire[4] = (rt_uint8_t)aic8800_radio_channel_fw_power(
+            context, channel->band, channel->number,
+            AIC_CHANNEL_DEFAULT_POWER_DBM);
         channel_count_2ghz++;
     }
     channels[252] = (rt_uint8_t)channel_count_2ghz;
@@ -4603,10 +5836,10 @@ static rt_err_t aic_configure_channels(struct aic8800_context *context)
         (!context->firmware_capabilities_valid ||
          context->firmware_supports_5ghz))
     {
-        for (index = 0; index < g_aic8800_band_5ghz.channel_count; index++)
+        for (index = 0; index < context->band_5ghz.channel_count; index++)
         {
             const struct rt_wlan_offload_channel *channel =
-                &g_aic8800_channels_5ghz[index];
+                &context->channels_5ghz[index];
             rt_uint8_t *wire;
 
             if (!aic8800_radio_channel_allowed(context, channel->band,
@@ -4618,9 +5851,9 @@ static rt_err_t aic_configure_channels(struct aic8800_context *context)
             aic_put_le16(wire, channel->center_frequency_mhz);
             wire[2] = 1;
             wire[3] = aic_channel_flags(channel->flags);
-            wire[4] = (rt_uint8_t)aic8800_radio_channel_power(
+            wire[4] = (rt_uint8_t)aic8800_radio_channel_fw_power(
                 context, channel->band, channel->number,
-                channel->max_power_dbm);
+                AIC_CHANNEL_DEFAULT_POWER_DBM);
             channel_count_5ghz++;
         }
         channels[253] = (rt_uint8_t)channel_count_5ghz;
@@ -4645,7 +5878,6 @@ static rt_err_t aic_configure_firmware(struct aic8800_context *context)
     rt_uint8_t version[28];
     rt_uint8_t mac_response[6];
     rt_uint8_t get_mac[4];
-    struct aic_wire_me_config_req me_config;
     struct rt_wlan_offload_firmware_info info;
     rt_size_t response_length = 0;
     rt_uint32_t raw_features;
@@ -4772,8 +6004,6 @@ static rt_err_t aic_configure_firmware(struct aic8800_context *context)
     context->firmware_phy_features = aic_get_le32(version + 12);
     context->firmware_features = aic_decode_firmware_features(
         context, raw_features, &context->firmware_feature_map_compact);
-    /* MM_VERSION advertises support, not the current operating state. */
-    context->power_save_level = 0;
 #if defined(AIC8800_WIFI_POWER_SAVE)
     if (context->firmware_features & AIC_FW_CAP_PS)
     {
@@ -4789,12 +6019,9 @@ static rt_err_t aic_configure_firmware(struct aic8800_context *context)
      * authoritative. */
     aic_refresh_channel_metadata(context);
 
-    aic8800_radio_prepare(context, &me_config);
-    result = aic_execute(context, AIC_ME_CONFIG_REQ, AIC_ME_CONFIG_CFM,
-                         &me_config, sizeof(me_config), RT_NULL, 0, RT_NULL);
+    result = aic_send_me_config(context);
     if (result != RT_EOK)
     {
-        LOG_E("ME configuration failed: %d", result);
         return result;
     }
 
@@ -4805,7 +6032,7 @@ static rt_err_t aic_configure_firmware(struct aic8800_context *context)
     }
 
     rt_memset(&info, 0, sizeof(info));
-    info.protocol_version = 15;
+    info.protocol_version = aic8800_protocol_version(context);
     info.firmware_version = aic_get_le32(version);
     info.features = raw_features;
     info.max_stations = aic_get_le16(version + 24);
@@ -4871,6 +6098,7 @@ static rt_err_t aic_wlan_offload_stop(struct rt_wlan_offload_radio *radio)
     aic_cancel_mgmt_confirmations(context, -RT_EIO);
     aic_rx_reorder_reset(context);
     aic_tcp_ack_reset(context);
+    context->scan_completion_pending = RT_FALSE;
     context->scan_followup_pending = RT_FALSE;
     if (context->scan_work_initialized)
     {
@@ -4882,6 +6110,18 @@ static rt_err_t aic_wlan_offload_stop(struct rt_wlan_offload_radio *radio)
         rt_work_cancel_sync(&context->ap_rechannel_work);
         context->ap_rechannel_work_queued = RT_FALSE;
     }
+    if (context->traffic_work_initialized)
+    {
+        rt_work_cancel_sync(&context->traffic_work);
+        context->traffic_work_queued = RT_FALSE;
+    }
+    if (context->station_loss_work_initialized)
+    {
+        rt_work_cancel_sync(&context->station_loss_work);
+        context->station_loss_work_queued = RT_FALSE;
+        rt_memset(context->station_loss, 0,
+                  sizeof(context->station_loss));
+    }
     context->lmac_started = RT_FALSE;
     context->firmware_capabilities_valid = RT_FALSE;
     context->firmware_supports_5ghz = RT_FALSE;
@@ -4891,6 +6131,8 @@ static rt_err_t aic_wlan_offload_stop(struct rt_wlan_offload_radio *radio)
     context->radio.capabilities &= ~RT_WLAN_OFFLOAD_CAP_POWER_SAVE;
     context->station_enabled = RT_FALSE;
     context->station_connected = RT_FALSE;
+    context->station_qos = RT_FALSE;
+    context->station_acm = 0;
     context->station_interface_recycle_pending = RT_FALSE;
     context->ap_enabled = RT_FALSE;
     context->ap_started = RT_FALSE;
@@ -4978,6 +6220,7 @@ static rt_err_t aic_change_interface(struct rt_wlan_offload_vif *vif,
                 context->ap_station_index = AIC8800_INVALID_INDEX;
                 context->station_channel_index = AIC8800_INVALID_INDEX;
                 context->scan_request_id = 0;
+                context->scan_completion_pending = RT_FALSE;
                 context->scan_followup_pending = RT_FALSE;
                 context->connect_request_id = 0;
                 context->disconnect_request_id = 0;
@@ -5025,13 +6268,24 @@ static rt_err_t aic_change_interface(struct rt_wlan_offload_vif *vif,
         {
             return result;
         }
+        result = aic_configure_runtime_rx_gain(context);
+        if (result != RT_EOK)
+        {
+            LOG_E("runtime RX gain setup failed: %d", result);
+            return result;
+        }
+        result = aic_configure_coexistence(context);
+        if (result != RT_EOK)
+        {
+            LOG_W("Wi-Fi/Bluetooth coexistence setup failed: %d", result);
+        }
         context->lmac_started = RT_TRUE;
     }
 
     rt_memset(request, 0, sizeof(request));
     request[0] = iftype == RT_WLAN_OFFLOAD_IFTYPE_STATION ? 0 : 2;
     rt_memcpy(request + 2, vif->address, 6);
-    rt_memset(confirmation, 0, sizeof(confirmation));
+    rt_memset(&confirmation, 0, sizeof(confirmation));
     result = aic_execute(context, AIC_MM_ADD_IF_REQ, AIC_MM_ADD_IF_CFM,
                          request, sizeof(request), confirmation,
                          sizeof(confirmation), &confirmation_length);
@@ -5053,6 +6307,39 @@ static rt_err_t aic_change_interface(struct rt_wlan_offload_vif *vif,
               *interface_index);
     }
     return result;
+}
+
+/* ME_CONFIG carries the PHY capabilities the firmware puts into the
+ * association request, so it has to be resent whenever those change. */
+static rt_err_t aic_send_me_config(struct aic8800_context *context)
+{
+    struct aic_wire_me_config_req me_config;
+    rt_err_t result;
+
+    aic8800_radio_prepare(context, &me_config);
+    context->power_save_level = me_config.power_save_enabled ? 1 : 0;
+    result = aic_execute(context, AIC_ME_CONFIG_REQ, AIC_ME_CONFIG_CFM,
+                         &me_config, sizeof(me_config), RT_NULL, 0, RT_NULL);
+    if (result != RT_EOK)
+    {
+        LOG_E("ME configuration failed: %d", result);
+        return result;
+    }
+    context->me_config_stale = RT_FALSE;
+    return RT_EOK;
+}
+
+/* Republish the advertised capabilities before associating when a previous
+ * association proved one of them wrong.  This runs on the caller's thread, not
+ * a receive worker, so the synchronous command is safe here. */
+static rt_err_t aic_apply_pending_me_config(struct aic8800_context *context)
+{
+    if (!context->me_config_stale || !context->lmac_started)
+    {
+        return RT_EOK;
+    }
+    LOG_I("republishing PHY capabilities before associating");
+    return aic_send_me_config(context);
 }
 
 static rt_err_t aic_recycle_station_interface(
@@ -5138,6 +6425,7 @@ static void aic_prepare_scan_common(
     const struct rt_wlan_offload_scan_request *request,
     struct aic_wire_scanu_start_req *wire)
 {
+    rt_uint32_t duration_ms = request->duration_ms;
     rt_size_t index;
 
     rt_memset(wire, 0, sizeof(*wire));
@@ -5154,16 +6442,37 @@ static void aic_prepare_scan_common(
     }
     wire->vif_index = context->vif_index;
     wire->ssid_count = (rt_uint8_t)request->ssid_count;
-    if (!wire->ssid_count &&
-        !(request->flags & RT_WLAN_OFFLOAD_SCAN_PASSIVE))
+    if (!(request->flags & RT_WLAN_OFFLOAD_SCAN_PASSIVE))
     {
-        /* cfg80211 represents an active wildcard scan as one zero-length
-         * SSID.  A zero SSID count asks AIC firmware to rely on passive
-         * beacon discovery, which can miss APs during the channel dwell. */
-        wire->ssid_count = 1;
+        /* Include a wildcard entry so active scans send broadcast probes.
+         * Retain named entries as well so hidden networks remain reachable. */
+        if (!wire->ssid_count)
+        {
+            wire->ssid_count = 1;
+        }
+        else if (wire->ssid_count < AIC_SCAN_SSID_COUNT)
+        {
+            rt_bool_t wildcard = RT_FALSE;
+
+            for (index = 0; index < wire->ssid_count; index++)
+            {
+                wildcard = wildcard || !wire->ssids[index].length;
+            }
+            if (!wildcard)
+            {
+                wire->ssids[wire->ssid_count].length = 0;
+                wire->ssid_count++;
+            }
+        }
     }
-    aic_put_le32(&wire->duration_us,
-                 request->duration_ms ? request->duration_ms * 1000U : 0);
+    /* Leave duration at zero unless the caller asked for a specific dwell.
+     * Both vendor Linux drivers always send zero here - the SDIO one spells it
+     * out ("req->duration = 0") and the USB one never assigns the field - which
+     * leaves the LMAC scan module scheduling its own per-channel dwell. A
+     * host-supplied value overrides that schedule and makes the firmware report
+     * a different partial subset of the visible BSSes on every pass, so
+     * directed scans issued by a join frequently return nothing at all. */
+    aic_put_le32(&wire->duration_us, duration_ms * 1000U);
 }
 
 static rt_err_t aic_scan(struct rt_wlan_offload_vif *vif,
@@ -5209,6 +6518,7 @@ static rt_err_t aic_scan(struct rt_wlan_offload_vif *vif,
         {
             const struct rt_wlan_offload_channel_definition *channel =
                 &request->channels[index];
+            const struct rt_wlan_offload_channel *configured;
             rt_uint8_t *wire;
             rt_uint16_t channel_number = channel->primary_channel ?
                 channel->primary_channel :
@@ -5220,6 +6530,13 @@ static rt_err_t aic_scan(struct rt_wlan_offload_vif *vif,
                 return -RT_EINVAL;
             }
             if (!aic_channel_allowed(context, channel->band, channel_number))
+            {
+                return -RT_EINVAL;
+            }
+            configured = aic_channel_metadata(
+                context, channel->band, channel_number);
+            if (!configured ||
+                (configured->flags & RT_WLAN_OFFLOAD_CHANNEL_DISABLED))
             {
                 return -RT_EINVAL;
             }
@@ -5235,8 +6552,10 @@ static rt_err_t aic_scan(struct rt_wlan_offload_vif *vif,
             }
             aic_encode_channel(
                 wire, channel,
-                aic8800_radio_channel_power(context, channel->band,
-                                            channel_number, 20));
+                aic8800_radio_channel_fw_power(
+                    context, configured->band, configured->number,
+                    AIC_CHANNEL_DEFAULT_POWER_DBM));
+            wire[3] = aic_channel_flags(configured->flags);
             if (request->flags & RT_WLAN_OFFLOAD_SCAN_PASSIVE)
             {
                 wire[3] |= 1U;
@@ -5245,32 +6564,31 @@ static rt_err_t aic_scan(struct rt_wlan_offload_vif *vif,
     }
     else
     {
-        for (index = 0; index < g_aic8800_band_2ghz.channel_count; index++)
+        for (index = 0; index < context->band_2ghz.channel_count; index++)
         {
+            const struct rt_wlan_offload_channel *configured =
+                &context->channels_2ghz[index];
             struct rt_wlan_offload_channel_definition channel;
             rt_uint8_t *wire =
                 (rt_uint8_t *)&scan_request.channels[count_2ghz];
 
             if (!aic8800_radio_channel_allowed(
-                    context, g_aic8800_channels_2ghz[index].band,
-                    g_aic8800_channels_2ghz[index].number))
+                    context, configured->band, configured->number))
             {
                 continue;
             }
 
             aic_channel_definition(
-                g_aic8800_channels_2ghz[index].center_frequency_mhz,
+                configured->center_frequency_mhz,
                 &channel);
 
             aic_encode_channel(wire,
                                &channel,
-                               aic8800_radio_channel_power(
-                                   context,
-                                   g_aic8800_channels_2ghz[index].band,
-                                   g_aic8800_channels_2ghz[index].number,
-                                   g_aic8800_channels_2ghz[index].max_power_dbm));
-            wire[3] = aic_channel_flags(
-                g_aic8800_channels_2ghz[index].flags);
+                               aic8800_radio_channel_fw_power(
+                                   context, configured->band,
+                                   configured->number,
+                                   AIC_CHANNEL_DEFAULT_POWER_DBM));
+            wire[3] = aic_channel_flags(configured->flags);
             if (request->flags & RT_WLAN_OFFLOAD_SCAN_PASSIVE)
             {
                 wire[3] |= 1U;
@@ -5282,32 +6600,31 @@ static rt_err_t aic_scan(struct rt_wlan_offload_vif *vif,
             (!context->firmware_capabilities_valid ||
              context->firmware_supports_5ghz))
         {
-            for (index = 0; index < g_aic8800_band_5ghz.channel_count; index++)
+            for (index = 0; index < context->band_5ghz.channel_count; index++)
             {
+                const struct rt_wlan_offload_channel *configured =
+                    &context->channels_5ghz[index];
                 struct rt_wlan_offload_channel_definition channel;
                 rt_uint8_t *wire =
                     (rt_uint8_t *)&context->scan_followup.channels[
                         count_5ghz];
 
                 if (!aic8800_radio_channel_allowed(
-                        context, g_aic8800_channels_5ghz[index].band,
-                        g_aic8800_channels_5ghz[index].number))
+                        context, configured->band, configured->number))
                 {
                     continue;
                 }
 
                 aic_channel_definition(
-                    g_aic8800_channels_5ghz[index].center_frequency_mhz,
+                    configured->center_frequency_mhz,
                     &channel);
                 aic_encode_channel(wire,
                                    &channel,
-                                   aic8800_radio_channel_power(
-                                       context,
-                                       g_aic8800_channels_5ghz[index].band,
-                                       g_aic8800_channels_5ghz[index].number,
-                                       g_aic8800_channels_5ghz[index].max_power_dbm));
-                wire[3] = aic_channel_flags(
-                    g_aic8800_channels_5ghz[index].flags);
+                                   aic8800_radio_channel_fw_power(
+                                       context, configured->band,
+                                       configured->number,
+                                       AIC_CHANNEL_DEFAULT_POWER_DBM));
+                wire[3] = aic_channel_flags(configured->flags);
                 if (request->flags & RT_WLAN_OFFLOAD_SCAN_PASSIVE)
                 {
                     wire[3] |= 1U;
@@ -5336,12 +6653,28 @@ static rt_err_t aic_scan(struct rt_wlan_offload_vif *vif,
     context->scan_request_id = request->request_id;
     context->scan_results_2ghz = 0;
     context->scan_results_5ghz = 0;
+    context->scan_completion_pending = RT_FALSE;
+    context->scan_expected_results = 0;
+    context->scan_result_count_valid = RT_TRUE;
+    context->scan_completion_retry_count = 0;
     context->scan_followup_pending = count_5ghz != 0;
     context->scan_followup_retry_count = 0;
     context->scan_work_queued = RT_FALSE;
-    LOG_I("starting scan: first=%u channels followup-5GHz=%u channels",
-          scan_request.channel_count,
-          context->scan_followup.channel_count);
+    if (aic_get_le32(&scan_request.duration_us))
+    {
+        LOG_I("starting scan: first=%u channels followup-5GHz=%u channels "
+              "dwell=%u ms",
+              scan_request.channel_count,
+              context->scan_followup.channel_count,
+              (unsigned int)(aic_get_le32(&scan_request.duration_us) / 1000U));
+    }
+    else
+    {
+        LOG_I("starting scan: first=%u channels followup-5GHz=%u channels "
+              "dwell=firmware",
+              scan_request.channel_count,
+              context->scan_followup.channel_count);
+    }
     result = aic_submit_scan_wire(context, &scan_request);
     if (result != RT_EOK)
     {
@@ -5365,6 +6698,7 @@ static rt_err_t aic_abort_scan(struct rt_wlan_offload_vif *vif,
     {
         return -RT_EINVAL;
     }
+    context->scan_completion_pending = RT_FALSE;
     context->scan_followup_pending = RT_FALSE;
     if (context->scan_work_initialized)
     {
@@ -5382,7 +6716,8 @@ static rt_err_t aic_abort_scan(struct rt_wlan_offload_vif *vif,
     }
     if (context->scan_request_id)
     {
-        aic_report_scan_done_status(context, completion_status);
+        aic_report_scan_done_status(
+            context, completion_status, RT_FALSE, 0);
     }
     return completion_status;
 }
@@ -5468,8 +6803,9 @@ static rt_err_t aic_connect_submit(
         }
         aic_encode_channel(
             request + 40, channel,
-            aic8800_radio_channel_power(context, channel->band,
-                                        channel_number, 20));
+            aic8800_radio_channel_fw_power(context, channel->band,
+                                           channel_number,
+                                           AIC_CHANNEL_DEFAULT_POWER_DBM));
     }
     else
     {
@@ -5582,6 +6918,11 @@ static rt_err_t aic_connect(struct rt_wlan_offload_vif *vif,
     if (!context->station_enabled)
     {
         return -RT_EINVAL;
+    }
+    result = aic_apply_pending_me_config(context);
+    if (result != RT_EOK)
+    {
+        return result;
     }
     if (!aic_security_supported(request->security))
     {
@@ -6152,8 +7493,9 @@ static rt_err_t aic_start_ap_firmware(
         request.basic_rates.array[3] = 0x96;
     }
     aic_encode_channel((rt_uint8_t *)&request.channel, &settings->channel,
-        aic8800_radio_channel_power(context, settings->channel.band,
-                                    channel_number, 20));
+        aic8800_radio_channel_fw_power(context, settings->channel.band,
+                                       channel_number,
+                                       AIC_CHANNEL_DEFAULT_POWER_DBM));
     request.center_frequency1 = settings->channel.center_frequency1_mhz ?
         settings->channel.center_frequency1_mhz :
         settings->channel.primary_frequency_mhz;
@@ -6174,13 +7516,18 @@ static rt_err_t aic_start_ap_firmware(
         bandwidth_mhz = 80;
         break;
     case RT_WLAN_OFFLOAD_CHANNEL_WIDTH_160:
-        request.channel_width = 3;
-        bandwidth_mhz = 160;
-        break;
     case RT_WLAN_OFFLOAD_CHANNEL_WIDTH_80P80:
-        request.channel_width = 4;
-        bandwidth_mhz = 160;
-        break;
+        /* APM_START_REQ can carry these, but aic_build_beacon() only emits a
+         * VHT operation element for 20/40/80 MHz.  Starting here would put a
+         * beacon describing a narrower channel on a wider one, so refuse
+         * instead.  The advertised band maximum is 80 MHz, so the framework
+         * should never ask; a direct rt_wlan_start_ap_with_channel() can. */
+        LOG_E("SoftAP at %u MHz is not supported; the beacon builder covers "
+              "20, 40 and 80 MHz only",
+              (unsigned int)aic_channel_width_mhz(
+                  settings->channel.width ==
+                          RT_WLAN_OFFLOAD_CHANNEL_WIDTH_80P80 ? 4U : 3U));
+        return -RT_ENOSYS;
     default:
         return -RT_ENOSYS;
     }
@@ -6471,6 +7818,7 @@ static rt_err_t aic_add_station(
     rt_size_t length;
     rt_size_t index;
     rt_size_t response_length = 0;
+    rt_uint16_t uapsd_tids = 0;
     rt_err_t result;
 
     (void)request_id;
@@ -6561,11 +7909,22 @@ static rt_err_t aic_add_station(
     {
         rt_size_t size = station->association_ies[index + 1U];
         if (index + 2U + size > station->association_ies_length) break;
-        if (station->association_ies[index] == 221 && size >= 6U &&
+        if (station->association_ies[index] == 221 && size >= 7U &&
             rt_memcmp(station->association_ies + index + 2,
                       "\x00\x50\xf2\x02", 4) == 0)
         {
+            rt_uint8_t qos_info = station->association_ies[index + 8U];
+
             request.flags |= 1UL;
+            /* Linux passes the WMM station QoS Info fields through in
+             * ME_STA_ADD_REQ.  Firmware needs these in addition to the QoS
+             * capability bit to schedule U-APSD service periods correctly. */
+            request.uapsd_queues = qos_info & 0x0fU;
+            request.max_sp_length = ((qos_info >> 5U) & 0x03U) * 2U;
+            if (qos_info & (1U << 0)) uapsd_tids |= AIC_UAPSD_TIDS_VO;
+            if (qos_info & (1U << 1)) uapsd_tids |= AIC_UAPSD_TIDS_VI;
+            if (qos_info & (1U << 2)) uapsd_tids |= AIC_UAPSD_TIDS_BK;
+            if (qos_info & (1U << 3)) uapsd_tids |= AIC_UAPSD_TIDS_BE;
             break;
         }
         index += 2U + size;
@@ -6573,28 +7932,39 @@ static rt_err_t aic_add_station(
     request.aid = station->aid;
     request.vif_index = context->ap_vif_index;
     rt_memset(&confirmation, 0, sizeof(confirmation));
+    aic_station_add_begin(context);
     result = aic_execute(context, AIC_ME_STA_ADD_REQ, AIC_ME_STA_ADD_CFM,
                          &request, sizeof(request), &confirmation,
                          sizeof(confirmation), &response_length);
-    if (result != RT_EOK) return result;
+    if (result != RT_EOK)
+    {
+        aic_station_add_cancel(context);
+        return result;
+    }
     if (response_length < 2U || confirmation.status ||
         confirmation.station_index >= AIC8800_STATION_SLOTS)
     {
+        aic_station_add_cancel(context);
         return -RT_ERROR;
     }
     result = rt_mutex_take(context->frame_mutex, RT_WAITING_FOREVER);
     if (result != RT_EOK)
     {
+        aic_station_add_cancel(context);
         return result;
     }
     entry->aid = station->aid;
     entry->firmware_index = confirmation.station_index;
+    entry->qos = (request.flags & 1UL) != 0;
+    entry->acm = 0;
+    entry->uapsd_tids = uapsd_tids;
     rt_memcpy(entry->address, station->mac, 6);
     entry->valid = RT_TRUE;
     aic_tx_credit_reset(context, entry->firmware_index);
     aic_station_state_set(
         context, entry->firmware_index, RT_TRUE,
-        response_length >= sizeof(confirmation) && confirmation.power_state);
+        response_length >= 3U && confirmation.power_state, uapsd_tids,
+        RT_TRUE);
     rt_mutex_release(context->frame_mutex);
     return RT_EOK;
 }
@@ -6602,6 +7972,14 @@ static rt_err_t aic_add_station(
 static rt_err_t aic_del_station(struct rt_wlan_offload_vif *vif,
                                 rt_uint32_t request_id,
                                 const rt_uint8_t mac[6], rt_uint16_t reason)
+{
+    return aic_del_station_internal(vif, request_id, mac, reason, RT_FALSE);
+}
+
+static rt_err_t aic_del_station_internal(
+    struct rt_wlan_offload_vif *vif, rt_uint32_t request_id,
+    const rt_uint8_t mac[6], rt_uint16_t reason,
+    rt_bool_t firmware_station_lost)
 {
     struct aic8800_context *context = aic_context_from_vif(vif);
     struct aic8800_ap_station *entry;
@@ -6636,12 +8014,12 @@ static rt_err_t aic_del_station(struct rt_wlan_offload_vif *vif,
     (void)aic_station_state_snapshot(
         context, entry->firmware_index, RT_NULL, &power_save);
     aic_station_state_set(
-        context, entry->firmware_index, RT_FALSE, RT_FALSE);
+        context, entry->firmware_index, RT_FALSE, RT_FALSE, 0, RT_FALSE);
     rt_mutex_release(context->tx_mutex);
     rt_mutex_release(context->frame_mutex);
     result = aic_execute(context, AIC_ME_STA_DEL_REQ, AIC_ME_STA_DEL_CFM,
                          &request, sizeof(request), RT_NULL, 0, RT_NULL);
-    if (result == RT_EOK)
+    if (result == RT_EOK || firmware_station_lost)
     {
         struct aic8800_hardware_key *key;
         while ((key = aic_find_hardware_key(
@@ -6670,7 +8048,8 @@ static rt_err_t aic_del_station(struct rt_wlan_offload_vif *vif,
                 rt_mutex_take(context->tx_mutex, RT_WAITING_FOREVER) == RT_EOK)
             {
                 aic_station_state_set(
-                    context, entry->firmware_index, RT_TRUE, power_save);
+                    context, entry->firmware_index, RT_TRUE, power_save,
+                    entry->uapsd_tids, RT_FALSE);
                 rt_mutex_release(context->tx_mutex);
             }
             rt_mutex_release(context->frame_mutex);
@@ -6822,7 +8201,7 @@ static rt_err_t aic_add_key(struct rt_wlan_offload_vif *vif,
 {
     struct aic8800_context *context = aic_context_from_vif(vif);
     rt_uint8_t request[44];
-    rt_uint8_t confirmation[2];
+    struct aic_wire_mm_key_add_cfm confirmation;
     rt_size_t confirmation_length = 0;
     rt_uint8_t hardware_index;
     rt_uint8_t station_index = AIC8800_INVALID_INDEX;
@@ -6893,9 +8272,9 @@ static rt_err_t aic_add_key(struct rt_wlan_offload_vif *vif,
     request[40] = (rt_uint8_t)cipher;
     request[41] = vif_index;
     request[43] = key->pairwise;
-    rt_memset(confirmation, 0, sizeof(confirmation));
+    rt_memset(&confirmation, 0, sizeof(confirmation));
     result = aic_execute(context, AIC_MM_KEY_ADD_REQ, AIC_MM_KEY_ADD_CFM,
-                         request, sizeof(request), confirmation,
+                         request, sizeof(request), &confirmation,
                          sizeof(confirmation), &confirmation_length);
     if (result != RT_EOK)
     {
@@ -6905,7 +8284,8 @@ static rt_err_t aic_add_key(struct rt_wlan_offload_vif *vif,
     {
         return -RT_EIO;
     }
-    result = aic_confirmation_status(confirmation, confirmation_length);
+    result = aic_confirmation_status(
+        (const rt_uint8_t *)&confirmation, confirmation_length);
     if (result == RT_EOK && confirmation_length >= 2)
     {
         entry->valid = RT_TRUE;
@@ -6913,7 +8293,7 @@ static rt_err_t aic_add_key(struct rt_wlan_offload_vif *vif,
         entry->index = key->index;
         entry->pairwise = key->pairwise;
         rt_memcpy(entry->peer, key->peer, 6);
-        entry->hardware_index = confirmation[1];
+        entry->hardware_index = confirmation.hardware_key_index;
     }
     return result;
 }
@@ -6995,83 +8375,180 @@ static struct aic8800_ap_station *aic_find_ap_station(
     return RT_NULL;
 }
 
-#if AIC8800_WIFI_TX_TRACE_FRAMES
-/* Diagnostic ring for the AP+STA firmware wedge.  Recorded on the transmit
- * path with interrupts masked so the watchdog, which runs on the workqueue,
- * cannot observe a half-written entry.  See aic8800_core_dump_tx_trace(). */
-static void aic_tx_trace_record(
-    struct aic8800_context *context,
-    const struct aic_wire_tx_host_descriptor *descriptor,
-    const rt_uint8_t *destination, rt_uint16_t ethertype,
-    rt_uint16_t total_length, rt_bool_t management)
+static rt_uint8_t aic_tx_access_category(rt_uint8_t tid)
 {
-    struct aic8800_tx_trace_entry *entry;
-    rt_base_t level;
-
-    if (!context || !descriptor || !destination)
+    static const rt_uint8_t categories[8] =
     {
-        return;
-    }
-    level = rt_hw_interrupt_disable();
-    entry = &context->tx_trace[context->tx_trace_count %
-                               AIC8800_WIFI_TX_TRACE_FRAMES];
-    entry->tick = rt_tick_get();
-    entry->length = total_length;
-    entry->ethertype = ethertype;
-    rt_memcpy(entry->destination, destination, 6);
-    entry->vif_index = descriptor->vif_index;
-    entry->station_index = descriptor->station_index;
-    entry->tid = descriptor->tid;
-    entry->access_category = descriptor->access_category;
-    entry->management = management ? 1U : 0U;
-    context->tx_trace_count++;
-    rt_hw_interrupt_enable(level);
+        AIC_TX_ACCESS_CATEGORY_BEST_EFFORT,
+        AIC_TX_ACCESS_CATEGORY_BACKGROUND,
+        AIC_TX_ACCESS_CATEGORY_BACKGROUND,
+        AIC_TX_ACCESS_CATEGORY_BEST_EFFORT,
+        AIC_TX_ACCESS_CATEGORY_VIDEO,
+        AIC_TX_ACCESS_CATEGORY_VIDEO,
+        AIC_TX_ACCESS_CATEGORY_VOICE,
+        AIC_TX_ACCESS_CATEGORY_VOICE,
+    };
+
+    return categories[tid & 7U];
 }
 
-void aic8800_core_dump_tx_trace(struct aic8800_context *context,
-                                const char *reason)
+static rt_uint8_t aic_classify_8021d(const rt_uint8_t *frame,
+                                     rt_size_t length)
 {
-    rt_uint32_t total;
-    rt_uint32_t shown;
-    rt_uint32_t index;
+    rt_uint16_t ethertype;
+    rt_size_t network_offset = 14U;
 
-    if (!context)
+    if (!frame || length < network_offset)
     {
-        return;
+        return AIC_TX_TID_BEST_EFFORT;
     }
-    total = context->tx_trace_count;
-    shown = total < AIC8800_WIFI_TX_TRACE_FRAMES ?
-            total : AIC8800_WIFI_TX_TRACE_FRAMES;
-    rt_kprintf("AIC TX trace (%s): %u frame(s), last %u, now=%u\n",
-               reason ? reason : "on demand", (unsigned int)total,
-               (unsigned int)shown, (unsigned int)rt_tick_get());
-    for (index = 0; index < shown; index++)
+    ethertype = ((rt_uint16_t)frame[12] << 8) | frame[13];
+    if ((ethertype == AIC_ETHERTYPE_VLAN ||
+         ethertype == AIC_ETHERTYPE_VLAN_PROVIDER) && length >= 18U)
     {
-        const struct aic8800_tx_trace_entry *entry =
-            &context->tx_trace[(total - shown + index) %
-                               AIC8800_WIFI_TX_TRACE_FRAMES];
+        return (frame[14] >> 5) & 7U;
+    }
+    if (ethertype == AIC_ETHERTYPE_IPV4 && length >= network_offset + 2U)
+    {
+        return (frame[network_offset + 1U] >> 5) & 7U;
+    }
+    if (ethertype == AIC_ETHERTYPE_IPV6 && length >= network_offset + 2U)
+    {
+        rt_uint8_t traffic_class =
+            (rt_uint8_t)((frame[network_offset] << 4) |
+                         (frame[network_offset + 1U] >> 4));
 
-        rt_kprintf("  %c%u t=%u %s vif=%u sta=%u tid=0x%02x ac=%u len=%u "
-                   "dst=%02x:%02x:%02x:%02x:%02x:%02x eth=%04x%s%s\n",
-                   index + 1U == shown ? '*' : ' ',
-                   (unsigned int)(total - shown + index),
-                   (unsigned int)entry->tick,
-                   entry->management ? "mgmt" : "data",
-                   (unsigned int)entry->vif_index,
-                   (unsigned int)entry->station_index,
-                   (unsigned int)entry->tid,
-                   (unsigned int)entry->access_category,
-                   (unsigned int)entry->length,
-                   entry->destination[0], entry->destination[1],
-                   entry->destination[2], entry->destination[3],
-                   entry->destination[4], entry->destination[5],
-                   (unsigned int)entry->ethertype,
-                   (entry->destination[0] & 1U) ? " group" : "",
-                   (entry->length % 512U) ? "" : " mps-multiple");
+        return (traffic_class >> 5) & 7U;
     }
+    return AIC_TX_TID_BEST_EFFORT;
 }
 
-#endif
+static rt_uint16_t aic_frame_get_be16(const rt_uint8_t *data)
+{
+    return ((rt_uint16_t)data[0] << 8) | data[1];
+}
+
+/* The reference Linux driver can keep tens of bulk OUT requests in flight.
+ * This port deliberately uses a small request pool to coexist with Bluetooth
+ * and the fixed DWC2 request pool, so bootstrap traffic must not sit behind a
+ * saturated data queue.  Only packets which are safe to move ahead of normal
+ * stream data are selected here. */
+static rt_bool_t aic_is_latency_control_frame(const rt_uint8_t *frame,
+                                              rt_size_t length)
+{
+    const rt_uint8_t *network;
+    const rt_uint8_t *transport;
+    rt_uint16_t ethertype;
+    rt_uint16_t source_port;
+    rt_uint16_t destination_port;
+    rt_size_t network_offset = 14U;
+    rt_size_t transport_offset;
+    rt_size_t ip_header_length;
+    rt_uint8_t protocol;
+
+    if (!frame || length < network_offset)
+    {
+        return RT_FALSE;
+    }
+    ethertype = aic_frame_get_be16(frame + 12U);
+    for (rt_size_t tags = 0;
+         tags < 2U && (ethertype == AIC_ETHERTYPE_VLAN ||
+                      ethertype == AIC_ETHERTYPE_VLAN_PROVIDER);
+         tags++)
+    {
+        if (length < network_offset + 4U)
+        {
+            return RT_FALSE;
+        }
+        ethertype = aic_frame_get_be16(frame + network_offset + 2U);
+        network_offset += 4U;
+    }
+    if (ethertype == AIC_ETHERTYPE_EAPOL || ethertype == AIC_ETHERTYPE_ARP)
+    {
+        return RT_TRUE;
+    }
+    if (ethertype == AIC_ETHERTYPE_IPV4)
+    {
+        if (length < network_offset + 20U)
+        {
+            return RT_FALSE;
+        }
+        network = frame + network_offset;
+        ip_header_length = (rt_size_t)(network[0] & 0x0fU) * 4U;
+        if ((network[0] >> 4) != 4U || ip_header_length < 20U ||
+            length < network_offset + ip_header_length ||
+            (aic_frame_get_be16(network + 6U) & 0x1fffU) != 0U)
+        {
+            return RT_FALSE;
+        }
+        protocol = network[9];
+        transport_offset = network_offset + ip_header_length;
+    }
+    else if (ethertype == AIC_ETHERTYPE_IPV6)
+    {
+        if (length < network_offset + 40U ||
+            (frame[network_offset] >> 4) != 6U)
+        {
+            return RT_FALSE;
+        }
+        network = frame + network_offset;
+        protocol = network[6];
+        transport_offset = network_offset + 40U;
+        if (protocol == AIC_IPV6_NEXT_HEADER_ICMP &&
+            length > transport_offset)
+        {
+            rt_uint8_t type = frame[transport_offset];
+
+            return type >= 133U && type <= 136U;
+        }
+    }
+    else
+    {
+        return RT_FALSE;
+    }
+
+    transport = frame + transport_offset;
+    if (protocol == AIC_IP_PROTOCOL_TCP &&
+        length >= transport_offset + 20U)
+    {
+        return (transport[13] & (AIC_TCP_FLAG_SYN | AIC_TCP_FLAG_RST)) != 0U;
+    }
+    if (protocol != AIC_IP_PROTOCOL_UDP ||
+        length < transport_offset + 8U)
+    {
+        return RT_FALSE;
+    }
+    source_port = aic_frame_get_be16(transport);
+    destination_port = aic_frame_get_be16(transport + 2U);
+    if ((source_port == AIC_DHCP_SERVER_PORT ||
+         source_port == AIC_DHCP_CLIENT_PORT) &&
+        (destination_port == AIC_DHCP_SERVER_PORT ||
+         destination_port == AIC_DHCP_CLIENT_PORT))
+    {
+        return RT_TRUE;
+    }
+    return (source_port == AIC_DHCPV6_CLIENT_PORT ||
+            source_port == AIC_DHCPV6_SERVER_PORT) &&
+           (destination_port == AIC_DHCPV6_CLIENT_PORT ||
+            destination_port == AIC_DHCPV6_SERVER_PORT);
+}
+
+static rt_uint8_t aic_downgrade_tid(rt_uint8_t tid, rt_uint8_t acm)
+{
+    static const rt_uint8_t downgrade_tid[4] = {2U, 3U, 5U, 7U};
+    rt_uint8_t category = aic_tx_access_category(tid);
+
+    while (acm & (1U << category))
+    {
+        if (category == AIC_TX_ACCESS_CATEGORY_BACKGROUND)
+        {
+            return 1U;
+        }
+        category--;
+        tid = downgrade_tid[category];
+    }
+    return tid;
+}
 
 static rt_err_t aic_transmit_frame(struct aic8800_context *context,
                                    struct rt_wlan_offload_vif *vif,
@@ -7092,13 +8569,18 @@ static rt_err_t aic_transmit_frame(struct aic8800_context *context,
     rt_bool_t group_addressed = RT_FALSE;
     rt_bool_t accounted = RT_FALSE;
     rt_bool_t power_save = RT_FALSE;
+    rt_bool_t peer_qos = RT_FALSE;
+    rt_uint8_t peer_acm = 0;
+    rt_uint16_t peer_uapsd_tids = 0;
+    rt_uint8_t tid = AIC_TX_TID_NON_QOS;
+    rt_uint8_t ps_id = AIC_PS_ID_LEGACY;
     rt_bool_t high_priority;
     struct aic8800_tx_metadata accounting_metadata;
 #ifdef AIC8800_WIFI_DEBUG_STATS
     rt_bool_t icmp = RT_FALSE;
     rt_uint16_t ethertype;
 #endif
-    struct aic8800_ap_station *station;
+    struct aic8800_ap_station *station = RT_NULL;
 
     rt_memset(&accounting_metadata, 0, sizeof(accounting_metadata));
     accounting_metadata.station_index = AIC8800_INVALID_INDEX;
@@ -7134,11 +8616,12 @@ static rt_err_t aic_transmit_frame(struct aic8800_context *context,
     raw_length = AIC8800_USB_HEADER_SIZE + AIC_TX_DESCRIPTOR_SIZE +
                  payload_length;
     /* The Linux AIC USB driver submits ordinary data records at their exact
-     * length. SDIO performs its required four-byte padding in
+     * length and pads records that request a firmware TX confirmation. SDIO
+     * performs its required four-byte padding in
      * aic8800_sdio_prepare_record(), after this transport-neutral frame has
      * been built. Advertising padding as USB payload changes the firmware
      * record boundary for non-word-sized Ethernet packets. */
-    total_length = raw_length;
+    total_length = status_descriptor ? aic_align4(raw_length) : raw_length;
     if (total_length > context->bus.max_tx_size ||
         total_length > AIC_USB_LENGTH_MASK ||
         total_length > sizeof(context->tx_frame))
@@ -7155,6 +8638,14 @@ static rt_err_t aic_transmit_frame(struct aic8800_context *context,
     if (vif->iftype == RT_WLAN_OFFLOAD_IFTYPE_STATION)
     {
         station_index = context->ap_station_index;
+        /* Match the vendor fullmac path: QoS peers use best-effort TID 0;
+         * non-QoS peers use the legacy station queue. Firmware owns block
+         * acknowledgement state for QoS traffic. */
+        if (!management)
+        {
+            tid = context->station_qos ? AIC_TX_TID_BEST_EFFORT :
+                                         AIC_TX_TID_NON_QOS;
+        }
     }
     else
     {
@@ -7164,6 +8655,9 @@ static rt_err_t aic_transmit_frame(struct aic8800_context *context,
         if (station)
         {
             station_index = station->firmware_index;
+            peer_qos = station->qos;
+            peer_acm = station->acm;
+            peer_uapsd_tids = station->uapsd_tids;
             if (!aic_station_state_snapshot(
                     context, station_index, &station_generation, &power_save))
             {
@@ -7208,23 +8702,14 @@ static rt_err_t aic_transmit_frame(struct aic8800_context *context,
         return RT_EOK;
     }
 
-    /* A sleeping AP peer cannot accept ordinary downlink records until the
-     * firmware announces that its service period has opened.  This port does
-     * not implement the vendor ME_TRAFFIC_IND handshake, so do not submit or
-     * accumulate traffic which can stall the shared firmware data endpoint.
-     * Report success to lwIP: this is an intentional link-layer drop and TCP
-     * will retransmit after the peer wakes. */
     if (!management && vif->iftype == RT_WLAN_OFFLOAD_IFTYPE_AP &&
-        !group_addressed && power_save)
+        !group_addressed && peer_qos)
     {
-        context->tx_power_save_drop_count++;
-        if (aic8800_log_throttle(context->tx_power_save_drop_count))
+        tid = aic_downgrade_tid(aic_classify_8021d(data, length), peer_acm);
+        if (peer_uapsd_tids & (1U << tid))
         {
-            LOG_D("dropping frame for sleeping station %u (drops=%u)",
-                  (unsigned int)station_index,
-                  (unsigned int)context->tx_power_save_drop_count);
+            ps_id = AIC_PS_ID_UAPSD;
         }
-        return RT_EOK;
     }
 
     /* The transport worker owns channel-context backpressure.  Queue new
@@ -7250,18 +8735,25 @@ static rt_err_t aic_transmit_frame(struct aic8800_context *context,
         !group_addressed)
     {
         result = aic_tx_pending_acquire(
-            context, station_index, station_generation);
+            context, station_index, station_generation, ps_id);
         if (result != RT_EOK)
         {
-            /* A deleted/sleeping station and a saturated per-peer window are
-             * link-layer drops.  Returning an error makes lwIP retry the same
-             * burst immediately and amplifies transport congestion. */
+            /* A deleted station and a saturated per-peer window are link-layer
+             * drops. Returning an error makes lwIP retry the same burst
+             * immediately and amplifies transport congestion. */
             return RT_EOK;
         }
         accounted = RT_TRUE;
         accounting_metadata.accounted = RT_TRUE;
+        accounting_metadata.host_buffered = RT_TRUE;
         accounting_metadata.station_index = station_index;
         accounting_metadata.station_generation = station_generation;
+        accounting_metadata.ps_id = ps_id;
+        if (power_save)
+        {
+            context->tx_power_save_buffered_count++;
+            aic_set_traffic_status(context, station_index, ps_id, RT_TRUE);
+        }
     }
 
     lock_result = rt_mutex_take(context->frame_mutex, RT_WAITING_FOREVER);
@@ -7284,16 +8776,15 @@ static rt_err_t aic_transmit_frame(struct aic8800_context *context,
         station = aic_find_ap_station(context, destination);
         if (!station || station->firmware_index != station_index ||
             !aic_station_state_matches(
-                context, station_index, station_generation, &power_save) ||
-            power_save)
+                context, station_index, station_generation, &power_save))
         {
-            if (power_save)
-            {
-                context->tx_power_save_drop_count++;
-            }
             aic8800_core_tx_complete(context, &accounting_metadata);
             rt_mutex_release(context->frame_mutex);
             return RT_EOK;
+        }
+        if (power_save)
+        {
+            aic_set_traffic_status(context, station_index, ps_id, RT_TRUE);
         }
     }
     else if (!management &&
@@ -7322,11 +8813,11 @@ static rt_err_t aic_transmit_frame(struct aic8800_context *context,
     aic_put_le16(&descriptor->packet_length,
                  (rt_uint16_t)payload_length);
     aic_put_le32(&descriptor->status_descriptor, status_descriptor);
-    descriptor->access_category =
-        management ? AIC_TX_ACCESS_CATEGORY_VOICE :
-                     AIC_TX_ACCESS_CATEGORY_BEST_EFFORT;
-    descriptor->tid = (management || group_addressed) ?
-                      AIC_TX_TID_NON_QOS : AIC_TX_TID_BEST_EFFORT;
+    descriptor->access_category = management ?
+        AIC_TX_ACCESS_CATEGORY_VOICE :
+        (tid == AIC_TX_TID_NON_QOS ? AIC_TX_ACCESS_CATEGORY_BEST_EFFORT :
+                                     aic_tx_access_category(tid));
+    descriptor->tid = tid;
     descriptor->vif_index =
         vif->iftype == RT_WLAN_OFFLOAD_IFTYPE_STATION ?
         context->vif_index : context->ap_vif_index;
@@ -7350,17 +8841,13 @@ static rt_err_t aic_transmit_frame(struct aic8800_context *context,
         rt_memcpy(frame + AIC8800_USB_HEADER_SIZE + AIC_TX_DESCRIPTOR_SIZE,
                   data + 14, payload_length);
     }
+    if (total_length > raw_length)
+    {
+        rt_memset(frame + raw_length, 0, total_length - raw_length);
+    }
     high_priority = management ||
-                    (length >= 14U && data[12] ==
-                         (rt_uint8_t)(AIC_ETHERTYPE_EAPOL >> 8) &&
-                     data[13] == (rt_uint8_t)AIC_ETHERTYPE_EAPOL);
-#if AIC8800_WIFI_TX_TRACE_FRAMES
-    aic_tx_trace_record(context, descriptor, management ? data + 4 : data,
-                        management ? 0U :
-                            (rt_uint16_t)(((rt_uint16_t)data[12] << 8) |
-                                          data[13]),
-                        (rt_uint16_t)total_length, management);
-#endif
+                    (!management &&
+                     aic_is_latency_control_frame(data, length));
     if (!management)
     {
         AIC8800_STAT(context->ethernet_tx_count++);
@@ -7515,7 +9002,7 @@ static void aic_log_station_rate(
 }
 
 #ifdef AIC8800_WIFI_DEBUG_STATS
-static void aic_print_rc_rate(rt_uint16_t rate_config)
+static void aic_stat_print_rate(rt_uint16_t rate_config)
 {
     rt_uint32_t format = (rate_config >> 11) & 0x07U;
     rt_uint32_t bandwidth = 20U << ((rate_config >> 7) & 0x03U);
@@ -7544,7 +9031,7 @@ static void aic_print_rc_rate(rt_uint16_t rate_config)
                (unsigned int)gi);
 }
 
-void aic8800_core_print_rc_stats(struct aic8800_context *context)
+static void aic_stat_print_rc(struct aic8800_context *context)
 {
     struct aic_wire_me_rc_stats_req request;
     struct aic_wire_me_rc_stats_cfm response;
@@ -7552,7 +9039,7 @@ void aic8800_core_print_rc_stats(struct aic8800_context *context)
     rt_uint16_t sample_count;
     rt_err_t result;
 
-    if (!context || !context->station_connected ||
+    if (!context->attached || !context->station_connected ||
         context->ap_station_index == AIC8800_INVALID_INDEX)
     {
         return;
@@ -7564,7 +9051,7 @@ void aic8800_core_print_rc_stats(struct aic8800_context *context)
                          &response, sizeof(response), &response_length);
     if (result != RT_EOK || response_length < sizeof(response))
     {
-        rt_kprintf("RC stats: unavailable result=%d length=%u\n", result,
+        rt_kprintf("RC: unavailable result=%d length=%u\n", result,
                    (unsigned int)response_length);
         return;
     }
@@ -7605,7 +9092,7 @@ void aic8800_core_print_rc_stats(struct aic8800_context *context)
                        't' : ' ',
                    aic_get_le16(&response.retry_step_index[2]) == index ?
                        'P' : ' ');
-        aic_print_rc_rate(aic_get_le16(&rate->rate_config));
+        aic_stat_print_rate(aic_get_le16(&rate->rate_config));
         rt_kprintf(" tp=%u.%u prob=%u.%u%% ok=%u/%u skipped=%u\n",
                    (unsigned int)(throughput / 10U),
                    (unsigned int)(throughput % 10U),
@@ -7616,13 +9103,205 @@ void aic8800_core_print_rc_stats(struct aic8800_context *context)
                    (unsigned int)rate->detail.sample.sample_skipped);
     }
 }
+
+static void aic_stat_print_common(const char *transport,
+                                  struct aic8800_context *context)
+{
+    int station_credit = -1;
+    unsigned int station_pending = 0;
+
+    if (context->ap_station_index < AIC8800_STATION_SLOTS)
+    {
+        station_credit = context->tx_credits[context->ap_station_index];
+        station_pending = context->tx_pending[context->ap_station_index];
+    }
+    rt_kprintf("[%s] connected=%d attached=%d station=%d ap=%d "
+               "vif=%u sta=%u port=%s\n",
+               transport, context->transport_connected, context->attached,
+               context->station_connected, context->ap_started,
+               context->vif_index, context->ap_station_index,
+               context->station_control_port_open ? "open" : "closed");
+    rt_kprintf("TX state: pending=%u full=%u ps-buffered=%u credits=%d "
+               "updates=%u no-station=%u off-channel=%u\n",
+               station_pending, (unsigned int)context->tx_pending_full_count,
+               (unsigned int)context->tx_power_save_buffered_count,
+               station_credit, (unsigned int)context->tx_credit_update_count,
+               (unsigned int)context->tx_no_station_count,
+               (unsigned int)context->tx_off_channel_count);
+    rt_kprintf("NET TX/RX: frames=%u/%u errors=%u/%u ARP=%u/%u ICMP=%u/%u\n",
+               (unsigned int)context->ethernet_tx_count,
+               (unsigned int)context->ethernet_rx_count,
+               (unsigned int)context->ethernet_tx_error_count,
+               (unsigned int)context->ethernet_rx_error_count,
+               (unsigned int)context->arp_tx_count,
+               (unsigned int)context->arp_rx_count,
+               (unsigned int)context->icmp_tx_count,
+               (unsigned int)context->icmp_rx_count);
+    rt_kprintf("RX decode: data=%u qos=%u amsdu=%u subframes=%u "
+               "no-llc=%u invalid=%u\n",
+               (unsigned int)context->rx_data_record_count,
+               (unsigned int)context->rx_qos_record_count,
+               (unsigned int)context->rx_amsdu_record_count,
+               (unsigned int)context->rx_amsdu_subframe_count,
+               (unsigned int)context->rx_no_llc_count,
+               (unsigned int)context->rx_invalid_data_count);
+    rt_kprintf("RX reorder: pending=%u queued=%u delivered=%u timeout=%u "
+               "duplicate=%u drops=%u\n",
+               (unsigned int)context->rx_reorder_pending,
+               (unsigned int)context->rx_reorder_queued,
+               (unsigned int)context->rx_reorder_delivered,
+               (unsigned int)context->rx_reorder_timeouts,
+               (unsigned int)context->rx_reorder_duplicates,
+               (unsigned int)context->rx_reorder_drops);
+#ifdef AIC8800_WIFI_TCP_ACK_FILTER
+    rt_kprintf("TCP ACK: suppressed=%u flushed=%u\n",
+               (unsigned int)context->tcp_ack_suppressed,
+               (unsigned int)context->tcp_ack_flushed);
 #endif
+}
+
+#ifdef AIC8800_WIFI_TRANSPORT_USB
+static void aic_stat_print_usb(struct aic8800_context *context)
+{
+    const struct aic8800_tx_worker *tx = &context->tx_worker;
+    const struct aic8800_rx_worker *data = &context->data_worker;
+    const struct aic8800_rx_worker *message = &context->message_worker;
+
+    aic_stat_print_common("USB", context);
+    rt_kprintf("USB TX queue: queued=%u depth=%u high=%u frames=%u "
+               "aggregates=%u max=%u drops=%u defer=%u worker-drop=%u "
+               "submit-busy=%u errors=%u\n",
+               context->usb_tx_queue ?
+                   (unsigned int)context->usb_tx_queue->entry : 0U,
+               (unsigned int)AIC8800_WIFI_USB_TX_QUEUE_DEPTH,
+               (unsigned int)context->usb_tx_queue_high_water,
+               (unsigned int)context->usb_tx_frame_count,
+               (unsigned int)context->usb_tx_aggregate_count,
+               (unsigned int)context->usb_tx_max_aggregate,
+               (unsigned int)context->usb_tx_queue_drop_count,
+               (unsigned int)context->usb_tx_record_defer_count,
+               (unsigned int)context->usb_tx_record_drop_count,
+               (unsigned int)context->usb_tx_submit_busy_count,
+               (unsigned int)context->usb_tx_error_count);
+    rt_kprintf("USB TX URB: active=%d slots=%u pending=%u complete=%u "
+               "bytes=%llu waits=%u timeouts=%u watchdog=%u reclaims=%u "
+               "recoveries=%u max-burst=%u errors=%u last=%d\n",
+               tx->active, (unsigned int)tx->slot_count,
+               (unsigned int)tx->pending,
+               (unsigned int)tx->completion_count,
+               (unsigned long long)tx->byte_count,
+               (unsigned int)tx->wait_count,
+               (unsigned int)tx->timeout_count,
+               (unsigned int)tx->watchdog_count,
+               (unsigned int)tx->reclaim_count,
+               (unsigned int)tx->recovery_count,
+               (unsigned int)tx->max_burst_count,
+               (unsigned int)tx->error_count, tx->last_error);
+    rt_kprintf("USB RX data/msg: complete=%u/%u errors=%u/%u retries=%u/%u "
+               "recoveries=%u/%u backlog-high=%u/%u overflow=%d/%d\n",
+               (unsigned int)data->completion_count,
+               (unsigned int)message->completion_count,
+               (unsigned int)data->error_count,
+               (unsigned int)message->error_count,
+               (unsigned int)data->retry_count,
+               (unsigned int)message->retry_count,
+               (unsigned int)data->recovery_count,
+               (unsigned int)message->recovery_count,
+               (unsigned int)data->queue_high_water,
+               (unsigned int)message->queue_high_water,
+               data->queue_overflow, message->queue_overflow);
+    rt_kprintf("USB RX dispatch: data max=%u us last=%u us "
+               "msg max=%u us last=%u us\n",
+               (unsigned int)data->dispatch_max_us,
+               (unsigned int)data->dispatch_last_us,
+               (unsigned int)message->dispatch_max_us,
+               (unsigned int)message->dispatch_last_us);
+    aic_stat_print_rc(context);
+}
+#endif
+
+#ifdef AIC8800_WIFI_TRANSPORT_SDIO
+static void aic_stat_print_sdio(struct aic8800_context *context)
+{
+    unsigned int clock_khz = 0;
+    unsigned int width = 0;
+    unsigned int timing = 0;
+
+    if (context->sdio_card)
+    {
+        clock_khz = context->sdio_card->host->io_cfg.clock / 1000U;
+        width = context->sdio_card->host->io_cfg.bus_width ==
+                    MMCSD_BUS_WIDTH_4 ? 4U : 1U;
+        timing = context->sdio_card->host->io_cfg.timing;
+    }
+    aic_stat_print_common("SDIO", context);
+    rt_kprintf("SDIO bus: active=%d clock=%u kHz width=%u timing=%u\n",
+               context->sdio_active, clock_khz, width, timing);
+    rt_kprintf("SDIO TX: transfers=%u frames=%u aggregates=%u max=%u "
+               "queued=%u high=%u drops=%u errors=%u defer=%u "
+               "worker-drop=%u\n",
+               (unsigned int)context->sdio_tx_count,
+               (unsigned int)context->sdio_tx_frame_count,
+               (unsigned int)context->sdio_tx_aggregate_count,
+               (unsigned int)context->sdio_tx_max_aggregate,
+               context->sdio_tx_queue ?
+                   (unsigned int)context->sdio_tx_queue->entry : 0U,
+               (unsigned int)context->sdio_tx_queue_high_water,
+               (unsigned int)context->sdio_tx_queue_drop_count,
+               (unsigned int)context->sdio_tx_error_count,
+               (unsigned int)context->sdio_tx_record_defer_count,
+               (unsigned int)context->sdio_tx_record_drop_count);
+    rt_kprintf("SDIO flow: credits=%u reads=%u waits=%u retries=%u "
+               "max-retry=%u timeouts=%u fallbacks=%u wait-ms=%u "
+               "granted=%u\n",
+               (unsigned int)context->sdio_tx_available_credits,
+               (unsigned int)context->sdio_tx_flow_read_count,
+               (unsigned int)context->sdio_tx_credit_wait_count,
+               (unsigned int)context->sdio_tx_credit_retry_count,
+               (unsigned int)context->sdio_tx_credit_max_retries,
+               (unsigned int)context->sdio_tx_credit_timeout_count,
+               (unsigned int)context->sdio_tx_credit_fallback_count,
+               (unsigned int)(context->sdio_tx_credit_wait_ticks * 1000U /
+                              RT_TICK_PER_SECOND),
+               (unsigned int)context->sdio_tx_credit_grant_frames);
+    rt_kprintf("SDIO RX: transfers=%u I/O-errors=%u protocol-drops=%u "
+               "queued=%u processed=%u drops=%u queue-high=%u\n",
+               (unsigned int)context->sdio_rx_count,
+               (unsigned int)context->sdio_error_count,
+               (unsigned int)context->sdio_protocol_drop_count,
+               (unsigned int)context->sdio_data_queued_count,
+               (unsigned int)context->sdio_data_processed_count,
+               (unsigned int)context->sdio_data_drop_count,
+               (unsigned int)context->sdio_data_queue_high_water);
+    aic_stat_print_rc(context);
+}
+#endif
+
+static int aic8800_stat(int argc, char **argv)
+{
+    (void)argv;
+    if (argc != 1)
+    {
+        rt_kprintf("usage: aic8800_stat\n");
+        return -RT_EINVAL;
+    }
+#ifdef AIC8800_WIFI_TRANSPORT_USB
+    aic_stat_print_usb(aic8800_usb_stat_context());
+#endif
+#ifdef AIC8800_WIFI_TRANSPORT_SDIO
+    aic_stat_print_sdio(aic8800_sdio_stat_context());
+#endif
+    return 0;
+}
+MSH_CMD_EXPORT(aic8800_stat, show AIC8800 USB and SDIO statistics);
+#endif /* AIC8800_WIFI_DEBUG_STATS */
 
 static rt_err_t aic_get_rssi(struct rt_wlan_offload_vif *vif, int *rssi)
 {
     struct aic8800_context *context = aic_context_from_vif(vif);
-    struct aic_wire_mm_get_sta_info_req request;
+    struct aic_wire_mm_get_sta_info_compat_req request;
     struct aic_wire_mm_get_sta_info_cfm response;
+    rt_size_t request_length;
     rt_size_t response_length = 0;
     rt_err_t result;
 
@@ -7635,15 +9314,25 @@ static rt_err_t aic_get_rssi(struct rt_wlan_offload_vif *vif, int *rssi)
         return -RT_EIO;
     }
     request.station_index = context->ap_station_index;
+    request.pattern[0] = 's';
+    request.pattern[1] = 't';
+    request.pattern[2] = 'a';
+    request_length =
+        context->product_id == AIC8800_USB_PID_AIC8800D80X2 ||
+        context->product_id == AIC8800_USB_PID_AIC8800D81X2 ||
+        context->product_id == AIC8800_USB_PID_AIC8800D89X2 ?
+            sizeof(struct aic_wire_mm_get_sta_info_req) : sizeof(request);
     rt_memset(&response, 0, sizeof(response));
     result = aic_execute(context, AIC_MM_GET_STA_INFO_REQ,
-                         AIC_MM_GET_STA_INFO_CFM, &request, sizeof(request),
+                         AIC_MM_GET_STA_INFO_CFM, &request, request_length,
                          &response, sizeof(response), &response_length);
     if (result != RT_EOK)
     {
         return result;
     }
-    if (response_length < sizeof(response))
+    /* V5 returns the 32-byte statistics extension. Older compatible firmware
+     * may stop after the original RSSI fields at byte 12. */
+    if (response_length < 12U)
     {
         return -RT_EIO;
     }
@@ -8089,6 +9778,11 @@ static void aic_refresh_channel_metadata(struct aic8800_context *context)
 
 #ifdef AIC8800_WIFI_5GHZ
     context->band_5ghz = g_aic8800_band_5ghz;
+    if (aic8800_radio_supports_80mhz(context))
+    {
+        context->band_5ghz.max_channel_width =
+            RT_WLAN_OFFLOAD_CHANNEL_WIDTH_80;
+    }
     if (aic_device_supports_vht(context))
     {
         context->band_5ghz.phy_capabilities |= RT_WLAN_OFFLOAD_PHY_VHT;
@@ -8134,6 +9828,20 @@ static void aic_refresh_channel_metadata(struct aic8800_context *context)
 
 static void aic8800_core_cancel_work(struct aic8800_context *context)
 {
+    if (context->traffic_work_initialized)
+    {
+        rt_work_cancel_sync(&context->traffic_work);
+        context->traffic_work_initialized = RT_FALSE;
+        context->traffic_work_queued = RT_FALSE;
+    }
+    if (context->station_loss_work_initialized)
+    {
+        rt_work_cancel_sync(&context->station_loss_work);
+        context->station_loss_work_initialized = RT_FALSE;
+        context->station_loss_work_queued = RT_FALSE;
+        rt_memset(context->station_loss, 0,
+                  sizeof(context->station_loss));
+    }
     if (context->scan_work_initialized)
     {
         rt_work_cancel_sync(&context->scan_work);
@@ -8145,6 +9853,15 @@ static void aic8800_core_cancel_work(struct aic8800_context *context)
         rt_work_cancel_sync(&context->ap_rechannel_work);
         context->ap_rechannel_work_initialized = RT_FALSE;
         context->ap_rechannel_work_queued = RT_FALSE;
+    }
+}
+
+static void aic_command_gate_deinit(struct aic8800_context *context)
+{
+    if (context && context->command_gate_initialized)
+    {
+        rt_sem_detach(&context->command_gate);
+        context->command_gate_initialized = RT_FALSE;
     }
 }
 
@@ -8178,6 +9895,13 @@ static const char *aic8800_transport_name(
     return context->transport == AIC8800_TRANSPORT_SDIO ? "SDIO" : "USB";
 }
 
+static rt_uint16_t aic8800_protocol_version(
+    const struct aic8800_context *context)
+{
+    return context && context->transport == AIC8800_TRANSPORT_SDIO ?
+           AIC_WIRE_MSG_API_VERSION_SDIO : AIC_WIRE_MSG_API_VERSION_USB;
+}
+
 rt_err_t aic8800_core_attach(struct aic8800_context *context)
 {
     struct rt_wlan_offload_command_manager_config command_config;
@@ -8199,8 +9923,13 @@ rt_err_t aic8800_core_attach(struct aic8800_context *context)
         return result;
     }
     aic_refresh_channel_metadata(context);
-    rt_work_init(&context->scan_work, aic_scan_followup_work, context);
+    rt_work_init(&context->scan_work, aic_scan_work, context);
     context->scan_work_initialized = RT_TRUE;
+    rt_work_init(&context->station_loss_work,
+                 aic_station_loss_work, context);
+    context->station_loss_work_initialized = RT_TRUE;
+    context->station_loss_work_queued = RT_FALSE;
+    rt_memset(context->station_loss, 0, sizeof(context->station_loss));
     rt_work_init(&context->ap_rechannel_work, aic_ap_rechannel_work, context);
     context->ap_rechannel_work_initialized = RT_TRUE;
     result = rt_mutex_init(&context->mgmt_confirmation_mutex, "aic-cfm",
@@ -8211,6 +9940,16 @@ rt_err_t aic8800_core_attach(struct aic8800_context *context)
         return result;
     }
     context->mgmt_confirmation_mutex_initialized = RT_TRUE;
+    result = rt_sem_init(&context->command_gate, "aic-cmd", 1,
+                         RT_IPC_FLAG_PRIO);
+    if (result != RT_EOK)
+    {
+        rt_mutex_detach(&context->mgmt_confirmation_mutex);
+        context->mgmt_confirmation_mutex_initialized = RT_FALSE;
+        aic8800_core_cancel_work(context);
+        return result;
+    }
+    context->command_gate_initialized = RT_TRUE;
     rt_memset(&command_config, 0, sizeof(command_config));
     command_config.max_pending = 1;
     command_config.push = aic_command_push;
@@ -8219,6 +9958,7 @@ rt_err_t aic8800_core_attach(struct aic8800_context *context)
                                              &command_config);
     if (result != RT_EOK)
     {
+        aic_command_gate_deinit(context);
         rt_mutex_detach(&context->mgmt_confirmation_mutex);
         context->mgmt_confirmation_mutex_initialized = RT_FALSE;
         aic8800_core_cancel_work(context);
@@ -8257,7 +9997,8 @@ rt_err_t aic8800_core_attach(struct aic8800_context *context)
         sizeof(g_aic8800_iface_combinations[0]);
     radio_config.max_scan_ssids = AIC_SCAN_SSID_COUNT;
     radio_config.max_scan_ie_length = AIC_SCAN_IE_MAX;
-    radio_config.firmware_info.protocol_version = 15;
+    radio_config.firmware_info.protocol_version =
+        aic8800_protocol_version(context);
     radio_config.firmware_info.max_stations = 10;
     radio_config.firmware_info.max_vifs = 2;
     radio_config.firmware_info.max_channel_contexts = 1;
@@ -8267,6 +10008,7 @@ rt_err_t aic8800_core_attach(struct aic8800_context *context)
     {
         rt_wlan_offload_bus_set_callbacks(&context->bus, RT_NULL, RT_NULL, RT_NULL);
         rt_wlan_offload_command_manager_deinit(&context->commands);
+        aic_command_gate_deinit(context);
         rt_mutex_detach(&context->mgmt_confirmation_mutex);
         context->mgmt_confirmation_mutex_initialized = RT_FALSE;
         aic8800_core_cancel_work(context);
@@ -8279,6 +10021,7 @@ rt_err_t aic8800_core_attach(struct aic8800_context *context)
         rt_wlan_offload_bus_set_callbacks(&context->bus, RT_NULL, RT_NULL,
                                           RT_NULL);
         rt_wlan_offload_command_manager_deinit(&context->commands);
+        aic_command_gate_deinit(context);
         rt_mutex_detach(&context->mgmt_confirmation_mutex);
         context->mgmt_confirmation_mutex_initialized = RT_FALSE;
         aic8800_core_cancel_work(context);
@@ -8293,6 +10036,7 @@ rt_err_t aic8800_core_attach(struct aic8800_context *context)
         rt_wlan_offload_bus_set_callbacks(&context->bus, RT_NULL, RT_NULL,
                                           RT_NULL);
         rt_wlan_offload_command_manager_deinit(&context->commands);
+        aic_command_gate_deinit(context);
         rt_mutex_detach(&context->mgmt_confirmation_mutex);
         context->mgmt_confirmation_mutex_initialized = RT_FALSE;
         aic8800_core_cancel_work(context);
@@ -8313,6 +10057,7 @@ rt_err_t aic8800_core_attach(struct aic8800_context *context)
             rt_wlan_offload_bus_set_callbacks(&context->bus, RT_NULL,
                                               RT_NULL, RT_NULL);
             rt_wlan_offload_command_manager_deinit(&context->commands);
+            aic_command_gate_deinit(context);
             rt_mutex_detach(&context->mgmt_confirmation_mutex);
             context->mgmt_confirmation_mutex_initialized = RT_FALSE;
             aic8800_core_cancel_work(context);
@@ -8351,12 +10096,16 @@ rt_err_t aic8800_core_attach(struct aic8800_context *context)
             rt_wlan_offload_bus_set_callbacks(&context->bus, RT_NULL, RT_NULL,
                                          RT_NULL);
             rt_wlan_offload_command_manager_deinit(&context->commands);
+            aic_command_gate_deinit(context);
             rt_mutex_detach(&context->mgmt_confirmation_mutex);
             context->mgmt_confirmation_mutex_initialized = RT_FALSE;
             aic8800_core_cancel_work(context);
             return result;
         }
     }
+    rt_work_init(&context->traffic_work, aic_traffic_work, context);
+    context->traffic_work_initialized = RT_TRUE;
+    context->traffic_work_queued = RT_FALSE;
     context->attached = RT_TRUE;
     {
         char control[RT_NAME_MAX];
@@ -8429,6 +10178,7 @@ rt_err_t aic8800_core_detach(struct aic8800_context *context)
         LOG_E("command manager teardown failed: %d", result);
         return result;
     }
+    aic_command_gate_deinit(context);
     if (context->mgmt_confirmation_mutex_initialized)
     {
         result = rt_mutex_detach(&context->mgmt_confirmation_mutex);

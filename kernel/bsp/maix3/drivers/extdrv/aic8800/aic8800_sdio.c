@@ -3,7 +3,8 @@
  *
  * SPDX-License-Identifier: Apache-2.0
  *
- * RT-Smart SDIO transport for the AIC8801 and AIC8800D80 WLAN chips.
+ * RT-Smart SDIO transport for the AIC8801, AIC8800DC and AIC8800D80 WLAN
+ * chips.
  */
 #include "aic8800_wifi.h"
 
@@ -14,6 +15,7 @@
 #include <rtdbg.h>
 
 #define AIC8800_SDIO_FUNCTION                 1U
+#define AIC8800_SDIO_MESSAGE_FUNCTION         2U
 #define AIC8800_SDIO_BLOCK_SIZE             512U
 #define AIC8800_SDIO_FLOW_BUFFER_SIZE       1536U
 #define AIC8800_SDIO_EVENT_RX             (1U << 0)
@@ -21,7 +23,17 @@
 #define AIC8800_SDIO_MAX_RX_BURST            32U
 #define AIC8800_SDIO_POLL_DELAY_US           200U
 #define AIC8800_SDIO_WAKE_RETRIES              50U
-#define AIC8800_SDIO_DATA_CREDIT_RESERVE         2U
+/* Firmware host-write buffers held back from the data path, matching vendor
+ * Linux DATA_FLOW_CTRL_THRESH. */
+#ifndef AIC8800_WIFI_SDIO_DATA_CREDIT_RESERVE
+#define AIC8800_WIFI_SDIO_DATA_CREDIT_RESERVE    2U
+#endif
+#define AIC8800_SDIO_DATA_CREDIT_RESERVE \
+    AIC8800_WIFI_SDIO_DATA_CREDIT_RESERVE
+/* A DC/DW can occasionally remain at the reserved-credit floor until the host
+ * queue times out. After the short polling phase and ten 2 ms sleeps, submit
+ * one frame while retaining one credit for control traffic. */
+#define AIC8800_SDIO_DC_CREDIT_FALLBACK_RETRY    40U
 
 #define AIC8800_SDIO_LEGACY_BYTE_LENGTH      0x02U
 #define AIC8800_SDIO_LEGACY_INTERRUPT        0x04U
@@ -58,7 +70,21 @@ static struct rt_mutex g_aic8800_sdio_frame_mutex;
 static struct rt_workqueue *g_aic8800_sdio_attach_workqueue;
 static rt_bool_t g_aic8800_sdio_ipc_initialized;
 
+#ifdef AIC8800_WIFI_DEBUG_STATS
+struct aic8800_context *aic8800_sdio_stat_context(void)
+{
+    return &g_aic8800_sdio_context;
+}
+#endif
+
 static rt_bool_t aic8800_sdio_should_log_error(rt_uint32_t count);
+
+static struct rt_sdio_function *aic8800_sdio_firmware_function(
+    struct aic8800_context *context)
+{
+    return context->sdio_message_function ? context->sdio_message_function :
+                                            context->sdio_function;
+}
 
 static rt_uint16_t aic8800_sdio_get_le16(const rt_uint8_t *data)
 {
@@ -168,6 +194,8 @@ static rt_err_t aic8800_sdio_initialize_function(
     struct aic8800_context *context)
 {
     struct rt_sdio_function *function = context->sdio_function;
+    struct rt_sdio_function *message_function =
+        context->sdio_message_function;
     struct rt_sdio_function *function0 = context->sdio_card->sdio_function[0];
     rt_err_t result;
 
@@ -200,8 +228,53 @@ static rt_err_t aic8800_sdio_initialize_function(
         result = sdio_io_writeb(function,
                                 context->sdio_registers.byte_mode_enable, 1U);
     }
+    if (result == RT_EOK && message_function)
+    {
+        result = sdio_set_block_size(
+            message_function, AIC8800_SDIO_BLOCK_SIZE);
+        if (result == RT_EOK)
+        {
+            result = sdio_enable_func(message_function);
+            if (result == RT_EOK)
+            {
+                context->sdio_message_function_enabled = RT_TRUE;
+            }
+        }
+        if (result == RT_EOK)
+        {
+            result = sdio_io_writeb(
+                message_function, context->sdio_registers.register_block, 1U);
+        }
+        if (result == RT_EOK)
+        {
+            result = sdio_io_writeb(
+                message_function, context->sdio_registers.byte_mode_enable,
+                1U);
+        }
+    }
     mmcsd_host_unlock(context->sdio_card->host);
     return result;
+}
+
+static void aic8800_sdio_disable_functions(
+    struct aic8800_context *context)
+{
+    if (!context || !context->sdio_card)
+    {
+        return;
+    }
+    mmcsd_host_lock(context->sdio_card->host);
+    if (context->sdio_message_function_enabled)
+    {
+        sdio_disable_func(context->sdio_message_function);
+        context->sdio_message_function_enabled = RT_FALSE;
+    }
+    if (context->sdio_function_enabled)
+    {
+        sdio_disable_func(context->sdio_function);
+        context->sdio_function_enabled = RT_FALSE;
+    }
+    mmcsd_host_unlock(context->sdio_card->host);
 }
 
 static rt_err_t aic8800_sdio_runtime_wakeup(
@@ -238,7 +311,8 @@ static rt_err_t aic8800_sdio_runtime_wakeup(
 }
 
 static rt_err_t aic8800_sdio_receive_length_locked(
-    struct aic8800_context *context, rt_size_t *length)
+    struct aic8800_context *context, struct rt_sdio_function *function,
+    rt_size_t *length)
 {
     const struct aic8800_sdio_registers *registers =
         &context->sdio_registers;
@@ -252,7 +326,7 @@ static rt_err_t aic8800_sdio_receive_length_locked(
 
         for (retry = 0; retry < AIC8800_WIFI_SDIO_FLOW_RETRIES; retry++)
         {
-            status = sdio_io_readb(context->sdio_function,
+            status = sdio_io_readb(function,
                                    registers->block_count, &result);
             if (result != RT_EOK)
             {
@@ -278,7 +352,7 @@ static rt_err_t aic8800_sdio_receive_length_locked(
         }
         else
         {
-            status = sdio_io_readb(context->sdio_function,
+            status = sdio_io_readb(function,
                                    registers->byte_length, &result);
             if (result != RT_EOK)
             {
@@ -289,7 +363,7 @@ static rt_err_t aic8800_sdio_receive_length_locked(
         return *length ? RT_EOK : -RT_EEMPTY;
     }
 
-    status = sdio_io_readb(context->sdio_function,
+    status = sdio_io_readb(function,
                            registers->interrupt_status, &result);
     if (result != RT_EOK)
     {
@@ -302,13 +376,13 @@ static rt_err_t aic8800_sdio_receive_length_locked(
     if (status & AIC8800_SDIO_OTHER_INTERRUPT)
     {
         rt_uint8_t pending = sdio_io_readb(
-            context->sdio_function, registers->interrupt_pending, &result);
+            function, registers->interrupt_pending, &result);
 
         if (result != RT_EOK)
         {
             return result;
         }
-        result = sdio_io_writeb(context->sdio_function,
+        result = sdio_io_writeb(function,
                                 registers->interrupt_pending,
                                 pending & (rt_uint8_t)~1U);
         if (result != RT_EOK)
@@ -324,7 +398,7 @@ static rt_err_t aic8800_sdio_receive_length_locked(
     }
     if (status == AIC8800_SDIO_V3_BYTE_MODE_STATUS)
     {
-        status = sdio_io_readb(context->sdio_function,
+        status = sdio_io_readb(function,
                                registers->byte_length, &result);
         if (result != RT_EOK)
         {
@@ -341,20 +415,22 @@ static rt_err_t aic8800_sdio_receive_length_locked(
 }
 
 static rt_err_t aic8800_sdio_receive_one(struct aic8800_context *context,
+                                          struct rt_sdio_function *function,
                                           void *data, rt_size_t capacity,
                                           rt_size_t *length)
 {
     rt_size_t available;
     rt_err_t result;
 
-    if (!context || !context->transport_connected || !data || !capacity ||
-        !length)
+    if (!context || !context->transport_connected || !function || !data ||
+        !capacity || !length)
     {
         return -RT_EINVAL;
     }
     *length = 0;
     mmcsd_host_lock(context->sdio_card->host);
-    result = aic8800_sdio_receive_length_locked(context, &available);
+    result = aic8800_sdio_receive_length_locked(
+        context, function, &available);
     if (result == RT_EOK && available > capacity)
     {
         result = -RT_EFULL;
@@ -362,7 +438,7 @@ static rt_err_t aic8800_sdio_receive_one(struct aic8800_context *context,
     if (result == RT_EOK)
     {
         result = sdio_io_read_multi_fifo_b(
-            context->sdio_function, context->sdio_registers.read_fifo,
+            function, context->sdio_registers.read_fifo,
             data, available);
     }
     mmcsd_host_unlock(context->sdio_card->host);
@@ -388,15 +464,26 @@ static rt_err_t aic8800_sdio_read_flow_credits(
     return result;
 }
 
+static rt_bool_t aic8800_sdio_is_dc_dw(
+    const struct aic8800_context *context)
+{
+    return context &&
+           (context->product_id == AIC8800_USB_PID_AIC8800DC ||
+            context->product_id == AIC8800_USB_PID_AIC8800DW);
+}
+
 static void aic8800_sdio_flow_retry_delay(rt_uint32_t retry)
 {
+    /* The firmware commonly returns credits within a few milliseconds. Keep
+     * the vendor driver's fast polling window so the TX worker does not sleep
+     * through confirmations and exhaust the queue under sustained traffic. */
     if (retry < 30U)
     {
         cpu_ticks_delay_us(AIC8800_SDIO_POLL_DELAY_US);
     }
     else if (retry < 40U)
     {
-        rt_thread_mdelay(1);
+        rt_thread_mdelay(2);
     }
     else
     {
@@ -438,12 +525,11 @@ static rt_err_t aic8800_sdio_wait_for_message_credits(
 static rt_err_t aic8800_sdio_wait_for_data_credits(
     struct aic8800_context *context, rt_uint8_t *frame_limit)
 {
+    rt_tick_t start = rt_tick_get();
     rt_uint32_t retry;
 
-    /* Match the D80 reference driver's DATA_FLOW_CTRL_THRESH behavior. Keep
-     * two firmware credits in reserve for control traffic and retain the
-     * mutex on success so the returned data credits cannot be consumed by a
-     * concurrent transfer before this aggregate is submitted. */
+    /* Retain the mutex on success so the returned data credits cannot be
+     * consumed by a concurrent transfer before this aggregate is submitted. */
     for (retry = 0; retry < AIC8800_WIFI_SDIO_FLOW_RETRIES; retry++)
     {
         rt_uint8_t credits;
@@ -487,6 +573,29 @@ static rt_err_t aic8800_sdio_wait_for_data_credits(
             *frame_limit = credits < AIC8800_WIFI_SDIO_TX_AGGREGATE_FRAMES ?
                            credits :
                            AIC8800_WIFI_SDIO_TX_AGGREGATE_FRAMES;
+            context->sdio_tx_credit_wait_ticks +=
+                (rt_uint32_t)(rt_tick_get() - start);
+            context->sdio_tx_credit_grant_frames += *frame_limit;
+            return RT_EOK;
+        }
+        if (aic8800_sdio_is_dc_dw(context) && credits > 1U &&
+            retry >= AIC8800_SDIO_DC_CREDIT_FALLBACK_RETRY)
+        {
+            if (retry)
+            {
+                context->sdio_tx_credit_wait_count++;
+                context->sdio_tx_credit_retry_count += retry;
+                if (retry > context->sdio_tx_credit_max_retries)
+                {
+                    context->sdio_tx_credit_max_retries =
+                        (rt_uint8_t)retry;
+                }
+            }
+            *frame_limit = 1U;
+            context->sdio_tx_credit_wait_ticks +=
+                (rt_uint32_t)(rt_tick_get() - start);
+            context->sdio_tx_credit_grant_frames++;
+            context->sdio_tx_credit_fallback_count++;
             return RT_EOK;
         }
         rt_mutex_release(context->tx_mutex);
@@ -496,6 +605,8 @@ static rt_err_t aic8800_sdio_wait_for_data_credits(
     context->sdio_tx_credit_retry_count +=
         AIC8800_WIFI_SDIO_FLOW_RETRIES;
     context->sdio_tx_credit_timeout_count++;
+    context->sdio_tx_credit_wait_ticks +=
+        (rt_uint32_t)(rt_tick_get() - start);
     if (AIC8800_WIFI_SDIO_FLOW_RETRIES >
         context->sdio_tx_credit_max_retries)
     {
@@ -548,7 +659,7 @@ static rt_size_t aic8800_sdio_prepare_record(
 
 static rt_err_t aic8800_sdio_write_buffer(
     struct aic8800_context *context, rt_size_t record_length,
-    rt_uint16_t frame_count)
+    rt_uint16_t frame_count, struct rt_sdio_function *function)
 {
     rt_size_t transfer_length = record_length;
     rt_err_t result;
@@ -569,7 +680,7 @@ static rt_err_t aic8800_sdio_write_buffer(
     }
     mmcsd_host_lock(context->sdio_card->host);
     result = sdio_io_write_multi_fifo_b(
-        context->sdio_function, context->sdio_registers.write_fifo,
+        function, context->sdio_registers.write_fifo,
         context->sdio_tx_buffer, transfer_length);
     mmcsd_host_unlock(context->sdio_card->host);
     if (result == RT_EOK)
@@ -590,13 +701,14 @@ static rt_err_t aic8800_sdio_write_buffer(
 
 static rt_err_t aic8800_sdio_transmit_direct(
     struct aic8800_context *context, const void *data, rt_size_t length,
-    rt_bool_t require_active)
+    rt_bool_t require_active, struct rt_sdio_function *function,
+    rt_bool_t check_credits)
 {
     rt_size_t record_length;
     rt_size_t transfer_length;
     rt_err_t result;
 
-    if (!context || !context->transport_connected || !data ||
+    if (!context || !context->transport_connected || !function || !data ||
         length < AIC8800_USB_HEADER_SIZE ||
         length > AIC8800_WIFI_TX_BUFFER_SIZE ||
         (require_active && !context->sdio_active) ||
@@ -615,7 +727,6 @@ static rt_err_t aic8800_sdio_transmit_direct(
         result = -RT_EIO;
         goto done;
     }
-
     record_length = aic8800_sdio_prepare_record(
         context, context->sdio_tx_buffer, context->sdio_tx_capacity,
         data, length);
@@ -635,11 +746,13 @@ static rt_err_t aic8800_sdio_transmit_direct(
         result = -RT_EFULL;
         goto done;
     }
-    result = aic8800_sdio_wait_for_message_credits(
-        context, transfer_length, require_active);
+    result = check_credits ?
+             aic8800_sdio_wait_for_message_credits(
+                 context, transfer_length, require_active) : RT_EOK;
     if (result == RT_EOK)
     {
-        result = aic8800_sdio_write_buffer(context, record_length, 1U);
+        result = aic8800_sdio_write_buffer(
+            context, record_length, 1U, function);
     }
     /* Message traffic shares the firmware buffer pool. Force the data path
      * to refresh its cached count before building another aggregate. */
@@ -679,20 +792,32 @@ static rt_err_t aic8800_sdio_transmit_aggregate(
     rt_err_t result;
 
     *carry = RT_NULL;
+    result = aic8800_sdio_wait_for_data_credits(context, &frame_limit);
+    if (result != RT_EOK)
+    {
+        /* Vendor Linux waits for firmware buffers before it dequeues the
+         * first packet. Preserve that packet across a temporary credit
+         * drought instead of turning poor RF conditions into host-side loss. */
+        if (result == -RT_ETIMEOUT && context->sdio_active &&
+            !context->sdio_tx_terminate)
+        {
+            *carry = record;
+            return -RT_EBUSY;
+        }
+        aic8800_core_tx_complete(context, &record->metadata);
+        rt_mp_free(record);
+        return result;
+    }
+    /* Only look for a second frame if one is already queued.  With
+     * AIC8800_WIFI_SDIO_TX_AGGREGATE_WAIT_MS at its default of zero this is a
+     * non-blocking peek; a non-zero value trades latency for aggregation and is
+     * taken while tx_mutex is held, so keep it small. */
     if (context->sdio_active && !context->sdio_tx_terminate)
     {
         (void)rt_mq_recv(
             context->sdio_tx_queue, &prefetched, sizeof(prefetched),
             rt_tick_from_millisecond(
                 AIC8800_WIFI_SDIO_TX_AGGREGATE_WAIT_MS));
-    }
-    result = aic8800_sdio_wait_for_data_credits(context, &frame_limit);
-    if (result != RT_EOK)
-    {
-        aic8800_core_tx_complete(context, &record->metadata);
-        rt_mp_free(record);
-        *carry = prefetched;
-        return result;
     }
     while (frame_count < frame_limit)
     {
@@ -701,9 +826,52 @@ static rt_err_t aic8800_sdio_transmit_aggregate(
 
         if (state != AIC8800_TX_RECORD_READY)
         {
-            if (state != AIC8800_TX_RECORD_DEFER ||
-                !aic8800_sdio_requeue_tx_record(context, record))
+            if (state == AIC8800_TX_RECORD_DEFER &&
+                aic8800_sdio_requeue_tx_record(context, record))
             {
+                context->sdio_tx_record_defer_count++;
+            }
+            else
+            {
+                context->sdio_tx_record_drop_count++;
+                aic8800_core_tx_complete(context, &record->metadata);
+                rt_mp_free(record);
+            }
+            record = RT_NULL;
+            if (++deferred_count >= AIC8800_WIFI_SDIO_TX_QUEUE_DEPTH)
+            {
+                break;
+            }
+            if (prefetched)
+            {
+                record = prefetched;
+                prefetched = RT_NULL;
+            }
+            else if (rt_mq_recv(context->sdio_tx_queue, &record,
+                                sizeof(record), 0) != RT_EOK)
+            {
+                record = RT_NULL;
+                break;
+            }
+            if (!record)
+            {
+                result = -RT_EBUSY;
+                break;
+            }
+            continue;
+        }
+        state = aic8800_core_tx_metadata_apply(
+            context, &record->metadata, record->data, record->length);
+        if (state != AIC8800_TX_RECORD_READY)
+        {
+            if (state == AIC8800_TX_RECORD_DEFER &&
+                aic8800_sdio_requeue_tx_record(context, record))
+            {
+                context->sdio_tx_record_defer_count++;
+            }
+            else
+            {
+                context->sdio_tx_record_drop_count++;
                 aic8800_core_tx_complete(context, &record->metadata);
                 rt_mp_free(record);
             }
@@ -779,7 +947,8 @@ static rt_err_t aic8800_sdio_transmit_aggregate(
     {
         result = context->sdio_active && !context->sdio_tx_terminate ?
                  aic8800_sdio_write_buffer(
-                     context, aggregate_length, frame_count) : -RT_EBUSY;
+                     context, aggregate_length, frame_count,
+                     context->sdio_function) : -RT_EBUSY;
     }
     if (result == RT_EOK)
     {
@@ -926,8 +1095,17 @@ static void aic8800_sdio_reset_tx_queue(struct aic8800_context *context)
 rt_err_t aic8800_sdio_firmware_transmit(struct aic8800_context *context,
                                          const void *data, rt_size_t length)
 {
+    struct rt_sdio_function *function;
+
+    if (!context)
+    {
+        return -RT_EINVAL;
+    }
+    function = aic8800_sdio_firmware_function(context);
+
     return aic8800_sdio_transmit_direct(
-        context, data, length, RT_FALSE);
+        context, data, length, RT_FALSE, function,
+        function == context->sdio_function);
 }
 
 rt_err_t aic8800_sdio_firmware_receive(struct aic8800_context *context,
@@ -935,6 +1113,8 @@ rt_err_t aic8800_sdio_firmware_receive(struct aic8800_context *context,
                                         rt_size_t *length,
                                         rt_uint32_t timeout_ms)
 {
+    struct rt_sdio_function *control_function;
+    struct rt_sdio_function *alternate_function;
     rt_tick_t timeout;
     rt_tick_t start;
 
@@ -942,13 +1122,29 @@ rt_err_t aic8800_sdio_firmware_receive(struct aic8800_context *context,
     {
         return -RT_EINVAL;
     }
+    control_function = aic8800_sdio_firmware_function(context);
+    alternate_function = control_function == context->sdio_function ?
+                         context->sdio_message_function :
+                         context->sdio_function;
     start = rt_tick_get();
     timeout = rt_tick_from_millisecond(timeout_ms);
     do
     {
         rt_err_t result = aic8800_sdio_receive_one(
-            context, data, capacity, length);
+            context, control_function,
+            data, capacity, length);
 
+        /* DC/DW commands are sent through function 2, but the firmware can
+         * route the confirmation through function 1 as soon as its SDIO
+         * runtime setting is changed. The reference driver services both
+         * IRQ paths during firmware setup, so mirror that behavior while
+         * polling before the runtime worker is started. */
+        if (result == -RT_EEMPTY && alternate_function)
+        {
+            result = aic8800_sdio_receive_one(
+                context, alternate_function,
+                data, capacity, length);
+        }
         if (result != -RT_EEMPTY)
         {
             return result;
@@ -968,7 +1164,7 @@ rt_err_t aic8800_sdio_pump_command(
     rt_tick_t timeout;
     rt_tick_t start;
 
-    if (!context || !manager || !token || !timeout_ms ||
+    if (!context || !manager || !timeout_ms ||
         rt_thread_self() != context->sdio_thread ||
         !context->sdio_command_rx_buffer)
     {
@@ -981,7 +1177,8 @@ rt_err_t aic8800_sdio_pump_command(
     {
         rt_size_t length = 0;
         rt_err_t result = aic8800_sdio_receive_one(
-            context, context->sdio_command_rx_buffer,
+            context, context->sdio_function,
+            context->sdio_command_rx_buffer,
             AIC8800_WIFI_SDIO_RX_BUFFER_SIZE, &length);
 
         if (result == -RT_EEMPTY)
@@ -1033,6 +1230,29 @@ static rt_err_t aic8800_sdio_set_irq_source_locked(
     return result;
 }
 
+static rt_err_t aic8800_sdio_prepare_runtime_irq(
+    struct aic8800_context *context)
+{
+    rt_err_t result;
+
+    if (!context || !context->sdio_card)
+    {
+        return -RT_EINVAL;
+    }
+    mmcsd_host_lock(context->sdio_card->host);
+    result = aic8800_sdio_set_irq_source_locked(context, RT_FALSE);
+    if (result == RT_EOK && context->sdio_message_function)
+    {
+        /* Function 2 is the BSP/firmware-download message path. The Linux
+         * runtime driver releases it and handles all traffic on function 1. */
+        result = sdio_io_writeb(
+            context->sdio_message_function,
+            context->sdio_registers.interrupt_config, 0U);
+    }
+    mmcsd_host_unlock(context->sdio_card->host);
+    return result;
+}
+
 static rt_err_t aic8800_sdio_set_irq_source(
     struct aic8800_context *context, rt_bool_t enabled)
 {
@@ -1054,24 +1274,8 @@ static void aic8800_sdio_irq(struct rt_sdio_function *function)
 
     if (context && context->sdio_event_initialized)
     {
-        rt_err_t result = RT_EOK;
-
-        /* The generic priority-4 SDIO IRQ thread re-enables the host IRQ as
-         * soon as this callback returns. Mask the level-triggered device
-         * source until the deferred FIFO worker has drained it. */
-        if (!context->sdio_irq_source_masked)
-        {
-            result = aic8800_sdio_set_irq_source_locked(context, RT_FALSE);
-        }
+        sdio_irq_defer(context->sdio_card->host);
         rt_event_send(&context->sdio_event, AIC8800_SDIO_EVENT_RX);
-        if (result != RT_EOK)
-        {
-            context->sdio_error_count++;
-            if (aic8800_sdio_should_log_error(context->sdio_error_count))
-            {
-                LOG_W("failed to mask SDIO interrupt source: %d", result);
-            }
-        }
     }
 }
 
@@ -1123,10 +1327,12 @@ static void aic8800_sdio_note_protocol_drop(
 static void aic8800_sdio_worker(void *parameter)
 {
     struct aic8800_context *context = parameter;
+    rt_uint32_t scheduler_budget = 0;
 
     while (!context->sdio_terminate)
     {
         rt_uint32_t events = 0;
+        rt_uint32_t received = 0;
         rt_uint32_t count;
         rt_bool_t drained = RT_FALSE;
 
@@ -1145,8 +1351,10 @@ static void aic8800_sdio_worker(void *parameter)
         for (count = 0; count < AIC8800_SDIO_MAX_RX_BURST; count++)
         {
             rt_size_t length = 0;
-            rt_err_t result = aic8800_sdio_receive_one(
-                context, context->sdio_rx_buffer,
+            rt_err_t result;
+
+            result = aic8800_sdio_receive_one(
+                context, context->sdio_function, context->sdio_rx_buffer,
                 AIC8800_WIFI_SDIO_RX_BUFFER_SIZE, &length);
 
             if (result == -RT_EEMPTY)
@@ -1171,6 +1379,7 @@ static void aic8800_sdio_worker(void *parameter)
             }
             context->sdio_consecutive_errors = 0;
             context->sdio_rx_count++;
+            received++;
             result = rt_wlan_offload_bus_rx(&context->bus,
                                              context->sdio_rx_buffer, length);
             if (result != RT_EOK && result != -RT_EEMPTY)
@@ -1187,22 +1396,21 @@ static void aic8800_sdio_worker(void *parameter)
              * the protocol worker one tick to consume the records just read. */
             rt_event_send(&context->sdio_event, AIC8800_SDIO_EVENT_RX);
             rt_thread_delay(1);
+            scheduler_budget = 0;
         }
         else if (drained && context->sdio_active &&
-                 context->sdio_irq_source_masked)
+                 context->sdio_card->host->sdio_irq_deferred)
         {
-            rt_err_t result = aic8800_sdio_set_irq_source(context, RT_TRUE);
-
-            if (result != RT_EOK)
+            scheduler_budget += received;
+            /* Back off empty level interrupts, but only yield periodically
+             * while valid records are being drained. */
+            if (!received ||
+                scheduler_budget >= AIC8800_SDIO_MAX_RX_BURST)
             {
-                aic8800_sdio_note_transport_error(context, result);
-                if (context->sdio_active)
-                {
-                    rt_event_send(&context->sdio_event,
-                                  AIC8800_SDIO_EVENT_RX);
-                    rt_thread_delay(1);
-                }
+                rt_thread_delay(1);
+                scheduler_budget = 0;
             }
+            sdio_irq_rearm(context->sdio_card->host);
         }
     }
     rt_completion_done(&context->sdio_thread_stopped);
@@ -1216,6 +1424,10 @@ static rt_err_t aic8800_sdio_attach_irq(struct aic8800_context *context)
 
     mmcsd_host_lock(context->sdio_card->host);
     result = sdio_attach_irq(context->sdio_function, aic8800_sdio_irq);
+    if (result == RT_EOK)
+    {
+        context->sdio_irq_attached = RT_TRUE;
+    }
     if (result == RT_EOK && context->sdio_v3)
     {
         result = function0 ? sdio_io_writeb(
@@ -1224,16 +1436,13 @@ static rt_err_t aic8800_sdio_attach_irq(struct aic8800_context *context)
         if (result != RT_EOK)
         {
             sdio_detach_irq(context->sdio_function);
+            context->sdio_irq_attached = RT_FALSE;
         }
     }
     mmcsd_host_unlock(context->sdio_card->host);
     if (result == RT_EOK)
     {
-        context->sdio_irq_attached = RT_TRUE;
-        /* sdio_attach_irq() installs the common SDIO IRQ thread but does not
-         * unmask the K230 host controller's card-interrupt source. */
-        context->sdio_card->host->ops->enable_sdio_irq(
-            context->sdio_card->host, 1);
+        sdio_irq_rearm(context->sdio_card->host);
     }
     return result;
 }
@@ -1248,7 +1457,10 @@ static void aic8800_sdio_detach_irq(struct aic8800_context *context)
     }
     function0 = context->sdio_card->sdio_function[0];
     mmcsd_host_lock(context->sdio_card->host);
-    sdio_detach_irq(context->sdio_function);
+    if (context->sdio_irq_attached)
+    {
+        sdio_detach_irq(context->sdio_function);
+    }
     if (context->sdio_v3 && function0)
     {
         sdio_io_writeb(function0, SDIO_REG_CCCR_INT_EN, 0U);
@@ -1274,7 +1486,7 @@ static rt_err_t aic8800_sdio_bus_start(struct rt_wlan_offload_bus *bus)
     context->sdio_consecutive_errors = 0;
     context->sdio_recovery_reported = RT_FALSE;
     aic8800_core_tx_pending_reset(context);
-    result = aic8800_sdio_set_irq_source(context, RT_FALSE);
+    result = aic8800_sdio_prepare_runtime_irq(context);
     if (result != RT_EOK)
     {
         return result;
@@ -1295,7 +1507,8 @@ static rt_err_t aic8800_sdio_bus_start(struct rt_wlan_offload_bus *bus)
         return result;
     }
     rt_event_send(&context->sdio_event, AIC8800_SDIO_EVENT_RX);
-    LOG_I("SDIO bus started on function %u: clock=%u kHz width=%u timing=%u protocol=%s aggregate=%u wait=%u ms",
+    LOG_I("SDIO bus started on function %u: clock=%u kHz width=%u "
+          "timing=%u protocol=%s aggregate=%u wait=%u ms reserve=%u",
           context->sdio_function->num,
           (unsigned int)(context->sdio_card->host->io_cfg.clock / 1000U),
           context->sdio_card->host->io_cfg.bus_width == MMCSD_BUS_WIDTH_4 ?
@@ -1303,7 +1516,8 @@ static rt_err_t aic8800_sdio_bus_start(struct rt_wlan_offload_bus *bus)
           context->sdio_card->host->io_cfg.timing,
           context->sdio_v3 ? "v3" : "legacy",
           (unsigned int)AIC8800_WIFI_SDIO_TX_AGGREGATE_FRAMES,
-          (unsigned int)AIC8800_WIFI_SDIO_TX_AGGREGATE_WAIT_MS);
+          (unsigned int)AIC8800_WIFI_SDIO_TX_AGGREGATE_WAIT_MS,
+          (unsigned int)AIC8800_SDIO_DATA_CREDIT_RESERVE);
     return RT_EOK;
 }
 
@@ -1335,7 +1549,8 @@ static rt_err_t aic8800_sdio_bus_stop(struct rt_wlan_offload_bus *bus)
     LOG_I("SDIO bus stopped: RX=%u TX transfers=%u frames=%u aggregates=%u "
           "max_aggregate=%u queue_high_water=%u queue_drops=%u "
           "flow_reads=%u credit_waits=%u credit_retries=%u "
-          "credit_max_retry=%u credit_timeouts=%u TX errors=%u "
+          "credit_max_retry=%u credit_timeouts=%u credit_fallbacks=%u "
+          "TX errors=%u "
           "RX I/O errors=%u protocol drops=%u",
           (unsigned int)context->sdio_rx_count,
           (unsigned int)context->sdio_tx_count,
@@ -1349,10 +1564,43 @@ static rt_err_t aic8800_sdio_bus_stop(struct rt_wlan_offload_bus *bus)
           (unsigned int)context->sdio_tx_credit_retry_count,
           (unsigned int)context->sdio_tx_credit_max_retries,
           (unsigned int)context->sdio_tx_credit_timeout_count,
+          (unsigned int)context->sdio_tx_credit_fallback_count,
           (unsigned int)context->sdio_tx_error_count,
           (unsigned int)context->sdio_error_count,
           (unsigned int)context->sdio_protocol_drop_count);
     return result;
+}
+
+static rt_bool_t aic8800_sdio_tx_queue_wait_expired(rt_tick_t start,
+                                                    rt_tick_t timeout)
+{
+    return !timeout || (rt_tick_t)(rt_tick_get() - start) >= timeout;
+}
+
+/* Try once, never sleep.  Normal-priority traffic leaves
+ * AIC8800_WIFI_SDIO_TX_PRIORITY_RESERVE blocks behind so a saturated data queue
+ * cannot starve the EAPOL and management frames that share this pool.  The
+ * caller owns any producer backpressure, and must apply it with
+ * sdio_tx_queue_mutex released. */
+static struct aic8800_sdio_tx_record *aic8800_sdio_try_alloc_tx_record(
+    struct aic8800_context *context,
+    enum rt_wlan_offload_bus_priority priority)
+{
+    struct aic8800_sdio_tx_record *record =
+        rt_mp_alloc(context->sdio_tx_pool, 0);
+
+    if (!record)
+    {
+        return RT_NULL;
+    }
+    if (priority == RT_WLAN_OFFLOAD_BUS_PRIORITY_NORMAL &&
+        context->sdio_tx_pool->block_free_count <
+            AIC8800_WIFI_SDIO_TX_PRIORITY_RESERVE)
+    {
+        rt_mp_free(record);
+        return RT_NULL;
+    }
+    return record;
 }
 
 static rt_err_t aic8800_sdio_bus_transmit_priority(
@@ -1363,8 +1611,8 @@ static rt_err_t aic8800_sdio_bus_transmit_priority(
     struct aic8800_context *context =
         rt_wlan_offload_bus_get_driver_data(bus);
     struct aic8800_sdio_tx_record *record = RT_NULL;
-    rt_tick_t wait_started = 0;
-    rt_tick_t wait_timeout = 0;
+    rt_tick_t start;
+    rt_tick_t timeout;
     rt_err_t result;
 
     if (!context || !data || length < AIC8800_USB_HEADER_SIZE ||
@@ -1374,96 +1622,93 @@ static rt_err_t aic8800_sdio_bus_transmit_priority(
     }
     if (priority == RT_WLAN_OFFLOAD_BUS_PRIORITY_CONTROL)
     {
-        return aic8800_sdio_transmit_direct(context, data, length, RT_TRUE);
+        /* The DC BSP uses function 2 while loading firmware, but its FDRV
+         * sends runtime commands through the function 1 data FIFO. */
+        return aic8800_sdio_transmit_direct(
+            context, data, length, RT_TRUE, context->sdio_function,
+            context->sdio_message_function == RT_NULL);
     }
     if (!context->sdio_tx_queue_mutex_initialized)
     {
         return -RT_EIO;
     }
-    result = rt_mutex_take(&context->sdio_tx_queue_mutex,
-                           RT_WAITING_FOREVER);
-    if (result != RT_EOK)
-    {
-        return result;
-    }
-    if (!context->sdio_active || context->sdio_tx_terminate ||
-        !context->sdio_tx_queue || !context->sdio_tx_pool)
-    {
-        rt_mutex_release(&context->sdio_tx_queue_mutex);
-        return -RT_EBUSY;
-    }
 
-    if (priority == RT_WLAN_OFFLOAD_BUS_PRIORITY_NORMAL)
-    {
-        wait_started = rt_tick_get();
-        wait_timeout = rt_tick_from_millisecond(AIC8800_WIFI_TX_WAIT_MS);
-    }
+    /* Never wait for a free record while holding the queue mutex; management
+     * and EAPOL traffic must remain able to use the reserved entries. */
+    start = rt_tick_get();
+    timeout = priority == RT_WLAN_OFFLOAD_BUS_PRIORITY_NORMAL ?
+        rt_tick_from_millisecond(AIC8800_WIFI_TX_QUEUE_WAIT_MS) : 0;
+
     for (;;)
     {
-        record = rt_mp_alloc(context->sdio_tx_pool, 0);
-        if (record && priority == RT_WLAN_OFFLOAD_BUS_PRIORITY_NORMAL &&
-            context->sdio_tx_pool->block_free_count <
-                AIC8800_WIFI_SDIO_TX_PRIORITY_RESERVE)
+        result = rt_mutex_take(&context->sdio_tx_queue_mutex,
+                               RT_WAITING_FOREVER);
+        if (result != RT_EOK)
         {
+            return result;
+        }
+        if (!context->sdio_active || context->sdio_tx_terminate ||
+            !context->sdio_tx_queue || !context->sdio_tx_pool)
+        {
+            rt_mutex_release(&context->sdio_tx_queue_mutex);
+            return -RT_EBUSY;
+        }
+        record = aic8800_sdio_try_alloc_tx_record(context, priority);
+        if (record)
+        {
+            record->length = (rt_uint16_t)length;
+            record->priority = (rt_uint8_t)priority;
+            aic8800_core_tx_metadata_init(
+                context, data, length, &record->metadata);
+            rt_memcpy(record->data, data, length);
+            /* The pool and the queue have the same depth and every queued
+             * record owns a pool block, so holding a block leaves at least one
+             * free queue entry: this send does not need to wait either. */
+            result = priority == RT_WLAN_OFFLOAD_BUS_PRIORITY_HIGH ?
+                     rt_mq_urgent(context->sdio_tx_queue, &record,
+                                  sizeof(record)) :
+                     rt_mq_send(context->sdio_tx_queue, &record,
+                                sizeof(record));
+            if (result == RT_EOK)
+            {
+                rt_uint16_t queue_depth = context->sdio_tx_queue->entry;
+
+                if (queue_depth > context->sdio_tx_queue_high_water)
+                {
+                    context->sdio_tx_queue_high_water = queue_depth;
+                }
+                rt_mutex_release(&context->sdio_tx_queue_mutex);
+                return RT_EOK;
+            }
             rt_mp_free(record);
             record = RT_NULL;
         }
-        if (record || priority != RT_WLAN_OFFLOAD_BUS_PRIORITY_NORMAL ||
-            (rt_tick_t)(rt_tick_get() - wait_started) >= wait_timeout)
+        else
+        {
+            result = -RT_EFULL;
+        }
+        rt_mutex_release(&context->sdio_tx_queue_mutex);
+        if (aic8800_sdio_tx_queue_wait_expired(start, timeout))
         {
             break;
         }
+        rt_thread_delay(1);
+    }
 
-        /* The worker does not take this mutex while returning pool blocks. */
-        rt_thread_mdelay(1);
-    }
-    if (!record)
+    context->sdio_tx_queue_drop_count++;
+    if (aic8800_sdio_should_log_error(context->sdio_tx_queue_drop_count))
     {
-        result = -RT_EFULL;
+        LOG_W("SDIO transmit queue full: result=%d drops=%u depth=%u "
+              "high=%u credits=%u credit_waits=%u max_retry=%u",
+              result,
+              (unsigned int)context->sdio_tx_queue_drop_count,
+              context->sdio_tx_queue ?
+                  (unsigned int)context->sdio_tx_queue->entry : 0U,
+              (unsigned int)context->sdio_tx_queue_high_water,
+              (unsigned int)context->sdio_tx_available_credits,
+              (unsigned int)context->sdio_tx_credit_wait_count,
+              (unsigned int)context->sdio_tx_credit_max_retries);
     }
-    else
-    {
-        rt_uint16_t queue_depth;
-
-        record->length = (rt_uint16_t)length;
-        record->priority = (rt_uint8_t)priority;
-        aic8800_core_tx_metadata_init(
-            context, data, length, &record->metadata);
-        rt_memcpy(record->data, data, length);
-        result = priority == RT_WLAN_OFFLOAD_BUS_PRIORITY_HIGH ?
-                 rt_mq_urgent(context->sdio_tx_queue, &record,
-                              sizeof(record)) :
-                 rt_mq_send(context->sdio_tx_queue, &record, sizeof(record));
-        queue_depth = context->sdio_tx_queue->entry;
-        if (result == RT_EOK &&
-            queue_depth > context->sdio_tx_queue_high_water)
-        {
-            context->sdio_tx_queue_high_water = queue_depth;
-        }
-    }
-    if (result != RT_EOK)
-    {
-        if (record)
-        {
-            rt_mp_free(record);
-        }
-        context->sdio_tx_queue_drop_count++;
-        if (aic8800_sdio_should_log_error(
-                context->sdio_tx_queue_drop_count))
-        {
-            LOG_W("SDIO transmit queue full: result=%d drops=%u depth=%u "
-                  "high=%u credits=%u credit_waits=%u max_retry=%u",
-                  result,
-                  (unsigned int)context->sdio_tx_queue_drop_count,
-                  context->sdio_tx_queue ?
-                      (unsigned int)context->sdio_tx_queue->entry : 0U,
-                  (unsigned int)context->sdio_tx_queue_high_water,
-                  (unsigned int)context->sdio_tx_available_credits,
-                  (unsigned int)context->sdio_tx_credit_wait_count,
-                  (unsigned int)context->sdio_tx_credit_max_retries);
-        }
-    }
-    rt_mutex_release(&context->sdio_tx_queue_mutex);
     return result;
 }
 
@@ -1757,19 +2002,14 @@ fail:
     aic8800_firmware_disconnected(context);
     aic8800_sdio_stop_worker(context);
     aic8800_sdio_free_transport(context);
-    if (context->sdio_function_enabled)
-    {
-        mmcsd_host_lock(context->sdio_card->host);
-        sdio_disable_func(context->sdio_function);
-        mmcsd_host_unlock(context->sdio_card->host);
-        context->sdio_function_enabled = RT_FALSE;
-    }
+    aic8800_sdio_disable_functions(context);
 }
 
 static rt_int32_t aic8800_sdio_probe(struct rt_mmcsd_card *card)
 {
     struct aic8800_context *context = &g_aic8800_sdio_context;
     struct rt_sdio_function *function;
+    struct rt_sdio_function *message_function = RT_NULL;
     rt_err_t result;
 
     if (!card || card->sdio_function_num < AIC8800_SDIO_FUNCTION ||
@@ -1783,13 +2023,35 @@ static rt_int32_t aic8800_sdio_probe(struct rt_mmcsd_card *card)
     context->transport = AIC8800_TRANSPORT_SDIO;
     context->sdio_card = card;
     context->sdio_function = function;
-    context->sdio_vendor_id = card->cis.manufacturer;
+    context->sdio_vendor_id = function->manufacturer;
     context->sdio_product_id = function->product;
     context->vendor_id = AIC8800_USB_VENDOR_ID;
     if (context->sdio_vendor_id == AIC8800_SDIO_VENDOR_AIC8801 &&
         context->sdio_product_id == AIC8800_SDIO_PRODUCT_AIC8801)
     {
         context->product_id = AIC8800_USB_PID_AIC8800;
+    }
+    else if (context->sdio_vendor_id == AIC8800_SDIO_VENDOR_AIC8800DC &&
+             context->sdio_product_id == AIC8800_SDIO_PRODUCT_AIC8800DC)
+    {
+        if (card->sdio_function_num < AIC8800_SDIO_MESSAGE_FUNCTION ||
+            !card->sdio_function[AIC8800_SDIO_MESSAGE_FUNCTION])
+        {
+            rt_memset(context, 0, sizeof(*context));
+            return -RT_ENOSYS;
+        }
+        message_function =
+            card->sdio_function[AIC8800_SDIO_MESSAGE_FUNCTION];
+        if (message_function->manufacturer !=
+                AIC8800_SDIO_VENDOR_AIC8800DC ||
+            message_function->product !=
+                AIC8800_SDIO_PRODUCT_AIC8800DC_MSG)
+        {
+            rt_memset(context, 0, sizeof(*context));
+            return -RT_ENOSYS;
+        }
+        context->product_id = AIC8800_USB_PID_AIC8800DC;
+        context->sdio_message_function = message_function;
     }
     else if (context->sdio_vendor_id == AIC8800_SDIO_VENDOR_AIC8800D80 &&
              context->sdio_product_id == AIC8800_SDIO_PRODUCT_AIC8800D80)
@@ -1812,6 +2074,10 @@ static rt_int32_t aic8800_sdio_probe(struct rt_mmcsd_card *card)
     context->frame_mutex_initialized = RT_TRUE;
     aic8800_sdio_initialize_registers(context);
     sdio_set_drvdata(function, context);
+    if (message_function)
+    {
+        sdio_set_drvdata(message_function, context);
+    }
 
     context->transport_connected = RT_TRUE;
     context->sdio_attach_result = -RT_EIO;
@@ -1837,6 +2103,10 @@ queue_failed:
     context->transport_connected = RT_FALSE;
     aic8800_firmware_disconnected(context);
     sdio_set_drvdata(function, RT_NULL);
+    if (message_function)
+    {
+        sdio_set_drvdata(message_function, RT_NULL);
+    }
     rt_memset(context, 0, sizeof(*context));
     return result;
 }
@@ -1845,6 +2115,7 @@ static rt_int32_t aic8800_sdio_remove(struct rt_mmcsd_card *card)
 {
     struct aic8800_context *context = &g_aic8800_sdio_context;
     struct rt_sdio_function *function;
+    struct rt_sdio_function *message_function;
     rt_err_t result;
 
     if (!context->sdio_function || context->sdio_card != card)
@@ -1852,6 +2123,7 @@ static rt_int32_t aic8800_sdio_remove(struct rt_mmcsd_card *card)
         return RT_EOK;
     }
     function = context->sdio_function;
+    message_function = context->sdio_message_function;
     if (context->sdio_attach_work_initialized)
     {
         rt_workqueue_cancel_work_sync(g_aic8800_sdio_attach_workqueue,
@@ -1884,13 +2156,12 @@ static rt_int32_t aic8800_sdio_remove(struct rt_mmcsd_card *card)
     }
     aic8800_firmware_disconnected(context);
     aic8800_sdio_free_transport(context);
-    if (context->sdio_function_enabled)
-    {
-        mmcsd_host_lock(card->host);
-        sdio_disable_func(function);
-        mmcsd_host_unlock(card->host);
-    }
+    aic8800_sdio_disable_functions(context);
     sdio_set_drvdata(function, RT_NULL);
+    if (message_function)
+    {
+        sdio_set_drvdata(message_function, RT_NULL);
+    }
     LOG_I("detached AIC SDIO device %04x:%04x",
           context->sdio_vendor_id, context->sdio_product_id);
     rt_memset(context, 0, sizeof(*context));
@@ -1907,6 +2178,17 @@ static struct rt_sdio_device_id g_aic8800d80_sdio_id = {
     AIC8800_SDIO_PRODUCT_AIC8800D80,
 };
 
+static struct rt_sdio_device_id g_aic8800dc_sdio_ids[] = {
+    {
+        SDIO_ANY_FUNC_ID, AIC8800_SDIO_VENDOR_AIC8800DC,
+        AIC8800_SDIO_PRODUCT_AIC8800DC,
+    },
+    {
+        SDIO_ANY_FUNC_ID, AIC8800_SDIO_VENDOR_AIC8800DC,
+        AIC8800_SDIO_PRODUCT_AIC8800DC_MSG,
+    },
+};
+
 static struct rt_sdio_driver g_aic8801_sdio_driver = {
     "aic8801-wifi", aic8800_sdio_probe, aic8800_sdio_remove,
     &g_aic8801_sdio_id,
@@ -1915,6 +2197,12 @@ static struct rt_sdio_driver g_aic8801_sdio_driver = {
 static struct rt_sdio_driver g_aic8800d80_sdio_driver = {
     "aic8800d80-wifi", aic8800_sdio_probe, aic8800_sdio_remove,
     &g_aic8800d80_sdio_id,
+};
+
+static struct rt_sdio_driver g_aic8800dc_sdio_driver = {
+    "aic8800dc-wifi", aic8800_sdio_probe, aic8800_sdio_remove,
+    g_aic8800dc_sdio_ids,
+    sizeof(g_aic8800dc_sdio_ids) / sizeof(g_aic8800dc_sdio_ids[0]),
 };
 
 rt_err_t aic8800_sdio_driver_init(void)
@@ -1957,6 +2245,13 @@ rt_err_t aic8800_sdio_driver_init(void)
     result = sdio_register_driver(&g_aic8800d80_sdio_driver);
     if (result != RT_EOK && result != -RT_EEMPTY)
     {
+        sdio_unregister_driver(&g_aic8801_sdio_driver);
+        return result;
+    }
+    result = sdio_register_driver(&g_aic8800dc_sdio_driver);
+    if (result != RT_EOK && result != -RT_EEMPTY)
+    {
+        sdio_unregister_driver(&g_aic8800d80_sdio_driver);
         sdio_unregister_driver(&g_aic8801_sdio_driver);
         return result;
     }

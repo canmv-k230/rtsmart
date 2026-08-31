@@ -37,6 +37,16 @@ group = DefineGroup('aic8800', src,
 
 if GetDepend(['RT_USING_AIC8800_WIFI']):
     firmware_transports = []
+    firmware_families = {
+        'aic8800': GetDepend(['AIC8800_WIFI_FIRMWARE_AIC8800']),
+        'aic8800D80': GetDepend(['AIC8800_WIFI_FIRMWARE_D80']),
+        'aic8800D80X2': GetDepend(['AIC8800_WIFI_FIRMWARE_D80X2']),
+        'aic8800DC': GetDepend(['AIC8800_WIFI_FIRMWARE_DC_DW']),
+    }
+    transport_families = {
+        'usb': ('aic8800', 'aic8800D80', 'aic8800D80X2', 'aic8800DC'),
+        'sdio': ('aic8800', 'aic8800D80', 'aic8800DC'),
+    }
     if GetDepend(['AIC8800_WIFI_TRANSPORT_USB']):
         firmware_transports += ['usb']
     if GetDepend(['AIC8800_WIFI_TRANSPORT_SDIO']):
@@ -46,25 +56,46 @@ if GetDepend(['RT_USING_AIC8800_WIFI']):
 
     if not firmware_stage:
         raise RuntimeError('RTSMART_FIRMWARE_STAGE_DIR is not set')
+    if not any(firmware_families.values()):
+        raise RuntimeError('Select at least one AIC8800 firmware family')
 
     for firmware_transport in firmware_transports:
-        firmware_source = os.path.join(cwd, 'firmware', firmware_transport)
         transport_stage = firmware_stage
         if len(firmware_transports) > 1:
             transport_stage = os.path.join(firmware_stage, firmware_transport)
 
-        for directory, subdirectories, filenames in os.walk(firmware_source):
-            subdirectories.sort()
-            filenames.sort()
-            relative_directory = os.path.relpath(directory, firmware_source)
-            destination = transport_stage
-            if relative_directory != '.':
-                destination = os.path.join(destination, relative_directory)
+        for firmware_family in transport_families[firmware_transport]:
+            if not firmware_families[firmware_family]:
+                continue
+            firmware_source = os.path.join(
+                cwd, 'firmware', firmware_transport, firmware_family)
+            if not os.path.isdir(firmware_source):
+                raise RuntimeError(
+                    'Selected AIC8800 firmware directory is missing: ' +
+                    firmware_source)
 
-            for filename in filenames:
-                source = os.path.join(directory, filename)
-                target = os.path.join(destination, filename)
-                firmware_targets += Env.InstallAs(target, source)
+            family_targets = []
+            for directory, subdirectories, filenames in os.walk(
+                    firmware_source):
+                subdirectories.sort()
+                filenames.sort()
+                relative_directory = os.path.relpath(
+                    directory, firmware_source)
+                destination = os.path.join(transport_stage, firmware_family)
+                if relative_directory != '.':
+                    destination = os.path.join(
+                        destination, relative_directory)
+
+                for filename in filenames:
+                    source = os.path.join(directory, filename)
+                    target = os.path.join(destination, filename)
+                    family_targets += Env.InstallAs(target, source)
+
+            if not family_targets:
+                raise RuntimeError(
+                    'Selected AIC8800 firmware directory is empty: ' +
+                    firmware_source)
+            firmware_targets += family_targets
 
     if not firmware_targets:
         raise RuntimeError('AIC8800 firmware directory is empty')

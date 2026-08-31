@@ -1434,6 +1434,17 @@ rt_bool_t rt_wlan_offload_hostapd_filter_event(
         rt_timer_stop(hostapd->timer);
         hostapd_clear_locked(hostapd);
     }
+    else if (event->type == RT_WLAN_OFFLOAD_EVENT_DEL_STATION &&
+             event->iftype == RT_WLAN_OFFLOAD_IFTYPE_AP && hostapd->active)
+    {
+        struct wlan_offload_hostapd_station *station =
+            hostapd_find_station_locked(hostapd, event->data.station.mac);
+
+        if (station)
+        {
+            hostapd_station_clear(station);
+        }
+    }
     else if (event->type == RT_WLAN_OFFLOAD_EVENT_MGMT_RX &&
              event->iftype == RT_WLAN_OFFLOAD_IFTYPE_AP && hostapd->active)
     {

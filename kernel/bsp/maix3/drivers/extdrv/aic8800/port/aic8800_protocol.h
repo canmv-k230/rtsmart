@@ -11,6 +11,7 @@
 #include <rtthread.h>
 
 #define AIC_WIRE_TASK_MM                 0U
+#define AIC_WIRE_TASK_DBG                1U
 #define AIC_WIRE_TASK_SCANU              4U
 #define AIC_WIRE_TASK_ME                 5U
 #define AIC_WIRE_TASK_SM                 6U
@@ -45,6 +46,10 @@
 #define AIC_MM_CHANNEL_PRE_SWITCH_IND AIC_WIRE_MSG(AIC_WIRE_TASK_MM, 69)
 /* An associated peer entering or leaving firmware-managed power save. */
 #define AIC_MM_PS_CHANGE_IND      AIC_WIRE_MSG(AIC_WIRE_TASK_MM, 73)
+/* A sleeping peer has opened a legacy PS-Poll or U-APSD service period. */
+#define AIC_MM_TRAFFIC_REQ_IND    AIC_WIRE_MSG(AIC_WIRE_TASK_MM, 74)
+#define AIC_MM_SET_COEX_REQ       AIC_WIRE_MSG(AIC_WIRE_TASK_MM, 101)
+#define AIC_MM_SET_COEX_CFM       AIC_WIRE_MSG(AIC_WIRE_TASK_MM, 102)
 #define AIC_MM_SET_RF_CONFIG_REQ  AIC_WIRE_MSG(AIC_WIRE_TASK_MM, 103)
 #define AIC_MM_SET_RF_CONFIG_CFM  AIC_WIRE_MSG(AIC_WIRE_TASK_MM, 104)
 #define AIC_MM_SET_RF_CALIB_REQ   AIC_WIRE_MSG(AIC_WIRE_TASK_MM, 105)
@@ -57,12 +62,18 @@
 #define AIC_MM_SET_TXPWR_OFST_CFM AIC_WIRE_MSG(AIC_WIRE_TASK_MM, 122)
 #define AIC_MM_SET_STACK_START_REQ AIC_WIRE_MSG(AIC_WIRE_TASK_MM, 123)
 #define AIC_MM_SET_STACK_START_CFM AIC_WIRE_MSG(AIC_WIRE_TASK_MM, 124)
+#define AIC_MM_APM_STALOSS_IND  AIC_WIRE_MSG(AIC_WIRE_TASK_MM, 125)
 #define AIC_MM_GET_STA_INFO_REQ   AIC_WIRE_MSG(AIC_WIRE_TASK_MM, 117)
 #define AIC_MM_GET_STA_INFO_CFM   AIC_WIRE_MSG(AIC_WIRE_TASK_MM, 118)
 #define AIC_MM_GET_FW_VERSION_REQ  AIC_WIRE_MSG(AIC_WIRE_TASK_MM, 128)
 #define AIC_MM_GET_FW_VERSION_CFM  AIC_WIRE_MSG(AIC_WIRE_TASK_MM, 129)
 #define AIC_MM_SET_TXPWR_ADJ_REQ  AIC_WIRE_MSG(AIC_WIRE_TASK_MM, 137)
 #define AIC_MM_SET_TXPWR_ADJ_CFM  AIC_WIRE_MSG(AIC_WIRE_TASK_MM, 138)
+#define AIC_MM_FW_PANIC_IND      AIC_WIRE_MSG(AIC_WIRE_TASK_MM, 149)
+#define AIC_MM_FW_ASSERT_IND     AIC_WIRE_MSG(AIC_WIRE_TASK_MM, 150)
+
+#define AIC_DBG_MEM_MASK_WRITE_REQ AIC_WIRE_MSG(AIC_WIRE_TASK_DBG, 17)
+#define AIC_DBG_MEM_MASK_WRITE_CFM AIC_WIRE_MSG(AIC_WIRE_TASK_DBG, 18)
 
 /* AIC firmware ships with two incompatible MM_VERSION feature layouts.  The
  * full layout appears in the vendor USB driver, while current D80 firmware and
@@ -155,6 +166,7 @@
 #define AIC_ME_CHAN_CONFIG_CFM    AIC_WIRE_MSG(AIC_WIRE_TASK_ME, 3)
 #define AIC_ME_CONTROL_PORT_REQ   AIC_WIRE_MSG(AIC_WIRE_TASK_ME, 4)
 #define AIC_ME_CONTROL_PORT_CFM   AIC_WIRE_MSG(AIC_WIRE_TASK_ME, 5)
+#define AIC_ME_TKIP_MIC_FAILURE_IND AIC_WIRE_MSG(AIC_WIRE_TASK_ME, 6)
 #define AIC_ME_STA_ADD_REQ        AIC_WIRE_MSG(AIC_WIRE_TASK_ME, 7)
 #define AIC_ME_STA_ADD_CFM        AIC_WIRE_MSG(AIC_WIRE_TASK_ME, 8)
 #define AIC_ME_STA_DEL_REQ        AIC_WIRE_MSG(AIC_WIRE_TASK_ME, 9)
@@ -162,6 +174,8 @@
 /* Firmware-reported transmit credit offsets.  This generation's vendor driver
  * leaves enforcement disabled, so the values are collected for diagnostics. */
 #define AIC_ME_TX_CREDITS_UPDATE_IND AIC_WIRE_MSG(AIC_WIRE_TASK_ME, 11)
+#define AIC_ME_TRAFFIC_IND_REQ    AIC_WIRE_MSG(AIC_WIRE_TASK_ME, 12)
+#define AIC_ME_TRAFFIC_IND_CFM    AIC_WIRE_MSG(AIC_WIRE_TASK_ME, 13)
 #define AIC_ME_RC_STATS_REQ       AIC_WIRE_MSG(AIC_WIRE_TASK_ME, 14)
 #define AIC_ME_RC_STATS_CFM       AIC_WIRE_MSG(AIC_WIRE_TASK_ME, 15)
 #define AIC_ME_SET_PS_MODE_REQ    AIC_WIRE_MSG(AIC_WIRE_TASK_ME, 19)
@@ -200,7 +214,8 @@
 #define AIC_USB_LENGTH_MASK              0x0fffU
 
 #define AIC_WIRE_E2A_PATTERN       0xaddeDe2aUL
-#define AIC_WIRE_MSG_API_VERSION             15U
+#define AIC_WIRE_MSG_API_VERSION_USB         15U
+#define AIC_WIRE_MSG_API_VERSION_SDIO        33U
 #define AIC_WIRE_SCAN_CHANNEL_COUNT          42U
 #define AIC_WIRE_SCAN_SSID_COUNT              3U
 #define AIC_WIRE_SCAN_IE_MAX                200U
@@ -268,6 +283,17 @@ struct aic_wire_mm_start_req
     rt_uint16_t lp_clock_accuracy;
 };
 
+struct aic_wire_mm_set_coex_req
+{
+    rt_uint8_t bt_on;
+    rt_uint8_t disable_coexnull;
+    rt_uint8_t enable_nullcts;
+    rt_uint8_t enable_periodic_timer;
+    rt_uint8_t coex_timeslot_set;
+    rt_uint8_t reserved[3];
+    rt_uint32_t coex_timeslot[2];
+};
+
 struct aic_wire_mm_version_cfm
 {
     rt_uint32_t lmac_version;
@@ -299,6 +325,12 @@ struct aic_wire_mm_get_sta_info_req
     rt_uint8_t station_index;
 };
 
+struct aic_wire_mm_get_sta_info_compat_req
+{
+    rt_uint8_t station_index;
+    rt_uint8_t pattern[3];
+};
+
 struct aic_wire_mm_set_filter_req
 {
     rt_uint32_t filter;
@@ -310,6 +342,11 @@ struct aic_wire_mm_get_sta_info_cfm
     rt_uint32_t tx_failed;
     rt_int8_t rssi;
     rt_uint8_t reserved[3];
+    rt_uint32_t channel_time;
+    rt_uint32_t channel_busy_time;
+    rt_uint32_t ack_failed;
+    rt_uint32_t ack_succeeded;
+    rt_uint32_t channel_tx_busy_time;
 };
 
 /* The operating-channel ABI is shared by MM_SET_CHANNEL and several ME
@@ -347,6 +384,26 @@ struct aic_wire_mm_ps_change_ind
 {
     rt_uint8_t station_index;
     rt_uint8_t power_save;      /* 0: awake, 1: sleeping */
+};
+
+struct aic_wire_mm_traffic_req_ind
+{
+    rt_uint8_t station_index;
+    rt_uint8_t packet_count;    /* 0: all buffered, 255: U-APSD interrupted */
+    rt_uint8_t uapsd;
+};
+
+struct aic_wire_mm_apm_staloss_ind
+{
+    rt_uint8_t station_index;
+    rt_uint8_t vif_index;
+    rt_uint8_t address[6];
+};
+
+struct aic_wire_mm_firmware_fault_ind
+{
+    rt_uint32_t length;
+    rt_uint8_t info[384];
 };
 
 struct aic_wire_mm_channel_switch_ind
@@ -392,6 +449,13 @@ struct aic_wire_mm_key_add_req
     rt_uint8_t pairwise;
 };
 
+struct aic_wire_mm_key_add_cfm
+{
+    rt_uint8_t status;
+    rt_uint8_t hardware_key_index;
+    rt_uint8_t aligned[2];
+};
+
 struct aic_wire_mac_rateset
 {
     rt_uint8_t length;
@@ -421,6 +485,7 @@ struct aic_wire_me_sta_add_cfm
     rt_uint8_t station_index;
     rt_uint8_t status;
     rt_uint8_t power_state;
+    rt_uint8_t aligned;
 };
 
 struct aic_wire_me_sta_del_req
@@ -477,15 +542,14 @@ struct aic_wire_me_config_req
     rt_uint8_t dynamic_power_save;
 };
 
-#define AIC_WIRE_RC_SAMPLE_COUNT 10U
-#define AIC_WIRE_RC_HE_SAMPLE_INDEX AIC_WIRE_RC_SAMPLE_COUNT
-
 struct aic_wire_me_tx_credits_update_ind
 {
     rt_uint8_t station_index;
     rt_uint8_t tid;
     rt_int8_t credits;          /* Offset to apply, may be negative. */
 };
+
+#define AIC_WIRE_RC_SAMPLE_COUNT 10U
 
 struct aic_wire_me_rc_stats_req
 {
@@ -520,8 +584,7 @@ struct aic_wire_me_rc_stats_cfm
     rt_uint8_t software_retry_step;
     rt_uint8_t sample_wait;
     rt_uint16_t retry_step_index[4];
-    struct aic_wire_rc_rate_stats
-        rates[AIC_WIRE_RC_SAMPLE_COUNT + 1U];
+    struct aic_wire_rc_rate_stats rates[AIC_WIRE_RC_SAMPLE_COUNT + 1U];
     rt_uint32_t throughput[AIC_WIRE_RC_SAMPLE_COUNT + 1U];
 };
 
@@ -591,6 +654,24 @@ struct aic_wire_tx_host_descriptor
     rt_uint8_t vif_index;
     rt_uint8_t station_index;
     rt_uint16_t flags;
+};
+
+struct aic_wire_me_traffic_ind_req
+{
+    rt_uint8_t station_index;
+    rt_uint8_t tx_available;
+    rt_uint8_t uapsd;
+};
+
+/* u64_l is naturally aligned at offset 8 in the vendor ABI. */
+struct aic_wire_me_tkip_mic_failure_ind
+{
+    rt_uint8_t address[6];
+    rt_uint8_t reserved[2];
+    rt_uint8_t tsc[8];
+    rt_uint8_t group_addressed;
+    rt_uint8_t key_index;
+    rt_uint8_t vif_index;
 };
 
 struct aic_wire_tx_power_index
@@ -740,6 +821,8 @@ _Static_assert(sizeof(struct aic_wire_he_capability) == 56,
                "AIC HE capability ABI changed");
 _Static_assert(sizeof(struct aic_wire_mm_start_req) == 72,
                "AIC start request ABI changed");
+_Static_assert(sizeof(struct aic_wire_mm_set_coex_req) == 16,
+               "AIC coexistence request ABI changed");
 _Static_assert(sizeof(struct aic_wire_mm_version_cfm) == 28,
                "AIC version confirmation ABI changed");
 _Static_assert(sizeof(struct aic_wire_mm_set_stack_start_req) == 4,
@@ -748,9 +831,11 @@ _Static_assert(sizeof(struct aic_wire_mm_set_stack_start_cfm) == 2,
                "AIC stack-start confirmation ABI changed");
 _Static_assert(sizeof(struct aic_wire_mm_get_sta_info_req) == 1,
                "AIC station-info request ABI changed");
+_Static_assert(sizeof(struct aic_wire_mm_get_sta_info_compat_req) == 4,
+               "AIC compatible station-info request ABI changed");
 _Static_assert(sizeof(struct aic_wire_mm_set_filter_req) == 4,
                "AIC RX-filter request ABI changed");
-_Static_assert(sizeof(struct aic_wire_mm_get_sta_info_cfm) == 12,
+_Static_assert(sizeof(struct aic_wire_mm_get_sta_info_cfm) == 32,
                "AIC station-info confirmation ABI changed");
 _Static_assert(sizeof(struct aic_wire_mac_chan_op) == 10,
                "AIC operating-channel ABI changed");
@@ -766,10 +851,14 @@ _Static_assert(sizeof(struct aic_wire_mm_add_if_req) == 10,
                "AIC add-interface ABI changed");
 _Static_assert(sizeof(struct aic_wire_mm_key_add_req) == 44,
                "AIC key request ABI changed");
+_Static_assert(sizeof(struct aic_wire_mm_key_add_cfm) == 4,
+               "AIC key confirmation ABI changed");
 _Static_assert(sizeof(struct aic_wire_mac_rateset) == 13,
                "AIC rate-set ABI changed");
 _Static_assert(sizeof(struct aic_wire_me_sta_add_req) == 136,
                "AIC station-add ABI changed");
+_Static_assert(sizeof(struct aic_wire_me_sta_add_cfm) == 4,
+               "AIC station-add confirmation ABI changed");
 _Static_assert(sizeof(struct aic_wire_me_sta_del_req) == 2,
                "AIC station-delete ABI changed");
 _Static_assert(sizeof(struct aic_wire_apm_start_req) == 52,
@@ -778,6 +867,12 @@ _Static_assert(sizeof(struct aic_wire_apm_start_cfm) == 4,
                "AIC AP-start confirmation ABI changed");
 _Static_assert(sizeof(struct aic_wire_mm_ps_change_ind) == 2,
                "AIC power-save indication ABI changed");
+_Static_assert(sizeof(struct aic_wire_mm_traffic_req_ind) == 3,
+               "AIC power-save traffic request ABI changed");
+_Static_assert(sizeof(struct aic_wire_mm_apm_staloss_ind) == 8,
+               "AIC AP station-loss indication ABI changed");
+_Static_assert(sizeof(struct aic_wire_mm_firmware_fault_ind) == 388,
+               "AIC firmware-fault indication ABI changed");
 _Static_assert(sizeof(struct aic_wire_mm_channel_switch_ind) == 4,
                "AIC channel-switch indication ABI changed");
 _Static_assert(sizeof(struct aic_wire_mm_channel_pre_switch_ind) == 1,
@@ -806,6 +901,10 @@ _Static_assert(sizeof(struct aic_wire_sm_external_auth_required_rsp) == 4,
                "AIC external-auth response ABI changed");
 _Static_assert(sizeof(struct aic_wire_tx_host_descriptor) == 28,
                "AIC TX descriptor ABI changed");
+_Static_assert(sizeof(struct aic_wire_me_traffic_ind_req) == 3,
+               "AIC ME traffic indication ABI changed");
+_Static_assert(sizeof(struct aic_wire_me_tkip_mic_failure_ind) == 19,
+               "AIC TKIP MIC indication ABI changed");
 _Static_assert(sizeof(struct aic_wire_tx_power_index) == 10,
                "AIC TX-power index ABI changed");
 _Static_assert(sizeof(struct aic_wire_tx_power_v2) == 35,

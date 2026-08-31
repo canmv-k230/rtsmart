@@ -590,6 +590,8 @@ struct rt_scan_info
     rt_uint8_t bssid[6];
     rt_int16_t channel_min;
     rt_int16_t channel_max;
+    rt_802_11_band_t band;
+    rt_bool_t band_locked;
     rt_bool_t passive;
 };
 
@@ -644,6 +646,9 @@ rt_err_t rt_wlan_dev_ap_deauth(struct rt_wlan_device *device, rt_uint8_t mac[6])
  * wlan device scan interface
  */
 rt_err_t rt_wlan_dev_scan(struct rt_wlan_device *device, struct rt_wlan_info *info);
+rt_err_t rt_wlan_dev_scan_by_band(struct rt_wlan_device *device,
+                                  struct rt_wlan_info *info,
+                                  rt_802_11_band_t band);
 rt_err_t rt_wlan_dev_scan_stop(struct rt_wlan_device *device);
 
 /*

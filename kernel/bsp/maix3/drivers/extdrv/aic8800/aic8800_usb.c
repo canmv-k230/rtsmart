@@ -6,6 +6,9 @@
  * CherryUSB transport for the RT-Smart AIC8800 WLAN offload driver.
  */
 #include "aic8800_wifi.h"
+#ifdef AIC8800_WIFI_DEBUG_STATS
+#include "tick.h"
+#endif
 
 #include <rtlibc.h>
 
@@ -20,6 +23,14 @@
 #define AIC8800_USB_RX_RETRY_SHORT_MS      5U
 #define AIC8800_USB_RX_RETRY_LONG_MS      20U
 #define AIC8800_USB_RX_SUBMIT_RETRIES      8U
+/* Consecutive bulk IN failures that are still consistent with the device
+ * simply being busy - it goes deaf on both IN endpoints during association
+ * while the firmware retunes, which measures 20-21 consecutive errors over
+ * roughly 200 ms at the retry cadence.  Below this the retries are logged at
+ * debug level; at or above it they are worth a warning.  32 puts the first
+ * warning at roughly 390 ms of continuous silence, half way to the
+ * AIC8800_WIFI_RX_RECOVERY_ERRORS give-up point. */
+#define AIC8800_USB_RX_ERRORS_EXPECTED    32U
 #define AIC8800_USB_RX_WAIT_MS            100U
 #define AIC8800_USB_TX_AGGREGATE_PREFIX     4U
 #define AIC8800_USB_PID_MSC               0x5721
@@ -60,6 +71,13 @@ static rt_bool_t g_aic8800_transport_ipc_initialized;
 /* One forced port re-enumeration per attached fake-storage device. */
 static rt_bool_t g_aic8800_modeswitch_rescanned;
 
+#ifdef AIC8800_WIFI_DEBUG_STATS
+struct aic8800_context *aic8800_usb_stat_context(void)
+{
+    return &g_aic8800_context;
+}
+#endif
+
 static USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX rt_uint8_t
     g_aic8800_modeswitch_cbw[AIC8800_USB_MODESWITCH_CBW_SIZE];
 
@@ -68,10 +86,6 @@ static USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX rt_uint8_t
 
 static USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX rt_uint8_t
     g_aic8800_modeswitch_data[AIC8800_USB_MODESWITCH_DATA_SIZE];
-
-#if defined(RT_USING_FINSH) && defined(AIC8800_WIFI_DEBUG_STATS)
-#include <finsh.h>
-#endif
 
 static void aic8800_usb_stop_worker(struct aic8800_rx_worker *worker);
 static void aic8800_usb_free_worker_buffer(
@@ -88,7 +102,7 @@ static void aic8800_usb_tx_complete(void *parameter, int length);
 static void aic8800_usb_attach_work(struct rt_work *work, void *work_data);
 static rt_err_t aic8800_usb_transmit_data(
     struct aic8800_context *context, const void *data, rt_size_t length,
-    const struct aic8800_tx_metadata *metadata, rt_size_t metadata_count,
+    struct aic8800_tx_metadata *metadata, rt_size_t metadata_count,
     rt_bool_t *metadata_consumed);
 static rt_bool_t aic8800_usb_supports_tx_aggregation(
     const struct aic8800_context *context);
@@ -96,161 +110,6 @@ static rt_err_t aic8800_usb_start_tx_queue(
     struct aic8800_context *context);
 static void aic8800_usb_stop_tx_queue(struct aic8800_context *context);
 static void aic8800_usb_free_tx_queue(struct aic8800_context *context);
-
-#if defined(RT_USING_FINSH) && defined(AIC8800_WIFI_DEBUG_STATS)
-static int aic8800_stat(int argc, char **argv)
-{
-    const struct aic8800_context *context = &g_aic8800_context;
-    const struct aic8800_tx_worker *tx = &context->tx_worker;
-    const struct aic8800_rx_worker *data = &context->data_worker;
-    const struct aic8800_rx_worker *message = &context->message_worker;
-
-    (void)argc;
-    (void)argv;
-    rt_kprintf("AIC state: transport=%d attached=%d station=%d\n",
-               context->transport_connected, context->attached,
-               context->station_connected);
-    rt_kprintf("Station: vif=%u sta=%u port=%s pending=%d sets=%u errors=%u\n",
-               context->vif_index, context->ap_station_index,
-               context->station_control_port_open ? "open" : "closed",
-               context->station_control_port_pending,
-               (unsigned int)context->station_control_port_set_count,
-               (unsigned int)context->station_control_port_error_count);
-    rt_kprintf("TX window: full=%u ps-drops=%u ap-sta=%u held=%d\n",
-               (unsigned int)context->tx_pending_full_count,
-               (unsigned int)context->tx_power_save_drop_count,
-               context->ap_stations[0].valid &&
-                   context->ap_stations[0].firmware_index <
-                       AIC8800_STATION_SLOTS ?
-                   context->tx_pending[
-                       context->ap_stations[0].firmware_index] : 0U,
-               context->ap_stations[0].valid &&
-                   context->ap_stations[0].firmware_index <
-                       AIC8800_STATION_SLOTS ?
-                   context->tx_pending_held[
-                       context->ap_stations[0].firmware_index] : 0);
-    rt_kprintf("TX credits (observed only): reported=%d updates=%u "
-               "sta=%d bcmc=%d\n",
-               context->tx_credits_tracked,
-               (unsigned int)context->tx_credit_update_count,
-               context->ap_station_index < AIC8800_STATION_SLOTS ?
-                   context->tx_credits[context->ap_station_index] : -1,
-               context->ap_broadcast_station_index <
-                   AIC8800_STATION_SLOTS ?
-                   context->tx_credits[
-                       context->ap_broadcast_station_index] : -1);
-    rt_kprintf("Channel ctx: station=%u ap=%u active=%u tracked=%d\n",
-               (unsigned int)context->station_channel_index,
-               (unsigned int)context->ap_channel_index,
-               (unsigned int)context->active_channel_index,
-               context->channel_context_tracked);
-    rt_kprintf("NET TX: frames=%u errors=%u no-station=%u off-channel=%u "
-               "arp=%u icmp=%u\n",
-               (unsigned int)context->ethernet_tx_count,
-               (unsigned int)context->ethernet_tx_error_count,
-               (unsigned int)context->tx_no_station_count,
-               (unsigned int)context->tx_off_channel_count,
-               (unsigned int)context->arp_tx_count,
-               (unsigned int)context->icmp_tx_count);
-    rt_kprintf("NET RX: frames=%u errors=%u arp=%u icmp=%u\n",
-               (unsigned int)context->ethernet_rx_count,
-               (unsigned int)context->ethernet_rx_error_count,
-               (unsigned int)context->arp_rx_count,
-               (unsigned int)context->icmp_rx_count);
-#ifdef AIC8800_WIFI_TCP_ACK_FILTER
-    rt_kprintf("TCP ACK: suppressed=%u flushed=%u\n",
-               (unsigned int)context->tcp_ack_suppressed,
-               (unsigned int)context->tcp_ack_flushed);
-#endif
-    rt_kprintf("ICMP TX check: malformed=%u ip-csum=%u icmp-csum=%u\n",
-               (unsigned int)context->icmp_tx_malformed_count,
-               (unsigned int)context->icmp_tx_ip_checksum_error_count,
-               (unsigned int)context->icmp_tx_checksum_error_count);
-    rt_kprintf("RX decode: data=%u qos=%u amsdu=%u subframes=%u "
-               "no-llc=%u invalid=%u\n",
-               (unsigned int)context->rx_data_record_count,
-               (unsigned int)context->rx_qos_record_count,
-               (unsigned int)context->rx_amsdu_record_count,
-               (unsigned int)context->rx_amsdu_subframe_count,
-               (unsigned int)context->rx_no_llc_count,
-               (unsigned int)context->rx_invalid_data_count);
-    rt_kprintf("RX reorder: pending=%u queued=%u delivered=%u timeout=%u "
-               "duplicate=%u drops=%u\n",
-               (unsigned int)context->rx_reorder_pending,
-               (unsigned int)context->rx_reorder_queued,
-               (unsigned int)context->rx_reorder_delivered,
-               (unsigned int)context->rx_reorder_timeouts,
-               (unsigned int)context->rx_reorder_duplicates,
-               (unsigned int)context->rx_reorder_drops);
-    rt_kprintf("USB TX: active=%d slots=%u pending=%u complete=%u errors=%u "
-               "waits=%u timeouts=%u watchdog=%u reclaims=%u recoveries=%u "
-               "max_burst=%u last=%d\n",
-               tx->active, (unsigned int)tx->slot_count,
-               (unsigned int)tx->pending,
-               (unsigned int)tx->completion_count,
-               (unsigned int)tx->error_count,
-               (unsigned int)tx->wait_count,
-               (unsigned int)tx->timeout_count,
-               (unsigned int)tx->watchdog_count,
-               (unsigned int)tx->reclaim_count,
-               (unsigned int)tx->recovery_count,
-               (unsigned int)tx->max_burst_count, tx->last_error);
-    rt_kprintf("USB TX queue: enabled=%d aggregate=%d frames=%u aggregates=%u "
-               "max=%u high=%u drops=%u errors=%u\n",
-               context->usb_tx_queue_enabled,
-               context->usb_tx_aggregation_enabled,
-               (unsigned int)context->usb_tx_frame_count,
-               (unsigned int)context->usb_tx_aggregate_count,
-               (unsigned int)context->usb_tx_max_aggregate,
-               (unsigned int)context->usb_tx_queue_high_water,
-               (unsigned int)context->usb_tx_queue_drop_count,
-               (unsigned int)context->usb_tx_error_count);
-    rt_kprintf("USB RX data: slots=%u active=%d complete=%u rearm=%u "
-               "complete_rearm=%u spare=%u/%u empty=%u errors=%u retries=%u "
-               "backlog_high=%u assembly=%u overflow=%d\n",
-               (unsigned int)data->slot_count, data->active,
-               (unsigned int)data->completion_count,
-               (unsigned int)data->rearm_count,
-               (unsigned int)data->complete_rearm_count,
-               (unsigned int)data->spare_available,
-               (unsigned int)data->spare_count,
-               (unsigned int)data->spare_empty_count,
-               (unsigned int)data->error_count,
-               (unsigned int)data->retry_count,
-               (unsigned int)data->queue_high_water,
-               (unsigned int)data->assembly_length,
-               data->queue_overflow);
-    rt_kprintf("USB RX msg: slots=%u active=%d complete=%u rearm=%u "
-               "complete_rearm=%u spare=%u/%u empty=%u errors=%u retries=%u "
-               "backlog_high=%u assembly=%u overflow=%d\n",
-               (unsigned int)message->slot_count, message->active,
-               (unsigned int)message->completion_count,
-               (unsigned int)message->rearm_count,
-               (unsigned int)message->complete_rearm_count,
-               (unsigned int)message->spare_available,
-               (unsigned int)message->spare_count,
-               (unsigned int)message->spare_empty_count,
-               (unsigned int)message->error_count,
-               (unsigned int)message->retry_count,
-               (unsigned int)message->queue_high_water,
-               (unsigned int)message->assembly_length,
-               message->queue_overflow);
-    aic8800_core_print_rc_stats(&g_aic8800_context);
-    return 0;
-}
-MSH_CMD_EXPORT(aic8800_stat, show AIC8800 USB and network counters);
-#endif
-
-#if AIC8800_WIFI_TX_TRACE_FRAMES && defined(RT_USING_FINSH)
-static int aic8800_txtrace(int argc, char **argv)
-{
-    (void)argc;
-    (void)argv;
-    aic8800_core_dump_tx_trace(&g_aic8800_context, "on demand");
-    return 0;
-}
-MSH_CMD_EXPORT(aic8800_txtrace, dump the recent AIC8800 transmit descriptors);
-#endif
 
 static struct aic8800_context *aic8800_context_from_bus(
     struct rt_wlan_offload_bus *bus)
@@ -498,14 +357,26 @@ static rt_bool_t aic8800_usb_rx_submit_retryable(int result)
            aic8800_usb_is_stall(result);
 }
 
+/* Back off on both axes: how many completions have failed in a row, and how
+ * many times this particular slot has already been re-submitted without
+ * success.  The second matters because the device can stop answering IN tokens
+ * for tens of milliseconds at a time - it does so during association while the
+ * firmware retunes - and a flat one-millisecond retry just spends dozens of
+ * transactions discovering that.  The vendor driver does not retry a failed
+ * bulk IN URB at all; it drops the buffer back into its pool and lets the next
+ * successful completion re-arm everything.  That is quieter but has no way out
+ * if every queued URB fails, so keep retrying, just far less eagerly. */
 static rt_uint32_t aic8800_usb_rx_retry_delay(
-    const struct aic8800_rx_worker *worker)
+    const struct aic8800_rx_worker *worker, rt_uint32_t submit_attempts)
 {
-    if (worker->consecutive_errors <= AIC8800_USB_RX_RETRY_FAST_MAX)
+    rt_uint32_t errors = worker->consecutive_errors > submit_attempts ?
+                         worker->consecutive_errors : submit_attempts;
+
+    if (errors <= AIC8800_USB_RX_RETRY_FAST_MAX)
     {
         return AIC8800_USB_RX_RETRY_FAST_MS;
     }
-    if (worker->consecutive_errors <= AIC8800_USB_RX_RETRY_SHORT_MAX)
+    if (errors <= AIC8800_USB_RX_RETRY_SHORT_MAX)
     {
         return AIC8800_USB_RX_RETRY_SHORT_MS;
     }
@@ -687,21 +558,13 @@ static void aic8800_usb_tx_watchdog_work(struct rt_work *work,
         {
             continue;
         }
-#ifdef AIC8800_WIFI_DEBUG_STATS
-        AIC8800_STAT(worker->watchdog_count++);
+        worker->watchdog_count++;
         LOG_W("bulk OUT ep 0x%02x request stuck for %u ms; cancelling "
-              "(watchdog=%u pending=%u)",
+              "(watchdog=%u pending=%u len=%u sta=%u mps-multiple=%d)",
               worker->endpoint ? worker->endpoint->bEndpointAddress : 0,
               (unsigned int)((rt_tick_t)(now - stuck_since) * 1000U /
                              RT_TICK_PER_SECOND),
               (unsigned int)worker->watchdog_count,
-              (unsigned int)worker->pending);
-#else
-        LOG_W("bulk OUT ep 0x%02x request stuck for %u ms; cancelling "
-              "(pending=%u len=%u sta=%u mps-multiple=%d)",
-              worker->endpoint ? worker->endpoint->bEndpointAddress : 0,
-              (unsigned int)((rt_tick_t)(now - stuck_since) * 1000U /
-                             RT_TICK_PER_SECOND),
               (unsigned int)worker->pending,
               (unsigned int)slot->length,
               slot->metadata_count ?
@@ -710,7 +573,6 @@ static void aic8800_usb_tx_watchdog_work(struct rt_work *work,
               worker->endpoint &&
                   !(slot->length % USB_GET_MAXPACKETSIZE(
                         worker->endpoint->wMaxPacketSize)));
-#endif
         /* Never hold tx_mutex here.  usbh_kill_urb() halts the channel and
          * then blocks until giveback has run, and giveback runs on the host
          * controller's bottom-half thread. */
@@ -729,17 +591,11 @@ static void aic8800_usb_tx_watchdog_work(struct rt_work *work,
         rt_hw_interrupt_enable(level);
         if (expired)
         {
-#ifdef AIC8800_WIFI_DEBUG_STATS
-            AIC8800_STAT(worker->reclaim_count++);
+            worker->reclaim_count++;
             LOG_W("bulk OUT ep 0x%02x request not returned after cancel; "
                   "reclaiming slot (reclaims=%u)",
                   worker->endpoint ? worker->endpoint->bEndpointAddress : 0,
                   (unsigned int)worker->reclaim_count);
-#else
-            LOG_W("bulk OUT ep 0x%02x request not returned after cancel; "
-                  "reclaiming slot",
-                  worker->endpoint ? worker->endpoint->bEndpointAddress : 0);
-#endif
             aic8800_usb_tx_complete(slot, -USB_ERR_TIMEOUT);
         }
         recovered = RT_TRUE;
@@ -748,15 +604,6 @@ static void aic8800_usb_tx_watchdog_work(struct rt_work *work,
     {
         return;
     }
-#if AIC8800_WIFI_TX_TRACE_FRAMES
-    /* First stuck request on this bus: dump what the firmware was last given.
-     * Once only, so a wedged endpoint cannot flood the console. */
-    if (!context->tx_trace_dumped)
-    {
-        context->tx_trace_dumped = RT_TRUE;
-        aic8800_core_dump_tx_trace(context, "bulk OUT stuck");
-    }
-#endif
     /* The endpoint carried a request the controller could not finish, so its
      * halt and data toggle are both suspect.  Clear them before the reclaimed
      * slot is handed to the next frame.  A cancelled request gives back as
@@ -989,6 +836,9 @@ static void aic8800_usb_rx_complete(void *parameter, int length)
     done.buffer = slot->buffer;
     done.length = length > 0 ? (rt_size_t)length : 0;
     done.result = length < 0 ? length : 0;
+#ifdef AIC8800_WIFI_DEBUG_STATS
+    done.queued_us = cpu_ticks_us();
+#endif
 
     /* Giveback runs on the DWC2 low-priority workqueue (priority 1), ahead
      * of the RX worker.  Swap in a spare buffer and resubmit immediately so
@@ -1091,15 +941,37 @@ static rt_bool_t aic8800_usb_recover_rx_slot(
     }
     if (aic8800_log_throttle(worker->consecutive_errors))
     {
-        LOG_W("bulk IN ep 0x%02x error %d; retrying (consecutive=%u)",
-              worker->endpoint->bEndpointAddress, error,
-              (unsigned int)worker->consecutive_errors);
+        /* A handful of failed bulk IN transfers is routine on this device: it
+         * stops answering IN tokens for tens of milliseconds during
+         * association while the firmware retunes, and both IN endpoints fail
+         * together for the duration.  The vendor driver logs this at debug
+         * level and does not even retry.  Only start warning once the run is
+         * long enough to suggest something other than that.
+         *
+         * That reasoning only holds once the endpoint has delivered something.
+         * Before the first completion there is no association to blame, so a
+         * failure here is a genuine attach fault and must be visible: demoting
+         * it hid a total attach failure behind an empty log, because LOG_D is
+         * compiled out at the default ULOG_OUTPUT_LVL_I. */
+        if (worker->ever_completed &&
+            worker->consecutive_errors < AIC8800_USB_RX_ERRORS_EXPECTED)
+        {
+            LOG_D("bulk IN ep 0x%02x error %d; retrying (consecutive=%u)",
+                  worker->endpoint->bEndpointAddress, error,
+                  (unsigned int)worker->consecutive_errors);
+        }
+        else
+        {
+            LOG_W("bulk IN ep 0x%02x error %d; retrying (consecutive=%u)",
+                  worker->endpoint->bEndpointAddress, error,
+                  (unsigned int)worker->consecutive_errors);
+        }
     }
 
     while (worker->active && context->transport_connected && context->hport &&
            context->hport->connected)
     {
-        rt_thread_mdelay(aic8800_usb_rx_retry_delay(worker));
+        rt_thread_mdelay(aic8800_usb_rx_retry_delay(worker, submit_attempts));
         result = aic8800_usb_submit_rx_slot(slot);
         if (!result)
         {
@@ -1152,6 +1024,9 @@ static rt_bool_t aic8800_usb_recover_rx_slot(
 
 static void aic8800_usb_note_rx_success(struct aic8800_rx_worker *worker)
 {
+    rt_bool_t was_completed = worker->ever_completed;
+
+    worker->ever_completed = RT_TRUE;
     if (!worker->consecutive_errors)
     {
         return;
@@ -1159,10 +1034,23 @@ static void aic8800_usb_note_rx_success(struct aic8800_rx_worker *worker)
     worker->recovery_count++;
     if (aic8800_log_throttle(worker->recovery_count))
     {
-        LOG_I("bulk IN ep 0x%02x recovered after %u error(s); last=%d recoveries=%u",
-              worker->endpoint->bEndpointAddress,
-              (unsigned int)worker->consecutive_errors, worker->last_error,
-              (unsigned int)worker->recovery_count);
+        /* Match the level the failures were reported at, so a short run does
+         * not produce a recovery notice with nothing before it. */
+        if (was_completed &&
+            worker->consecutive_errors < AIC8800_USB_RX_ERRORS_EXPECTED)
+        {
+            LOG_D("bulk IN ep 0x%02x recovered after %u error(s); last=%d recoveries=%u",
+                  worker->endpoint->bEndpointAddress,
+                  (unsigned int)worker->consecutive_errors, worker->last_error,
+                  (unsigned int)worker->recovery_count);
+        }
+        else
+        {
+            LOG_I("bulk IN ep 0x%02x recovered after %u error(s); last=%d recoveries=%u",
+                  worker->endpoint->bEndpointAddress,
+                  (unsigned int)worker->consecutive_errors, worker->last_error,
+                  (unsigned int)worker->recovery_count);
+        }
     }
     worker->consecutive_errors = 0;
     worker->last_error = 0;
@@ -1211,6 +1099,15 @@ static void aic8800_usb_rx_thread(void *parameter)
             /* Completions left waiting behind this one: the endpoint is
              * outrunning this worker and its requests rearm late. */
             worker->queue_high_water = worker->completed->entry;
+        }
+        {
+            rt_uint64_t waited = cpu_ticks_us() - done.queued_us;
+
+            worker->dispatch_last_us = (rt_uint32_t)waited;
+            if (waited > worker->dispatch_max_us)
+            {
+                worker->dispatch_max_us = (rt_uint32_t)waited;
+            }
         }
 #endif
         slot = done.slot;
@@ -1362,6 +1259,7 @@ static rt_err_t aic8800_usb_start_worker(
     AIC8800_STAT(worker->retry_count = 0);
     worker->recovery_count = 0;
     worker->consecutive_errors = 0;
+    worker->ever_completed = RT_FALSE;
     AIC8800_STAT(worker->queue_high_water = 0);
     worker->last_error = 0;
     worker->completion_log_count = 0;
@@ -1540,8 +1438,8 @@ static void aic8800_usb_tx_complete(void *parameter, int length)
     }
     else
     {
-        AIC8800_STAT(worker->completion_count++);
-        AIC8800_STAT(worker->byte_count += (rt_uint64_t)length);
+        worker->completion_count++;
+        worker->byte_count += (rt_uint64_t)length;
     }
     if (worker->pending)
     {
@@ -1602,16 +1500,16 @@ static rt_err_t aic8800_usb_start_tx(struct aic8800_tx_worker *worker,
     worker->context = context;
     worker->endpoint = context->data_out;
     worker->pending = 0;
-    AIC8800_STAT(worker->completion_count = 0);
-    AIC8800_STAT(worker->byte_count = 0);
+    worker->completion_count = 0;
+    worker->byte_count = 0;
     worker->error_count = 0;
-    AIC8800_STAT(worker->wait_count = 0);
+    worker->wait_count = 0;
     worker->timeout_count = 0;
     worker->recovery_count = 0;
-    AIC8800_STAT(worker->watchdog_count = 0);
-    AIC8800_STAT(worker->reclaim_count = 0);
-    AIC8800_STAT(worker->burst_count = 0);
-    AIC8800_STAT(worker->max_burst_count = 0);
+    worker->watchdog_count = 0;
+    worker->reclaim_count = 0;
+    worker->burst_count = 0;
+    worker->max_burst_count = 0;
     worker->next_slot = 0;
     worker->last_error = 0;
     rt_completion_init(&worker->stopped);
@@ -1733,9 +1631,6 @@ static rt_err_t aic8800_usb_bus_start(struct rt_wlan_offload_bus *bus)
     context->invalid_rx_log_count = 0;
     /* Anything the previous session had in flight is gone with it. */
     aic8800_core_tx_pending_reset(context);
-#if AIC8800_WIFI_TX_TRACE_FRAMES
-    context->tx_trace_dumped = RT_FALSE;
-#endif
     result = aic8800_usb_start_tx(&context->tx_worker, context);
     if (result != RT_EOK)
     {
@@ -1898,25 +1793,26 @@ static struct aic8800_tx_slot *aic8800_usb_acquire_tx_slot(
     result = rt_sem_take(available, RT_WAITING_NO);
     if (result == RT_EOK)
     {
-#ifdef AIC8800_WIFI_DEBUG_STATS
-        AIC8800_STAT(worker->burst_count++);
+        worker->burst_count++;
         if (worker->burst_count > worker->max_burst_count)
         {
             worker->max_burst_count = worker->burst_count;
         }
-#endif
     }
     else
     {
-        AIC8800_STAT(worker->burst_count = 0);
-        AIC8800_STAT(worker->wait_count++);
+        worker->burst_count = 0;
+        worker->wait_count++;
         result = rt_sem_take(
             available, rt_tick_from_millisecond(AIC8800_WIFI_TX_WAIT_MS));
     }
     if (result != RT_EOK)
     {
         worker->timeout_count++;
-        *error = result == -RT_ETIMEOUT ? -RT_EFULL : result;
+        /* Exhausting the fixed TX request pool is transport backpressure.
+         * The queue worker retains ownership and retries the record, matching
+         * the vendor driver's stop/wake behavior at its TX-URB watermarks. */
+        *error = result == -RT_ETIMEOUT ? -RT_EBUSY : result;
         return RT_NULL;
     }
 
@@ -2002,7 +1898,7 @@ static void aic8800_usb_release_unsubmitted_tx_slot(
 
 static rt_err_t aic8800_usb_transmit_data(
     struct aic8800_context *context, const void *data, rt_size_t length,
-    const struct aic8800_tx_metadata *metadata, rt_size_t metadata_count,
+    struct aic8800_tx_metadata *metadata, rt_size_t metadata_count,
     rt_bool_t *metadata_consumed)
 {
     struct aic8800_tx_worker *worker;
@@ -2030,16 +1926,22 @@ static rt_err_t aic8800_usb_transmit_data(
     slot = aic8800_usb_acquire_tx_slot(worker, &result);
     if (!slot)
     {
-        if (result == -RT_EFULL &&
+        if (result == -RT_EBUSY &&
             aic8800_log_throttle(worker->timeout_count))
         {
+            /* A slot wait running past AIC8800_WIFI_TX_WAIT_MS is the designed
+             * backpressure regime when offered load exceeds airtime: the
+             * firmware withholds completions until it has credits, the caller
+             * keeps the record and retries, and nothing is lost.  A request
+             * the controller actually swallowed is the TX watchdog's job; it
+             * warns and reclaims on its own at ten times this wait. */
 #ifdef AIC8800_WIFI_DEBUG_STATS
-            LOG_W("bulk OUT queue full: waits=%u timeouts=%u pending=%u",
+            LOG_D("bulk OUT backpressure: waits=%u timeouts=%u pending=%u",
                   (unsigned int)worker->wait_count,
                   (unsigned int)worker->timeout_count,
                   (unsigned int)worker->pending);
 #else
-            LOG_W("bulk OUT queue full: timeouts=%u pending=%u",
+            LOG_D("bulk OUT backpressure: timeouts=%u pending=%u",
                   (unsigned int)worker->timeout_count,
                   (unsigned int)worker->pending);
 #endif
@@ -2077,6 +1979,20 @@ static rt_err_t aic8800_usb_transmit_data(
             rt_mutex_release(context->tx_mutex);
             aic8800_usb_release_unsubmitted_tx_slot(slot);
             return -RT_EBUSY;
+        }
+    }
+    if (metadata_count == 1U)
+    {
+        enum aic8800_tx_record_state state =
+            aic8800_core_tx_metadata_apply(
+                context, &metadata[0], slot->buffer, slot->length);
+
+        if (state != AIC8800_TX_RECORD_READY)
+        {
+            rt_mutex_release(context->tx_mutex);
+            aic8800_usb_release_unsubmitted_tx_slot(slot);
+            return state == AIC8800_TX_RECORD_DEFER ?
+                   -RT_EBUSY : -RT_EIO;
         }
     }
     if (metadata_count)
@@ -2126,6 +2042,10 @@ static rt_err_t aic8800_usb_transmit_data(
 static rt_bool_t aic8800_usb_supports_tx_aggregation(
     const struct aic8800_context *context)
 {
+#ifndef AIC8800_WIFI_USB_TX_AGGREGATION
+    (void)context;
+    return RT_FALSE;
+#else
     if (!context)
     {
         return RT_FALSE;
@@ -2138,6 +2058,7 @@ static rt_bool_t aic8800_usb_supports_tx_aggregation(
     default:
         return RT_FALSE;
     }
+#endif
 }
 
 static void aic8800_usb_reset_tx_queue(struct aic8800_context *context)
@@ -2200,7 +2121,7 @@ static rt_size_t aic8800_usb_append_tx_aggregate(
 
 static rt_err_t aic8800_usb_submit_tx_transfer(
     struct aic8800_context *context, const void *data, rt_size_t length,
-    const struct aic8800_tx_metadata *metadata, rt_size_t metadata_count,
+    struct aic8800_tx_metadata *metadata, rt_size_t metadata_count,
     rt_bool_t *metadata_consumed)
 {
     return aic8800_usb_transmit_data(
@@ -2263,11 +2184,13 @@ static void aic8800_usb_tx_queue_worker(void *parameter)
             if (state == AIC8800_TX_RECORD_DEFER &&
                 aic8800_usb_requeue_tx_record(context, records[count]))
             {
+                context->usb_tx_record_defer_count++;
                 rt_thread_mdelay(1);
                 continue;
             }
             if (state != AIC8800_TX_RECORD_READY)
             {
+                context->usb_tx_record_drop_count++;
                 aic8800_core_tx_complete(
                     context, &records[count]->metadata);
                 rt_mp_free(records[count]);
@@ -2374,13 +2297,44 @@ static void aic8800_usb_tx_queue_worker(void *parameter)
         {
             continue;
         }
-        aggregate_length = 0;
-        for (rt_size_t index = 0; index < count; index++)
         {
-            wire_lengths[index] = aic8800_usb_align4(
-                AIC8800_USB_TX_AGGREGATE_PREFIX + records[index]->length);
-            aggregate_length += wire_lengths[index];
-            metadata[index] = records[index]->metadata;
+            rt_size_t valid_count = 0;
+
+            aggregate_length = 0;
+            for (rt_size_t index = 0; index < count; index++)
+            {
+                enum aic8800_tx_record_state state =
+                    aic8800_core_tx_metadata_apply(
+                        context, &records[index]->metadata,
+                        records[index]->data, records[index]->length);
+
+                if (state == AIC8800_TX_RECORD_READY)
+                {
+                    wire_lengths[valid_count] = aic8800_usb_align4(
+                        AIC8800_USB_TX_AGGREGATE_PREFIX +
+                        records[index]->length);
+                    aggregate_length += wire_lengths[valid_count];
+                    metadata[valid_count] = records[index]->metadata;
+                    records[valid_count++] = records[index];
+                }
+                else if (state == AIC8800_TX_RECORD_DEFER &&
+                         aic8800_usb_requeue_tx_record(
+                             context, records[index]))
+                {
+                    /* Ownership remains with the queue. */
+                }
+                else
+                {
+                    aic8800_core_tx_complete(
+                        context, &records[index]->metadata);
+                    rt_mp_free(records[index]);
+                }
+            }
+            count = valid_count;
+        }
+        if (!count)
+        {
+            continue;
         }
         if (!context->usb_tx_aggregation_enabled)
         {
@@ -2412,17 +2366,15 @@ static void aic8800_usb_tx_queue_worker(void *parameter)
         }
         if (result == RT_EOK)
         {
-            AIC8800_STAT(context->usb_tx_frame_count += count);
+            context->usb_tx_frame_count += count;
             if (context->usb_tx_aggregation_enabled)
             {
-                AIC8800_STAT(context->usb_tx_aggregate_count++);
+                context->usb_tx_aggregate_count++;
             }
-#ifdef AIC8800_WIFI_DEBUG_STATS
             if (count > context->usb_tx_max_aggregate)
             {
                 context->usb_tx_max_aggregate = (rt_uint16_t)count;
             }
-#endif
         }
         else if (!context->usb_tx_terminate && result != -RT_EBUSY)
         {
@@ -2443,19 +2395,27 @@ static void aic8800_usb_tx_queue_worker(void *parameter)
         }
         else if (!context->usb_tx_terminate)
         {
+            /* -RT_EBUSY: the bulk OUT stage had no free request.  Ordinary
+             * backpressure, but count it - it is the difference between "the
+             * air lost these" and "the host never placed them". */
+            context->usb_tx_submit_busy_count++;
             rt_thread_mdelay(1);
         }
         if (result != RT_EOK && !metadata_consumed)
         {
             for (rt_size_t index = 0; index < count; index++)
             {
+                aic8800_core_tx_metadata_restore(
+                    context, &records[index]->metadata);
                 if (aic8800_usb_requeue_tx_record(
                         context, records[index]))
                 {
                     records[index] = RT_NULL;
+                    context->usb_tx_record_defer_count++;
                 }
                 else
                 {
+                    context->usb_tx_record_drop_count++;
                     aic8800_core_tx_complete(
                         context, &records[index]->metadata);
                 }
@@ -2486,12 +2446,12 @@ static rt_err_t aic8800_usb_start_tx_queue(
     {
         return -RT_EINVAL;
     }
-    AIC8800_STAT(context->usb_tx_frame_count = 0);
-    AIC8800_STAT(context->usb_tx_aggregate_count = 0);
+    context->usb_tx_frame_count = 0;
+    context->usb_tx_aggregate_count = 0;
     context->usb_tx_queue_drop_count = 0;
     context->usb_tx_error_count = 0;
-    AIC8800_STAT(context->usb_tx_max_aggregate = 0);
-    AIC8800_STAT(context->usb_tx_queue_high_water = 0);
+    context->usb_tx_max_aggregate = 0;
+    context->usb_tx_queue_high_water = 0;
     context->usb_tx_queue_enabled = RT_FALSE;
     context->usb_tx_aggregation_enabled =
         aic8800_usb_supports_tx_aggregation(context) &&
@@ -2562,6 +2522,43 @@ static void aic8800_usb_stop_tx_queue(struct aic8800_context *context)
     aic8800_usb_reset_tx_queue(context);
 }
 
+static rt_bool_t aic8800_usb_tx_queue_wait_expired(rt_tick_t start,
+                                                   rt_tick_t timeout)
+{
+    return !timeout || (rt_tick_t)(rt_tick_get() - start) >= timeout;
+}
+
+static struct aic8800_usb_tx_record *aic8800_usb_alloc_tx_record(
+    struct aic8800_context *context, rt_bool_t urgent)
+{
+    struct aic8800_usb_tx_record *record;
+    rt_tick_t start = rt_tick_get();
+    rt_tick_t timeout = urgent ? 0 :
+        rt_tick_from_millisecond(AIC8800_WIFI_TX_QUEUE_WAIT_MS);
+
+    while (context->usb_tx_queue_enabled && !context->usb_tx_terminate)
+    {
+        record = rt_mp_alloc(context->usb_tx_pool, 0);
+        if (record)
+        {
+            if (urgent ||
+                context->usb_tx_pool->block_free_count >=
+                    AIC8800_WIFI_USB_TX_PRIORITY_RESERVE)
+            {
+                return record;
+            }
+            rt_mp_free(record);
+        }
+        if (urgent ||
+            aic8800_usb_tx_queue_wait_expired(start, timeout))
+        {
+            break;
+        }
+        rt_thread_delay(1);
+    }
+    return RT_NULL;
+}
+
 static rt_err_t aic8800_usb_queue_transmit(
     struct aic8800_context *context, const void *data, rt_size_t length,
     rt_bool_t urgent)
@@ -2576,9 +2573,7 @@ static rt_err_t aic8800_usb_queue_transmit(
     {
         return -RT_EINVAL;
     }
-    record = rt_mp_alloc(
-        context->usb_tx_pool,
-        rt_tick_from_millisecond(AIC8800_WIFI_TX_WAIT_MS));
+    record = aic8800_usb_alloc_tx_record(context, urgent);
     if (!record)
     {
         result = -RT_EFULL;
@@ -2588,6 +2583,10 @@ static rt_err_t aic8800_usb_queue_transmit(
     aic8800_core_tx_metadata_init(
         context, data, length, &record->metadata);
     rt_memcpy(record->data, data, length);
+    /* The pool and the queue have the same depth and every queued record owns a
+     * pool block, so holding a block leaves at least one free queue entry.
+     * aic8800_usb_alloc_tx_record() has already applied the producer
+     * backpressure; waiting again here only doubles the stall. */
     result = urgent ?
              rt_mq_urgent(context->usb_tx_queue, &record, sizeof(record)) :
              rt_mq_send(context->usb_tx_queue, &record, sizeof(record));
@@ -2596,30 +2595,39 @@ static rt_err_t aic8800_usb_queue_transmit(
         rt_mp_free(record);
         goto failed;
     }
-#ifdef AIC8800_WIFI_DEBUG_STATS
     if (context->usb_tx_queue->entry > context->usb_tx_queue_high_water)
     {
         context->usb_tx_queue_high_water = context->usb_tx_queue->entry;
     }
-#endif
     return RT_EOK;
 
 failed:
     context->usb_tx_queue_drop_count++;
     if (aic8800_log_throttle(context->usb_tx_queue_drop_count))
     {
-#ifdef AIC8800_WIFI_DEBUG_STATS
-        LOG_W("USB transmit queue full: result=%d drops=%u depth=%u high=%u",
-              result, (unsigned int)context->usb_tx_queue_drop_count,
-              context->usb_tx_queue ?
-                  (unsigned int)context->usb_tx_queue->entry : 0U,
-              (unsigned int)context->usb_tx_queue_high_water);
-#else
-        LOG_W("USB transmit queue full: result=%d drops=%u depth=%u",
-              result, (unsigned int)context->usb_tx_queue_drop_count,
-              context->usb_tx_queue ?
-                  (unsigned int)context->usb_tx_queue->entry : 0U);
-#endif
+        /* Dropping a best-effort frame after the producer has already waited
+         * AIC8800_WIFI_TX_QUEUE_WAIT_MS is ordinary congestion shedding - the
+         * offered load exceeds what the air is delivering, and every network
+         * stack sheds silently there.  An urgent frame is different: it
+         * bypasses the wait and draws on the PRIORITY_RESERVE slice, so
+         * failing one means the pool is exhausted past its reserve and
+         * handshake-class traffic is being lost. */
+        if (urgent)
+        {
+            LOG_W("USB transmit queue full: result=%d drops=%u depth=%u high=%u",
+                  result, (unsigned int)context->usb_tx_queue_drop_count,
+                  context->usb_tx_queue ?
+                      (unsigned int)context->usb_tx_queue->entry : 0U,
+                  (unsigned int)context->usb_tx_queue_high_water);
+        }
+        else
+        {
+            LOG_D("USB transmit queue full: result=%d drops=%u depth=%u high=%u",
+                  result, (unsigned int)context->usb_tx_queue_drop_count,
+                  context->usb_tx_queue ?
+                      (unsigned int)context->usb_tx_queue->entry : 0U,
+                  (unsigned int)context->usb_tx_queue_high_water);
+        }
     }
     return result;
 }

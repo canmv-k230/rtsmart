@@ -152,6 +152,9 @@ struct rt_sdio_driver
     rt_int32_t (*probe)(struct rt_mmcsd_card *card);
     rt_int32_t (*remove)(struct rt_mmcsd_card *card);
     struct rt_sdio_device_id *id;
+    /* Zero keeps the legacy single-ID behavior. Adding this field changes
+     * the binary layout; out-of-tree SDIO drivers must be rebuilt. */
+    rt_size_t id_count;
 };
 
 rt_int32_t sdio_io_send_op_cond(struct rt_mmcsd_host *host,
@@ -223,6 +226,8 @@ rt_int32_t sdio_attach_irq(struct rt_sdio_function *func,
                            rt_sdio_irq_handler_t   *handler);
 rt_int32_t sdio_detach_irq(struct rt_sdio_function *func);
 void sdio_irq_wakeup(struct rt_mmcsd_host *host);
+void sdio_irq_defer(struct rt_mmcsd_host *host);
+void sdio_irq_rearm(struct rt_mmcsd_host *host);
 rt_int32_t sdio_enable_func(struct rt_sdio_function *func);
 rt_int32_t sdio_disable_func(struct rt_sdio_function *func);
 void sdio_set_drvdata(struct rt_sdio_function *func, void *data);
@@ -238,4 +243,3 @@ void rt_sdio_init(void);
 #endif
 
 #endif
-

@@ -45,6 +45,11 @@
 #define RT_WLAN_PROT_LWIP_NAME  ("lwip")
 #endif
 
+#ifndef RT_WLAN_IP_READY_POLL_MS
+/* This one-shot timer is rearmed only while the interface has no IP address. */
+#define RT_WLAN_IP_READY_POLL_MS 100
+#endif
+
 struct lwip_prot_des
 {
     struct rt_wlan_prot prot;
@@ -511,8 +516,9 @@ static struct rt_wlan_prot *rt_wlan_lwip_protocol_register(struct rt_wlan_prot *
     }
     rt_memcpy(&lwip_prot->prot, prot, sizeof(struct rt_wlan_prot));
     rt_snprintf(timer_name, sizeof(timer_name), "timer_%s", eth_name);
-    rt_timer_init(&lwip_prot->timer, timer_name, timer_callback, wlan, rt_tick_from_millisecond(1000),
-                    RT_TIMER_FLAG_SOFT_TIMER | RT_TIMER_FLAG_ONE_SHOT);
+    rt_timer_init(&lwip_prot->timer, timer_name, timer_callback, wlan,
+                  rt_tick_from_millisecond(RT_WLAN_IP_READY_POLL_MS),
+                  RT_TIMER_FLAG_SOFT_TIMER | RT_TIMER_FLAG_ONE_SHOT);
     netif_set_up(eth->netif);
     LOG_I("eth device init ok name:%s", eth_name);
 #ifdef RT_USING_NETDEV

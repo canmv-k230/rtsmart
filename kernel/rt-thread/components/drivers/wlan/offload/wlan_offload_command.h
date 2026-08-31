@@ -81,7 +81,8 @@ rt_err_t rt_wlan_offload_command_complete(
     rt_err_t status, const void *response, rt_size_t response_length);
 
 /* Used by single-threaded transports which must service RX while push() is
- * executing from their receive callback. */
+ * executing from their receive callback. A zero token tests for any pending
+ * transaction. */
 rt_bool_t rt_wlan_offload_command_is_pending(
     struct rt_wlan_offload_command_manager *manager, rt_uint32_t token);
 

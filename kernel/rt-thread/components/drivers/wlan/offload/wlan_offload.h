@@ -156,6 +156,7 @@ enum rt_wlan_offload_event_type
     RT_WLAN_OFFLOAD_EVENT_REGULATORY_CHANGED,
     RT_WLAN_OFFLOAD_EVENT_EXTERNAL_AUTH_REQUIRED,
     RT_WLAN_OFFLOAD_EVENT_FIRMWARE_ERROR,
+    RT_WLAN_OFFLOAD_EVENT_TKIP_MIC_FAILURE,
 };
 
 struct rt_wlan_offload_radio;
@@ -440,6 +441,13 @@ struct rt_wlan_offload_event
             const void *dump;
             rt_size_t dump_length;
         } firmware;
+        struct
+        {
+            rt_uint8_t source[6];
+            rt_uint8_t tsc[8];
+            rt_uint8_t key_index;
+            rt_bool_t group;
+        } mic_failure;
     } data;
 };
 

@@ -59,6 +59,14 @@ static const rt_uint32_t speed_unit[8] =
 
 rt_inline rt_int32_t sdio_match_card(struct rt_mmcsd_card           *card,
                                      const struct rt_sdio_device_id *id);
+rt_inline rt_int32_t sdio_match_function(
+    const struct rt_sdio_function  *function,
+    const struct rt_sdio_device_id *id);
+rt_inline rt_int32_t sdio_match_card_driver(
+    struct rt_mmcsd_card *card, const struct rt_sdio_driver *driver);
+rt_inline rt_int32_t sdio_match_function_driver(
+    const struct rt_sdio_function *function,
+    const struct rt_sdio_driver   *driver);
 
 
 rt_int32_t sdio_io_send_op_cond(struct rt_mmcsd_host *host,
@@ -849,6 +857,7 @@ static rt_int32_t sdio_set_highspeed(struct rt_mmcsd_card *card)
         return ret;
 
     card->flags |= CARD_FLAG_HIGHSPEED;
+    mmcsd_set_timing(card->host, MMCSD_TIMING_SD_HS);
 
     return 0;
 }
@@ -907,11 +916,34 @@ static rt_int32_t sdio_register_card(struct rt_mmcsd_card *card)
          function_num <= card->sdio_function_num;
          function_num++)
     {
+        rt_bool_t id_matched = RT_FALSE;
+
         function = card->sdio_function[function_num];
-        if (function)
+        if (!function)
         {
-            LOG_D("SDIO function %u class=0x%02x %04x:%04x",
-                  function->num, function->func_code,
+            continue;
+        }
+
+        LOG_D("SDIO function %u class=0x%02x %04x:%04x",
+              function->num, function->func_code,
+              function->manufacturer, function->product);
+        for (l = (&sdio_drivers)->next; l != &sdio_drivers; l = l->next)
+        {
+            sd = (struct sdio_driver *)rt_list_entry(
+                l, struct sdio_driver, list);
+            if (sdio_match_function_driver(function, sd->drv))
+            {
+                id_matched = RT_TRUE;
+                break;
+            }
+        }
+        if (!id_matched)
+        {
+            LOG_W("no driver for SDIO function %u on %s: "
+                  "class=0x%02x id=%04x:%04x",
+                  function->num,
+                  card->host ? card->host->name : "unknown",
+                  function->func_code,
                   function->manufacturer, function->product);
         }
     }
@@ -924,7 +956,7 @@ static rt_int32_t sdio_register_card(struct rt_mmcsd_card *card)
     for (l = (&sdio_drivers)->next; l != &sdio_drivers; l = l->next)
     {
         sd = (struct sdio_driver *)rt_list_entry(l, struct sdio_driver, list);
-        if (sdio_match_card(card, sd->drv->id))
+        if (sdio_match_card_driver(card, sd->drv))
         {
             probe_result = sd->drv->probe(card);
             if (probe_result != RT_EOK)
@@ -1211,7 +1243,11 @@ static void sdio_irq_thread(void *param)
 
         out:
             mmcsd_host_unlock(host);
-            if (host->flags & MMCSD_SUP_SDIO_IRQ)
+            /* A concurrent defer/rearm can make both paths enable the IRQ;
+             * the K230 op only sets the same controller bit, so this is
+             * intentionally harmless. */
+            if ((host->flags & MMCSD_SUP_SDIO_IRQ) &&
+                !host->sdio_irq_deferred)
                 host->ops->enable_sdio_irq(host, 1);
             continue;
         }
@@ -1225,6 +1261,7 @@ static rt_int32_t sdio_irq_thread_create(struct rt_mmcsd_card *card)
 
     if (!host->sdio_irq_num)
     {
+        host->sdio_irq_deferred = RT_FALSE;
         host->sdio_irq_sem = rt_sem_create("sdio_irq", 0, RT_IPC_FLAG_FIFO);
         if (host->sdio_irq_sem == RT_NULL)
         {
@@ -1276,6 +1313,7 @@ static rt_int32_t sdio_irq_thread_delete(struct rt_mmcsd_card *card)
         host->sdio_irq_thread = RT_NULL;
         rt_sem_delete(host->sdio_irq_sem);
         host->sdio_irq_sem = RT_NULL;
+        host->sdio_irq_deferred = RT_FALSE;
         mmcsd_host_unlock(host);
     }
 
@@ -1399,6 +1437,29 @@ void sdio_irq_wakeup(struct rt_mmcsd_host *host)
         rt_sem_release(host->sdio_irq_sem);
 }
 
+void sdio_irq_defer(struct rt_mmcsd_host *host)
+{
+    RT_ASSERT(host != RT_NULL);
+
+    /* Called from a function IRQ handler while sdio_irq_thread owns the host
+     * lock. Keep a level-triggered host IRQ masked until deferred I/O drains
+     * the card source. */
+    host->sdio_irq_deferred = RT_TRUE;
+    if (host->flags & MMCSD_SUP_SDIO_IRQ)
+        host->ops->enable_sdio_irq(host, 0);
+}
+
+void sdio_irq_rearm(struct rt_mmcsd_host *host)
+{
+    RT_ASSERT(host != RT_NULL);
+
+    mmcsd_host_lock(host);
+    host->sdio_irq_deferred = RT_FALSE;
+    if (host->sdio_irq_num && (host->flags & MMCSD_SUP_SDIO_IRQ))
+        host->ops->enable_sdio_irq(host, 1);
+    mmcsd_host_unlock(host);
+}
+
 rt_int32_t sdio_enable_func(struct rt_sdio_function *func)
 {
     rt_int32_t ret;
@@ -1520,6 +1581,19 @@ rt_int32_t sdio_set_block_size(struct rt_sdio_function *func,
     return 0;
 }
 
+rt_inline rt_int32_t sdio_match_function(
+    const struct rt_sdio_function  *function,
+    const struct rt_sdio_device_id *id)
+{
+    return (function != RT_NULL) &&
+           ((id->manufacturer == SDIO_ANY_MAN_ID) ||
+            (id->manufacturer == function->manufacturer)) &&
+           ((id->func_code == SDIO_ANY_FUNC_ID) ||
+            (id->func_code == function->func_code)) &&
+           ((id->product == SDIO_ANY_PROD_ID) ||
+            (id->product == function->product));
+}
+
 rt_inline rt_int32_t sdio_match_card(struct rt_mmcsd_card           *card,
                                      const struct rt_sdio_device_id *id)
 {
@@ -1529,13 +1603,7 @@ rt_inline rt_int32_t sdio_match_card(struct rt_mmcsd_card           *card,
     {
         struct rt_sdio_function *function = card->sdio_function[num];
 
-        if ((function != RT_NULL) &&
-            ((id->manufacturer == SDIO_ANY_MAN_ID) ||
-             (id->manufacturer == function->manufacturer)) &&
-            ((id->func_code == SDIO_ANY_FUNC_ID) ||
-             (id->func_code == function->func_code)) &&
-            ((id->product == SDIO_ANY_PROD_ID) ||
-             (id->product == function->product)))
+        if (sdio_match_function(function, id))
             return 1;
         num++;
     }
@@ -1543,8 +1611,52 @@ rt_inline rt_int32_t sdio_match_card(struct rt_mmcsd_card           *card,
     return 0;
 }
 
+rt_inline rt_int32_t sdio_match_function_driver(
+    const struct rt_sdio_function *function,
+    const struct rt_sdio_driver   *driver)
+{
+    rt_size_t count;
+    rt_size_t index;
 
-static struct rt_mmcsd_card *sdio_match_driver(struct rt_sdio_device_id *id)
+    if (!driver || !driver->id)
+    {
+        return 0;
+    }
+    count = driver->id_count ? driver->id_count : 1U;
+    for (index = 0; index < count; index++)
+    {
+        if (sdio_match_function(function, &driver->id[index]))
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+rt_inline rt_int32_t sdio_match_card_driver(
+    struct rt_mmcsd_card *card, const struct rt_sdio_driver *driver)
+{
+    rt_size_t count;
+    rt_size_t index;
+
+    if (!driver || !driver->id)
+    {
+        return 0;
+    }
+    count = driver->id_count ? driver->id_count : 1U;
+    for (index = 0; index < count; index++)
+    {
+        if (sdio_match_card(card, &driver->id[index]))
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+
+static struct rt_mmcsd_card *sdio_match_driver(
+    const struct rt_sdio_driver *driver)
 {
     rt_list_t *l;
     struct sdio_card *sc;
@@ -1555,7 +1667,7 @@ static struct rt_mmcsd_card *sdio_match_driver(struct rt_sdio_device_id *id)
         sc = (struct sdio_card *)rt_list_entry(l, struct sdio_card, list);
         card = sc->card;
 
-        if (sdio_match_card(card, id))
+        if (sdio_match_card_driver(card, driver))
         {
             return card;
         }
@@ -1582,7 +1694,7 @@ rt_int32_t sdio_register_driver(struct rt_sdio_driver *driver)
 
     if (!rt_list_isempty(&sdio_cards))
     {
-        card = sdio_match_driver(driver->id);
+        card = sdio_match_driver(driver);
         if (card != RT_NULL)
         {
             return driver->probe(card);
@@ -1615,7 +1727,7 @@ rt_int32_t sdio_unregister_driver(struct rt_sdio_driver *driver)
 
     if (!rt_list_isempty(&sdio_cards))
     {
-        card = sdio_match_driver(driver->id);
+        card = sdio_match_driver(driver);
         if (card != RT_NULL)
         {
             rt_int32_t result = driver->remove(card);

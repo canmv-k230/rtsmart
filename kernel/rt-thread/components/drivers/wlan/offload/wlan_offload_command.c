@@ -344,9 +344,15 @@ rt_bool_t rt_wlan_offload_command_is_pending(
     rt_list_t *node;
     rt_bool_t pending = RT_FALSE;
 
-    if (!token || wlan_offload_command_lock(manager) != RT_EOK)
+    if (wlan_offload_command_lock(manager) != RT_EOK)
     {
         return RT_FALSE;
+    }
+    if (!token)
+    {
+        pending = manager->pending_count != 0;
+        rt_mutex_release(&manager->lock);
+        return pending;
     }
     rt_list_for_each(node, &manager->pending)
     {

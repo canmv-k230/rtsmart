@@ -1287,6 +1287,8 @@ static rt_bool_t rt_wlan_band_is_valid(rt_802_11_band_t band)
 static rt_err_t rt_wlan_connect_adv_internal(struct rt_wlan_info *info,
                                               const char *password,
                                               rt_bool_t band_locked);
+static struct rt_wlan_scan_result *rt_wlan_scan_with_info_internal(
+    struct rt_wlan_info *info, rt_bool_t band_locked);
 
 rt_err_t rt_wlan_connect_by_band(const char *ssid, const char *password,
                                  rt_802_11_band_t band)
@@ -1323,7 +1325,6 @@ rt_err_t rt_wlan_connect_by_band(const char *ssid, const char *password,
         RT_WLAN_LOG_E("ssid is to long! ssid:%s len:%d", ssid, ssid_len);
         return -RT_EINVAL;
     }
-
     if ((rt_wlan_is_connected() == RT_TRUE) &&
             (rt_strcmp((char *)&_sta_mgnt.info.ssid.val[0], ssid) == 0) &&
             (band == RT_802_11_BAND_UNKNOWN ||
@@ -1355,7 +1356,8 @@ rt_err_t rt_wlan_connect_by_band(const char *ssid, const char *password,
         /* Match the reference cfg80211 path: include the requested SSID so
          * firmware sends a directed probe instead of relying on beacons and
          * wildcard probe responses. */
-        rt_wlan_scan_with_info(&scan_info);
+        rt_wlan_scan_with_info_internal(
+            &scan_info, band != RT_802_11_BAND_UNKNOWN);
     }
     rt_wlan_scan_result_clean();
 
@@ -2166,7 +2168,8 @@ struct rt_wlan_scan_result *rt_wlan_scan_sync(void)
     return result;
 }
 
-struct rt_wlan_scan_result *rt_wlan_scan_with_info(struct rt_wlan_info *info)
+static struct rt_wlan_scan_result *rt_wlan_scan_with_info_internal(
+    struct rt_wlan_info *info, rt_bool_t band_locked)
 {
     rt_err_t err = RT_EOK;
     struct rt_wlan_complete_des *complete;
@@ -2185,6 +2188,11 @@ struct rt_wlan_scan_result *rt_wlan_scan_with_info(struct rt_wlan_info *info)
     if (info != RT_NULL && info->ssid.len > RT_WLAN_SSID_MAX_LENGTH)
     {
         RT_WLAN_LOG_E("ssid is to long!");
+        return RT_NULL;
+    }
+    if (band_locked && info == RT_NULL)
+    {
+        RT_WLAN_LOG_E("band-locked scan requires scan info");
         return RT_NULL;
     }
 
@@ -2207,7 +2215,14 @@ struct rt_wlan_scan_result *rt_wlan_scan_with_info(struct rt_wlan_info *info)
     }
 
     /* run scan */
-    err = rt_wlan_dev_scan(STA_DEVICE(), info);
+    if (band_locked)
+    {
+        err = rt_wlan_dev_scan_by_band(STA_DEVICE(), info, info->band);
+    }
+    else
+    {
+        err = rt_wlan_dev_scan(STA_DEVICE(), info);
+    }
     if (err != RT_EOK)
     {
         rt_wlan_complete_delete(complete);
@@ -2237,6 +2252,11 @@ scan_exit:
     rt_hw_interrupt_enable(level);
     result = &scan_result;
     return result;
+}
+
+struct rt_wlan_scan_result *rt_wlan_scan_with_info(struct rt_wlan_info *info)
+{
+    return rt_wlan_scan_with_info_internal(info, RT_FALSE);
 }
 
 int rt_wlan_scan_get_info_num(void)

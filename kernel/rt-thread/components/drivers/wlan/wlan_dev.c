@@ -652,7 +652,10 @@ rt_country_code_t rt_wlan_dev_get_country(struct rt_wlan_device *device)
     return country_code;
 }
 
-rt_err_t rt_wlan_dev_scan(struct rt_wlan_device *device, struct rt_wlan_info *info)
+static rt_err_t rt_wlan_dev_scan_internal(struct rt_wlan_device *device,
+                                          struct rt_wlan_info *info,
+                                          rt_802_11_band_t band,
+                                          rt_bool_t band_locked)
 {
     struct rt_scan_info scan_info = { 0 };
     struct rt_scan_info *p_scan_info = RT_NULL;
@@ -661,6 +664,12 @@ rt_err_t rt_wlan_dev_scan(struct rt_wlan_device *device, struct rt_wlan_info *in
     if (device == RT_NULL)
     {
         return -RT_EIO;
+    }
+    if (band_locked && band != RT_802_11_BAND_2_4GHZ &&
+        band != RT_802_11_BAND_5GHZ)
+    {
+        LOG_E("invalid scan band: %d", band);
+        return -RT_EINVAL;
     }
 
     if (info != RT_NULL)
@@ -685,8 +694,28 @@ rt_err_t rt_wlan_dev_scan(struct rt_wlan_device *device, struct rt_wlan_info *in
         scan_info.passive = info->hidden ? RT_TRUE : RT_FALSE;
         p_scan_info = &scan_info;
     }
+    if (band_locked)
+    {
+        scan_info.band = band;
+        scan_info.band_locked = RT_TRUE;
+        p_scan_info = &scan_info;
+    }
     result = rt_device_control(RT_DEVICE(device), RT_WLAN_CMD_SCAN, p_scan_info);
     return result;
+}
+
+rt_err_t rt_wlan_dev_scan(struct rt_wlan_device *device,
+                          struct rt_wlan_info *info)
+{
+    return rt_wlan_dev_scan_internal(device, info,
+                                     RT_802_11_BAND_UNKNOWN, RT_FALSE);
+}
+
+rt_err_t rt_wlan_dev_scan_by_band(struct rt_wlan_device *device,
+                                  struct rt_wlan_info *info,
+                                  rt_802_11_band_t band)
+{
+    return rt_wlan_dev_scan_internal(device, info, band, RT_TRUE);
 }
 
 rt_err_t rt_wlan_dev_scan_stop(struct rt_wlan_device *device)

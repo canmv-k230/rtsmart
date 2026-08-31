@@ -946,6 +946,7 @@ struct giveback_urb_bh {
     * @eps_out:		The OUT endpoints being supplied to the gadget framework
     * @new_connection:	Used in host mode. True if there are new connected
     *			device
+    * @ddma_desc_error_count:	Unhandled descriptor errors seen by the host
     * @enabled:		Indicates the enabling state of controller
     *
     */
@@ -1049,6 +1050,7 @@ struct giveback_urb_bh {
         u16 periodic_qh_count;
         volatile int periodic_qh_inst_count;
         bool new_connection;
+        u32 ddma_desc_error_count;
 
         u16 last_frame_num;
 

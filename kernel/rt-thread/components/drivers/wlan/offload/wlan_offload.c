@@ -1526,6 +1526,7 @@ static rt_err_t wlan_offload_wlan_scan(struct rt_wlan_device *wlan,
     struct rt_wlan_offload_scan_request request;
     struct rt_wlan_offload_scan_ssid ssid;
     struct rt_wlan_offload_channel_definition channel;
+    struct rt_wlan_offload_channel_definition *band_channels = RT_NULL;
     rt_err_t result;
 
     rt_memset(&request, 0, sizeof(request));
@@ -1553,18 +1554,84 @@ static rt_err_t wlan_offload_wlan_scan(struct rt_wlan_device *wlan,
             request.ssid_count = 1;
         }
         rt_memcpy(request.bssid, scan_info->bssid, sizeof(request.bssid));
+        if (scan_info->band_locked &&
+            scan_info->band != RT_802_11_BAND_2_4GHZ &&
+            scan_info->band != RT_802_11_BAND_5GHZ)
+        {
+            result = -RT_EINVAL;
+            goto exit;
+        }
         if (scan_info->channel_min > 0 &&
             scan_info->channel_min == scan_info->channel_max)
         {
-            result = wlan_offload_resolve_channel(vif->radio,
-                                             scan_info->channel_min,
-                                             RT_FALSE, &channel);
+            enum rt_wlan_offload_band_id band = RT_WLAN_OFFLOAD_BAND_MAX;
+
+            if (scan_info->band_locked &&
+                scan_info->band == RT_802_11_BAND_2_4GHZ)
+            {
+                band = RT_WLAN_OFFLOAD_BAND_2GHZ;
+            }
+            else if (scan_info->band_locked &&
+                     scan_info->band == RT_802_11_BAND_5GHZ)
+            {
+                band = RT_WLAN_OFFLOAD_BAND_5GHZ;
+            }
+            result = wlan_offload_resolve_channel_for_band(
+                vif->radio, band, scan_info->channel_min, RT_FALSE, RT_TRUE,
+                &channel);
             if (result != RT_EOK)
             {
                 goto exit;
             }
             request.channels = &channel;
             request.channel_count = 1;
+        }
+        else if (scan_info->band_locked)
+        {
+            enum rt_wlan_offload_band_id band_id =
+                scan_info->band == RT_802_11_BAND_2_4GHZ ?
+                    RT_WLAN_OFFLOAD_BAND_2GHZ : RT_WLAN_OFFLOAD_BAND_5GHZ;
+            const struct rt_wlan_offload_supported_band *band =
+                vif->radio->bands[band_id];
+            rt_size_t index;
+
+            if (!band || !band->channel_count)
+            {
+                result = -RT_EINVAL;
+                goto exit;
+            }
+            band_channels = rt_calloc(
+                band->channel_count, sizeof(*band_channels));
+            if (!band_channels)
+            {
+                result = -RT_ENOMEM;
+                goto exit;
+            }
+            for (index = 0; index < band->channel_count; index++)
+            {
+                const struct rt_wlan_offload_channel *configured =
+                    &band->channels[index];
+                struct rt_wlan_offload_channel_definition *definition;
+
+                if (configured->flags & RT_WLAN_OFFLOAD_CHANNEL_DISABLED)
+                {
+                    continue;
+                }
+                definition = &band_channels[request.channel_count++];
+                definition->band = band_id;
+                definition->width = RT_WLAN_OFFLOAD_CHANNEL_WIDTH_20;
+                definition->primary_channel = configured->number;
+                definition->primary_frequency_mhz =
+                    configured->center_frequency_mhz;
+                definition->center_frequency1_mhz =
+                    configured->center_frequency_mhz;
+            }
+            if (!request.channel_count)
+            {
+                result = -RT_EINVAL;
+                goto exit;
+            }
+            request.channels = band_channels;
         }
         if (scan_info->passive)
         {
@@ -1574,6 +1641,7 @@ static rt_err_t wlan_offload_wlan_scan(struct rt_wlan_device *wlan,
     result = wlan_offload_scan_submit(vif, &request);
 
 exit:
+    rt_free(band_channels);
     wlan_offload_operation_exit(vif->radio);
     return result;
 }
@@ -2905,7 +2973,7 @@ rt_err_t rt_wlan_offload_report_event(struct rt_wlan_offload_radio *radio,
     rt_bool_t schedule_recovery = RT_FALSE;
 
     if (!radio || !event || (int)event->type < 0 ||
-        event->type > RT_WLAN_OFFLOAD_EVENT_FIRMWARE_ERROR)
+        event->type > RT_WLAN_OFFLOAD_EVENT_TKIP_MIC_FAILURE)
     {
         return -RT_EINVAL;
     }
@@ -3141,6 +3209,9 @@ rt_err_t rt_wlan_offload_report_event(struct rt_wlan_offload_radio *radio,
             radio->recovery_queued = RT_TRUE;
             schedule_recovery = RT_TRUE;
         }
+        break;
+
+    case RT_WLAN_OFFLOAD_EVENT_TKIP_MIC_FAILURE:
         break;
 
     default:

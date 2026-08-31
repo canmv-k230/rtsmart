@@ -346,6 +346,7 @@ static void dwc2_port_intr(struct dwc2_hsotg *hsotg)
                  hprt0, !!(hprt0 & HPRT0_ENA));
         if (hprt0 & HPRT0_ENA) {
             hsotg->new_connection = true;
+            hsotg->ddma_desc_error_count = 0;
             dwc2_hprt0_enable(hsotg, hprt0, &hprt0_modify);
         } else {
             hsotg->flags.b.port_enable_change = 1;

@@ -12,6 +12,7 @@
 #include <rtdbg.h>
 
 #define WPA_HANDSHAKE_TIMEOUT_MS 8000
+#define WPA_TKIP_COUNTERMEASURE_MS 60000
 
 #define EAPOL_TYPE_KEY            3
 #define EAPOL_KEY_DESCRIPTOR_RSN  2
@@ -111,6 +112,10 @@ struct rt_wlan_offload_supplicant
     rt_uint8_t password_length;
     struct rt_wlan_offload_sae sae;
     const struct wlan_offload_wpa_profile *profile;
+    rt_tick_t tkip_mic_failure_tick;
+    rt_tick_t tkip_countermeasure_tick;
+    rt_bool_t tkip_mic_failure_valid;
+    rt_bool_t tkip_countermeasures_active;
 };
 
 static const rt_uint8_t g_wpa2_psk_ccmp_rsn_ie[] = {
@@ -1048,14 +1053,15 @@ static void supplicant_report_result(struct rt_wlan_offload_radio *radio,
     rt_wlan_offload_report_event(radio, &event);
 }
 
-static void supplicant_disconnect_failed_link(struct rt_wlan_offload_radio *radio)
+static void supplicant_disconnect_failed_link(struct rt_wlan_offload_radio *radio,
+                                              rt_uint16_t reason)
 {
     rt_uint32_t request_id = rt_wlan_offload_alloc_request_id(radio);
 
     if (request_id)
     {
         rt_wlan_offload_disconnect(radio, RT_WLAN_OFFLOAD_IFTYPE_STATION,
-                              request_id, 15);
+                              request_id, reason);
     }
 }
 
@@ -1076,7 +1082,7 @@ static void supplicant_fail(struct rt_wlan_offload_radio *radio, rt_err_t status
     rt_timer_stop(supplicant->timer);
     rt_mutex_release(&supplicant->lock);
     supplicant_report_result(radio, request_id, status, bssid);
-    supplicant_disconnect_failed_link(radio);
+    supplicant_disconnect_failed_link(radio, 15U);
 }
 
 static void supplicant_reject_external(struct rt_wlan_offload_radio *radio,
@@ -1126,7 +1132,7 @@ static void supplicant_timeout(void *parameter)
     {
         LOG_W("WPA authentication timed out");
         supplicant_report_result(radio, request_id, -RT_ETIMEOUT, bssid);
-        supplicant_disconnect_failed_link(radio);
+        supplicant_disconnect_failed_link(radio, 15U);
     }
 }
 
@@ -1229,6 +1235,28 @@ rt_err_t rt_wlan_offload_supplicant_prepare(
     }
 
     rt_mutex_take(&supplicant->lock, RT_WAITING_FOREVER);
+    if (supplicant->tkip_countermeasures_active)
+    {
+        rt_tick_t elapsed = rt_tick_get() -
+            supplicant->tkip_countermeasure_tick;
+        rt_bool_t tkip = profile->pairwise_cipher ==
+                             RT_WLAN_OFFLOAD_CIPHER_TKIP ||
+                         profile->group_cipher == RT_WLAN_OFFLOAD_CIPHER_TKIP;
+
+        if (elapsed < rt_tick_from_millisecond(WPA_TKIP_COUNTERMEASURE_MS) &&
+            tkip)
+        {
+            rt_wlan_offload_crypto_zero(raw_pmk, sizeof(raw_pmk));
+            rt_mutex_release(&supplicant->lock);
+            LOG_W("TKIP association blocked during MIC countermeasures");
+            return -RT_EBUSY;
+        }
+        if (elapsed >= rt_tick_from_millisecond(
+                           WPA_TKIP_COUNTERMEASURE_MS))
+        {
+            supplicant->tkip_countermeasures_active = RT_FALSE;
+        }
+    }
     if (supplicant->state != WLAN_OFFLOAD_SUPPLICANT_IDLE)
     {
         rt_wlan_offload_crypto_zero(raw_pmk, sizeof(raw_pmk));
@@ -1571,6 +1599,7 @@ rt_bool_t rt_wlan_offload_supplicant_filter_event(
 {
     struct rt_wlan_offload_supplicant *supplicant;
     rt_bool_t consume = RT_FALSE;
+    rt_bool_t mic_disconnect = RT_FALSE;
 
     if (!radio || !event)
     {
@@ -1589,7 +1618,36 @@ rt_bool_t rt_wlan_offload_supplicant_filter_event(
     {
         return RT_FALSE;
     }
-    if (event->type == RT_WLAN_OFFLOAD_EVENT_CONNECT_RESULT &&
+    if (event->type == RT_WLAN_OFFLOAD_EVENT_TKIP_MIC_FAILURE &&
+        event->iftype == RT_WLAN_OFFLOAD_IFTYPE_STATION &&
+        supplicant->profile &&
+        (supplicant->profile->pairwise_cipher == RT_WLAN_OFFLOAD_CIPHER_TKIP ||
+         supplicant->profile->group_cipher == RT_WLAN_OFFLOAD_CIPHER_TKIP) &&
+        supplicant->state == WLAN_OFFLOAD_SUPPLICANT_CONNECTED)
+    {
+        rt_tick_t now = rt_tick_get();
+        rt_tick_t window =
+            rt_tick_from_millisecond(WPA_TKIP_COUNTERMEASURE_MS);
+
+        if (supplicant->tkip_mic_failure_valid &&
+            now - supplicant->tkip_mic_failure_tick < window)
+        {
+            supplicant->tkip_mic_failure_valid = RT_FALSE;
+            supplicant->tkip_countermeasures_active = RT_TRUE;
+            supplicant->tkip_countermeasure_tick = now;
+            rt_timer_stop(supplicant->timer);
+            supplicant_clear_locked(supplicant);
+            mic_disconnect = RT_TRUE;
+            LOG_E("second TKIP MIC failure; countermeasures enabled");
+        }
+        else
+        {
+            supplicant->tkip_mic_failure_tick = now;
+            supplicant->tkip_mic_failure_valid = RT_TRUE;
+            LOG_W("TKIP MIC failure detected");
+        }
+    }
+    else if (event->type == RT_WLAN_OFFLOAD_EVENT_CONNECT_RESULT &&
         event->request_id == supplicant->request_id &&
         (supplicant->state == WLAN_OFFLOAD_SUPPLICANT_ASSOCIATING ||
          supplicant->state == WLAN_OFFLOAD_SUPPLICANT_WAIT_M1 ||
@@ -1624,6 +1682,10 @@ rt_bool_t rt_wlan_offload_supplicant_filter_event(
         supplicant_clear_locked(supplicant);
     }
     rt_mutex_release(&supplicant->lock);
+    if (mic_disconnect)
+    {
+        supplicant_disconnect_failed_link(radio, 14U);
+    }
     return consume;
 }
 

@@ -81,6 +81,7 @@ enum rtwo_ctrl_message_type
     RTWO_CTRL_EVENT_FIRMWARE_ERROR,
     RTWO_CTRL_EVENT_EXTERNAL_AUTH_REQUIRED,
     RTWO_CTRL_EVENT_NAMES,
+    RTWO_CTRL_EVENT_TKIP_MIC_FAILURE,
 };
 
 enum rtwo_ctrl_scan_flags
@@ -309,6 +310,14 @@ struct rtwo_ctrl_firmware_error
     uint32_t reason;
     uint16_t dump_length;
     uint8_t dump[RTWO_CTRL_MAX_IE_LENGTH];
+};
+
+struct rtwo_ctrl_tkip_mic_failure
+{
+    uint8_t source[6];
+    uint8_t tsc[8];
+    uint8_t key_index;
+    uint8_t group;
 };
 
 struct rtwo_ctrl_external_auth

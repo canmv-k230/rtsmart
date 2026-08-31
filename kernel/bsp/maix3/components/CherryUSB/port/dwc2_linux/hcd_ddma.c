@@ -1058,6 +1058,14 @@ stop_scan:
     qh->td_first = idx;
 }
 
+static bool dwc2_ddma_desc_error_should_log(struct dwc2_hsotg *hsotg)
+{
+    u32 count = ++hsotg->ddma_desc_error_count;
+
+    /* Log the first four occurrences, then only powers of two. */
+    return count <= 4U || (count & (count - 1U)) == 0U;
+}
+
 static int dwc2_update_non_isoc_urb_state_ddma(struct dwc2_hsotg *hsotg,
                                                struct dwc2_host_chan *chan,
                                                struct dwc2_qtd *qtd,
@@ -1101,10 +1109,58 @@ static int dwc2_update_non_isoc_urb_state_ddma(struct dwc2_hsotg *hsotg,
                 dev_err(hsotg->dev, "XactErr\n");
             urb->status = -EPROTO;
             break;
+        case DWC2_HC_XFER_COMPLETE:
+            if (chan->hcint & HCINTMSK_XCS_XACT) {
+                /* Descriptor-DMA three-strikes halt: the device gave no
+                 * handshake to three consecutive tokens, so the core retired
+                 * the chain with XFERCOMPL and XCS_XACT both set and marked
+                 * the untouched descriptor PKTERR.  The halt dispatcher
+                 * checks XFERCOMPL first, so the halt reason arrives here as
+                 * a plain completion.  Same wire condition as XACT_ERR
+                 * above - a device that stopped answering - and some devices
+                 * do it routinely (the AIC8800 WLAN module goes deaf on its
+                 * IN endpoints while its firmware is busy with RF work), so
+                 * report the same status and leave the logging to the class
+                 * driver's retry path.
+                 */
+                dev_dbg(hsotg->dev,
+                        "XactErr (excessive transaction errors) on channel %d\n",
+                        chan->hc_num);
+                urb->status = -EPROTO;
+                break;
+            }
+            /* fall through - PKTERR on a genuine completion is unexplained */
         default:
-            dev_err(hsotg->dev,
-                    "%s: Unhandled descriptor error status (%d)\n",
-                    __func__, halt_status);
+            /* The descriptor reports a packet error while the channel halted
+             * for some other reason.  Upstream leaves urb->status alone here,
+             * but upstream's caller does not complete the URB with it the way
+             * this port does, so leaving it at its submit-time -EINPROGRESS
+             * hands the class driver "still in progress" as a final status.
+             * Report the packet error the descriptor actually described.
+             *
+             * The register dump is kept because reaching this branch means the
+             * halt reason is one this switch was not written for; without it
+             * the log says only that something unhandled happened. */
+            if (dwc2_ddma_desc_error_should_log(hsotg)) {
+                dev_err(hsotg->dev,
+                        "%s: Unhandled descriptor error status (%d), count=%u\n",
+                        __func__, halt_status,
+                        hsotg->ddma_desc_error_count);
+                dev_err(hsotg->dev,
+                        "  desc.status=%08x desc.buf=%08x hcint=%08x\n",
+                        dma_desc->status, dma_desc->buf, chan->hcint);
+                dev_err(hsotg->dev,
+                        "  HCCHAR=%08x HCINT=%08x HCINTMSK=%08x HCTSIZ=%08x\n",
+                        dwc2_readl(hsotg, HCCHAR(chan->hc_num)),
+                        dwc2_readl(hsotg, HCINT(chan->hc_num)),
+                        dwc2_readl(hsotg, HCINTMSK(chan->hc_num)),
+                        dwc2_readl(hsotg, HCTSIZ(chan->hc_num)));
+                dev_err(hsotg->dev,
+                        "  ep_type=%d in=%d mps=%d n_bytes=%d remain=%d ntd=%d\n",
+                        chan->ep_type, chan->ep_is_in, chan->max_packet,
+                        n_bytes, remain, chan->ntd);
+            }
+            urb->status = -EPROTO;
             break;
         }
         return 1;

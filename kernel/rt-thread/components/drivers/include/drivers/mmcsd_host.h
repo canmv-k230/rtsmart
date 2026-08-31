@@ -146,6 +146,7 @@ struct rt_mmcsd_host
     rt_uint32_t       sdio_irq_num;
     struct rt_semaphore    *sdio_irq_sem;
     struct rt_thread     *sdio_irq_thread;
+    volatile rt_bool_t sdio_irq_deferred;
 
     void *private_data;
 };

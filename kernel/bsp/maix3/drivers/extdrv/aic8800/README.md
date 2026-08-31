@@ -5,8 +5,8 @@ This directory contains the Apache-2.0 RT-Smart AIC8800 source implementation:
 - an RT-Thread WLAN offload Wi-Fi driver;
 - a USB boot-ROM firmware loader for AIC8800, AIC8800D80/D40, and
   AIC8800D80X2 devices;
-- an SDIO transport and boot-ROM firmware loader for AIC8801 and
-  AIC8800D80 devices;
+- an SDIO transport and boot-ROM firmware loader for AIC8801, AIC8800D80,
+  and AIC8800DC/DW/DL devices;
 - a USB Bluetooth HCI transport for BLE host stacks.
 
 `SConscript` builds the top-level `aic8800_*.c` files and the fixed-width
@@ -87,7 +87,8 @@ firmware/
 |   `-- aic8800DC/
 `-- sdio/
     |-- aic8800/
-    `-- aic8800D80/
+    |-- aic8800D80/
+    `-- aic8800DC/
 ```
 
 For a single-transport build, the SCons component stages the selected
@@ -112,11 +113,18 @@ layout:
 |   |-- fw_patch_8800d80_u02.bin
 |   |-- fw_patch_8800d80_u02_ext0.bin
 |   `-- fw_patch_table_8800d80_u02.bin
-`-- aic8800D80X2/
-    |-- fmacfw_8800d80x2.bin
-    |-- fw_adid_8800d80x2_u03.bin
-    |-- fw_patch_8800d80x2_u03.bin
-    `-- fw_patch_table_8800d80x2_u03.bin
+|-- aic8800D80X2/
+|   |-- fmacfw_8800d80x2.bin
+|   |-- fw_adid_8800d80x2_u03.bin
+|   |-- fw_patch_8800d80x2_u03.bin
+|   `-- fw_patch_table_8800d80x2_u03.bin
+`-- aic8800DC/
+    |-- fmacfw_patch_8800dc_u02.bin
+    |-- fmacfw_patch_8800dc_h_u02.bin
+    |-- fmacfw_calib_8800dc_u02.bin
+    |-- fmacfw_calib_8800dc_h_u02.bin
+    |-- fmacfw_patch_tbl_8800dc_u02.bin
+    `-- fmacfw_patch_tbl_8800dc_h_u02.bin
 ```
 
 For a dual-transport build, both trees are retained so same-named USB and SDIO
@@ -131,7 +139,8 @@ firmware cannot overwrite each other:
 |   `-- aic8800DC/
 `-- sdio/
     |-- aic8800/
-    `-- aic8800D80/
+    |-- aic8800D80/
+    `-- aic8800DC/
 ```
 
 The firmware repository is distributed separately because its vendor licensing
@@ -165,12 +174,50 @@ Supported Wi-Fi USB IDs are:
 
 An AIC8800D40 module reports the D80/D81 IDs above and its `MM_VERSION` PHY
 register advertises an 80 MHz-capable modem, so neither the product ID nor the
-firmware capabilities can distinguish it from an 80 MHz part. Set
-`AIC8800_WIFI_USB_LIMIT_40MHZ` for D40 boards. Leaving it clear makes the
-driver advertise 80 MHz bandwidth, short GI 80, an 80 MHz VHT highest data
-rate, and 80 MHz HE PPE thresholds on hardware that cannot use them; on a
-40 MHz link this was observed to hold the rate controller at MCS7 where the
-corrected capabilities reach MCS9.
+firmware capabilities can distinguish it from an 80 MHz part at startup. The
+vendor Linux driver has the same blind spot and answers it with a `use_80=0`
+module parameter; `AIC8800_WIFI_USB_LIMIT_40MHZ` is its equivalent here, and
+setting it for a known D40 board is still the way to get the first association
+right.
+
+This is confirmed hardware behaviour, not a precaution. An AIC8800D40L module
+enumerates as `a69c:8d81`, loads the `aic8800D80/` firmware, and reports an
+80 MHz modem, while the AIC8800D40 datasheet specifies "data rates up to
+286.8 Mbps with 20/40 MHz bandwidth" - 286.8 Mbps being HE40, one spatial
+stream, MCS11 at 0.8 us GI. Such a module never negotiates wider than 40 MHz,
+including against a dedicated 80 MHz AP at -51 dBm. Loading the D80 firmware is
+correct: AIC ships one image for the family, and the vendor driver likewise maps
+its D40N/D40LN/D40WN product IDs onto `PRODUCT_ID_AIC8800D80N`. Only the
+bandwidth inference is wrong.
+
+The driver corrects itself instead, so one image serves both parts. The
+firmware chooses the operating width from the AP's HT/VHT operation elements
+and its own modem, and reports the result in `SM_CONNECT_IND`. An association
+that settles for 40 MHz where the AP offered 80 MHz or more indicates the
+`MM_VERSION` width is wrong, because a station that could use 80 MHz would have
+taken it. After `AIC_BANDWIDTH_80_FAILURES` such associations the driver stops
+advertising 80 MHz and republishes `ME_CONFIG` before the next association.
+
+The threshold exists because the costs are asymmetric: capping a real
+AIC8800D80 at 40 MHz throws away half of its 600.4 Mbps, while letting an
+AIC8800D40 advertise a width it never uses costs little. So the evidence has to
+repeat, and any association that does reach 80 MHz proves the modem outright
+and clears the count. The correction is logged at warning level and lasts until
+the device is detached; `AIC8800_WIFI_USB_LIMIT_40MHZ` remains available for
+integrators who know their board and want the very first association right.
+
+This matters beyond the rate controller. The AP builds its **downlink** rate
+table from what the station advertises, so claiming a width the receiver cannot
+demodulate costs inbound frames, not just outbound rate. Uplink is unaffected
+because the station picks its own width, which makes the failure look like a
+transmit-only success: bulk sending runs at full rate while anything waiting on
+a reply - EAPOL, DHCP, a TCP handshake - stalls for seconds and then arrives in
+a burst.
+
+The AP's operating width is decoded from both VHT Operation encodings. Besides
+the deprecated width codes 2 and 3, a 160 MHz or 80+80 MHz AP may keep the
+width code at 1 and signal the width through a non-zero second centre-frequency
+segment; reading the width code alone reports such an AP as 80 MHz.
 
 Supported Wi-Fi SDIO IDs are:
 
@@ -178,6 +225,12 @@ Supported Wi-Fi SDIO IDs are:
 | --- | --- | --- |
 | AIC8801 | `5449` | `0145` |
 | AIC8800D80 | `c8a1` | `0082` |
+| AIC8800DC/DW/DL | `c8a1` | `c08d` (`c18d` on function 2) |
+
+The vendor SDIO source exposes DC and DW product enums and groups its RF/test
+assets as `AIC8800DCDWDL`; there is no separate DL product ID or DL firmware
+filename. DL modules therefore use the revision-selected files in
+`aic8800DC/`.
 
 The SDIO transport uses 512-byte fixed-address FIFO transfers, firmware flow
 control, interrupt-driven receive processing, and the D80 header CRC-8. It does
@@ -194,14 +247,26 @@ interface at `a69c:5721`; the USB driver walks the standard mass-storage
 initialization and issues the bulk-only SCSI eject, then binds the device
 after it re-enumerates with its AIC runtime ID.
 
-AIC8800DC/DW WLAN startup uses the vendor v2 TX-power ABI, revision-specific
+AIC8800DC/DW/DL WLAN startup uses the vendor v2 TX-power ABI, revision-specific
 2.4 GHz TX gain tables, 20/40 MHz RX gain tables, and DC calibration mask. The
 driver reads the chip and sub-revision before starting the firmware stack so
-the matching request formats are selected correctly. AIC8800DC/DW U02 non-H
+the matching request formats are selected correctly. AIC8800DC/DW/DL U02 non-H
 and H silicon receive their matching vendor system configuration, Wi-Fi ROM
-patch, LDPC/AGC/TX-gain tables, patch descriptor, and DPD calibration helper
-before the patched ROM is started. Other DC/DW ROM patch revisions are
-rejected explicitly until their matching host tables are ported.
+patch, LDPC/AGC/TX-gain tables, and patch descriptor before the patched ROM is
+started. USB and SDIO run the matching DPD calibration helper for both non-H
+and H silicon, following the vendor Linux configuration, and treat calibration
+failure as fatal. Other DC/DW ROM patch revisions are rejected explicitly until
+their matching host tables are ported.
+
+Configuration defaults changed with the DC/DW transport update: firmware
+station power save changed from enabled to disabled because sustained traffic
+can stop the DC/DW transmit queue and trigger the firmware AC1 assertion; USB
+data RX URBs changed from 5 to 4 for descriptor-DMA builds and from 5 to 20 for
+non-DDMA builds; USB data TX URBs changed from 2 to 64 to seed firmware air
+aggregation without enabling the vendor-disabled USB aggregate wire format; the
+previously implicit USB TX aggregation changed to disabled; and the SDIO TX
+aggregation wait changed from 1 ms to 0 ms. Board defconfigs that require the
+old power or throughput profile must set these options explicitly.
 
 ## Wi-Fi and BLE interfaces
 
@@ -237,6 +302,13 @@ table synchronized. WPA/WPA2-TKIP, WPA3-SAE, Enterprise/802.1X, WPS, FT, PMF,
 VLAN assignment, and dynamic beacon reconfiguration are not implemented for
 SoftAP.
 
+Downlink frames for a sleeping SoftAP client remain in the bounded transport
+queue. `ME_TRAFFIC_IND` updates the firmware TIM state, `MM_PS_CHANGE_IND`
+tracks whether the client is asleep, and `MM_TRAFFIC_REQ_IND` releases the
+bounded number of frames requested for a PS-Poll or U-APSD service period. QoS
+peers retain their 802.1d TID/access category, including ACM downgrade; non-QoS
+and group traffic use TID `0xff` as required by the firmware ABI.
+
 With `AIC8800_WIFI_AUTO_START=y`, both `wlan0` (station) and `wlan0ap` (AP) are
 initialized when the device attaches; the AP VIF consumes no airtime until it
 is started. Existing shell commands provide the bare interface:
@@ -268,6 +340,11 @@ channel definition when the complete four-channel block is permitted. The
 beacon and association response advertise one-stream VHT MCS 0-9, and client
 VHT capabilities are forwarded to the firmware station table. A standalone
 channel such as 165, or a block containing a restricted channel, remains 20 MHz.
+160 MHz and 80+80 MHz SoftAP are rejected: `APM_START_REQ` can carry them, but
+the beacon builder only emits a VHT operation element for 20/40/80 MHz, so
+starting one would advertise a narrower channel than the AP actually occupies.
+The advertised band maximum is 80 MHz, so only a direct
+`rt_wlan_start_ap_with_channel()` can ask for them.
 
 Station-only, SoftAP-only, and concurrent station plus SoftAP modes are
 advertised. The AIC firmware exposes one channel context, so concurrent mode
@@ -291,12 +368,16 @@ Dual-band scans are issued as consecutive 2.4 GHz and 5 GHz firmware requests
 under one WLAN offload request ID. Some AIC8800D80 firmware revisions return only
 the final band when both channel sets are supplied in one `SCANU_START_REQ`.
 RT-Thread receives `SCAN_DONE` only after both requests finish, so its scan
-cache contains results from both bands.
+cache contains results from both bands. The confirmation can arrive on the
+message endpoint before the last result indication on the data endpoint, so
+completion is deferred until the reported result count arrives or a bounded
+200 ms drain expires.
 
 The current Apache implementation does not advertise Linux-driver P2P, mesh,
 TDLS, remain-on-channel, DFS/CAC, monitor-mode frame delivery, or multiple
 channel contexts. Enterprise 802.1X still belongs in an external supplicant.
-AIC8800DC/DW U02 non-H and H Wi-Fi ROM patch and DPD calibration are supported.
+AIC8800DC/DW/DL U02 non-H and H Wi-Fi ROM patch and DPD calibration are
+supported.
 DC/DW U01, optional LOFT calibration, and the Bluetooth patch stage are not
 yet ported.
 
@@ -307,6 +388,30 @@ first. After `AIC8800_WIFI_RX_RECOVERY_ERRORS` consecutive failures, the
 transport marks the WLAN offload bus failed; the framework then restarts the bus,
 firmware stack, and previously enabled WLAN interface. Recovery counters are
 included in the endpoint shutdown log.
+
+A short run of failed bulk IN transfers is normal on this device rather than a
+fault. During association the firmware retunes and stops answering IN tokens on
+both IN endpoints together, typically for a few milliseconds of transaction
+errors followed by tens of milliseconds of silence. The retry delay therefore
+backs off on the number of re-submissions as well as the consecutive error
+count, so a stall costs a handful of transactions instead of one per
+millisecond, and runs shorter than `AIC8800_USB_RX_ERRORS_EXPECTED` are logged
+at debug level with their matching recovery notice.
+
+That demotion applies only after the endpoint has completed at least one
+transfer, tracked by `ever_completed` in the receive worker. Before the first
+completion there is no association in progress to explain the failure, so the
+error is reported at warning level however short the run is. The distinction
+matters because `LOG_D` is compiled out at the default `ULOG_OUTPUT_LVL_I`:
+without it, an endpoint that never delivers anything produces a completely
+silent log, and an attach failure shows up only as an unexplained firmware
+command timeout several seconds later.
+
+The vendor Linux driver
+does not retry a failed bulk IN URB at all - it returns the buffer to its pool
+and relies on the next successful completion to re-arm the queue - which is
+quieter still but has no way out if every queued URB fails. Retrying keeps that
+exit while the backoff and log level keep the ordinary case quiet.
 
 The SDIO receive worker distinguishes controller I/O failures from malformed
 firmware aggregates. Malformed records are discarded without taking the radio
@@ -338,48 +443,42 @@ Wi-Fi data transmission uses an asynchronous USB request and an aligned DMA
 buffer. Firmware control messages remain synchronous so command ordering and
 error reporting are preserved. A reusable frame staging buffer also removes
 per-packet heap allocation from the normal Wi-Fi transmit path. The default
-pool contains two requests: one active and one ready.
+pool contains 64 requests. This is the largest pipeline supported by the
+driver configuration and leaves half of the RT-Smart DWC2 controller's fixed
+128-request pool for receive, Bluetooth, and other USB devices. The vendor
+driver uses 200 ordinary TX URBs when USB TX aggregation is disabled; the
+deeper RT-Smart pipeline similarly lets a cold firmware receive enough records
+to establish air aggregation without requiring a preliminary traffic run.
 
 Enable `AIC8800_WIFI_DEBUG_STATS` to collect the optional USB, network, and
-receive-reorder diagnostics and export the `aic8800_stat` FinSH command. It
-also enables transmit ICMP checksum validation and firmware rate-control
-statistics used for transport tuning and fault diagnosis. With the option
-disabled, stat-only fields and per-frame accounting are not compiled.
+receive-reorder diagnostics and export the read-only `aic8800_stat` command.
+The command reports common WLAN and firmware rate-control state followed by
+USB and SDIO transport counters when those transports are configured. The
+option also enables transmit ICMP checksum validation. It defaults off so
+production builds avoid the stat-only fields and per-frame accounting.
 
-Transmit throughput is limited by the radio, not by this pool. Measured on an
-AIC8800D40 over high-speed USB with a saturated UDP stream, raising
-`AIC8800_WIFI_DATA_TX_URBS` from two to four left the fraction of submissions
-that had to wait for a free request unchanged at 96%, while `aic8800_stat`
-reported bursts of over a thousand frames submitted without ever blocking. The
-frame rate matched the rate controller's own throughput estimate for the
-negotiated MCS, so frames accumulate because the firmware drains them at the
-air rate. Deepening the pool or the queue only adds buffering latency and
-memory pressure; a 128-entry queue costs roughly 260 KB, which the USB host
-controller then cannot use for its own transfers. The vendor Linux driver keeps
-200 requests, but throttles at the network interface once free requests fall
-below a quarter of the pool, so it is not queueing 200 frames either. Raise
-either value only if `aic8800_stat` shows a low wait fraction together with a
-saturated queue, which would mean the host really is the bottleneck.
-
-`AIC8800_WIFI_TX_WAIT_MS` bounds the backpressure wait when every request is
-busy. Because transmit is normally radio-limited, this wait is what paces the
-sender: shortening it converts the stall into a dropped frame rather than
-raising throughput. Ordinary data is posted through a bounded queue to a
-dedicated transmit worker, matching the reference driver's asynchronous
-submission policy. Firmware control traffic bypasses the queue. On DC/DW,
+`AIC8800_WIFI_TX_WAIT_MS` bounds direct USB request backpressure on firmware
+families that do not use the host queue. Queued USB and SDIO admission is
+non-blocking so a saturated normal-data producer cannot hold the shared bus
+lock ahead of management or EAPOL traffic. Reserved pool entries and urgent
+queue insertion keep those records available. Ordinary data is posted through
+a bounded queue to a dedicated transmit worker, matching the reference
+driver's asynchronous submission policy. Firmware control traffic bypasses
+the queue. On DC/DW/DL,
 EAPOL and management traffic enters at the queue head so the worker applies
 the mandatory USB aggregate envelope without adding ordinary-data latency;
 unaggregated devices continue to submit it directly.
 D80/D80X2 records remain unaggregated because their bundled runtime does not
 accept the vendor DC/DW aggregate envelope. Transmit completion, byte,
-queue-wait, burst, and error counters are printed when the bus stops.
+queue-wait, burst, and error counters are printed when the bus stops if
+`AIC8800_WIFI_DEBUG_STATS` is enabled.
 
 The receive workers must run at a higher priority than the transmit worker.
 They rearm the bulk IN requests, so if the transmit worker can preempt them a
 saturated transmit path stops receive entirely. Keep
 `AIC8800_WIFI_RX_THREAD_PRIORITY` ahead of
-`AIC8800_WIFI_USB_TX_THREAD_PRIORITY`; `aic8800_stat` reports the receive
-completion backlog high-water mark to confirm the workers are keeping up.
+`AIC8800_WIFI_USB_TX_THREAD_PRIORITY`. With debug statistics enabled, the
+endpoint shutdown log includes the receive completion backlog high-water mark.
 
 USB and SDIO receive data marked `flags_need_reord` by the firmware is reordered
 per VIF, station, QoS TID, and 12-bit 802.11 sequence number before it reaches
@@ -391,12 +490,10 @@ records bypass reordering as they do in the reference driver. USB receive
 records are copied into the assembly buffer before the request is rearmed, so
 command responses cannot race reuse of the DMA buffer.
 
-SDIO TX waits once, before taking the transport mutex, for up to 1 ms for a
-second queued frame. It then drains the remaining ready records without
-blocking and combines them into the firmware's 32-frame CMD53 aggregate. Queue
-admission applies up to `AIC8800_WIFI_TX_WAIT_MS` of producer backpressure when
-the bounded pool is saturated instead of immediately dropping socket traffic.
-Four records remain reserved for EAPOL and other high-priority traffic, while
+SDIO TX drains ready records without blocking and combines them into the
+firmware's 32-frame CMD53 aggregate. Queue admission never waits while holding
+the shared bus lock. Four records remain reserved for EAPOL and other
+high-priority traffic, while
 firmware control traffic bypasses the data queue. The standard lwIP Ethernet TX
 worker keeps this wait out of application threads. Queue reset is serialized
 with producers so recovery and shutdown cannot strand TX pool records.
@@ -419,6 +516,15 @@ overhead.
 started but idle. A country change is rejected during scan, association, or an
 active connection. If the firmware rejects the replacement channel table, the
 driver restores the previous country and channel metadata.
+
+The country table gates channel validity and the maximum power reported to the
+host stack, but by default it does not cap the power programmed into the
+firmware. The firmware transmits at the minimum of the per-channel value and
+the per-rate userconfig targets (20/18/16 dBm), and the vendor Linux driver
+fills the per-channel field with a flat 30 dBm so the targets alone decide.
+Set
+`AIC8800_WIFI_COUNTRY_TX_POWER_LIMIT=y` to enforce the country value as a hard
+firmware cap.
 
 With the USB transport, `AIC8800_WIFI_BLE=y` exposes the standard Bluetooth USB interface
 (`e0/01/01`) is registered by the common HCI framework as the next available
