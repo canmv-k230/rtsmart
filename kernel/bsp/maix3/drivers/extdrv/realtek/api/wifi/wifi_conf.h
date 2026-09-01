@@ -184,6 +184,9 @@ int wifi_connect(
  * @return  RTW_ERROR: if an error occurred.
  * @note  Please make sure the Wi-Fi is enabled before invoking this function. (@ref wifi_on())
  * @note  The difference between @ref wifi_connect_bssid() and @ref wifi_connect() is that BSSID has higher priority as the basis of connection in @ref wifi_connect_bssid.
+ * @note  On 64-bit platforms, scan the target AP before calling this function;
+ *        the legacy ioctl can pass the BSSID but cannot carry its 32-bit SSID
+ *        pointer extension.
  */
 int wifi_connect_bssid(
 	unsigned char 		bssid[ETH_ALEN],

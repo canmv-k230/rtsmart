@@ -1089,8 +1089,13 @@ static rt_int32_t sdio_init_card(struct rt_mmcsd_host *host, rt_uint32_t ocr)
     }
 
 
-    /* register sdio card */
+    /* Driver probes may start worker threads which access the card, or stop
+     * those threads again while recovering from an initialization error.  Do
+     * not keep the bus locked across probe: a worker cannot otherwise complete
+     * its SDIO request and the probe deadlocks waiting for that worker. */
+    mmcsd_host_unlock(host);
     err = sdio_register_card(card);
+    mmcsd_host_lock(host);
     if (err == -RT_EBUSY)
     {
         return err;

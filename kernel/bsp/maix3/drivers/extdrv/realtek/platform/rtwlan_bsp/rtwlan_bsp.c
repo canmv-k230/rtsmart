@@ -30,6 +30,9 @@ static void wlan_log_tx_power(const char* ifname);
 #ifndef REALTEK_AUTOLOAD_RETRY_DELAY_MS
 #define REALTEK_AUTOLOAD_RETRY_DELAY_MS 100
 #endif
+#ifndef REALTEK_JOIN_RETRY_DELAY_MS
+#define REALTEK_JOIN_RETRY_DELAY_MS 100
+#endif
 #ifndef REALTEK_COUNTRY_CODE
 #define REALTEK_COUNTRY_CODE "CN"
 #endif
@@ -228,10 +231,22 @@ static rtw_result_t scan_result_handler(rtw_scan_handler_result_t* malloced_scan
         return RTW_SUCCESS;
     }
     rtw_scan_result_t* record = &malloced_scan_result->ap_details;
-    /* rtw_security_t and rtw_802_11_band_t are numerically identical to their
-     * rt_wlan counterparts, so both carry straight across. */
+    /* rtw_security_t is numerically identical to the rt_wlan counterpart. */
     wlan_info.security = record->security;
-    wlan_info.band = record->band;
+#if defined(REALTEK_SDIO_RTL8189FTV)
+    /* The RTL8189FTV library leaves record->band at its zero-filled value,
+     * which means 5 GHz in this API even though the chip is 2.4-GHz-only. */
+    wlan_info.band = RT_802_11_BAND_2_4GHZ;
+#else
+    /* Channel is reliable with older dual-band library builds which did not
+     * populate the band member of rtw_scan_result_t. */
+    if (record->channel >= 1 && record->channel <= 14)
+        wlan_info.band = RT_802_11_BAND_2_4GHZ;
+    else if (record->channel > 14)
+        wlan_info.band = RT_802_11_BAND_5GHZ;
+    else
+        wlan_info.band = record->band;
+#endif
     /* rtw_scan_result_t carries no rate, so leave it unreported rather than
      * inventing one; this is why the Mbps column of "wifi scan" reads 0. */
     wlan_info.datarate = 0;
@@ -260,6 +275,7 @@ static rt_err_t wlan_scan(struct rt_wlan_device* wlan, struct rt_scan_info* scan
 static rt_err_t wlan_join(struct rt_wlan_device* wlan, struct rt_sta_info* sta_info)
 {
     int ret;
+    int reason;
 
     if (wifi_is_up(RTW_AP_INTERFACE)) {
         wifi_off();
@@ -272,15 +288,35 @@ static rt_err_t wlan_join(struct rt_wlan_device* wlan, struct rt_sta_info* sta_i
         }
     }
 
+    /* The vendor BSSID join ABI embeds a 32-bit pointer in ioctl payload data
+     * and is not safe on K230's RV64 build. Use the firmware's established
+     * SSID association path for both Realtek variants. */
     ret = wifi_connect(sta_info->ssid.val, sta_info->security, sta_info->key.val,
         sta_info->ssid.len, sta_info->key.len, 0, NULL);
+    reason = wifi_get_last_error();
+    if (ret == RTW_ERROR &&
+        (reason == RTW_NONE_NETWORK || reason == RTW_CONNECT_FAIL)) {
+        /* The firmware performs another scan for an SSID join and can miss the
+         * target or reject the first association attempt immediately after
+         * switching channels. Retry generic transient failures once without
+         * masking key and handshake errors. */
+        LOG_W("join %.*s transient failure reason=%d; retrying",
+              sta_info->ssid.len, sta_info->ssid.val, reason);
+        rt_thread_mdelay(REALTEK_JOIN_RETRY_DELAY_MS);
+        ret = wifi_connect(sta_info->ssid.val, sta_info->security,
+            sta_info->key.val, sta_info->ssid.len, sta_info->key.len, 0, NULL);
+    }
     if (ret == RTW_SUCCESS)
         wlan_log_tx_power(WLAN0_NAME);
+    else
+        LOG_W("join %.*s failed: rtw=%d reason=%d",
+              sta_info->ssid.len, sta_info->ssid.val,
+              ret, wifi_get_last_error());
 out:
     rt_wlan_dev_indicate_event_handle(&wlan_sta, ret ? RT_WLAN_DEV_EVT_CONNECT_FAIL :
         RT_WLAN_DEV_EVT_CONNECT, NULL);
 
-    return ret;
+    return ret == RTW_SUCCESS ? RT_EOK : -RT_ERROR;
 }
 
 static rt_err_t wlan_softap(struct rt_wlan_device* wlan, struct rt_ap_info* ap_info)
@@ -324,13 +360,15 @@ out:
 
 static rt_err_t wlan_disconnect(struct rt_wlan_device* wlan)
 {
-    int ret;
+    if (wifi_is_connected_to_ap() != RTW_SUCCESS) {
+        rt_wlan_dev_indicate_event_handle(wlan, RT_WLAN_DEV_EVT_DISCONNECT,
+                                          NULL);
+        return RT_EOK;
+    }
 
-    ret = wifi_disconnect();
-    if (ret == 0)
-        rt_wlan_dev_indicate_event_handle(&wlan_sta, RT_WLAN_DEV_EVT_DISCONNECT, NULL);
-
-    return ret;
+    /* wlan_event_indication() forwards the firmware's disconnect event.  Do
+     * not complete the RT-Thread request before that teardown has finished. */
+    return wifi_disconnect();
 }
 
 static rt_err_t wlan_ap_stop(struct rt_wlan_device* wlan)

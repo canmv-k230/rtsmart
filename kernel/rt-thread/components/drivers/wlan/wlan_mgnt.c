@@ -1350,9 +1350,10 @@ rt_err_t rt_wlan_connect_by_band(const char *ssid, const char *password,
     SSID_SET(&scan_info, ssid);
     scan_info.band = band;
     MGNT_LOCK();
-    while (scan_retry-- &&
-           rt_wlan_find_best_by_cache_band(ssid, band, &info) != RT_TRUE)
+    while (rt_wlan_find_best_by_cache_band(ssid, band, &info) != RT_TRUE &&
+           scan_retry > 0)
     {
+        scan_retry--;
         /* Match the reference cfg80211 path: include the requested SSID so
          * firmware sends a directed probe instead of relying on beacons and
          * wildcard probe responses. */

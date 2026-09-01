@@ -19,6 +19,7 @@
 #define SCAN_USE_SEMAPHORE	0
 
 #define RTW_JOIN_TIMEOUT 15000
+#define RTW_DISCONNECT_TIMEOUT 5000
 
 #define JOIN_ASSOCIATED             (uint32_t)(1 << 0)
 #define JOIN_AUTHENTICATED          (uint32_t)(1 << 1)
@@ -232,6 +233,10 @@ static int wifi_connect_bssid_local(rtw_network_info_t *pWifi)
 		case RTW_SECURITY_WPA_AES_PSK:
 		case RTW_SECURITY_WPA2_AES_PSK:
 		case RTW_SECURITY_WPA2_MIXED_PSK:
+		case RTW_SECURITY_WPA_WPA2_MIXED_PSK:
+#if CONFIG_SAE_SUPPORT
+		case RTW_SECURITY_WPA3_AES_PSK:
+#endif
 			ret = wext_set_auth_param(WLAN0_NAME, IW_AUTH_80211_AUTH_ALG, IW_AUTH_ALG_OPEN_SYSTEM);
 			if(ret == 0)
 				ret = wext_set_key_ext(WLAN0_NAME, IW_ENCODE_ALG_CCMP, NULL, 0, 0, 0, 0, NULL, 0);
@@ -245,11 +250,18 @@ static int wifi_connect_bssid_local(rtw_network_info_t *pWifi)
 	}
 	if(ret == 0){
 		memcpy(bssid, pWifi->bssid.octet, ETH_ALEN);
+#if UINTPTR_MAX == UINT32_MAX
+		/* The vendor ioctl encodes a 32-bit rtw_network_info_t pointer in
+		 * the six bytes following the BSSID. */
 		if(pWifi->ssid.len){
 			bssid[ETH_ALEN] = '#';
 			bssid[ETH_ALEN + 1] = '@';
 			memcpy(bssid + ETH_ALEN + 2, &pWifi, sizeof(pWifi));
 		}
+#else
+		/* The private extension cannot carry an RV64 pointer. Use the
+		 * library's plain-BSSID path; callers must scan the AP first. */
+#endif
 		ret = wext_set_bssid(WLAN0_NAME, bssid);
 	}
 	return ret;
@@ -266,6 +278,24 @@ static void wifi_no_network_hdl(char* buf, int buf_len, int flags, void* userdat
  	 rtw_join_status = JOIN_NO_NETWORKS | JOIN_CONNECTING;
 }
 
+static rtw_bool_t wifi_security_uses_handshake(rtw_security_t security_type)
+{
+	switch(security_type){
+		case RTW_SECURITY_WPA_TKIP_PSK:
+		case RTW_SECURITY_WPA_AES_PSK:
+		case RTW_SECURITY_WPA2_TKIP_PSK:
+		case RTW_SECURITY_WPA2_AES_PSK:
+		case RTW_SECURITY_WPA2_MIXED_PSK:
+		case RTW_SECURITY_WPA_WPA2_MIXED_PSK:
+#if CONFIG_SAE_SUPPORT
+		case RTW_SECURITY_WPA3_AES_PSK:
+#endif
+			return RTW_TRUE;
+		default:
+			return RTW_FALSE;
+	}
+}
+
 static void wifi_connected_hdl( char* buf, int buf_len, int flags, void* userdata)
 {
 	rtw_memcpy(ap_bssid, buf, ETH_ALEN);
@@ -277,13 +307,10 @@ static void wifi_connected_hdl( char* buf, int buf_len, int flags, void* userdat
 	}
 #endif /* CONFIG_ENABLE_EAP */
 	
-	if((join_user_data!=NULL)&&((join_user_data->network_info.security_type == RTW_SECURITY_OPEN) ||
-		(join_user_data->network_info.security_type == RTW_SECURITY_WEP_PSK) ||
-		(join_user_data->network_info.security_type == RTW_SECURITY_WEP_SHARED))){
+	if(join_user_data != NULL){
 		rtw_join_status = JOIN_COMPLETE | JOIN_SECURITY_COMPLETE | JOIN_ASSOCIATED | JOIN_AUTHENTICATED | JOIN_LINK_READY | JOIN_CONNECTING;
-		rtw_up_sema(&join_user_data->join_sema);
-	}else if((join_user_data!=NULL)&&((join_user_data->network_info.security_type == RTW_SECURITY_WPA2_AES_PSK) )){
-		rtw_join_status = JOIN_COMPLETE | JOIN_SECURITY_COMPLETE | JOIN_ASSOCIATED | JOIN_AUTHENTICATED | JOIN_LINK_READY | JOIN_CONNECTING;
+		if(!wifi_security_uses_handshake(join_user_data->network_info.security_type))
+			rtw_up_sema(&join_user_data->join_sema);
 	}
 }
 static void wifi_handshake_done_hdl( char* buf, int buf_len, int flags, void* userdata)
@@ -301,34 +328,18 @@ static void wifi_disconn_hdl( char* buf, int buf_len, int flags, void* userdata)
 	disconn_reason =*(u16*)(buf+6);
 
 	if(join_user_data != NULL){
-		if(join_user_data->network_info.security_type == RTW_SECURITY_OPEN){
-
-			if(rtw_join_status & JOIN_NO_NETWORKS)
-				error_flag = RTW_NONE_NETWORK;
-
-		}else if(join_user_data->network_info.security_type == RTW_SECURITY_WEP_PSK){
-
-			if(rtw_join_status & JOIN_NO_NETWORKS)
-				error_flag = RTW_NONE_NETWORK;
-
-			else if(rtw_join_status == 0)
-		 		error_flag = RTW_CONNECT_FAIL;
-
-		}else if(join_user_data->network_info.security_type == RTW_SECURITY_WPA2_AES_PSK){
-
-			if(rtw_join_status & JOIN_NO_NETWORKS)
-				error_flag = RTW_NONE_NETWORK;
-
-			else if(rtw_join_status == 0)
-		 		error_flag = RTW_CONNECT_FAIL;
-
-			else if(rtw_join_status == (JOIN_COMPLETE | JOIN_SECURITY_COMPLETE | JOIN_ASSOCIATED | JOIN_AUTHENTICATED | JOIN_LINK_READY | JOIN_CONNECTING))
-			{
-				 if(disconn_reason == REASON_4WAY_HNDSHK_TIMEOUT)
-					error_flag = RTW_4WAY_HANDSHAKE_TIMEOUT;
-				else
-					error_flag = RTW_WRONG_PASSWORD;	
-			}
+		if(rtw_join_status & JOIN_NO_NETWORKS){
+			error_flag = RTW_NONE_NETWORK;
+		}else if(!(rtw_join_status & JOIN_ASSOCIATED)){
+			error_flag = RTW_CONNECT_FAIL;
+		}else if(wifi_security_uses_handshake(join_user_data->network_info.security_type) &&
+			 !(rtw_join_status & JOIN_HANDSHAKE_DONE)){
+			if(disconn_reason == REASON_4WAY_HNDSHK_TIMEOUT)
+				error_flag = RTW_4WAY_HANDSHAKE_TIMEOUT;
+			else
+				error_flag = RTW_WRONG_PASSWORD;
+		}else{
+			error_flag = RTW_CONNECT_FAIL;
 		}
 		
 	}else{
@@ -345,6 +356,10 @@ static void wifi_disconn_hdl( char* buf, int buf_len, int flags, void* userdata)
 #endif
 #endif
 
+	/* Do not carry association state into the next join.  RT-Thread waits for
+	 * this disconnect indication before starting a replacement connection. */
+	rtw_join_status &= (JOIN_SIMPLE_CONFIG | JOIN_AIRKISS);
+
 	if(join_user_data != NULL)
 		rtw_up_sema(&join_user_data->join_sema);
 	//DBG_INFO("WiFi Disconnect. Error flag is %d.\n", error_flag);
@@ -357,6 +372,41 @@ static void wifi_disconn_hdl( char* buf, int buf_len, int flags, void* userdata)
 #endif
 }
 
+static rtw_result_t wifi_disconnect_before_join(void)
+{
+	u32 start;
+
+	if(join_user_data == NULL &&
+	   wifi_is_connected_to_ap() != RTW_SUCCESS){
+		rtw_join_status &= (JOIN_SIMPLE_CONFIG | JOIN_AIRKISS);
+		return RTW_SUCCESS;
+	}
+
+	if(wifi_disconnect() < 0){
+		DBG_INFO("wifi_disconnect Operation failed!");
+		error_flag = RTW_CONNECT_FAIL;
+		return RTW_ERROR;
+	}
+
+	start = rtw_get_current_time();
+	while((rtw_join_status & (JOIN_ASSOCIATED | JOIN_CONNECTING)) ||
+		  join_user_data != NULL){
+		if(join_user_data == NULL &&
+		   wifi_is_connected_to_ap() != RTW_SUCCESS){
+			rtw_join_status &= (JOIN_SIMPLE_CONFIG | JOIN_AIRKISS);
+			break;
+		}
+		if(rtw_get_passing_time_ms(start) >= RTW_DISCONNECT_TIMEOUT){
+			DBG_INFO("RTW API: Disconnect before join timeout\r\n");
+			error_flag = RTW_CONNECT_FAIL;
+			return RTW_TIMEOUT;
+		}
+		rtw_msleep_os(1);
+	}
+
+	return RTW_SUCCESS;
+}
+
 //----------------------------------------------------------------------------//
 int wifi_connect(
 	char 				*ssid,
@@ -367,19 +417,15 @@ int wifi_connect(
 	int 				key_id,
 	void 				*semaphore)
 {
-	_sema join_semaphore;
+	_sema join_semaphore = NULL;
 	rtw_result_t result = RTW_SUCCESS;
 	u8 wep_hex = 0;
 	u8 wep_pwd[14] = {0};
 
-	if(rtw_join_status & (JOIN_ASSOCIATED||JOIN_CONNECTING)){
-		if(wifi_disconnect() < 0){
-			DBG_INFO("wifi_disconnect Operation failed!");
-			return RTW_ERROR;
-		}
-		while(rtw_join_status & JOIN_CONNECTING){
-			rtw_msleep_os(1);
-		}
+	if(rtw_join_status & (JOIN_ASSOCIATED | JOIN_CONNECTING)){
+		result = wifi_disconnect_before_join();
+		if(result != RTW_SUCCESS)
+			return result;
 	}
 
 	if(rtw_join_status & JOIN_SIMPLE_CONFIG || rtw_join_status & JOIN_AIRKISS){
@@ -394,7 +440,8 @@ int wifi_connect(
              ( security_type == RTW_SECURITY_WPA_AES_PSK ) ||
              ( security_type == RTW_SECURITY_WPA2_AES_PSK ) ||
              ( security_type == RTW_SECURITY_WPA2_TKIP_PSK ) ||
-             ( security_type == RTW_SECURITY_WPA2_MIXED_PSK )
+             ( security_type == RTW_SECURITY_WPA2_MIXED_PSK ) ||
+             ( security_type == RTW_SECURITY_WPA_WPA2_MIXED_PSK )
 #if CONFIG_SAE_SUPPORT
 			 || ( security_type == RTW_SECURITY_WPA3_AES_PSK)
 #endif
@@ -487,7 +534,7 @@ int wifi_connect(
 	rtw_join_status = JOIN_CONNECTING;
 	join_user_data = join_result;
 
-	wifi_connect_local(&join_result->network_info);
+	result = (rtw_result_t)wifi_connect_local(&join_result->network_info);
 
 #if CONFIG_WIFI_IND_USE_THREAD
 	if(disconnect_sema != NULL){
@@ -495,6 +542,13 @@ int wifi_connect(
 		rtw_free_sema( &disconnect_sema);
 	}
 #endif
+	if(result != RTW_SUCCESS) {
+		error_flag = RTW_CONNECT_FAIL;
+		if(password_len) {
+			rtw_free(join_result->network_info.password);
+		}
+		goto error;
+	}
 
 
 	if(semaphore == NULL) {
@@ -503,6 +557,8 @@ int wifi_connect(
 		if(get_eap_phase()){
 			if(rtw_down_timeout_sema( &join_result->join_sema, 60000 ) == RTW_FALSE) {
 				DBG_INFO("RTW API: Join bss timeout\r\n");
+				if(error_flag == RTW_UNKNOWN)
+					error_flag = RTW_CONNECT_FAIL;
 				if(password_len) {
 					rtw_free(join_result->network_info.password);
 				}
@@ -510,6 +566,8 @@ int wifi_connect(
 				goto error;
 			} else {
 				if(wifi_is_connected_to_ap( ) != RTW_SUCCESS) {
+					if(error_flag == RTW_UNKNOWN)
+						error_flag = RTW_CONNECT_FAIL;
 					result = RTW_ERROR;
 					goto error;
 				}
@@ -520,6 +578,8 @@ int wifi_connect(
 		if(rtw_down_timeout_sema( &join_result->join_sema, RTW_JOIN_TIMEOUT ) == RTW_FALSE) {
 			rtw_indicate_connect_timeout();
 			DBG_INFO("RTW API: Join bss timeout\r\n");
+			if(error_flag == RTW_UNKNOWN)
+				error_flag = RTW_CONNECT_FAIL;
 			if(password_len) {
 				rtw_free(join_result->network_info.password);
 			}
@@ -530,12 +590,15 @@ int wifi_connect(
 				rtw_free(join_result->network_info.password);
 			}
 			if(wifi_is_connected_to_ap( ) != RTW_SUCCESS) {
+				if(error_flag == RTW_UNKNOWN)
+					error_flag = RTW_CONNECT_FAIL;
 				result = RTW_ERROR;
 				goto error;
 			}
 		}
 	}
 
+	error_flag = RTW_NO_ERROR;
 	result = RTW_SUCCESS;
 #if CONFIG_LWIP_LAYER
 #if defined(CONFIG_PLATFOMR_CUSTOMER_RTOS)
@@ -569,19 +632,15 @@ int wifi_connect_bssid(
 	int 				key_id,
 	void 				*semaphore)
 {
-	_sema join_semaphore;
+	_sema join_semaphore = NULL;
 	rtw_result_t result = RTW_SUCCESS;
     u8 wep_hex = 0;
 	u8 wep_pwd[14] = {0};
 	
-	if(rtw_join_status & JOIN_CONNECTING){
-		if(wifi_disconnect() < 0){
-			DBG_INFO("wifi_disconnect Operation failed!");
-			return RTW_ERROR;
-		}
-		while(rtw_join_status & JOIN_CONNECTING){
-			rtw_mdelay_os(1);
-		}
+	if(rtw_join_status & (JOIN_ASSOCIATED | JOIN_CONNECTING)){
+		result = wifi_disconnect_before_join();
+		if(result != RTW_SUCCESS)
+			return result;
 	}
 
 	if(rtw_join_status & JOIN_SIMPLE_CONFIG || rtw_join_status & JOIN_AIRKISS){
@@ -597,7 +656,13 @@ int wifi_connect_bssid(
              ( security_type == RTW_SECURITY_WPA_AES_PSK ) ||
              ( security_type == RTW_SECURITY_WPA2_AES_PSK ) ||
              ( security_type == RTW_SECURITY_WPA2_TKIP_PSK ) ||
-             ( security_type == RTW_SECURITY_WPA2_MIXED_PSK ) ) )) {
+             ( security_type == RTW_SECURITY_WPA2_MIXED_PSK ) ||
+             ( security_type == RTW_SECURITY_WPA_WPA2_MIXED_PSK )
+#if CONFIG_SAE_SUPPORT
+			 || ( security_type == RTW_SECURITY_WPA3_AES_PSK)
+#endif
+	) )) {
+		error_flag = RTW_WRONG_PASSWORD;
 		return RTW_INVALID_KEY;
 	}
 
@@ -678,13 +743,21 @@ int wifi_connect_bssid(
 	wifi_reg_event_handler(WIFI_EVENT_FOURWAY_HANDSHAKE_DONE, wifi_handshake_done_hdl, NULL);
 
 	rtw_join_status = JOIN_CONNECTING;
-	wifi_connect_bssid_local(&join_result->network_info);
-
 	join_user_data = join_result;
+	result = (rtw_result_t)wifi_connect_bssid_local(&join_result->network_info);
+	if(result != RTW_SUCCESS) {
+		error_flag = RTW_CONNECT_FAIL;
+		if(password_len) {
+			rtw_free(join_result->network_info.password);
+		}
+		goto error;
+	}
 
 	if(semaphore == NULL) {
 		if(rtw_down_timeout_sema( &join_result->join_sema, RTW_JOIN_TIMEOUT ) == RTW_FALSE) {
 			DBG_INFO("RTW API: Join bss timeout\r\n");
+			if(error_flag == RTW_UNKNOWN)
+				error_flag = RTW_CONNECT_FAIL;
 			if(password_len) {
 				rtw_free(join_result->network_info.password);
 			}
@@ -695,12 +768,15 @@ int wifi_connect_bssid(
 				rtw_free(join_result->network_info.password);
 			}
 			if( wifi_is_connected_to_ap( ) != RTW_SUCCESS) {
+				if(error_flag == RTW_UNKNOWN)
+					error_flag = RTW_CONNECT_FAIL;
 				result = RTW_ERROR;
 				goto error;
 			}
 		}
 	}
 
+	error_flag = RTW_NO_ERROR;
 	result = RTW_SUCCESS;
 	
 #if CONFIG_LWIP_LAYER
