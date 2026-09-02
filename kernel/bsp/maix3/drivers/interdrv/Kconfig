@@ -413,6 +413,27 @@ menu "InterDriver"
                     Maximum amount of data submitted in one eMMC request. The
                     SDHCI driver allocates an equally sized persistent SDMA
                     bounce buffer for the eMMC host.
+
+            config BSP_SDIO_STORAGE_WRITE_TIMEOUT_MS
+                int "SD/MMC storage write request watchdog (ms)"
+                default 5000
+                range 1000 120000
+                help
+                    Software watchdog applied to a complete write request for
+                    SD, MMC/eMMC, and SDIO combo storage. Slow managed-flash
+                    storage can occasionally spend seconds doing internal
+                    garbage collection during metadata-heavy workloads. This
+                    watchdog is independent of the controller instance and is
+                    separate from the controller data timeout.
+
+            config BSP_SDIO_IO_WRITE_TIMEOUT_MS
+                int "SDIO device write request watchdog (ms)"
+                default 1000
+                range 1000 120000
+                help
+                    Software watchdog applied to a complete SDIO CMD53 write
+                    request, including I/O functions on SDIO combo cards. This
+                    setting is independent of the controller instance.
         endif
 
     menuconfig RT_USING_SPI

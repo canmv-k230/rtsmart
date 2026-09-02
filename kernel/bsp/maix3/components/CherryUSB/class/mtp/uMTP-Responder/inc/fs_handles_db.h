@@ -38,7 +38,10 @@ struct fs_entry
 	uint32_t handle;
 	uint32_t parent;
 	uint32_t storage_id;
-	char name[FS_HANDLE_MAX_FILENAME_SIZE + 1];
+	/* Points into the variable-sized record, or to a replacement after rename. */
+	char * name;
+	uint16_t name_capacity;
+	uint32_t record_size;
 	uint32_t flags;
 	uint32_t edit_session_id;
 	mtp_size size;
@@ -58,6 +61,7 @@ struct fs_entry
 #define ENTRY_IS_DIR 0x00000001
 #define ENTRY_IS_DELETED 0x00000002
 #define ENTRY_FROM_DB_POOL 0x00000004
+#define ENTRY_NAME_SEPARATE 0x00000008
 
 #define _DEF_FS_HANDLES_ 1
 
@@ -74,9 +78,12 @@ typedef struct fs_handles_db_
 	fs_entry ** handle_cache;
 	uint32_t entry_cache_bucket_count;
 
-	fs_entry * entry_pool;
-	uint32_t entry_pool_count;
-	uint32_t entry_pool_next;
+	/* Byte arena containing variable-sized fs_entry + filename records. */
+	unsigned char * entry_pool;
+	uint32_t entry_pool_size;
+	uint32_t entry_pool_used;
+	uint32_t entry_pool_allocations;
+	uint32_t entry_count;
 	int entry_pool_exhausted;
 	fs_entry * free_entry_list;
 
@@ -112,6 +119,8 @@ fs_entry * get_entry_by_storageid( fs_handles_db * db, uint32_t storage_id, fs_e
 fs_entry * add_entry(fs_handles_db * db, filefoundinfo *fileinfo, uint32_t parent, uint32_t storage_id);
 fs_entry * search_entry(fs_handles_db * db, filefoundinfo *fileinfo, uint32_t parent, uint32_t storage_id);
 fs_entry * alloc_root_entry(fs_handles_db * db, uint32_t storage_id);
+int fs_entry_set_name(fs_entry * entry, const char * name);
+void fs_entry_compact_name(fs_entry * entry);
 void fs_rebuild_entry_cache(fs_handles_db * db);
 void fs_invalidate_scan_cache(fs_handles_db * db);
 void fs_invalidate_scan_cache_context(void * mtp_ctx);

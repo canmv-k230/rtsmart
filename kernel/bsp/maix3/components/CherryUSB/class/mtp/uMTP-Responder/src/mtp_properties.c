@@ -527,19 +527,22 @@ int setObjectPropValue(mtp_ctx * ctx,MTP_PACKET_HEADER * mtp_packet_hdr, uint32_
 
 				strncpy(old_filename, entry->name, FS_HANDLE_MAX_FILENAME_SIZE);
 				old_filename[FS_HANDLE_MAX_FILENAME_SIZE] = '\0';
-				strncpy(entry->name, tmpstr, FS_HANDLE_MAX_FILENAME_SIZE);
-				entry->name[FS_HANDLE_MAX_FILENAME_SIZE] = '\0';
+				if( fs_entry_set_name(entry, tmpstr) )
+				{
+					free(path);
+					return MTP_RESPONSE_GENERAL_ERROR;
+				}
 
 				path2 = build_full_path(ctx->fs_db, mtp_get_storage_root(ctx, entry->storage_id), entry);
 				if(!path2)
 				{
-					strcpy(entry->name, old_filename);
+					fs_entry_set_name(entry, old_filename);
 					free(path);
 					return MTP_RESPONSE_GENERAL_ERROR;
 				}
 				if( strcmp(path, path2) && !stat(path2, &target_stat) )
 				{
-					strcpy(entry->name, old_filename);
+					fs_entry_set_name(entry, old_filename);
 					free(path);
 					free(path2);
 					return MTP_RESPONSE_ACCESS_DENIED;
@@ -557,7 +560,7 @@ int setObjectPropValue(mtp_ctx * ctx,MTP_PACKET_HEADER * mtp_packet_hdr, uint32_
 				{
 					PRINT_ERROR("setObjectPropValue : Can't rename %s to %s", path, path2);
 
-					strcpy(entry->name, old_filename);
+					fs_entry_set_name(entry, old_filename);
 
 					free(path);
 					free(path2);
@@ -566,6 +569,7 @@ int setObjectPropValue(mtp_ctx * ctx,MTP_PACKET_HEADER * mtp_packet_hdr, uint32_
 
 				free(path);
 				free(path2);
+				fs_entry_compact_name(entry);
 				fs_rebuild_entry_cache(ctx->fs_db);
 				fs_invalidate_scan_cache(ctx->fs_db);
 				return MTP_RESPONSE_OK;

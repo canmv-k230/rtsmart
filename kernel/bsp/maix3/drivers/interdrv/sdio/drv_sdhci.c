@@ -77,6 +77,13 @@
 #define SDHCI_TUNING_TIMEOUT_MS 50
 #define SDHCI_TUNING_TOTAL_TIMEOUT_MS 2000
 #define SDHCI_COMMAND_TIMEOUT_MS 1000
+#ifndef BSP_SDIO_STORAGE_WRITE_TIMEOUT_MS
+#define BSP_SDIO_STORAGE_WRITE_TIMEOUT_MS 5000U
+#endif
+#ifndef BSP_SDIO_IO_WRITE_TIMEOUT_MS
+#define BSP_SDIO_IO_WRITE_TIMEOUT_MS 1000U
+#endif
+#define SDHCI_SLOW_WRITE_WARN_MS 1000U
 #define SDHCI0_BASE_CLOCK 200000000U
 #define SDHCI1_BASE_CLOCK 100000000U
 #define SDHCI_CARD_MIN_CLOCK 400000U
@@ -379,6 +386,14 @@ static rt_tick_t sdhci_ms_to_tick(rt_uint32_t ms)
     return tick ? (rt_tick_t)tick : 1;
 }
 
+static rt_uint32_t sdhci_write_timeout_ms(const struct rt_mmcsd_cmd *cmd)
+{
+    if (cmd->cmd_code == SD_IO_RW_EXTENDED)
+        return BSP_SDIO_IO_WRITE_TIMEOUT_MS;
+
+    return BSP_SDIO_STORAGE_WRITE_TIMEOUT_MS;
+}
+
 static rt_err_t sdhci_wait_internal_clock(struct sdhci_host* host)
 {
     rt_uint32_t timeout = 150000U;
@@ -547,18 +562,38 @@ static rt_err_t sdhci_transfer_data_blocking(struct sdhci_host* sdhci_host, stru
 #ifdef SDHCI_SDMA_ENABLE
     rt_err_t err;
     rt_uint32_t event;
+    rt_uint32_t status;
+    rt_tick_t start;
+    rt_tick_t elapsed;
 
     /* SDMA boundary crossings are serviced in sdhci_irq(); this only has to
      * wait for the transfer to end.  The only bits sdhci_irq() forwards are
      * the two waited on here, so one recv decides the transfer. */
+    start = rt_tick_get();
     err = rt_event_recv(&sdhci_host->event,
         SDHCI_INT_ERROR | SDHCI_INT_DATA_END,
         RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR,
         sdhci_ms_to_tick(data->timeoutMs), &event);
+    elapsed = rt_tick_get() - start;
     if (err != RT_EOK) {
-        LOG_E("host%d CMD%u data completion timeout after %u ms",
+        status = sdhci_get_int_status_flag(sdhci_host);
+        LOG_E("host%d CMD%u arg 0x%08x data %ux%u completion timeout after %u ms",
             sdhci_host->index, sdhci_host->sdhci_command->index,
+            sdhci_host->sdhci_command->argument,
+            (unsigned int)data->blockSize,
+            (unsigned int)data->blockCount,
             (unsigned int)data->timeoutMs);
+        LOG_E("host%d status=0x%08x int_en=0x%08x sig_en=0x%08x "
+              "dma=0x%08x start=0x%08x next=0x%08x blocks_left=%u "
+              "state=0x%08x",
+            sdhci_host->index, status,
+            sdhci_readl(sdhci_host, SDHCI_INT_ENABLE),
+            sdhci_readl(sdhci_host, SDHCI_SIGNAL_ENABLE),
+            sdhci_readl(sdhci_host, SDHCI_DMA_ADDRESS),
+            sdhci_host->sdma_start_addr,
+            sdhci_host->sdma_next_boundary,
+            (unsigned int)sdhci_readw(sdhci_host, SDHCI_BLOCK_COUNT),
+            sdhci_readl(sdhci_host, SDHCI_PRESENT_STATE));
         return err;
     }
     if (event & SDHCI_INT_ERROR) {
@@ -577,6 +612,18 @@ static rt_err_t sdhci_transfer_data_blocking(struct sdhci_host* sdhci_host, stru
             (unsigned int)sdhci_host->error_block_count,
             sdhci_host->error_present_state);
         return -RT_EIO;
+    }
+    if (data->txData &&
+        elapsed >= sdhci_ms_to_tick(SDHCI_SLOW_WRITE_WARN_MS)) {
+        rt_uint64_t elapsed_ms = (rt_uint64_t)elapsed * 1000U /
+                                 RT_TICK_PER_SECOND;
+
+        LOG_W("host%d CMD%u arg 0x%08x data %ux%u slow write completed in %llu ms",
+            sdhci_host->index, sdhci_host->sdhci_command->index,
+            sdhci_host->sdhci_command->argument,
+            (unsigned int)data->blockSize,
+            (unsigned int)data->blockCount,
+            (unsigned long long)elapsed_ms);
     }
     if (data && data->rxData)
         rt_hw_cpu_dcache_invalidate((void*)data->rxData, data->blockSize * data->blockCount);
@@ -978,12 +1025,20 @@ static void kd_mmc_request(struct rt_mmcsd_host* host, struct rt_mmcsd_req* req)
                               host->io_cfg.clock;
             }
 
-            if (timeout_ms < SDHCI_COMMAND_TIMEOUT_MS)
+            if (data->flags & DATA_DIR_WRITE)
+            {
+                rt_uint32_t write_timeout_ms =
+                    sdhci_write_timeout_ms(cmd);
+
+                if (timeout_ms < write_timeout_ms)
+                    timeout_ms = write_timeout_ms;
+            }
+            else if (timeout_ms < SDHCI_COMMAND_TIMEOUT_MS)
                 timeout_ms = SDHCI_COMMAND_TIMEOUT_MS;
             sdhci_data.timeoutMs = (rt_uint32_t)timeout_ms;
         }
 
-        if (data->flags == DATA_DIR_WRITE) {
+        if (data->flags & DATA_DIR_WRITE) {
             sdhci_data.txData = data->buf;
             sdhci_data.rxData = RT_NULL;
         } else {
@@ -1030,8 +1085,8 @@ static void kd_mmc_request(struct rt_mmcsd_host* host, struct rt_mmcsd_req* req)
         /* The advertised segment limit keeps normal requests within the
          * persistent buffer. Refuse callers that bypass that contract rather
          * than falling back to a fragmentation-prone runtime allocation. */
-        if ((data->flags == DATA_DIR_WRITE && !sdhci_data.txData) ||
-            (data->flags != DATA_DIR_WRITE && !sdhci_data.rxData)) {
+        if (((data->flags & DATA_DIR_WRITE) && !sdhci_data.txData) ||
+            (!(data->flags & DATA_DIR_WRITE) && !sdhci_data.rxData)) {
             LOG_E("%u byte transfer exceeds the %u byte bounce buffer",
                   (unsigned int)sz, (unsigned int)host->max_seg_size);
             cmd->err = -RT_EINVAL;

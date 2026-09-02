@@ -501,63 +501,266 @@ void fs_rebuild_entry_cache(fs_handles_db * db)
 	}
 }
 
-static fs_entry * fs_alloc_entry_storage(fs_handles_db * db)
+static size_t fs_entry_storage_size(size_t name_size)
 {
-	fs_entry * entry;
+	size_t size;
+	size_t alignment;
 
-	if( !db )
+	if( !name_size || (name_size > (FS_HANDLE_MAX_FILENAME_SIZE + 1U)) )
+		return 0;
+
+	alignment = sizeof(void *);
+	size = sizeof(fs_entry) + name_size;
+	if( size > (SIZE_MAX - (alignment - 1U)) )
+		return 0;
+
+	return (size + alignment - 1U) & ~(alignment - 1U);
+}
+
+static uint16_t fs_entry_inline_name_capacity(size_t storage_size)
+{
+	size_t capacity;
+
+	if( storage_size <= sizeof(fs_entry) )
+		return 0;
+
+	capacity = storage_size - sizeof(fs_entry);
+	if( capacity > (FS_HANDLE_MAX_FILENAME_SIZE + 1U) )
+		capacity = FS_HANDLE_MAX_FILENAME_SIZE + 1U;
+
+	return (uint16_t)capacity;
+}
+
+/* Free-list entries are blocks from entry_pool only. The list is kept in
+ * ascending address order so adjacent blocks can be coalesced when returned.
+ * record_size includes alignment padding and covers the entire block; while a
+ * block is free, its fs_entry header stores only record_size, flags, and next.
+ * Heap fallback records are freed directly and never enter this list. */
+static fs_entry * fs_take_free_entry(fs_handles_db * db, size_t storage_size)
+{
+	fs_entry ** best_link;
+	fs_entry ** link;
+	fs_entry * entry;
+	fs_entry * remainder;
+	size_t remainder_size;
+
+	best_link = NULL;
+	link = &db->free_entry_list;
+	while( *link )
+	{
+		if( (*link)->record_size >= storage_size &&
+			(!best_link || ((*link)->record_size < (*best_link)->record_size)) )
+		{
+			best_link = link;
+			if( (*link)->record_size == storage_size )
+				break;
+		}
+		link = &(*link)->next;
+	}
+
+	if( !best_link )
 		return NULL;
 
-	if( db->free_entry_list )
+	entry = *best_link;
+	remainder_size = entry->record_size - storage_size;
+	if( remainder_size >= fs_entry_storage_size(1U) )
 	{
-		entry = db->free_entry_list;
-		db->free_entry_list = entry->next;
-		memset(entry, 0, sizeof(*entry));
+		remainder = (fs_entry *)((unsigned char *)entry + storage_size);
+		memset(remainder, 0, sizeof(*remainder));
+		remainder->flags = ENTRY_FROM_DB_POOL;
+		remainder->record_size = (uint32_t)remainder_size;
+		remainder->next = entry->next;
+		*best_link = remainder;
+		entry->record_size = (uint32_t)storage_size;
+	}
+	else
+	{
+		*best_link = entry->next;
+	}
+	return entry;
+}
+
+static fs_entry * fs_alloc_entry_storage(fs_handles_db * db, const char * name)
+{
+	fs_entry * entry;
+	size_t name_size;
+	size_t record_size;
+	size_t storage_size;
+
+	if( !db || !name )
+		return NULL;
+
+	name_size = strnlen(name, FS_HANDLE_MAX_FILENAME_SIZE + 1U) + 1U;
+	storage_size = fs_entry_storage_size(name_size);
+	if( !storage_size || (storage_size > UINT32_MAX) )
+		return NULL;
+
+	entry = fs_take_free_entry(db, storage_size);
+	if( entry )
+	{
+		record_size = entry->record_size;
+		memset(entry, 0, record_size);
 		entry->flags = ENTRY_FROM_DB_POOL;
-		return entry;
+	}
+	else if( db->entry_pool && (storage_size <= (db->entry_pool_size - db->entry_pool_used)) )
+	{
+		entry = (fs_entry *)(db->entry_pool + db->entry_pool_used);
+		db->entry_pool_used += storage_size;
+		memset(entry, 0, storage_size);
+		entry->flags = ENTRY_FROM_DB_POOL;
+		record_size = storage_size;
+		db->entry_pool_allocations++;
+	}
+	else
+	{
+		entry = calloc(1, storage_size);
+		if( !entry )
+		{
+			PRINT_ERROR("fs_handles_db : object record allocation failed after %u entries (pool %u/%u bytes)",
+				db->entry_count, db->entry_pool_used, db->entry_pool_size);
+			return NULL;
+		}
+		if( db->entry_pool && !db->entry_pool_exhausted )
+		{
+			PRINT_WARN("fs_handles_db : %u-byte object pool exhausted after %u arena records, using heap entries",
+				db->entry_pool_size, db->entry_pool_allocations);
+			db->entry_pool_exhausted = 1;
+		}
+		record_size = storage_size;
 	}
 
-	if( db->entry_pool && (db->entry_pool_next < db->entry_pool_count) )
-	{
-		entry = &db->entry_pool[db->entry_pool_next++];
-		memset(entry, 0, sizeof(*entry));
-		entry->flags = ENTRY_FROM_DB_POOL;
-		return entry;
-	}
-
-	entry = calloc(1, sizeof(*entry));
-	if( entry && db->entry_pool && !db->entry_pool_exhausted )
-	{
-		PRINT_WARN("fs_handles_db : database cache buffer exhausted, using heap entries");
-		db->entry_pool_exhausted = 1;
-	}
+	entry->record_size = (uint32_t)record_size;
+	entry->name = (char *)(entry + 1);
+	entry->name_capacity = fs_entry_inline_name_capacity(record_size);
+	memcpy(entry->name, name, name_size);
+	db->entry_count++;
 
 	return entry;
 }
 
 static void fs_free_entry_storage(fs_entry * entry)
 {
-	if( entry && !(entry->flags & ENTRY_FROM_DB_POOL) )
+	int from_pool;
+
+	if( !entry )
+		return;
+
+	from_pool = entry->flags & ENTRY_FROM_DB_POOL;
+	if( entry->flags & ENTRY_NAME_SEPARATE )
+		free(entry->name);
+	if( !from_pool )
 		free(entry);
+}
+
+static void fs_return_pool_entry(fs_handles_db * db, fs_entry * entry, uint32_t record_size)
+{
+	fs_entry ** link;
+	fs_entry * previous;
+
+	memset(entry, 0, sizeof(*entry));
+	entry->flags = ENTRY_FROM_DB_POOL;
+	entry->record_size = record_size;
+
+	previous = NULL;
+	link = &db->free_entry_list;
+	while( *link && ((unsigned char *)*link < (unsigned char *)entry) )
+	{
+		previous = *link;
+		link = &(*link)->next;
+	}
+	entry->next = *link;
+	*link = entry;
+
+	if( entry->next &&
+		((unsigned char *)entry + entry->record_size == (unsigned char *)entry->next) )
+	{
+		entry->record_size += entry->next->record_size;
+		entry->next = entry->next->next;
+	}
+	if( previous &&
+		((unsigned char *)previous + previous->record_size == (unsigned char *)entry) )
+	{
+		previous->record_size += entry->record_size;
+		previous->next = entry->next;
+	}
 }
 
 static void fs_release_entry_storage(fs_handles_db * db, fs_entry * entry)
 {
+	int from_pool;
+	uint32_t record_size;
+
 	if( !entry )
 		return;
 
-	entry->cache_next = NULL;
-	entry->handle_cache_next = NULL;
-
-	if( entry->flags & ENTRY_FROM_DB_POOL )
-	{
-		entry->next = db->free_entry_list;
-		db->free_entry_list = entry;
-	}
+	from_pool = entry->flags & ENTRY_FROM_DB_POOL;
+	record_size = entry->record_size;
+	if( entry->flags & ENTRY_NAME_SEPARATE )
+		free(entry->name);
+	if( from_pool )
+		fs_return_pool_entry(db, entry, record_size);
 	else
-	{
 		free(entry);
+	if( db && db->entry_count )
+		db->entry_count--;
+}
+
+int fs_entry_set_name(fs_entry * entry, const char * name)
+{
+	char * new_name;
+	size_t name_size;
+
+	if( !entry || !name )
+		return -1;
+
+	name_size = strnlen(name, FS_HANDLE_MAX_FILENAME_SIZE + 1U) + 1U;
+	if( !name_size || (name_size > (FS_HANDLE_MAX_FILENAME_SIZE + 1U)) )
+		return -1;
+
+	if( name_size <= entry->name_capacity )
+	{
+		memmove(entry->name, name, name_size);
+		return 0;
 	}
+
+	new_name = malloc(name_size);
+	if( !new_name )
+		return -1;
+	memcpy(new_name, name, name_size);
+	if( entry->flags & ENTRY_NAME_SEPARATE )
+		free(entry->name);
+	entry->name = new_name;
+	entry->name_capacity = (uint16_t)name_size;
+	entry->flags |= ENTRY_NAME_SEPARATE;
+
+	return 0;
+}
+
+void fs_entry_compact_name(fs_entry * entry)
+{
+	char * old_name;
+	char * inline_name;
+	size_t inline_capacity;
+	size_t name_size;
+
+	if( !entry || !(entry->flags & ENTRY_NAME_SEPARATE) )
+		return;
+
+	name_size = strnlen(entry->name, FS_HANDLE_MAX_FILENAME_SIZE + 1U) + 1U;
+	inline_capacity = fs_entry_inline_name_capacity(entry->record_size);
+	if( (name_size > (FS_HANDLE_MAX_FILENAME_SIZE + 1U)) ||
+		(name_size > inline_capacity) )
+	{
+		return;
+	}
+
+	old_name = entry->name;
+	inline_name = (char *)(entry + 1);
+	memcpy(inline_name, old_name, name_size);
+	entry->name = inline_name;
+	entry->name_capacity = (uint16_t)inline_capacity;
+	entry->flags &= ~ENTRY_NAME_SEPARATE;
+	free(old_name);
 }
 
 fs_handles_db * init_fs_db(void * mtp_context)
@@ -575,16 +778,16 @@ fs_handles_db * init_fs_db(void * mtp_context)
 		db->mtp_ctx = mtp_context;
 
 		ctx = (mtp_ctx *)mtp_context;
-		if( ctx && ctx->fs_db_pool_size >= sizeof(*db->entry_pool) )
+		if( ctx && ctx->fs_db_pool_size >= fs_entry_storage_size(2) )
 		{
 			db->entry_pool = malloc(ctx->fs_db_pool_size);
 			if( db->entry_pool )
 			{
-				db->entry_pool_count = ctx->fs_db_pool_size / sizeof(*db->entry_pool);
+				db->entry_pool_size = ctx->fs_db_pool_size;
 			}
 			else
 			{
-				PRINT_WARN("init_fs_db : database cache buffer allocation failed, using heap entries");
+				PRINT_WARN("init_fs_db : object database pool allocation failed, using heap entries");
 			}
 		}
 
@@ -702,16 +905,13 @@ fs_entry * alloc_entry(fs_handles_db * db, filefoundinfo *fileinfo, uint32_t par
 {
 	fs_entry * entry;
 
-	entry = fs_alloc_entry_storage(db);
+	entry = fs_alloc_entry_storage(db, fileinfo->filename);
 	if( entry )
 	{
 		entry->handle = db->next_handle;
 		db->next_handle++;
 		entry->parent = parent;
 		entry->storage_id = storage_id;
-
-		strncpy(entry->name, fileinfo->filename, FS_HANDLE_MAX_FILENAME_SIZE);
-		entry->name[FS_HANDLE_MAX_FILENAME_SIZE] = '\0';
 
 		entry->size = fileinfo->size;
 		entry->date = fileinfo->date;
@@ -740,14 +940,12 @@ fs_entry * alloc_root_entry(fs_handles_db * db, uint32_t storage_id)
 	if( !db )
 		return NULL;
 
-	entry = fs_alloc_entry_storage(db);
+	entry = fs_alloc_entry_storage(db, "/");
 	if( entry )
 	{
 		entry->handle = 0x00000000;
 		entry->parent = 0x00000000;
 		entry->storage_id = storage_id;
-
-		strcpy(entry->name,"/");
 
 		entry->size = 1;
 
