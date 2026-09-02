@@ -549,9 +549,40 @@ static const drv_touch_probe touch_probes[] = {
     NULL
 };
 
+static int drv_touch_intr_value_to_edge(int intr_value, gpio_pin_edge_t* intr_edge)
+{
+    if (!intr_edge) {
+        return -RT_EINVAL;
+    }
+
+    switch (intr_value) {
+    case DRV_TOUCH_INTR_RISING:
+        *intr_edge = GPIO_PE_RISING;
+        break;
+    case DRV_TOUCH_INTR_FALLING:
+        *intr_edge = GPIO_PE_FALLING;
+        break;
+    case DRV_TOUCH_INTR_BOTH:
+        *intr_edge = GPIO_PE_BOTH;
+        break;
+    case DRV_TOUCH_INTR_HIGH:
+        *intr_edge = GPIO_PE_HIGH;
+        break;
+    case DRV_TOUCH_INTR_LOW:
+        *intr_edge = GPIO_PE_LOW;
+        break;
+    default:
+        return -RT_EINVAL;
+    }
+
+    return RT_EOK;
+}
+
 static struct drv_touch_dev* drv_touch_create_device(struct drv_touch_config* cfg)
 {
-    int ret;
+    int ret, intr_attached = 0;
+
+    gpio_pin_edge_t intr_edge = GPIO_PE_RISING;
 
     struct drv_touch_dev* dev = NULL;
     char                  dev_name[RT_NAME_MAX];
@@ -561,6 +592,13 @@ static struct drv_touch_dev* drv_touch_create_device(struct drv_touch_config* cf
 
     if (!cfg) {
         LOG_E("Invalid config");
+
+        goto _err_invalid_cfg;
+    }
+
+    if ((0 <= cfg->pin_intr) && (63 >= cfg->pin_intr)
+        && (RT_EOK != drv_touch_intr_value_to_edge(cfg->intr_value, &intr_edge))) {
+        LOG_E("Invalid touch interrupt mode %d", cfg->intr_value);
 
         goto _err_invalid_cfg;
     }
@@ -594,7 +632,7 @@ static struct drv_touch_dev* drv_touch_create_device(struct drv_touch_config* cf
     }
 
     dev->pin.intr      = cfg->pin_intr;
-    dev->pin.intr_edge = cfg->intr_value ? GPIO_PE_RISING : GPIO_PE_FALLING;
+    dev->pin.intr_edge = intr_edge;
     dev->pin.rst       = cfg->pin_reset;
     dev->pin.rst_valid = cfg->reset_value;
 
@@ -609,7 +647,12 @@ static struct drv_touch_dev* drv_touch_create_device(struct drv_touch_config* cf
         dev->pin.fake_intr = 0;
 
         kd_pin_mode(cfg->pin_intr, GPIO_DM_INPUT);
-        kd_pin_attach_irq(cfg->pin_intr, dev->pin.intr_edge, touch_int_irq, dev);
+        if (RT_EOK != (ret = kd_pin_attach_irq(cfg->pin_intr, dev->pin.intr_edge, touch_int_irq, dev))) {
+            LOG_E("Attach touch interrupt pin %d failed: %d", cfg->pin_intr, ret);
+
+            goto _err_attach_irq;
+        }
+        intr_attached = 1;
     } else {
         dev->pin.fake_intr = 1;
     }
@@ -693,10 +736,6 @@ static struct drv_touch_dev* drv_touch_create_device(struct drv_touch_config* cf
     return dev;
 
 _err_register_device:
-    if (0x00 == dev->pin.fake_intr) {
-        kd_pin_detach_irq(cfg->pin_intr);
-    }
-
 #ifdef TOUCH_DRV_MODEL_INT_WITH_THREAD
     rt_sem_detach(&dev->thr.ctrl_sem);
     rt_mq_detach(&dev->thr.ctrl_mq);
@@ -705,10 +744,16 @@ _err_register_device:
 #endif
 
 _err_probe_device:
+    if (intr_attached) {
+        kd_pin_detach_irq(cfg->pin_intr);
+    }
+
+_err_attach_irq:
 _err_set_i2c_clock:
     rt_device_close((rt_device_t)i2c_bus);
 _err_open_i2c_bus:
 _err_find_i2c_bus:
+    rt_free_align(dev);
 _err_alloc_dev:
 _err_invalid_cfg:
 

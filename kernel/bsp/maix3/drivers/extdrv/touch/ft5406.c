@@ -53,7 +53,7 @@ static int read_register(struct drv_touch_dev* dev, struct touch_register* reg)
 {
     reg->time = rt_tick_get();
 
-    return touch_dev_read_reg(dev, 0x02, (uint8_t*)&reg->reg[0], 0x1F - 0x02);
+    return touch_dev_read_reg(dev, 0x02, (uint8_t*)&reg->reg[0], sizeof(struct ft5x06_reg));
 }
 
 static int parse_register(struct drv_touch_dev* dev, struct touch_register* reg, struct touch_point* result)
@@ -87,15 +87,12 @@ static int parse_register(struct drv_touch_dev* dev, struct touch_register* reg,
     }
 
     if (finger_num) {
-        for (result_index = 0, point_index = 0; result_index < finger_num; result_index++, point_index++) {
-            point = &result->point[point_index];
-
+        for (result_index = 0, point_index = 0; result_index < finger_num; result_index++) {
             xh = ft5x06_reg->pos[result_index].xh & 0x0F;
             xl = ft5x06_reg->pos[result_index].xl;
 
             point_x = (xh << 8) | xl;
             if (point_x > dev->touch.range_x) {
-                point_index--;
                 continue;
             }
 
@@ -104,7 +101,6 @@ static int parse_register(struct drv_touch_dev* dev, struct touch_register* reg,
 
             point_y = (yh << 8) | yl;
             if (point_y > dev->touch.range_y) {
-                point_index--;
                 continue;
             }
 
@@ -112,6 +108,7 @@ static int parse_register(struct drv_touch_dev* dev, struct touch_register* reg,
             id  = ft5x06_reg->pos[result_index].yh >> 4;
 
             wight = ft5x06_reg->pos[result_index].weight;
+            point = &result->point[point_index];
 
             point->event        = event[flg];
             point->track_id     = id;
@@ -119,10 +116,12 @@ static int parse_register(struct drv_touch_dev* dev, struct touch_register* reg,
             point->x_coordinate = point_x;
             point->y_coordinate = point_y;
             point->timestamp    = time;
+
+            point_index++;
         }
     }
 
-    result->point_num = result_index;
+    result->point_num = point_index;
 
     return 0;
 }

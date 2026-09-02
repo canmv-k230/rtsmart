@@ -50,9 +50,10 @@
 #define CF1124_TOUCH_DATA_LEN   (1 + CF1124_MAX_TOUCHES * 4)
 
 struct cf1124_point {
-    uint8_t status;  /* bit 7: valid, bits 6-4: X[10:8], bits 3-0: Y[10:8] */
+    uint8_t status;  /* bit 7: valid, bits 6-4: X[10:8], bits 2-0: Y[10:8] */
     uint8_t xl;      /* X[7:0] */
     uint8_t yl;      /* Y[7:0] */
+    uint8_t reserved;
 };
 
 struct cf1124_reg {
@@ -93,8 +94,8 @@ static int parse_register(struct drv_touch_dev* dev, struct touch_register* reg,
         if (point_x > dev->touch.range_x)
             continue;
 
-        /* Y coordinate: bits [3:0] of status as high 4 bits, next next byte as low 8 bits */
-        point_y = (uint16_t)(st & 0x0F) << 8 | buf[1 + 4 * i + 2];
+        /* Y coordinate: bits [2:0] of status as high 3 bits, third byte as low 8 bits */
+        point_y = (uint16_t)(st & 0x07) << 8 | buf[1 + 4 * i + 2];
         if (point_y > dev->touch.range_y)
             continue;
 
@@ -163,8 +164,8 @@ int drv_touch_probe_cf1124(struct drv_touch_dev* dev)
 
     /* Read resolution from chip */
     if (0x00 == touch_dev_read_reg(dev, CF1124_REG_XY_RES_HIGH, buf, 3)) {
-        x_res = ((uint16_t)(buf[0] & 0xF0) << 4) | buf[1];
-        y_res = ((uint16_t)(buf[0] & 0x0F) << 8) | buf[2];
+        x_res = ((uint16_t)(buf[0] & 0x70) << 4) | buf[1];
+        y_res = ((uint16_t)(buf[0] & 0x07) << 8) | buf[2];
 
         if (x_res > 0 && y_res > 0) {
             dev->touch.range_x = x_res;

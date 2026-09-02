@@ -50,6 +50,15 @@ struct touch_point {
     struct rt_touch_data point[TOUCH_MAX_POINT_NUMBER];
 };
 
+enum drv_touch_intr_mode {
+    DRV_TOUCH_INTR_RISING = 0,
+    DRV_TOUCH_INTR_FALLING,
+    DRV_TOUCH_INTR_BOTH,
+    DRV_TOUCH_INTR_HIGH,
+    DRV_TOUCH_INTR_LOW,
+    DRV_TOUCH_INTR_MODE_MAX,
+};
+
 struct drv_touch_config {
     int touch_dev_index;
 
@@ -57,7 +66,7 @@ struct drv_touch_config {
     int range_y;
 
     int pin_intr;
-    int intr_value;
+    int intr_value; /* enum drv_touch_intr_mode */
     int pin_reset;
     int reset_value;
 

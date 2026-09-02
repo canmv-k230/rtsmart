@@ -31,6 +31,10 @@
 #define DBG_COLOR
 #include <rtdbg.h>
 
+#define CST128_REG_CHIP_ID       0xA3
+#define CST128_CHIP_ID           0x64
+#define CST128_CHIP_ID_COMPAT    0x54
+
 struct cst128_reg {
     uint8_t finger_num; // 0x02
 
@@ -50,7 +54,7 @@ static int read_register(struct drv_touch_dev* dev, struct touch_register* reg)
 {
     reg->time = rt_tick_get();
 
-    return touch_dev_read_reg(dev, 0x02, (uint8_t*)&reg->reg[0], 0x1F - 0x02);
+    return touch_dev_read_reg(dev, 0x02, (uint8_t*)&reg->reg[0], sizeof(struct cst128_reg));
 }
 
 static int parse_register(struct drv_touch_dev* dev, struct touch_register* reg, struct touch_point* result)
@@ -58,7 +62,7 @@ static int parse_register(struct drv_touch_dev* dev, struct touch_register* reg,
     int       finger_num = 0;
     uint8_t   xh, xl, yh, yl;
     uint16_t  point_x, point_y;
-    int       result_index, point_index;
+    int       result_index = 0, point_index = 0;
     rt_tick_t time = reg->time;
 
     struct rt_touch_data* point      = NULL;
@@ -80,15 +84,12 @@ static int parse_register(struct drv_touch_dev* dev, struct touch_register* reg,
     }
 
     if (finger_num) {
-        for (result_index = 0, point_index = 0; result_index < finger_num; result_index++, point_index++) {
-            point = &result->point[point_index];
-
+        for (result_index = 0, point_index = 0; result_index < finger_num; result_index++) {
             xh = cst128_reg->pos[result_index].xh;
             xl = cst128_reg->pos[result_index].xl;
 
             point_x = ((xh & 0x0F) << 8) | xl;
             if (point_x > dev->touch.range_x) {
-                point_index--;
                 continue;
             }
 
@@ -97,21 +98,23 @@ static int parse_register(struct drv_touch_dev* dev, struct touch_register* reg,
 
             point_y = ((yh & 0x0F) << 8) | yl;
             if (point_y > dev->touch.range_y) {
-                point_index--;
                 continue;
             }
 
+            point               = &result->point[point_index];
             point->event        = RT_TOUCH_EVENT_NONE;
             point->track_id     = result_index;
             point->width        = finger_num;
             point->x_coordinate = point_x;
             point->y_coordinate = point_y;
             point->timestamp    = time;
+
+            point_index++;
         }
     }
 
-    result->point_num = result_index;
-    touch_dev_update_event(result_index, result->point);
+    result->point_num = point_index;
+    touch_dev_update_event(point_index, result->point);
 
     return 0;
 }
@@ -134,16 +137,18 @@ static int get_default_rotate(struct drv_touch_dev* dev) { return RT_TOUCH_ROTAT
 
 int drv_touch_probe_cst128(struct drv_touch_dev* dev)
 {
-    uint8_t               chip_id;
-    struct touch_register reg_data;
+    uint8_t chip_id;
 
     dev->i2c.addr      = 0x38;
     dev->i2c.reg_width = 1;
 
     rt_thread_mdelay(50); // wait touch startup.
 
-    if (0x00 != touch_dev_read_reg(dev, 0xA3, &chip_id, 1)) {
+    if (0x00 != touch_dev_read_reg(dev, CST128_REG_CHIP_ID, &chip_id, 1)) {
         return -2;
+    }
+    if ((CST128_CHIP_ID != chip_id) && (CST128_CHIP_ID_COMPAT != chip_id)) {
+        LOG_W("unexpected chip ID: 0x%02x", chip_id);
     }
 
     rt_strncpy(dev->dev.drv_name, "cst128", sizeof(dev->dev.drv_name));

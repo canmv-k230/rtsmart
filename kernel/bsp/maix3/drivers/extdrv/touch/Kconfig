@@ -99,7 +99,7 @@ menuconfig RT_USING_TOUCH
                     default -1
 
                 choice
-                    bool "Touch Device INT Edge"
+                    bool "Touch Device Interrupt Trigger"
                     default TOUCH_DEV_INT_EDGE_FALLING
 
                     config TOUCH_DEV_INT_EDGE_RISING
@@ -121,6 +121,9 @@ menuconfig RT_USING_TOUCH
                     default 2 if TOUCH_DEV_INT_EDGE_BOTH
                     default 3 if TOUCH_DEV_INT_EDGE_HIGH
                     default 4 if TOUCH_DEV_INT_EDGE_LOW
+                    help
+                        Numeric interrupt mode passed through drv_touch_config.
+                        Values match enum drv_touch_intr_mode.
 
                 config TOUCH_DEV_RST_PIN
                     int "Touch Device RST Pin"
