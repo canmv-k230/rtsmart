@@ -350,7 +350,9 @@ static void sdhci_reset(struct sdhci_host* host, uint8_t mask)
                 emmc_ctl |= (1 << CARD_IS_EMMC);
             else
                 emmc_ctl &= ~(1 << CARD_IS_EMMC);
-            sdhci_writeb(host, emmc_ctl, EMMC_CTRL_R);
+            /* EMMC_CTRL_R is a 16-bit vendor register; update it with the
+             * access width defined by the controller. */
+            sdhci_writew(host, emmc_ctl, EMMC_CTRL_R);
         }
         if (host->have_phy)
             dwcmshc_phy_init(host);
@@ -1555,17 +1557,33 @@ static const struct rt_mmcsd_host_ops ops = {
     sdhci_execute_tuning_cmd,
 };
 
-void kd_sdhci0_reset(int value)
+rt_err_t kd_sdhci0_reset(int value)
 {
     struct sdhci_host* host = sdhci_host0;
+    uint16_t emmc_ctl;
+    uint16_t readback;
+    uint16_t expected;
 
-    uint16_t emmc_ctl = sdhci_readw(host, EMMC_CTRL_R);
+    if (!host)
+        return -RT_ENOSYS;
+
+    emmc_ctl = sdhci_readw(host, EMMC_CTRL_R);
     emmc_ctl |= (1 << EMMC_RST_N_OE);
     if (value)
         emmc_ctl |= (1 << EMMC_RST_N);
     else
         emmc_ctl &= ~(1 << EMMC_RST_N);
-    sdhci_writeb(host, emmc_ctl, EMMC_CTRL_R);
+    sdhci_writew(host, emmc_ctl, EMMC_CTRL_R);
+
+    expected = emmc_ctl & (BIT(EMMC_RST_N_OE) | BIT(EMMC_RST_N));
+    readback = sdhci_readw(host, EMMC_CTRL_R);
+    if ((readback & (BIT(EMMC_RST_N_OE) | BIT(EMMC_RST_N))) != expected) {
+        LOG_E("SDIO0 reset output did not latch: wrote=0x%04x read=0x%04x",
+              emmc_ctl, readback);
+        return -RT_EIO;
+    }
+
+    return RT_EOK;
 }
 
 static struct rt_mmcsd_host *kd_sdhci_get_host(int id)

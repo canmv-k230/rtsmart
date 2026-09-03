@@ -42,13 +42,13 @@ static void wlan_log_tx_power(const char* ifname);
 #define REALTEK_RX_FRAME_MAX 1600
 #endif
 
-/* Full fallback addresses embedded in the prebuilt vendor libraries.  The
- * shared 00:e0:4c prefix is also a valid Realtek OUI, so it is not enough to
- * identify an efuse autoload failure. */
 #if defined(REALTEK_SDIO_RTL8189FTV)
-static const rt_uint8_t realtek_default_mac[ETH_ALEN] =
-    { 0x00, 0xe0, 0x4c, 0xb7, 0x43, 0x36 };
-#elif defined(REALTEK_SDIO_RTL8733BS)
+#define RTL8189FTV_EFUSE_MAP_ID 0x8129U
+#endif
+
+/* Full fallback address embedded in the RTL8733BS vendor library.  The shared
+ * 00:e0:4c prefix is also a valid Realtek OUI, so compare the complete value. */
+#if defined(REALTEK_SDIO_RTL8733BS)
 static const rt_uint8_t realtek_default_mac[ETH_ALEN] =
     { 0x00, 0xe0, 0x4c, 0x87, 0x00, 0x00 };
 #endif
@@ -639,16 +639,33 @@ static const struct rt_wlan_dev_ops ops = {
     .wlan_send_raw_frame = wlan_send_raw_frame,
 };
 
-/* The chip loads its efuse into shadow registers during its own power-on
- * sequence, and that sequence only re-runs once the supply has actually dropped:
- * a warm reset, or a brief power cycle, can leave it skipped.  The driver then
- * substitutes defaults for the MAC, the crystal trim and the TX power tables
- * without reporting an error, after which the radio receives nothing at all and
- * a scan returns zero networks.
- *
- * The substituted MAC is the only part of that visible from here. */
-static rt_bool_t realtek_efuse_autoload_failed(void)
+/* The chip loads its efuse into a shadow map during initialization.  When that
+ * map is invalid the driver substitutes defaults for the MAC, crystal trim and
+ * TX power tables without returning an initialization error. */
+static rt_bool_t realtek_efuse_data_invalid(const char *model_name)
 {
+#if defined(REALTEK_SDIO_RTL8189FTV)
+    rt_uint8_t map_id[2] = {0};
+    rt_uint16_t id;
+
+    /* ReadAdapterInfo8188FS validates these same first two shadow-map bytes.
+     * Reading them here distinguishes invalid/unreadable efuse contents from
+     * a coincidental use of the library's fallback MAC address. */
+    if (rltk_wlan_map_read(map_id, sizeof(map_id)) < 0) {
+        LOG_W("%s efuse shadow map could not be read", model_name);
+        return RT_TRUE;
+    }
+
+    id = (rt_uint16_t)map_id[0] | ((rt_uint16_t)map_id[1] << 8);
+    if (id != RTL8189FTV_EFUSE_MAP_ID) {
+        LOG_W("%s efuse map ID is 0x%04x, expected 0x%04x",
+              model_name, (unsigned int)id,
+              (unsigned int)RTL8189FTV_EFUSE_MAP_ID);
+        return RT_TRUE;
+    }
+
+    return RT_FALSE;
+#else
     rt_uint8_t mac[ETH_ALEN] = {0};
 
     if (wlan_get_mac(&wlan_sta, mac) != RT_EOK)
@@ -656,18 +673,18 @@ static rt_bool_t realtek_efuse_autoload_failed(void)
 
     return rt_memcmp(mac, realtek_default_mac,
                      sizeof(realtek_default_mac)) == 0;
+#endif
 }
 
-/* Repeat the power-on sequence, which is usually enough to pick the efuse up.
- * Returns an error only when the chip could not be brought back up at all; a
- * radio still running on default calibration is reported and tolerated so the
- * interface at least registers. */
+/* Repeat the vendor initialization once.  If the data is still invalid, fail
+ * this probe so the board layer can tear the SDIO card down, toggle REG_ON and
+ * enumerate it again. */
 static rt_err_t realtek_recover_efuse_autoload(const char *model_name)
 {
-    if (!realtek_efuse_autoload_failed())
+    if (!realtek_efuse_data_invalid(model_name))
         return RT_EOK;
 
-    LOG_W("%s efuse autoload did not run; retrying initialization", model_name);
+    LOG_W("%s efuse data is invalid; retrying initialization", model_name);
     if (wifi_off() < 0) {
         LOG_E("%s could not be stopped for a retry", model_name);
         /* Vendor threads may still reference the SDIO function. Tell the core
@@ -680,15 +697,10 @@ static rt_err_t realtek_recover_efuse_autoload(const char *model_name)
         return -RT_EIO;
     }
 
-    if (realtek_efuse_autoload_failed()) {
-        /* Nothing further can be done from here: the part needs its reset or
-         * power-enable line driven, and this board wires neither
-         * (BSP_WIFI_SDIO_REG_ON_PIN is -1 and Set_WLAN_Power_On/Off() are
-         * empty).  Say plainly why the radio will not hear anything. */
-        LOG_E("%s is running on default calibration - scans will find nothing. "
-              "A full power-off is needed, or the module's reset line has to be "
-              "wired up and configured via BSP_WIFI_SDIO_REG_ON_PIN.",
+    if (realtek_efuse_data_invalid(model_name)) {
+        LOG_E("%s efuse data is still invalid; requesting a board reset",
               model_name);
+        return -RT_EIO;
     } else {
         LOG_I("%s efuse autoload recovered on retry", model_name);
     }
@@ -767,7 +779,7 @@ static rt_int32_t realtek_probe(struct rt_mmcsd_card* card)
     if (ret == -RT_EBUSY)
         return ret;
     if (ret != RT_EOK)
-        goto fail_disable_sdio;
+        goto fail_wifi;
 
     realtek_apply_country();
 

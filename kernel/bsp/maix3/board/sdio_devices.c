@@ -441,6 +441,7 @@ INIT_DEVICE_EXPORT_SEQ(board_sdio_storage_init, 210);
 #define BOARD_SDIO_WIFI_PROBE_ATTEMPTS    3U
 #define BOARD_SDIO_WIFI_PROBE_TIMEOUT_MS  3000U
 #define BOARD_SDIO_WIFI_RETRY_DELAY_MS    100U
+#define BOARD_SDIO_WIFI_PRE_RESET_DELAY_MS 10U
 
 int board_sdio_wifi_prepare(void)
 {
@@ -462,13 +463,23 @@ int board_sdio_wifi_prepare(void)
                    BSP_WIFI_SDIO_REG_ON_PIN, result);
         return result;
     }
+    kd_pin_write(BSP_WIFI_SDIO_REG_ON_PIN, released);
+    rt_thread_mdelay(BOARD_SDIO_WIFI_PRE_RESET_DELAY_MS);
     kd_pin_write(BSP_WIFI_SDIO_REG_ON_PIN, asserted);
     rt_thread_mdelay(BSP_WIFI_SDIO_RESET_PULSE_MS);
     kd_pin_write(BSP_WIFI_SDIO_REG_ON_PIN, released);
 #elif defined(BSP_WIFI_SDIO_USE_SDIO0_RESET)
-    kd_sdhci0_reset(asserted == GPIO_PV_HIGH);
+    rt_err_t result = kd_sdhci0_reset(released == GPIO_PV_HIGH);
+    if (result != RT_EOK)
+        return result;
+    rt_thread_mdelay(BOARD_SDIO_WIFI_PRE_RESET_DELAY_MS);
+    result = kd_sdhci0_reset(asserted == GPIO_PV_HIGH);
+    if (result != RT_EOK)
+        return result;
     rt_thread_mdelay(BSP_WIFI_SDIO_RESET_PULSE_MS);
-    kd_sdhci0_reset(released == GPIO_PV_HIGH);
+    result = kd_sdhci0_reset(released == GPIO_PV_HIGH);
+    if (result != RT_EOK)
+        return result;
 #endif
 
     rt_thread_mdelay(BSP_WIFI_SDIO_POWER_UP_DELAY_MS);
@@ -483,14 +494,18 @@ static void board_sdio_wifi_probe(void *parameter)
 
     (void)parameter;
 
-    if (board_sdio_wifi_prepare() != RT_EOK)
-    {
-        LOG_E("SDIO Wi-Fi socket preparation failed");
-        return;
-    }
-
     for (attempt = 1; attempt <= BOARD_SDIO_WIFI_PROBE_ATTEMPTS; attempt++)
     {
+        /* A driver probe can reject a card whose calibration data was not
+         * loaded.  Repeat the hardware reset before each rescan so the next
+         * attempt starts from a real REG_ON transition instead of merely
+         * re-running the vendor software initialization. */
+        if (board_sdio_wifi_prepare() != RT_EOK)
+        {
+            LOG_E("SDIO Wi-Fi socket preparation failed");
+            return;
+        }
+
         kd_sdhci_change(BSP_WIFI_SDIO_HOST);
         result = kd_sdhci_wait_card(
             BSP_WIFI_SDIO_HOST,
@@ -506,6 +521,14 @@ static void board_sdio_wifi_probe(void *parameter)
             LOG_E("SDIO Wi-Fi driver probe failed on host %d; "
                   "card retained because teardown is incomplete",
                   BSP_WIFI_SDIO_HOST);
+            return;
+        }
+        if (result != MMCSD_HOST_UNPLUGED)
+        {
+            /* A timeout can leave the detector and vendor probe active.  Do
+             * not reset the module underneath them. */
+            LOG_E("SDIO Wi-Fi probe wait failed on host %d: %d",
+                  BSP_WIFI_SDIO_HOST, result);
             return;
         }
         if (attempt < BOARD_SDIO_WIFI_PROBE_ATTEMPTS)

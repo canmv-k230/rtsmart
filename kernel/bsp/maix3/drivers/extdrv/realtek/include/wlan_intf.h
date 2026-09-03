@@ -67,6 +67,7 @@ int rltk_wlan_handshake_done(void);
 int rltk_wlan_rf_on(void);
 int rltk_wlan_rf_off(void);
 int rltk_wlan_check_bus(void);
+int rltk_wlan_map_read(unsigned char *map, int len);
 int rltk_wlan_wireless_mode(unsigned char mode);
 int rltk_wlan_get_wireless_mode(unsigned char *pmode);
 int rltk_set_tx_power_percentage(unsigned char power_percentage_idx);
