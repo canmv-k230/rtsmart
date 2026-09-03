@@ -763,7 +763,6 @@ static void aic_station_state_set(struct aic8800_context *context,
     context->sta_power_save[station_index] = present && power_save;
     context->sta_uapsd_tids[station_index] = present ? uapsd_tids : 0;
     context->tx_pending[station_index] = 0;
-    context->tx_pending_held[station_index] = RT_FALSE;
     for (ps_id = 0; ps_id < AIC8800_PS_ID_COUNT; ps_id++)
     {
         context->sta_buffered[station_index][ps_id] = 0;
@@ -858,6 +857,11 @@ static rt_bool_t aic_station_state_matches(
     return matches;
 }
 
+/* Every transport record with accounted metadata must reach this function
+ * exactly once, whether it was submitted, rejected by a worker, or drained
+ * during reset/teardown.  USB cancellation/watchdog recovery and both USB and
+ * SDIO queue cleanup paths preserve that contract.  The generation check
+ * below makes a late completion harmless after a station slot is reused. */
 void aic8800_core_tx_complete(
     struct aic8800_context *context,
     const struct aic8800_tx_metadata *metadata)
@@ -899,11 +903,6 @@ void aic8800_core_tx_complete(
             traffic_empty =
                 context->sta_buffered[station_index][ps_id] == 0;
         }
-        if (context->tx_pending[station_index] <
-            AIC8800_TX_PENDING_HIGH_WATER)
-        {
-            context->tx_pending_held[station_index] = RT_FALSE;
-        }
     }
     rt_hw_interrupt_enable(level);
     if (traffic_empty)
@@ -922,7 +921,6 @@ void aic8800_core_tx_pending_reset(struct aic8800_context *context)
     }
     level = rt_hw_interrupt_disable();
     rt_memset(context->tx_pending, 0, sizeof(context->tx_pending));
-    rt_memset(context->tx_pending_held, 0, sizeof(context->tx_pending_held));
     rt_memset(context->sta_present, 0, sizeof(context->sta_present));
     context->station_add_pending = RT_FALSE;
     rt_memset(context->sta_add_power_save, 0,
@@ -966,6 +964,9 @@ static rt_err_t aic_tx_pending_acquire(struct aic8800_context *context,
                                        rt_uint8_t ps_id)
 {
     rt_base_t level;
+    rt_bool_t watermark_reached = RT_FALSE;
+    rt_uint32_t watermark_events = 0;
+    rt_uint16_t pending = 0;
 
     if (!context || station_index >= AIC8800_STATION_SLOTS || !generation ||
         ps_id >= AIC8800_PS_ID_COUNT)
@@ -982,24 +983,31 @@ static rt_err_t aic_tx_pending_acquire(struct aic8800_context *context,
     if (context->tx_pending[station_index] >=
         AIC8800_TX_PENDING_HIGH_WATER)
     {
-        context->tx_pending_held[station_index] = RT_TRUE;
-        rt_hw_interrupt_enable(level);
-        context->tx_pending_full_count++;
-        if (aic8800_log_throttle(context->tx_pending_full_count))
-        {
-            LOG_D("station %u transmit window full (pending=%u drops=%u)",
-                  (unsigned int)station_index,
-                  (unsigned int)context->tx_pending[station_index],
-                  (unsigned int)context->tx_pending_full_count);
-        }
-        return -RT_EFULL;
+        context->tx_pending_watermark_count++;
+        watermark_reached = RT_TRUE;
+        watermark_events = context->tx_pending_watermark_count;
+        /* Do not turn this watermark into a drop gate.  RTP packetizers emit
+         * a keyframe as a tight burst, while the SDIO/USB worker drains the
+         * transport asynchronously.  The old early return discarded the tail
+         * of every burst once 64 records were pending, so the browser never
+         * received a complete decodable keyframe.  Transport memory remains
+         * bounded by the fixed TX record pools: USB uses
+         * AIC8800_WIFI_USB_TX_QUEUE_DEPTH records (64 in the maix3 config) and
+         * SDIO uses AIC8800_WIFI_SDIO_TX_QUEUE_DEPTH records (256).  Their
+         * producers apply a bounded wait and return an error when a pool is
+         * exhausted; USB URB and SDIO aggregate capacities are also fixed. */
     }
     context->tx_pending[station_index]++;
     context->sta_buffered[station_index][ps_id]++;
-    context->tx_pending_held[station_index] =
-        context->tx_pending[station_index] >=
-            AIC8800_TX_PENDING_HIGH_WATER;
+    pending = context->tx_pending[station_index];
     rt_hw_interrupt_enable(level);
+    if (watermark_reached && aic8800_log_throttle(watermark_events))
+    {
+        LOG_D("station %u pending watermark reached (pending=%u events=%u); queueing",
+              (unsigned int)station_index,
+              (unsigned int)pending,
+              (unsigned int)watermark_events);
+    }
     return RT_EOK;
 }
 
@@ -8729,8 +8737,9 @@ static rt_err_t aic_transmit_frame(struct aic8800_context *context,
         }
     }
 
-    /* Bound frames outstanding for one associated SoftAP client without
-     * sleeping in lwIP's direct transmit path. */
+    /* Account frames outstanding for an associated SoftAP client.  The
+     * transport worker applies bounded backpressure outside this direct lwIP
+     * transmit path. */
     if (!management && vif->iftype == RT_WLAN_OFFLOAD_IFTYPE_AP &&
         !group_addressed)
     {
@@ -8738,9 +8747,9 @@ static rt_err_t aic_transmit_frame(struct aic8800_context *context,
             context, station_index, station_generation, ps_id);
         if (result != RT_EOK)
         {
-            /* A deleted station and a saturated per-peer window are link-layer
-             * drops. Returning an error makes lwIP retry the same burst
-             * immediately and amplifies transport congestion. */
+            /* A station deleted or reused during transmit is a link-layer
+             * drop. Returning an error makes lwIP retry the same frame even
+             * though its destination is no longer valid. */
             return RT_EOK;
         }
         accounted = RT_TRUE;
@@ -9121,9 +9130,10 @@ static void aic_stat_print_common(const char *transport,
                context->station_connected, context->ap_started,
                context->vif_index, context->ap_station_index,
                context->station_control_port_open ? "open" : "closed");
-    rt_kprintf("TX state: pending=%u full=%u ps-buffered=%u credits=%d "
+    rt_kprintf("TX state: pending=%u watermark-events=%u ps-buffered=%u credits=%d "
                "updates=%u no-station=%u off-channel=%u\n",
-               station_pending, (unsigned int)context->tx_pending_full_count,
+               station_pending,
+               (unsigned int)context->tx_pending_watermark_count,
                (unsigned int)context->tx_power_save_buffered_count,
                station_credit, (unsigned int)context->tx_credit_update_count,
                (unsigned int)context->tx_no_station_count,

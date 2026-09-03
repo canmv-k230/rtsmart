@@ -124,8 +124,9 @@
  * broadcast/multicast pseudo-stations, which sit above the real ones (33 has
  * been observed for VIF 1). */
 #define AIC8800_STATION_SLOTS              40U
-/* Hard cap for records outstanding to one associated SoftAP client.  This is
- * checked without sleeping because WLAN interfaces use lwIP direct transmit. */
+/* Diagnostic watermark for records outstanding to one associated SoftAP
+ * client.  The transport queue/firmware flow control owns the actual bound;
+ * this value must not make lwIP's direct transmit path discard a video burst. */
 #define AIC8800_TX_PENDING_HIGH_WATER      64U
 /* Matches the vendor's NX_TXQ_INITIAL_CREDITS. */
 #define AIC8800_TX_INITIAL_CREDITS         64
@@ -889,7 +890,6 @@ struct aic8800_context
     rt_int16_t tx_credits[AIC8800_STATION_SLOTS];
     /* Frames handed to the transport for a station and not yet completed. */
     rt_uint16_t tx_pending[AIC8800_STATION_SLOTS];
-    rt_bool_t tx_pending_held[AIC8800_STATION_SLOTS];
     rt_uint16_t sta_generation[AIC8800_STATION_SLOTS];
     rt_bool_t sta_present[AIC8800_STATION_SLOTS];
     /* PS changes can arrive before ME_STA_ADD_CFM makes the station present. */
@@ -920,7 +920,9 @@ struct aic8800_context
     volatile rt_bool_t traffic_work_queued;
     rt_bool_t station_loss_work_initialized;
     volatile rt_bool_t station_loss_work_queued;
-    rt_uint32_t tx_pending_full_count;
+    /* Frames accepted while this station was already at the diagnostic
+     * pending watermark. */
+    rt_uint32_t tx_pending_watermark_count;
     rt_uint32_t tx_power_save_buffered_count;
     rt_bool_t tx_credits_tracked;
     rt_uint32_t tx_credit_update_count;
