@@ -9180,7 +9180,8 @@ static void aic_stat_print_usb(struct aic8800_context *context)
     aic_stat_print_common("USB", context);
     rt_kprintf("USB TX queue: queued=%u depth=%u high=%u frames=%u "
                "aggregates=%u max=%u drops=%u defer=%u worker-drop=%u "
-               "submit-busy=%u errors=%u\n",
+               "submit-busy=%u errors=%u token-recover=%u token-errors=%u "
+               "record-errors=%u pool-rebuilds=%u orphan-reclaims=%u\n",
                context->usb_tx_queue ?
                    (unsigned int)context->usb_tx_queue->entry : 0U,
                (unsigned int)AIC8800_WIFI_USB_TX_QUEUE_DEPTH,
@@ -9192,7 +9193,12 @@ static void aic_stat_print_usb(struct aic8800_context *context)
                (unsigned int)context->usb_tx_record_defer_count,
                (unsigned int)context->usb_tx_record_drop_count,
                (unsigned int)context->usb_tx_submit_busy_count,
-               (unsigned int)context->usb_tx_error_count);
+               (unsigned int)context->usb_tx_error_count,
+               (unsigned int)context->usb_tx_queue_token_recovery_count,
+               (unsigned int)context->usb_tx_queue_token_error_count,
+               (unsigned int)context->usb_tx_queue_record_error_count,
+               (unsigned int)context->usb_tx_pool_rebuild_count,
+               (unsigned int)context->usb_tx_queue_orphan_reclaim_count);
     rt_kprintf("USB TX URB: active=%d slots=%u pending=%u complete=%u "
                "bytes=%llu waits=%u timeouts=%u watchdog=%u reclaims=%u "
                "recoveries=%u max-burst=%u errors=%u last=%d\n",

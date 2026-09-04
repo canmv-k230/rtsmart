@@ -98,6 +98,7 @@
 #ifndef AIC8800_WIFI_USB_TX_QUEUE_DEPTH
 #define AIC8800_WIFI_USB_TX_QUEUE_DEPTH  64U
 #endif
+#define AIC8800_USB_TX_TOKEN_INDEX_MAX  256U
 #ifndef AIC8800_WIFI_USB_TX_PRIORITY_RESERVE
 #define AIC8800_WIFI_USB_TX_PRIORITY_RESERVE 4U
 #endif
@@ -334,10 +335,28 @@ struct aic8800_tx_worker
 
 struct aic8800_usb_tx_record
 {
+    rt_uint64_t token;
     rt_uint16_t length;
     struct aic8800_tx_metadata metadata;
     rt_uint8_t data[AIC8800_WIFI_TX_BUFFER_SIZE];
 };
+
+/* Do not put a native pointer in the message queue.  A damaged queue payload
+ * used to be consumed as a record address and was dereferenced immediately by
+ * the TX worker.  Keep a checked, redundant token at opposite ends of one
+ * RT_ALIGN_SIZE queue cell instead. */
+struct aic8800_usb_tx_queue_entry
+{
+    rt_uint64_t token;
+    rt_uint8_t reserved[48];
+    rt_uint64_t token_check;
+};
+
+_Static_assert(sizeof(struct aic8800_usb_tx_queue_entry) == 64,
+               "AIC USB TX queue entry must occupy one RT queue cell");
+_Static_assert(AIC8800_WIFI_USB_TX_QUEUE_DEPTH <=
+                   AIC8800_USB_TX_TOKEN_INDEX_MAX,
+               "AIC USB TX token index is eight bits");
 
 struct aic8800_rx_slot
 {
@@ -650,8 +669,15 @@ struct aic8800_context
     rt_uint32_t usb_tx_record_defer_count;
     rt_uint32_t usb_tx_record_drop_count;
     rt_uint32_t usb_tx_submit_busy_count;
+    rt_uint32_t usb_tx_queue_token_recovery_count;
+    rt_uint32_t usb_tx_queue_token_error_count;
+    rt_uint32_t usb_tx_queue_record_error_count;
+    rt_uint32_t usb_tx_pool_rebuild_count;
+    rt_uint32_t usb_tx_queue_orphan_reclaim_count;
+    rt_uint32_t usb_tx_token_sequence;
+    volatile rt_bool_t usb_tx_queue_recovery_pending;
     rt_bool_t usb_tx_thread_started;
-    rt_bool_t usb_tx_queue_enabled;
+    volatile rt_bool_t usb_tx_queue_enabled;
     rt_bool_t usb_tx_aggregation_enabled;
     volatile rt_bool_t usb_tx_terminate;
 #endif

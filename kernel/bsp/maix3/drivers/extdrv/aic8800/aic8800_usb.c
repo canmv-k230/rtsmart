@@ -33,6 +33,9 @@
 #define AIC8800_USB_RX_ERRORS_EXPECTED    32U
 #define AIC8800_USB_RX_WAIT_MS            100U
 #define AIC8800_USB_TX_AGGREGATE_PREFIX     4U
+#define AIC8800_USB_TX_TOKEN_TAG     0xa1c88000U
+#define AIC8800_USB_TX_TOKEN_TAG_MASK 0xffffff00U
+#define AIC8800_USB_TX_TOKEN_CHECK   0x69c7f4a12e58bd03ULL
 #define AIC8800_USB_PID_MSC               0x5721
 #define AIC8800_USB_VENDOR_ID_MSC_FACTORY 0x1111
 #define AIC8800_USB_PID_MSC_FACTORY       0x1111
@@ -66,6 +69,7 @@ static struct aic8800_context g_aic8800_context;
 static struct rt_workqueue *g_aic8800_attach_workqueue;
 static struct rt_mutex g_aic8800_tx_mutex;
 static struct rt_mutex g_aic8800_frame_mutex;
+static struct rt_mutex g_aic8800_tx_queue_mutex;
 static struct rt_semaphore g_aic8800_tx_available;
 static rt_bool_t g_aic8800_transport_ipc_initialized;
 /* One forced port re-enumeration per attached fake-storage device. */
@@ -108,8 +112,8 @@ static rt_bool_t aic8800_usb_supports_tx_aggregation(
     const struct aic8800_context *context);
 static rt_err_t aic8800_usb_start_tx_queue(
     struct aic8800_context *context);
-static void aic8800_usb_stop_tx_queue(struct aic8800_context *context);
-static void aic8800_usb_free_tx_queue(struct aic8800_context *context);
+static rt_err_t aic8800_usb_stop_tx_queue(struct aic8800_context *context);
+static rt_err_t aic8800_usb_free_tx_queue(struct aic8800_context *context);
 
 static struct aic8800_context *aic8800_context_from_bus(
     struct rt_wlan_offload_bus *bus)
@@ -1646,7 +1650,12 @@ static rt_err_t aic8800_usb_bus_start(struct rt_wlan_offload_bus *bus)
                                       context->data_in, "aic-rx");
     if (result != RT_EOK)
     {
-        aic8800_usb_stop_tx_queue(context);
+        rt_err_t stop_result = aic8800_usb_stop_tx_queue(context);
+
+        if (stop_result != RT_EOK)
+        {
+            return stop_result;
+        }
         aic8800_usb_stop_tx(&context->tx_worker);
         return result;
     }
@@ -1654,8 +1663,14 @@ static rt_err_t aic8800_usb_bus_start(struct rt_wlan_offload_bus *bus)
                                       context->message_in, "aic-msg");
     if (result != RT_EOK)
     {
+        rt_err_t stop_result;
+
         aic8800_usb_stop_worker(&context->data_worker);
-        aic8800_usb_stop_tx_queue(context);
+        stop_result = aic8800_usb_stop_tx_queue(context);
+        if (stop_result != RT_EOK)
+        {
+            return stop_result;
+        }
         aic8800_usb_stop_tx(&context->tx_worker);
         return result;
     }
@@ -1691,12 +1706,17 @@ static rt_err_t aic8800_usb_bus_start(struct rt_wlan_offload_bus *bus)
 static rt_err_t aic8800_usb_bus_stop(struct rt_wlan_offload_bus *bus)
 {
     struct aic8800_context *context = aic8800_context_from_bus(bus);
+    rt_err_t result;
 
     if (!context)
     {
         return -RT_EINVAL;
     }
-    aic8800_usb_stop_tx_queue(context);
+    result = aic8800_usb_stop_tx_queue(context);
+    if (result != RT_EOK)
+    {
+        return result;
+    }
     aic8800_usb_stop_tx(&context->tx_worker);
     aic8800_usb_stop_worker(&context->message_worker);
     aic8800_usb_stop_worker(&context->data_worker);
@@ -2061,33 +2081,468 @@ static rt_bool_t aic8800_usb_supports_tx_aggregation(
 #endif
 }
 
-static void aic8800_usb_reset_tx_queue(struct aic8800_context *context)
+static rt_size_t aic8800_usb_tx_pool_stride(const struct rt_mempool *pool)
+{
+    if (!pool || pool->block_size > (rt_size_t)-1 - sizeof(rt_uint8_t *))
+    {
+        return 0;
+    }
+    return pool->block_size + sizeof(rt_uint8_t *);
+}
+
+static rt_uint8_t *aic8800_usb_tx_pool_block(
+    const struct rt_mempool *pool, rt_size_t index)
+{
+    rt_size_t stride = aic8800_usb_tx_pool_stride(pool);
+
+    if (!stride || index >= pool->block_total_count || stride > pool->size ||
+        index > (pool->size - stride) / stride)
+    {
+        return RT_NULL;
+    }
+    return (rt_uint8_t *)pool->start_address + index * stride;
+}
+
+static struct aic8800_usb_tx_record *aic8800_usb_tx_pool_record(
+    const struct rt_mempool *pool, rt_size_t index)
+{
+    rt_uint8_t *block = aic8800_usb_tx_pool_block(pool, index);
+
+    return block ? (struct aic8800_usb_tx_record *)(
+                         block + sizeof(rt_uint8_t *)) : RT_NULL;
+}
+
+static rt_uint64_t aic8800_usb_tx_record_token(
+    struct aic8800_context *context, struct aic8800_usb_tx_record *record)
+{
+    struct rt_mempool *pool;
+    struct aic8800_usb_tx_record *first;
+    rt_ubase_t record_address;
+    rt_ubase_t first_record;
+    rt_size_t stride;
+    rt_size_t offset;
+    rt_size_t index;
+    rt_uint32_t sequence;
+    rt_base_t level;
+
+    if (!context || !context->usb_tx_pool || !record)
+    {
+        return 0;
+    }
+    pool = context->usb_tx_pool;
+    stride = aic8800_usb_tx_pool_stride(pool);
+    first = aic8800_usb_tx_pool_record(pool, 0);
+    if (!stride || !first)
+    {
+        return 0;
+    }
+    first_record = (rt_ubase_t)first;
+    record_address = (rt_ubase_t)record;
+    if (record_address < first_record)
+    {
+        return 0;
+    }
+    offset = (rt_size_t)(record_address - first_record);
+    if (offset % stride)
+    {
+        return 0;
+    }
+    index = offset / stride;
+    if (index >= pool->block_total_count ||
+        index >= AIC8800_USB_TX_TOKEN_INDEX_MAX)
+    {
+        return 0;
+    }
+
+    level = rt_hw_interrupt_disable();
+    /* A collision requires a stale entry for the same pool index to survive
+     * another 2^32 token allocations.  Queue depth does not strictly bound an
+     * entry's lifetime, but normal queue progress makes that vanishingly
+     * unlikely before the stale entry is consumed or recovery rebuilds the
+     * pool. */
+    sequence = ++context->usb_tx_token_sequence;
+    if (!sequence)
+    {
+        sequence = ++context->usb_tx_token_sequence;
+    }
+    rt_hw_interrupt_enable(level);
+    return ((rt_uint64_t)sequence << 32) |
+           (AIC8800_USB_TX_TOKEN_TAG | (rt_uint32_t)index);
+}
+
+/* Turn an untrusted queue token into a pool address only after checking every
+ * part used in the address calculation.  The hidden word immediately before
+ * an allocated RT-Thread memory-pool block must still name this pool; checking
+ * it also rejects stale duplicate entries after the block has been freed. */
+static struct aic8800_usb_tx_record *aic8800_usb_tx_record_from_token(
+    struct aic8800_context *context, rt_uint64_t token, rt_bool_t claim)
 {
     struct aic8800_usb_tx_record *record;
+    struct rt_mempool *pool;
+    rt_uint8_t *block;
+    rt_size_t index;
+    rt_bool_t owned;
+    rt_base_t level;
+
+    if (!context || !context->usb_tx_pool || !token ||
+        ((rt_uint32_t)token & AIC8800_USB_TX_TOKEN_TAG_MASK) !=
+            AIC8800_USB_TX_TOKEN_TAG || !(rt_uint32_t)(token >> 32))
+    {
+        return RT_NULL;
+    }
+    pool = context->usb_tx_pool;
+    index = (rt_size_t)((rt_uint32_t)token &
+                        ~AIC8800_USB_TX_TOKEN_TAG_MASK);
+    if (index >= pool->block_total_count)
+    {
+        return RT_NULL;
+    }
+    block = aic8800_usb_tx_pool_block(pool, index);
+    record = aic8800_usb_tx_pool_record(pool, index);
+    if (!block || !record)
+    {
+        return RT_NULL;
+    }
+
+    level = rt_hw_interrupt_disable();
+    owned = *(rt_uint8_t **)block == (rt_uint8_t *)pool &&
+            record->token == token;
+    if (owned && claim)
+    {
+        /* A queue entry may be damaged into a duplicate of another valid
+         * entry.  Claiming the generation here makes the second copy fail
+         * validation instead of processing and freeing one block twice. */
+        record->token = 0;
+    }
+    rt_hw_interrupt_enable(level);
+    return owned ? record : RT_NULL;
+}
+
+static void aic8800_usb_tx_queue_entry_set(
+    struct aic8800_usb_tx_queue_entry *entry, rt_uint64_t token)
+{
+    rt_memset(entry, 0, sizeof(*entry));
+    entry->token = token;
+    entry->token_check = token ^ AIC8800_USB_TX_TOKEN_CHECK;
+}
+
+static struct aic8800_usb_tx_record *aic8800_usb_tx_queue_entry_get(
+    struct aic8800_context *context,
+    const struct aic8800_usb_tx_queue_entry *entry)
+{
+    struct aic8800_usb_tx_record *primary;
+    struct aic8800_usb_tx_record *backup;
+    struct aic8800_usb_tx_record *record;
+    rt_uint64_t selected_token;
+    rt_uint64_t backup_token;
+    rt_base_t level;
+
+    if (!context || !entry)
+    {
+        return RT_NULL;
+    }
+    backup_token = entry->token_check ^ AIC8800_USB_TX_TOKEN_CHECK;
+    if (!entry->token && !backup_token)
+    {
+        return RT_NULL;
+    }
+    primary = aic8800_usb_tx_record_from_token(
+        context, entry->token, RT_FALSE);
+    backup = backup_token == entry->token ? primary :
+        aic8800_usb_tx_record_from_token(
+            context, backup_token, RT_FALSE);
+    if (primary && backup && primary != backup)
+    {
+        goto corrupt;
+    }
+    if (primary || backup)
+    {
+        selected_token = primary ? entry->token : backup_token;
+        record = aic8800_usb_tx_record_from_token(
+            context, selected_token, RT_TRUE);
+        if (!record)
+        {
+            goto corrupt;
+        }
+        if (entry->token != backup_token)
+        {
+            context->usb_tx_queue_token_recovery_count++;
+        }
+        return record;
+    }
+
+corrupt:
+    context->usb_tx_queue_token_error_count++;
+    level = rt_hw_interrupt_disable();
+    context->usb_tx_queue_enabled = RT_FALSE;
+    context->usb_tx_queue_recovery_pending = RT_TRUE;
+    rt_hw_interrupt_enable(level);
+    if (aic8800_log_throttle(context->usb_tx_queue_token_error_count))
+    {
+        LOG_W("discarded corrupt USB TX queue token "
+              "%08x%08x/%08x%08x (errors=%u)",
+              (unsigned int)(entry->token >> 32),
+              (unsigned int)entry->token,
+              (unsigned int)(backup_token >> 32),
+              (unsigned int)backup_token,
+              (unsigned int)context->usb_tx_queue_token_error_count);
+    }
+    return RT_NULL;
+}
+
+static rt_err_t aic8800_usb_tx_queue_receive(
+    struct aic8800_context *context, struct aic8800_usb_tx_record **record,
+    rt_int32_t timeout)
+{
+    struct aic8800_usb_tx_queue_entry entry;
+    rt_err_t result;
+
+    if (!context || !record || !context->usb_tx_queue)
+    {
+        return -RT_EINVAL;
+    }
+    *record = RT_NULL;
+    result = rt_mq_recv(context->usb_tx_queue, &entry, sizeof(entry), timeout);
+    if (result == RT_EOK)
+    {
+        *record = aic8800_usb_tx_queue_entry_get(context, &entry);
+    }
+    return result;
+}
+
+static void aic8800_usb_free_tx_record(
+    struct aic8800_usb_tx_record *record)
+{
+    if (record)
+    {
+        record->token = 0;
+        rt_mp_free(record);
+    }
+}
+
+static rt_bool_t aic8800_usb_tx_record_valid(
+    const struct aic8800_usb_tx_record *record)
+{
+    return record && record->length >= AIC8800_USB_HEADER_SIZE &&
+           record->length <= AIC8800_WIFI_TX_BUFFER_SIZE &&
+           aic8800_usb_get_length(record->data) == record->length;
+}
+
+static void aic8800_usb_discard_corrupt_tx_record(
+    struct aic8800_context *context, struct aic8800_usb_tx_record *record)
+{
+    if (!context || !record)
+    {
+        return;
+    }
+    context->usb_tx_queue_record_error_count++;
+    if (aic8800_log_throttle(context->usb_tx_queue_record_error_count))
+    {
+        LOG_W("discarded corrupt USB TX record length=%u wire=%u "
+              "(errors=%u)",
+              (unsigned int)record->length,
+              (unsigned int)aic8800_usb_get_length(record->data),
+              (unsigned int)context->usb_tx_queue_record_error_count);
+    }
+    aic8800_core_tx_complete(context, &record->metadata);
+    aic8800_usb_free_tx_record(record);
+}
+
+static void aic8800_usb_reset_tx_queue(struct aic8800_context *context)
+{
+    struct aic8800_usb_tx_queue_entry entry;
 
     if (!context || !context->usb_tx_queue)
     {
         return;
     }
-    while (rt_mq_recv(context->usb_tx_queue, &record, sizeof(record), 0) ==
+    while (rt_mq_recv(context->usb_tx_queue, &entry, sizeof(entry), 0) ==
            RT_EOK)
     {
+        struct aic8800_usb_tx_record *record =
+            aic8800_usb_tx_queue_entry_get(context, &entry);
+
         if (record)
         {
             aic8800_core_tx_complete(context, &record->metadata);
-            rt_mp_free(record);
+            aic8800_usb_free_tx_record(record);
         }
     }
     rt_mq_control(context->usb_tx_queue, RT_IPC_CMD_RESET, RT_NULL);
 }
 
+static rt_bool_t aic8800_usb_tx_queue_producer_enter(
+    struct aic8800_context *context)
+{
+    rt_bool_t entered = RT_FALSE;
+    rt_err_t result;
+    rt_base_t level;
+
+    if (!context)
+    {
+        return RT_FALSE;
+    }
+    result = rt_mutex_take(&g_aic8800_tx_queue_mutex, RT_WAITING_FOREVER);
+    if (result != RT_EOK)
+    {
+        LOG_E("failed to enter USB TX queue producer gate: %d", result);
+        return RT_FALSE;
+    }
+    level = rt_hw_interrupt_disable();
+    if (context->usb_tx_queue_enabled && !context->usb_tx_terminate &&
+        !context->usb_tx_queue_recovery_pending && context->usb_tx_queue &&
+        context->usb_tx_pool)
+    {
+        entered = RT_TRUE;
+    }
+    rt_hw_interrupt_enable(level);
+    if (!entered)
+    {
+        rt_mutex_release(&g_aic8800_tx_queue_mutex);
+    }
+    return entered;
+}
+
+static void aic8800_usb_tx_queue_producer_leave(
+    struct aic8800_context *context)
+{
+    if (!context)
+    {
+        return;
+    }
+    rt_mutex_release(&g_aic8800_tx_queue_mutex);
+}
+
+static rt_err_t aic8800_usb_wait_tx_queue_producers(
+    struct aic8800_context *context)
+{
+    rt_err_t result;
+
+    if (!context)
+    {
+        return -RT_EINVAL;
+    }
+    result = rt_mutex_take(
+        &g_aic8800_tx_queue_mutex,
+        rt_tick_from_millisecond(AIC8800_USB_STOP_TIMEOUT_MS));
+    if (result != RT_EOK)
+    {
+        LOG_E("timed out waiting for USB TX queue producer barrier: %d",
+              result);
+        return result;
+    }
+    rt_mutex_release(&g_aic8800_tx_queue_mutex);
+    return RT_EOK;
+}
+
+/* A queue entry whose redundant tokens are both unusable no longer identifies
+ * its memory-pool block.  Quiesce producers, drain every entry that can still
+ * be identified, account the remaining allocated blocks as orphans, and
+ * replace the pool.  Rebuilding is necessary: merely dropping the damaged
+ * entry would permanently consume one block on every such error. */
+static rt_err_t aic8800_usb_rebuild_tx_pool(
+    struct aic8800_context *context, rt_bool_t restart_queue)
+{
+    struct rt_mempool *pool;
+    rt_uint32_t reclaimed = 0;
+    rt_err_t result;
+    rt_base_t level;
+
+    if (!context || !context->usb_tx_queue || !context->usb_tx_pool)
+    {
+        return -RT_EINVAL;
+    }
+    level = rt_hw_interrupt_disable();
+    context->usb_tx_queue_enabled = RT_FALSE;
+    rt_hw_interrupt_enable(level);
+    result = aic8800_usb_wait_tx_queue_producers(context);
+    if (result != RT_EOK)
+    {
+        return result;
+    }
+    aic8800_usb_reset_tx_queue(context);
+
+    pool = context->usb_tx_pool;
+    for (rt_size_t index = 0; index < pool->block_total_count; index++)
+    {
+        rt_uint8_t *block = aic8800_usb_tx_pool_block(pool, index);
+        struct aic8800_usb_tx_record *record =
+            aic8800_usb_tx_pool_record(pool, index);
+        rt_bool_t allocated;
+
+        if (!block || !record)
+        {
+            LOG_E("invalid USB TX pool layout at block %u",
+                  (unsigned int)index);
+            return -RT_EIO;
+        }
+        level = rt_hw_interrupt_disable();
+        allocated = *(rt_uint8_t **)block == (rt_uint8_t *)pool;
+        rt_hw_interrupt_enable(level);
+        if (!allocated)
+        {
+            continue;
+        }
+        aic8800_core_tx_complete(context, &record->metadata);
+        record->token = 0;
+        reclaimed++;
+    }
+
+    context->usb_tx_pool = RT_NULL;
+    rt_mp_delete(pool);
+    context->usb_tx_pool = rt_mp_create(
+        "aic-utxp", AIC8800_WIFI_USB_TX_QUEUE_DEPTH,
+        sizeof(struct aic8800_usb_tx_record));
+    context->usb_tx_pool_rebuild_count++;
+    context->usb_tx_queue_orphan_reclaim_count += reclaimed;
+    level = rt_hw_interrupt_disable();
+    context->usb_tx_queue_recovery_pending = RT_FALSE;
+    if (context->usb_tx_pool && restart_queue &&
+        !context->usb_tx_terminate && context->transport_connected)
+    {
+        context->usb_tx_queue_enabled = RT_TRUE;
+    }
+    rt_hw_interrupt_enable(level);
+    if (!context->usb_tx_pool)
+    {
+        LOG_E("failed to rebuild USB TX pool after queue corruption");
+        return -RT_ENOMEM;
+    }
+    LOG_W("rebuilt USB TX pool after queue corruption "
+          "(rebuilds=%u orphans=%u)",
+          (unsigned int)context->usb_tx_pool_rebuild_count,
+          (unsigned int)reclaimed);
+    return RT_EOK;
+}
+
+/* Worker-only path: the TX queue worker retains ownership of record until the
+ * send succeeds.  It intentionally does not enter the producer gate because
+ * pool rebuild also runs in that worker, while stop waits for it to exit. */
 static rt_bool_t aic8800_usb_requeue_tx_record(
     struct aic8800_context *context, struct aic8800_usb_tx_record *record)
 {
-    return context && record && !context->usb_tx_terminate &&
-           context->usb_tx_queue &&
-           rt_mq_send(context->usb_tx_queue, &record, sizeof(record)) ==
-               RT_EOK;
+    struct aic8800_usb_tx_queue_entry entry;
+    rt_uint64_t token;
+    rt_err_t result;
+
+    if (!context || !record || context->usb_tx_terminate ||
+        !context->usb_tx_queue)
+    {
+        return RT_FALSE;
+    }
+    token = aic8800_usb_tx_record_token(context, record);
+    if (!token)
+    {
+        return RT_FALSE;
+    }
+    record->token = token;
+    aic8800_usb_tx_queue_entry_set(&entry, token);
+    result = rt_mq_send(context->usb_tx_queue, &entry, sizeof(entry));
+    if (result != RT_EOK)
+    {
+        record->token = 0;
+    }
+    return result == RT_EOK;
 }
 
 static rt_size_t aic8800_usb_append_tx_aggregate(
@@ -2148,6 +2603,31 @@ static void aic8800_usb_tx_queue_worker(void *parameter)
         rt_bool_t metadata_consumed = RT_FALSE;
         rt_err_t result;
 
+        if (context->usb_tx_queue_recovery_pending)
+        {
+            if (carry)
+            {
+                aic8800_core_tx_complete(context, &carry->metadata);
+                aic8800_usb_free_tx_record(carry);
+                carry = RT_NULL;
+            }
+            result = aic8800_usb_rebuild_tx_pool(context, RT_TRUE);
+            if (result != RT_EOK)
+            {
+                if (context->bus_initialized)
+                {
+                    rt_wlan_offload_bus_notify(
+                        &context->bus, RT_WLAN_OFFLOAD_BUS_EVENT_ERROR,
+                        result);
+                }
+                break;
+            }
+        }
+        if (context->usb_tx_terminate)
+        {
+            break;
+        }
+
         if (carry)
         {
             records[count] = carry;
@@ -2155,8 +2635,8 @@ static void aic8800_usb_tx_queue_worker(void *parameter)
         }
         else
         {
-            result = rt_mq_recv(context->usb_tx_queue, &records[count],
-                                sizeof(records[count]), RT_WAITING_FOREVER);
+            result = aic8800_usb_tx_queue_receive(
+                context, &records[count], RT_WAITING_FOREVER);
             if (result != RT_EOK)
             {
                 continue;
@@ -2168,12 +2648,18 @@ static void aic8800_usb_tx_queue_worker(void *parameter)
             {
                 aic8800_core_tx_complete(
                     context, &records[count]->metadata);
-                rt_mp_free(records[count]);
+                aic8800_usb_free_tx_record(records[count]);
             }
             break;
         }
         if (!records[count])
         {
+            continue;
+        }
+        if (!aic8800_usb_tx_record_valid(records[count]))
+        {
+            aic8800_usb_discard_corrupt_tx_record(
+                context, records[count]);
             continue;
         }
         {
@@ -2193,7 +2679,7 @@ static void aic8800_usb_tx_queue_worker(void *parameter)
                 context->usb_tx_record_drop_count++;
                 aic8800_core_tx_complete(
                     context, &records[count]->metadata);
-                rt_mp_free(records[count]);
+                aic8800_usb_free_tx_record(records[count]);
                 continue;
             }
         }
@@ -2211,8 +2697,8 @@ static void aic8800_usb_tx_queue_worker(void *parameter)
                     AIC8800_WIFI_USB_TX_AGGREGATE_WAIT_MS) : 0;
             rt_size_t wire_length;
 
-            if (rt_mq_recv(context->usb_tx_queue, &next, sizeof(next),
-                           timeout) != RT_EOK)
+            if (aic8800_usb_tx_queue_receive(
+                    context, &next, timeout) != RT_EOK)
             {
                 break;
             }
@@ -2222,6 +2708,11 @@ static void aic8800_usb_tx_queue_worker(void *parameter)
                 {
                     break;
                 }
+                continue;
+            }
+            if (!aic8800_usb_tx_record_valid(next))
+            {
+                aic8800_usb_discard_corrupt_tx_record(context, next);
                 continue;
             }
             {
@@ -2237,7 +2728,7 @@ static void aic8800_usb_tx_queue_worker(void *parameter)
                 if (state != AIC8800_TX_RECORD_READY)
                 {
                     aic8800_core_tx_complete(context, &next->metadata);
-                    rt_mp_free(next);
+                    aic8800_usb_free_tx_record(next);
                     continue;
                 }
             }
@@ -2261,7 +2752,7 @@ static void aic8800_usb_tx_queue_worker(void *parameter)
             {
                 aic8800_core_tx_complete(
                     context, &records[index]->metadata);
-                rt_mp_free(records[index]);
+                aic8800_usb_free_tx_record(records[index]);
             }
             break;
         }
@@ -2288,7 +2779,7 @@ static void aic8800_usb_tx_queue_worker(void *parameter)
                 {
                     aic8800_core_tx_complete(
                         context, &records[index]->metadata);
-                    rt_mp_free(records[index]);
+                    aic8800_usb_free_tx_record(records[index]);
                 }
             }
             count = valid_count;
@@ -2327,7 +2818,7 @@ static void aic8800_usb_tx_queue_worker(void *parameter)
                 {
                     aic8800_core_tx_complete(
                         context, &records[index]->metadata);
-                    rt_mp_free(records[index]);
+                    aic8800_usb_free_tx_record(records[index]);
                 }
             }
             count = valid_count;
@@ -2425,14 +2916,14 @@ static void aic8800_usb_tx_queue_worker(void *parameter)
         {
             if (records[index])
             {
-                rt_mp_free(records[index]);
+                aic8800_usb_free_tx_record(records[index]);
             }
         }
     }
     if (carry)
     {
         aic8800_core_tx_complete(context, &carry->metadata);
-        rt_mp_free(carry);
+        aic8800_usb_free_tx_record(carry);
     }
     rt_completion_done(&context->usb_tx_thread_stopped);
 }
@@ -2446,10 +2937,20 @@ static rt_err_t aic8800_usb_start_tx_queue(
     {
         return -RT_EINVAL;
     }
+    if (context->usb_tx_thread)
+    {
+        LOG_E("refusing to start a second USB TX queue worker");
+        return -RT_EBUSY;
+    }
     context->usb_tx_frame_count = 0;
     context->usb_tx_aggregate_count = 0;
     context->usb_tx_queue_drop_count = 0;
     context->usb_tx_error_count = 0;
+    context->usb_tx_queue_token_recovery_count = 0;
+    context->usb_tx_queue_token_error_count = 0;
+    context->usb_tx_queue_record_error_count = 0;
+    context->usb_tx_pool_rebuild_count = 0;
+    context->usb_tx_queue_orphan_reclaim_count = 0;
     context->usb_tx_max_aggregate = 0;
     context->usb_tx_queue_high_water = 0;
     context->usb_tx_queue_enabled = RT_FALSE;
@@ -2464,8 +2965,16 @@ static rt_err_t aic8800_usb_start_tx_queue(
         return -RT_EIO;
     }
     aic8800_usb_reset_tx_queue(context);
+    if (context->usb_tx_queue_recovery_pending)
+    {
+        result = aic8800_usb_rebuild_tx_pool(context, RT_FALSE);
+        if (result != RT_EOK)
+        {
+            context->usb_tx_aggregation_enabled = RT_FALSE;
+            return result;
+        }
+    }
     context->usb_tx_terminate = RT_FALSE;
-    context->usb_tx_queue_enabled = RT_TRUE;
     rt_completion_init(&context->usb_tx_thread_stopped);
     context->usb_tx_thread = rt_thread_create(
         "aic-utx", aic8800_usb_tx_queue_worker, context,
@@ -2487,22 +2996,47 @@ static rt_err_t aic8800_usb_start_tx_queue(
         return result;
     }
     context->usb_tx_thread_started = RT_TRUE;
+    {
+        rt_base_t level = rt_hw_interrupt_disable();
+
+        context->usb_tx_queue_enabled = RT_TRUE;
+        rt_hw_interrupt_enable(level);
+    }
     return RT_EOK;
 }
 
-static void aic8800_usb_stop_tx_queue(struct aic8800_context *context)
+static rt_err_t aic8800_usb_stop_tx_queue(struct aic8800_context *context)
 {
-    struct aic8800_usb_tx_record *stop = RT_NULL;
+    struct aic8800_usb_tx_queue_entry stop;
+    rt_err_t result;
+    rt_err_t wake_result = RT_EOK;
+    rt_base_t level;
 
     if (!context)
     {
-        return;
+        return -RT_EINVAL;
     }
+    level = rt_hw_interrupt_disable();
     context->usb_tx_queue_enabled = RT_FALSE;
     context->usb_tx_terminate = RT_TRUE;
+    rt_hw_interrupt_enable(level);
     if (context->usb_tx_queue)
     {
-        (void)rt_mq_urgent(context->usb_tx_queue, &stop, sizeof(stop));
+        aic8800_usb_tx_queue_entry_set(&stop, 0);
+        wake_result = rt_mq_urgent(
+            context->usb_tx_queue, &stop, sizeof(stop));
+        if (wake_result != RT_EOK)
+        {
+            LOG_E("failed to wake USB TX queue worker during stop: %d",
+                  wake_result);
+        }
+    }
+    result = aic8800_usb_wait_tx_queue_producers(context);
+    if (result != RT_EOK)
+    {
+        /* The mutex owner may still be using usb_tx_pool.  Preserve every TX
+         * queue resource so a late producer cannot touch freed storage. */
+        return result;
     }
     if (context->usb_tx_thread)
     {
@@ -2520,6 +3054,15 @@ static void aic8800_usb_stop_tx_queue(struct aic8800_context *context)
     context->usb_tx_thread_started = RT_FALSE;
     context->usb_tx_aggregation_enabled = RT_FALSE;
     aic8800_usb_reset_tx_queue(context);
+    if (context->usb_tx_queue_recovery_pending && context->usb_tx_pool)
+    {
+        result = aic8800_usb_rebuild_tx_pool(context, RT_FALSE);
+        if (result != RT_EOK)
+        {
+            return result;
+        }
+    }
+    return RT_EOK;
 }
 
 static rt_bool_t aic8800_usb_tx_queue_wait_expired(rt_tick_t start,
@@ -2547,7 +3090,7 @@ static struct aic8800_usb_tx_record *aic8800_usb_alloc_tx_record(
             {
                 return record;
             }
-            rt_mp_free(record);
+            aic8800_usb_free_tx_record(record);
         }
         if (urgent ||
             aic8800_usb_tx_queue_wait_expired(start, timeout))
@@ -2564,14 +3107,18 @@ static rt_err_t aic8800_usb_queue_transmit(
     rt_bool_t urgent)
 {
     struct aic8800_usb_tx_record *record;
+    struct aic8800_usb_tx_queue_entry entry;
+    rt_uint64_t token;
     rt_err_t result;
 
     if (!context || !data || length < AIC8800_USB_HEADER_SIZE ||
-        length > AIC8800_WIFI_TX_BUFFER_SIZE ||
-        !context->usb_tx_queue_enabled || !context->usb_tx_pool ||
-        !context->usb_tx_queue)
+        length > AIC8800_WIFI_TX_BUFFER_SIZE)
     {
         return -RT_EINVAL;
+    }
+    if (!aic8800_usb_tx_queue_producer_enter(context))
+    {
+        return -RT_EBUSY;
     }
     record = aic8800_usb_alloc_tx_record(context, urgent);
     if (!record)
@@ -2579,6 +3126,14 @@ static rt_err_t aic8800_usb_queue_transmit(
         result = -RT_EFULL;
         goto failed;
     }
+    token = aic8800_usb_tx_record_token(context, record);
+    if (!token)
+    {
+        aic8800_usb_free_tx_record(record);
+        result = -RT_EIO;
+        goto failed;
+    }
+    record->token = token;
     record->length = (rt_uint16_t)length;
     aic8800_core_tx_metadata_init(
         context, data, length, &record->metadata);
@@ -2587,18 +3142,20 @@ static rt_err_t aic8800_usb_queue_transmit(
      * pool block, so holding a block leaves at least one free queue entry.
      * aic8800_usb_alloc_tx_record() has already applied the producer
      * backpressure; waiting again here only doubles the stall. */
+    aic8800_usb_tx_queue_entry_set(&entry, token);
     result = urgent ?
-             rt_mq_urgent(context->usb_tx_queue, &record, sizeof(record)) :
-             rt_mq_send(context->usb_tx_queue, &record, sizeof(record));
+             rt_mq_urgent(context->usb_tx_queue, &entry, sizeof(entry)) :
+             rt_mq_send(context->usb_tx_queue, &entry, sizeof(entry));
     if (result != RT_EOK)
     {
-        rt_mp_free(record);
+        aic8800_usb_free_tx_record(record);
         goto failed;
     }
     if (context->usb_tx_queue->entry > context->usb_tx_queue_high_water)
     {
         context->usb_tx_queue_high_water = context->usb_tx_queue->entry;
     }
+    aic8800_usb_tx_queue_producer_leave(context);
     return RT_EOK;
 
 failed:
@@ -2629,6 +3186,7 @@ failed:
                   (unsigned int)context->usb_tx_queue_high_water);
         }
     }
+    aic8800_usb_tx_queue_producer_leave(context);
     return result;
 }
 
@@ -2863,6 +3421,8 @@ static void aic8800_usb_free_tx_buffers(struct aic8800_tx_worker *worker)
 static rt_err_t aic8800_usb_allocate_tx_queue(
     struct aic8800_context *context, rt_bool_t allocate_aggregate_buffer)
 {
+    rt_err_t result;
+
     if (!context)
     {
         return -RT_EINVAL;
@@ -2871,7 +3431,7 @@ static rt_err_t aic8800_usb_allocate_tx_queue(
         "aic-utxp", AIC8800_WIFI_USB_TX_QUEUE_DEPTH,
         sizeof(struct aic8800_usb_tx_record));
     context->usb_tx_queue = rt_mq_create(
-        "aic-utxq", sizeof(struct aic8800_usb_tx_record *),
+        "aic-utxq", sizeof(struct aic8800_usb_tx_queue_entry),
         AIC8800_WIFI_USB_TX_QUEUE_DEPTH, RT_IPC_FLAG_FIFO);
     if (allocate_aggregate_buffer)
     {
@@ -2882,19 +3442,26 @@ static rt_err_t aic8800_usb_allocate_tx_queue(
     if (!context->usb_tx_pool || !context->usb_tx_queue ||
         (allocate_aggregate_buffer && !context->usb_tx_aggregate_buffer))
     {
-        aic8800_usb_free_tx_queue(context);
-        return -RT_ENOMEM;
+        result = aic8800_usb_free_tx_queue(context);
+        return result == RT_EOK ? -RT_ENOMEM : result;
     }
     return RT_EOK;
 }
 
-static void aic8800_usb_free_tx_queue(struct aic8800_context *context)
+static rt_err_t aic8800_usb_free_tx_queue(struct aic8800_context *context)
 {
+    rt_err_t result;
+
     if (!context)
     {
-        return;
+        return -RT_EINVAL;
     }
-    aic8800_usb_stop_tx_queue(context);
+    result = aic8800_usb_stop_tx_queue(context);
+    if (result != RT_EOK)
+    {
+        LOG_E("preserving USB TX queue after stop failure: %d", result);
+        return result;
+    }
     if (context->usb_tx_queue)
     {
         rt_mq_delete(context->usb_tx_queue);
@@ -2910,6 +3477,7 @@ static void aic8800_usb_free_tx_queue(struct aic8800_context *context)
         rt_free_align(context->usb_tx_aggregate_buffer);
         context->usb_tx_aggregate_buffer = RT_NULL;
     }
+    return RT_EOK;
 }
 
 static rt_err_t aic8800_usb_allocate_buffers(struct aic8800_context *context)
@@ -2928,7 +3496,11 @@ static rt_err_t aic8800_usb_allocate_buffers(struct aic8800_context *context)
     result = aic8800_usb_allocate_tx_queue(context, aggregate);
     if (result != RT_EOK)
     {
-        aic8800_usb_free_tx_buffers(&context->tx_worker);
+        if (!context->usb_tx_queue && !context->usb_tx_pool &&
+            !context->usb_tx_aggregate_buffer)
+        {
+            aic8800_usb_free_tx_buffers(&context->tx_worker);
+        }
         return result;
     }
     result = aic8800_usb_allocate_worker_buffer(
@@ -2936,7 +3508,12 @@ static rt_err_t aic8800_usb_allocate_buffers(struct aic8800_context *context)
 
     if (result != RT_EOK)
     {
-        aic8800_usb_free_tx_queue(context);
+        rt_err_t queue_result = aic8800_usb_free_tx_queue(context);
+
+        if (queue_result != RT_EOK)
+        {
+            return queue_result;
+        }
         aic8800_usb_free_tx_buffers(&context->tx_worker);
         return result;
     }
@@ -2946,8 +3523,14 @@ static rt_err_t aic8800_usb_allocate_buffers(struct aic8800_context *context)
             &context->message_worker, AIC8800_USB_MESSAGE_RX_SLOT_COUNT);
         if (result != RT_EOK)
         {
+            rt_err_t queue_result;
+
             aic8800_usb_free_worker_buffer(&context->data_worker);
-            aic8800_usb_free_tx_queue(context);
+            queue_result = aic8800_usb_free_tx_queue(context);
+            if (queue_result != RT_EOK)
+            {
+                return queue_result;
+            }
             aic8800_usb_free_tx_buffers(&context->tx_worker);
             return result;
         }
@@ -2959,7 +3542,10 @@ static void aic8800_usb_free_buffers(struct aic8800_context *context)
 {
     aic8800_usb_free_worker_buffer(&context->message_worker);
     aic8800_usb_free_worker_buffer(&context->data_worker);
-    aic8800_usb_free_tx_queue(context);
+    if (aic8800_usb_free_tx_queue(context) != RT_EOK)
+    {
+        return;
+    }
     aic8800_usb_free_tx_buffers(&context->tx_worker);
 }
 
@@ -3891,11 +4477,20 @@ rt_err_t aic8800_usb_driver_init(void)
             rt_mutex_detach(&g_aic8800_tx_mutex);
             return result;
         }
+        result = rt_mutex_init(&g_aic8800_tx_queue_mutex, "aic-utql",
+                               RT_IPC_FLAG_PRIO);
+        if (result != RT_EOK)
+        {
+            rt_mutex_detach(&g_aic8800_frame_mutex);
+            rt_mutex_detach(&g_aic8800_tx_mutex);
+            return result;
+        }
         result = rt_sem_init(&g_aic8800_tx_available, "aic-txf",
                              AIC8800_WIFI_DATA_TX_URBS,
                              RT_IPC_FLAG_FIFO);
         if (result != RT_EOK)
         {
+            rt_mutex_detach(&g_aic8800_tx_queue_mutex);
             rt_mutex_detach(&g_aic8800_frame_mutex);
             rt_mutex_detach(&g_aic8800_tx_mutex);
             return result;
