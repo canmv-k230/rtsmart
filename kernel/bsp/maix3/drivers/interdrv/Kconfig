@@ -316,6 +316,20 @@ menu "InterDriver"
                 shutdown. PAD64 is reserved for the power-key long-press path.
 
         if RT_PMU_SHUTDOWN_WAKEUP
+            menuconfig RT_PMU_SHUTDOWN_WAKEUP_PAD64
+                bool "Enable PAD64 (power key) as edge/level shutdown wakeup"
+                help
+                    Reuse PAD64 as a generic edge/level shutdown wakeup
+                    source, exactly like PAD65-PAD68: readable as GPIO at
+                    runtime and armed for PMU wakeup at shutdown.
+
+                    Enabling this GIVES UP the runtime power-key long-press
+                    power-on/off behaviour on PAD64. Leave it disabled to
+                    keep the long-press function.
+            if RT_PMU_SHUTDOWN_WAKEUP_PAD64
+                source "drivers/interdrv/pmu/Kconfig.pad64"
+            endif
+
             menuconfig RT_PMU_SHUTDOWN_WAKEUP_PAD65
                 bool "Enable PAD65 shutdown wakeup"
             if RT_PMU_SHUTDOWN_WAKEUP_PAD65

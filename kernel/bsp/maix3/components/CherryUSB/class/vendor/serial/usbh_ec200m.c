@@ -345,3 +345,13 @@ CLASS_INFO_DEFINE const struct usbh_class_info simcom_a7680c_class_info = {
     .pid = 0x9011,
     .class_driver = &ec200m_class_driver
 };
+
+CLASS_INFO_DEFINE const struct usbh_class_info ml307h_class_info = {
+    .match_flags = USB_CLASS_MATCH_VENDOR | USB_CLASS_MATCH_PRODUCT | USB_CLASS_MATCH_INTF_CLASS,
+    .class = 0xff,
+    .subclass = 0xff,
+    .protocol = 0xff,
+    .vid = 0x3563,
+    .pid = 0x2000,
+    .class_driver = &ec200m_class_driver
+};

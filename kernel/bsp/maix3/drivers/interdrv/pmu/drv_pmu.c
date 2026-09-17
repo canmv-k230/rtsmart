@@ -50,6 +50,21 @@ static const struct pmu_irq_clear_map g_pmu_irq_clear_map[] = {
 };
 
 static const struct pmu_pad_wakeup_cfg g_pmu_pad_wakeup_cfgs[] = {
+#ifdef RT_PMU_SHUTDOWN_WAKEUP_PAD64
+    /*
+     * PAD64 is the power key (int0). When this wakeup entry is enabled it
+     * is treated exactly like PAD65-PAD68: GPIO/readable at runtime, armed
+     * for PMU edge/level wakeup at shutdown. This deliberately gives up the
+     * runtime long-press power path; its int0 edge/level unit (int0_2) is
+     * used as the wakeup source. When the entry is disabled PAD64 is absent
+     * from this table and keeps its power-key long-press behaviour.
+     */
+    { 64U, PMU_IO_CFG_0, PMU_IRQ_KEY_EDGE, PMU_DET_KEY_EDGE, PMU_KEY_EDGE_OFFSET,
+      PMU_INT0_LEVEL_DEBOUNCE_VAL, RT_PMU_SHUTDOWN_WAKEUP_PAD64_TRIGGER,
+      RT_PMU_SHUTDOWN_WAKEUP_PAD64_BIAS,
+      RT_PMU_SHUTDOWN_WAKEUP_PAD64_DEBOUNCE_TICKS,
+      RT_PMU_SHUTDOWN_WAKEUP_SOURCE_PAD64 },
+#endif
 #ifdef RT_PMU_SHUTDOWN_WAKEUP_PAD65
     { 65U, PMU_IO_CFG_1, PMU_IRQ_INT1_1, PMU_DET_INT1_1, PMU_INT1_EDGE_OFFSET,
       PMU_INT1_LEVEL_DEBOUNCE_VAL, RT_PMU_SHUTDOWN_WAKEUP_PAD65_TRIGGER,
@@ -345,6 +360,13 @@ static void pmu_capture_wakeup_source(struct pmu_dev *pmu)
         pmu->wakeup_source_count++;
         pmu->wakeup_source_name = "long press key wake up";
         pmu->wakeup_source_valid = true;
+        /*
+         * PAD64 long-press and its int0 edge/level unit are the same
+         * physical power key: a long-press wake also latches the edge
+         * state. Drop it so the power key still counts as one source and
+         * pmu_get_shutdown_wakeup_source() keeps reporting the long press.
+         */
+        status &= ~PMU_IRQ_KEY_EDGE;
     }
 
     if ((status & (PMU_IRQ_RTC_MASK | PMU_INT_STATE_RTC_INPUT_MASK)) != 0U) {

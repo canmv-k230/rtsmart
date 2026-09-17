@@ -76,7 +76,7 @@ void usb_hc_low_level_init(void)
     }
 
     uint32_t *hs_reg = (uint32_t *)rt_ioremap((void *)(0x91585000 + 0x7C), 0x1000);
-    uint32_t usb_ctl3 = *hs_reg | USB_IDPULLUP0;
+    uint32_t usb_ctl3 = *hs_reg;
 
     *hs_reg = usb_ctl3 | (USB_DMPULLDOWN0 | USB_DPPULLDOWN0);
 
@@ -99,7 +99,7 @@ void usb_hc_low_level_init(void)
     }
 
     uint32_t *hs_reg = (uint32_t *)rt_ioremap((void *)(0x91585000 + 0x9C), 0x1000);
-    uint32_t usb_ctl3 = *hs_reg | USB_IDPULLUP0;
+    uint32_t usb_ctl3 = *hs_reg;
 
     *hs_reg = usb_ctl3 | (USB_DMPULLDOWN0 | USB_DPPULLDOWN0);
 
