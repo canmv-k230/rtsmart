@@ -1696,11 +1696,50 @@ int rt_wlan_get_rssi(void)
     return rssi;
 }
 
+static void rt_wlan_resolve_ap_channel(struct rt_wlan_info *info)
+{
+    rt_bool_t band_auto = info->band == RT_802_11_BAND_UNKNOWN;
+    rt_bool_t channel_auto = info->channel <= 0;
+    struct rt_wlan_info sta_info;
+
+    if (!_sta_is_null() && !_ap_is_null() &&
+        STA_DEVICE()->radio_index == AP_DEVICE()->radio_index &&
+        rt_wlan_get_info(&sta_info) == RT_EOK &&
+        (sta_info.band == RT_802_11_BAND_2_4GHZ ||
+         sta_info.band == RT_802_11_BAND_5GHZ) &&
+        sta_info.channel > 0)
+    {
+        if (band_auto && channel_auto)
+        {
+            info->band = sta_info.band;
+            info->channel = sta_info.channel;
+            RT_WLAN_LOG_I("start concurrent AP on station channel %d",
+                          info->channel);
+            return;
+        }
+        if (channel_auto && info->band == sta_info.band)
+        {
+            info->channel = sta_info.channel;
+            RT_WLAN_LOG_I("start concurrent AP on station channel %d",
+                          info->channel);
+            return;
+        }
+    }
+
+    if (band_auto)
+    {
+        info->band = info->channel > 14 ? RT_802_11_BAND_5GHZ :
+                                         RT_802_11_BAND_2_4GHZ;
+    }
+    if (channel_auto)
+    {
+        info->channel = info->band == RT_802_11_BAND_5GHZ ? 36 : 6;
+    }
+}
+
 rt_err_t rt_wlan_start_ap(const char *ssid, const char *password)
 {
-    rt_802_11_band_t band = RT_802_11_BAND_2_4GHZ;
-    int channel = 6;
-    struct rt_wlan_info sta_info;
+    struct rt_wlan_info info;
 
     if (_ap_is_null() &&
         rt_wlan_select_device(RT_WLAN_AP,
@@ -1709,21 +1748,11 @@ rt_err_t rt_wlan_start_ap(const char *ssid, const char *password)
         return -RT_EIO;
     }
 
-    /* A concurrent STA/AP pair on one radio must share its RF channel. */
-    if (!_sta_is_null() && !_ap_is_null() &&
-        STA_DEVICE()->transport != RT_WLAN_TRANSPORT_UNKNOWN &&
-        STA_DEVICE()->transport == AP_DEVICE()->transport &&
-        rt_wlan_get_info(&sta_info) == RT_EOK &&
-        (sta_info.band == RT_802_11_BAND_2_4GHZ ||
-         sta_info.band == RT_802_11_BAND_5GHZ) &&
-        sta_info.channel > 0)
-    {
-        band = sta_info.band;
-        channel = sta_info.channel;
-        RT_WLAN_LOG_I("start concurrent AP on station channel %d", channel);
-    }
-
-    return rt_wlan_start_ap_with_channel(ssid, password, band, channel);
+    rt_memset(&info, 0, sizeof(info));
+    info.band = RT_802_11_BAND_UNKNOWN;
+    rt_wlan_resolve_ap_channel(&info);
+    return rt_wlan_start_ap_with_channel(ssid, password, info.band,
+                                         info.channel);
 }
 
 rt_err_t rt_wlan_start_ap_with_channel(const char *ssid, const char *password,
@@ -1811,6 +1840,7 @@ rt_err_t rt_wlan_start_ap_adv(struct rt_wlan_info *info, const char *password)
 {
     rt_err_t err = RT_EOK;
     int password_len = 0;
+    struct rt_wlan_info resolved_info;
 
     if (_ap_is_null())
     {
@@ -1821,6 +1851,17 @@ rt_err_t rt_wlan_start_ap_adv(struct rt_wlan_info *info, const char *password)
     {
         return -RT_EINVAL;
     }
+
+    resolved_info = *info;
+    rt_wlan_resolve_ap_channel(&resolved_info);
+    if ((resolved_info.band != RT_802_11_BAND_2_4GHZ &&
+         resolved_info.band != RT_802_11_BAND_5GHZ) ||
+        resolved_info.channel <= 0 || resolved_info.channel > 0x7fff)
+    {
+        return -RT_EINVAL;
+    }
+    info = &resolved_info;
+
     RT_WLAN_LOG_D("%s is run", __FUNCTION__);
     if (password != RT_NULL)
     {
