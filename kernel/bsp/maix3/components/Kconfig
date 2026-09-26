@@ -258,6 +258,15 @@ menu "Components Configuration"
                             bool "CDC + ADB"
                             select CHERRY_USB_DEVICE_ENABLE_CLASS_CDC_ACM
                             select CHERRY_USB_DEVICE_ENABLE_CLASS_ADB
+                        config CHERRY_USB_DEVICE_FUNC_CDC_MTP_ADB
+                            bool "CDC + MTP + ADB"
+                            depends on CANMV_USB_DEVICE_MAX_ENDPOINTS >= 6
+                            select CHERRY_USB_DEVICE_ENABLE_CLASS_CDC_ACM
+                            select CHERRY_USB_DEVICE_ENABLE_CLASS_MTP
+                            select CHERRY_USB_DEVICE_ENABLE_CLASS_ADB
+                            help
+                                Requires six endpoint numbers. K230 provides EP1 through EP6,
+                                which is the minimum requirement for this function.
                         config CHERRY_USB_DEVICE_FUNC_ADB
                             bool "ADB"
                             select CHERRY_USB_DEVICE_ENABLE_CLASS_ADB

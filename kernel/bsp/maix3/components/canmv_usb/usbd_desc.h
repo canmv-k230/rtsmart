@@ -67,6 +67,10 @@
 #include "usbd_desc_cdc_adb.h"
 #endif
 
+#ifdef CHERRY_USB_DEVICE_FUNC_CDC_MTP_ADB
+#include "usbd_desc_cdc_mtp_adb.h"
+#endif
+
 #ifdef CHERRY_USB_DEVICE_FUNC_ADB
 #include "usbd_desc_adb.h"
 #endif

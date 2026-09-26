@@ -16,7 +16,7 @@
 #include <dirent.h>
 #include <unistd.h>
 
-#if defined (CHERRY_USB_DEVICE_FUNC_ADB) || defined (CHERRY_USB_DEVICE_FUNC_CDC_ADB)
+#if defined (CHERRY_USB_DEVICE_FUNC_ADB) || defined (CHERRY_USB_DEVICE_FUNC_CDC_ADB) || defined (CHERRY_USB_DEVICE_FUNC_CDC_MTP_ADB)
 /* Max USB packet size */
 #define WCID_VENDOR_CODE 0x17
 

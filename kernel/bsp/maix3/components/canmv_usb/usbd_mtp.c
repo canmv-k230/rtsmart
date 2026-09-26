@@ -10,7 +10,7 @@
 
 #include "usb_osal.h"
 
-#if defined (CHERRY_USB_DEVICE_FUNC_CDC_MTP) || defined (CHERRY_USB_DEVICE_FUNC_HID_CDC_MTP)
+#if defined (CHERRY_USB_DEVICE_FUNC_CDC_MTP) || defined (CHERRY_USB_DEVICE_FUNC_HID_CDC_MTP) || defined (CHERRY_USB_DEVICE_FUNC_CDC_MTP_ADB)
 #define MTP_OUT_EP_IDX 0
 #define MTP_IN_EP_IDX  1
 #define MTP_INT_EP_IDX 2

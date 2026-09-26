@@ -6,7 +6,7 @@
 #include "usbd_desc.h"
 #include "usbd_cdc.h"
 
-#if defined(CHERRY_USB_DEVICE_FUNC_CDC) || defined (CHERRY_USB_DEVICE_FUNC_CDC_MTP) || defined (CHERRY_USB_DEVICE_FUNC_CDC_ADB) || defined (CHERRY_USB_DEVICE_FUNC_HID_CDC_MTP)
+#if defined(CHERRY_USB_DEVICE_FUNC_CDC) || defined (CHERRY_USB_DEVICE_FUNC_CDC_MTP) || defined (CHERRY_USB_DEVICE_FUNC_CDC_ADB) || defined (CHERRY_USB_DEVICE_FUNC_HID_CDC_MTP) || defined (CHERRY_USB_DEVICE_FUNC_CDC_MTP_ADB)
 
 #include "usbd_desc_cdc_common.h"
 
