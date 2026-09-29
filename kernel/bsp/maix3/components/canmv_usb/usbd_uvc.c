@@ -334,6 +334,7 @@ static inline __attribute__((always_inline)) rt_err_t _usbd_video_ioctl_get_buff
 static inline __attribute__((always_inline)) rt_err_t _usbd_video_ioctl_put_buffer(struct usbd_video_inst_t* inst, void* args)
 {
     rt_err_t ret = RT_EOK;
+    bool     found = false;
 
     struct usbd_video_buffer_wrap_t buffer;
     struct usbd_video_frame_t*      frame = NULL;
@@ -356,7 +357,7 @@ static inline __attribute__((always_inline)) rt_err_t _usbd_video_ioctl_put_buff
                     continue;
                 }
             } else {
-                if (frame->k_addr == buffer.user_buffer) {
+                if (frame->k_addr != buffer.user_buffer) {
                     continue;
                 }
             }
@@ -367,11 +368,17 @@ static inline __attribute__((always_inline)) rt_err_t _usbd_video_ioctl_put_buff
             } else {
                 rt_list_insert_after(&inst->free_list, &frame->list);
             }
+            found = true;
             break;
         }
 
-        // wake up thread
-        rt_event_send(&inst->event, USBD_VIDEO_THR_STREAM_FLAG);
+        if (found) {
+            // wake up thread
+            rt_event_send(&inst->event, USBD_VIDEO_THR_STREAM_FLAG);
+        } else {
+            LOG_E("Invalid video buffer %p", buffer.user_buffer);
+            ret = RT_EINVAL;
+        }
     } else {
         ret = RT_ERROR;
     }
@@ -462,58 +469,51 @@ static rt_err_t _usbd_video_dev_control(rt_device_t dev, int cmd, void* args)
 }
 
 /**
- * @brief Fills the 12-byte UVC payload header for a single packet.
+ * @brief Fills a UVC payload header for a single packet.
  *
- * @param header_buffer Pointer to a 12-byte buffer where the header will be written.
+ * @param header_buffer Pointer to the packet buffer where the header will be written.
  * @param packet_index The index of the current packet (0-based).
  * @param total_packets The total number of packets for the frame.
  * @param frame_counter A counter for the video frame number.
- * @param payload_size The size of the image data in this specific packet.
+ * @param presentation_time Frame timestamp in 48 MHz clock ticks.
+ * @return Payload header size in bytes.
  */
-static void video_payload_header_fill(uint8_t* header_buffer, uint32_t packet_index, uint32_t total_packets,
-                                      uint32_t frame_counter, uint32_t payload_size)
+static uint32_t video_payload_header_fill(uint8_t* header_buffer, uint32_t packet_index, uint32_t total_packets,
+                                          uint32_t frame_counter, uint32_t presentation_time)
 {
-    static uint32_t presentation_time = 0;
+    uint32_t header_size = UVC_PAYLOAD_HEADER_SIZE;
 
-    header_buffer[0] = 0x0C; // bHeaderLength: 12 bytes
-    header_buffer[1] = 0x00; // bmHeaderInfo: Clear all flags initially
+    header_buffer[1] = 1U << 7; // End of header.
 
-    // Set Frame ID (FID) bit - alternates for each new frame
     header_buffer[1] |= (frame_counter & 0x01);
 
-    // Set End of Frame (EOF) bit for the last packet
+    // Match the Linux UVC gadget behavior: put PTS on the first payload only.
+    if (packet_index == 0U) {
+        header_size = UVC_PAYLOAD_PTS_HEADER_SIZE;
+        header_buffer[1] |= 1U << 2;
+        header_buffer[2] = (uint8_t)(presentation_time >> 0);
+        header_buffer[3] = (uint8_t)(presentation_time >> 8);
+        header_buffer[4] = (uint8_t)(presentation_time >> 16);
+        header_buffer[5] = (uint8_t)(presentation_time >> 24);
+    }
+
     if (packet_index == (total_packets - 1)) {
-        header_buffer[1] |= (1 << 1); // Set EOF bit
+        header_buffer[1] |= 1U << 1;
     }
 
-    // On the very first packet of a new frame, update presentation time
-    if (packet_index == 0) {
-        // 333333 units of 100ns = 33.3333 ms (~30 FPS)
-        presentation_time += 333333;
-    }
-
-    // dwPresentationTime (4 bytes, little-endian)
-    header_buffer[2] = (uint8_t)(presentation_time >> 0);
-    header_buffer[3] = (uint8_t)(presentation_time >> 8);
-    header_buffer[4] = (uint8_t)(presentation_time >> 16);
-    header_buffer[5] = (uint8_t)(presentation_time >> 24);
-
-    // dwSourceClockReference is optional, can be zero or a simple time source
-    header_buffer[6]  = 0;
-    header_buffer[7]  = 0;
-    header_buffer[8]  = 0;
-    header_buffer[9]  = 0;
-    header_buffer[10] = 0;
-    header_buffer[11] = 0;
+    header_buffer[0] = (uint8_t)header_size;
+    return header_size;
 }
 
 static void _usbd_video_thread_entry(void* args)
 {
     uint32_t                   event;
     uint32_t                   frame_rate, frame_sleep_ms;
-    struct usbd_video_frame_t* frame         = NULL;
-    struct usbd_video_inst_t*  inst          = (struct usbd_video_inst_t*)args;
-    static uint32_t            frame_counter = 0;
+    struct usbd_video_frame_t* frame            = NULL;
+    struct usbd_video_inst_t*  inst             = (struct usbd_video_inst_t*)args;
+    static uint32_t            frame_counter    = 0;
+    static uint32_t            presentation_time = 0;
+    uint32_t                   completed_frames = 0;
 
     // Allocate two packet buffers for ping-pong
     uint8_t* buffer = rt_malloc_align(MAX_PAYLOAD_SIZE * 2, RT_CPU_CACHE_LINE_SZ);
@@ -563,25 +563,27 @@ static void _usbd_video_thread_entry(void* args)
             uint64_t frame_send_time_ms = cpu_ticks_ms();
 
             if (frame && tx_flag && g_usb_device_connected && usb_device_is_configured(USB_DEVICE_BUS_ID)) {
-                uint8_t* input_data   = (uint8_t*)frame->k_addr;
-                uint32_t input_len    = frame->data_length;
-                uint32_t bytes_sent   = 0;
-                uint32_t buffer_index = 0;
+                uint8_t* input_data       = (uint8_t*)frame->k_addr;
+                uint32_t input_len        = frame->data_length;
+                uint32_t bytes_sent       = 0;
+                uint32_t buffer_index     = 0;
+                uint32_t packets_started = 0;
 
-                // Max image data per packet after the UVC payload header.
-                const uint32_t data_per_packet = uvc_payload_size - UVC_PAYLOAD_HEADER_SIZE;
-                const uint32_t total_packets   = (input_len + data_per_packet - 1) / data_per_packet;
+                const uint32_t first_packet_data = uvc_payload_size - UVC_PAYLOAD_PTS_HEADER_SIZE;
+                const uint32_t next_packet_data  = uvc_payload_size - UVC_PAYLOAD_HEADER_SIZE;
+                const uint32_t total_packets = input_len <= first_packet_data
+                                                 ? 1U
+                                                 : 1U + (input_len - first_packet_data + next_packet_data - 1U)
+                                                              / next_packet_data;
 
-                // Pre-fill the first packet
-                uint32_t bytes_to_copy
-                    = (bytes_sent + data_per_packet > input_len) ? (input_len - bytes_sent) : data_per_packet;
-                video_payload_header_fill(packet_buffer[buffer_index], 0, total_packets, frame_counter, bytes_to_copy);
-                memcpy(packet_buffer[buffer_index] + UVC_PAYLOAD_HEADER_SIZE,
-                       input_data + bytes_sent, bytes_to_copy);
-                bytes_sent += bytes_to_copy;
+                presentation_time += UVC_CLOCK_FREQUENCY / (frame_rate > 0U ? frame_rate : 30U);
 
                 // Loop through and send all packets
                 for (uint32_t i = 0; i < total_packets; i++) {
+                    uint32_t header_size;
+                    uint32_t data_capacity;
+                    uint32_t bytes_to_copy;
+
                     if (!tx_flag || !g_usb_device_connected || !usb_device_is_configured(USB_DEVICE_BUS_ID)) {
                         break;
                     }
@@ -592,34 +594,52 @@ static void _usbd_video_thread_entry(void* args)
                         asm volatile("wfi");
                     }
 
-                    // Start transmission of the current buffer
-                    uint32_t total_packet_size = UVC_PAYLOAD_HEADER_SIZE + bytes_to_copy;
-                    iso_tx_busy                = true; // Set busy flag before starting transmission
-                    if (usbd_ep_start_write(USB_DEVICE_BUS_ID, VIDEO_IN_EP, packet_buffer[buffer_index], total_packet_size) < 0) {
+                    header_size = video_payload_header_fill(packet_buffer[buffer_index], i, total_packets,
+                                                            frame_counter, presentation_time);
+                    data_capacity = uvc_payload_size - header_size;
+                    bytes_to_copy = input_len - bytes_sent;
+                    if (bytes_to_copy > data_capacity)
+                        bytes_to_copy = data_capacity;
+                    memcpy(packet_buffer[buffer_index] + header_size, input_data + bytes_sent, bytes_to_copy);
+                    bytes_sent += bytes_to_copy;
+
+                    // Keep alternate-setting teardown from racing endpoint submission.
+                    uint32_t total_packet_size = header_size + bytes_to_copy;
+                    rt_base_t level = rt_hw_interrupt_disable();
+                    if (!tx_flag || !g_usb_device_connected || !usb_device_is_configured(USB_DEVICE_BUS_ID)) {
+                        rt_hw_interrupt_enable(level);
+                        break;
+                    }
+                    iso_tx_busy = true;
+                    int tx_ret = usbd_ep_start_write(USB_DEVICE_BUS_ID, VIDEO_IN_EP, packet_buffer[buffer_index],
+                                                     total_packet_size);
+                    rt_hw_interrupt_enable(level);
+                    if (tx_ret < 0) {
                         iso_tx_busy = false;
                         break;
                     }
+                    packets_started++;
 
                     // Switch to the other buffer
                     buffer_index = 1 - buffer_index;
-
-                    // Prepare the next packet's data and header
-                    if (i < total_packets - 1) {
-                        bytes_to_copy = (bytes_sent + data_per_packet > input_len) ? (input_len - bytes_sent) : data_per_packet;
-                        video_payload_header_fill(packet_buffer[buffer_index], i + 1, total_packets, frame_counter,
-                                                  bytes_to_copy);
-                        memcpy(packet_buffer[buffer_index] + UVC_PAYLOAD_HEADER_SIZE,
-                               input_data + bytes_sent, bytes_to_copy);
-                        bytes_sent += bytes_to_copy;
-                    }
                 }
 
-                // Wait for the last packet to finish
-                // while (iso_tx_busy && tx_flag) {
-                //     // rt_thread_mdelay(1);
-                //     asm volatile("wfi");
-                // }
+                // The last packet may still use either ping-pong buffer. Do not
+                // recycle the frame or overwrite a packet buffer until DMA ends.
+                while (iso_tx_busy && tx_flag && g_usb_device_connected
+                       && usb_device_is_configured(USB_DEVICE_BUS_ID)) {
+                    asm volatile("wfi");
+                }
 
+                if (packets_started == total_packets && !iso_tx_busy && tx_flag && g_usb_device_connected
+                    && usb_device_is_configured(USB_DEVICE_BUS_ID)) {
+                    completed_frames++;
+                    if ((completed_frames % 100U) == 0U) {
+                        LOG_I("sent %u UVC frames: latest=%u bytes, packets=%u, transfer=%llu ms",
+                              completed_frames, input_len, total_packets,
+                              (unsigned long long)(cpu_ticks_ms() - frame_send_time_ms));
+                    }
+                }
                 frame_counter++;
             }
             frame_send_time_ms = cpu_ticks_ms() - frame_send_time_ms;
@@ -798,6 +818,7 @@ void canmv_usb_device_uvc_on_connected(void)
     bool high_speed = usbd_get_port_speed(USB_DEVICE_BUS_ID, 0) == USB_SPEED_HIGH;
 
     uvc_payload_size = high_speed ? MAX_PAYLOAD_SIZE : UVC_FS_MAX_PAYLOAD_SIZE;
+    LOG_I("UVC connected at %s speed, max payload %u bytes", high_speed ? "high" : "full", uvc_payload_size);
     usbd_video_probe_and_commit_controls_init(USB_DEVICE_BUS_ID, INTERVAL, MAX_FRAME_SIZE,
                                               uvc_payload_size);
     tx_flag     = 0;

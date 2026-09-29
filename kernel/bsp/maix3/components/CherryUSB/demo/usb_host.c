@@ -976,7 +976,7 @@ static err_t usbh_rtl8152_if_init(struct netif *netif)
     return ERR_OK;
 }
 
-void usbh_rtl8152_run(struct usbh_rtl8152 *rtl8152_class)
+int usbh_rtl8152_run(struct usbh_rtl8152 *rtl8152_class)
 {
 #ifdef __RTTHREAD__
     struct netdev *netdev;
@@ -1021,6 +1021,7 @@ void usbh_rtl8152_run(struct usbh_rtl8152 *rtl8152_class)
     xTimerStart(dhcp_handle1, 0);
 #endif
 #endif
+    return 0;
 }
 
 void usbh_rtl8152_stop(struct usbh_rtl8152 *rtl8152_class)

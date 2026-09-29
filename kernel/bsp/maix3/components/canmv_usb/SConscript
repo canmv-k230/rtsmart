@@ -7,6 +7,9 @@ src     = []
 
 CPPPATH = [cwd]
 
+if GetDepend(['RT_USING_PUFS']):
+    CPPPATH += [cwd + '/../../drivers/interdrv/cipher/puf_fw']
+
 if GetDepend(['ENABLE_CHERRY_USB_DEVICE']) or GetDepend(['ENABLE_CHERRY_USB_OTG']):
     src += Glob('usbd_desc.c')
 

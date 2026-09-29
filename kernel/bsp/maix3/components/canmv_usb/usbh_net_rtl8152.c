@@ -69,8 +69,11 @@ static rt_err_t rt_usbh_rtl8152_eth_tx(rt_device_t dev, struct pbuf *p)
     return usbh_rtl8152_linkoutput(NULL, p);
 }
 
-void usbh_rtl8152_run(struct usbh_rtl8152 *rtl8152_class)
+int usbh_rtl8152_run(struct usbh_rtl8152 *rtl8152_class)
 {
+    rt_err_t result;
+    usb_osal_thread_t thread;
+
     rtl8152_class->stop_requested = false;
 
     if (!rtl8152_netdev_inited) {
@@ -81,9 +84,10 @@ void usbh_rtl8152_run(struct usbh_rtl8152 *rtl8152_class)
         rtl8152_dev.eth_tx = rt_usbh_rtl8152_eth_tx;
         rtl8152_dev.parent.user_data = rtl8152_class;
 
-        if (canmv_usbh_netdev_init(&rtl8152_dev) != RT_EOK) {
+        result = canmv_usbh_netdev_init(&rtl8152_dev);
+        if (result != RT_EOK) {
             rtl8152_dev.parent.user_data = RT_NULL;
-            return;
+            return result;
         }
         rtl8152_dev.flags |= ETHIF_TX_DIRECT;
         rtl8152_netdev_inited = true;
@@ -99,7 +103,15 @@ void usbh_rtl8152_run(struct usbh_rtl8152 *rtl8152_class)
     eth_device_linkchange(&rtl8152_dev, RT_FALSE);
 
     rtl8152_class->rx_thread_running = true;
-    usb_osal_thread_create("usbh_rtl8152_rx", 4096, 15, usbh_rtl8152_rx_thread, rtl8152_dev.netif);
+    thread = usb_osal_thread_create("usbh_rtl8152_rx", 4096, 15,
+                                    usbh_rtl8152_rx_thread,
+                                    rtl8152_dev.netif);
+    if (thread == NULL) {
+        rtl8152_class->rx_thread_running = false;
+        rtl8152_dev.parent.user_data = RT_NULL;
+        return -USB_ERR_NOMEM;
+    }
+    return 0;
 }
 
 void usbh_rtl8152_stop(struct usbh_rtl8152 *rtl8152_class)
@@ -107,7 +119,9 @@ void usbh_rtl8152_stop(struct usbh_rtl8152 *rtl8152_class)
     /* plug is already set to false by disconnect before this is called.
          Wait for RX thread to exit the data path before releasing the class. */
     rtl8152_class->stop_requested = true;
-    eth_device_linkchange(&rtl8152_dev, RT_FALSE);
+    if (rtl8152_netdev_inited && rtl8152_dev.netif != RT_NULL) {
+        eth_device_linkchange(&rtl8152_dev, RT_FALSE);
+    }
     rtl8152_dev.parent.user_data = RT_NULL;
 
     while (rtl8152_class->rx_thread_running) {
@@ -121,6 +135,10 @@ void usbh_rtl8152_stop(struct usbh_rtl8152 *rtl8152_class)
 void usbh_rtl8152_link_changed(struct usbh_rtl8152 *rtl8152_class, int state)
 {
     (void)rtl8152_class;
+    if (!rtl8152_netdev_inited || rtl8152_dev.netif == RT_NULL) {
+        return;
+    }
+
     if(0x00 == state) {
         eth_device_linkchange(&rtl8152_dev, RT_FALSE);
     } else {

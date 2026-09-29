@@ -22,12 +22,14 @@ struct usbh_rtl8152 {
     struct usbh_urb intin_urb;
 
     uint8_t intf;
+    uint8_t rx_urb_count;
 
     uint8_t mac[6];
     bool connect_status;
     bool stop_requested;
     bool rx_thread_running;
     bool plug;
+    int io_error;
 #ifdef CHERRY_USB_RTL8152_LINKCHECK
     bool submit_work;
 #endif
@@ -67,7 +69,7 @@ extern "C" {
 
 int usbh_rtl8152_get_connect_status(struct usbh_rtl8152 *rtl8152_class);
 
-void usbh_rtl8152_run(struct usbh_rtl8152 *rtl8152_class);
+int usbh_rtl8152_run(struct usbh_rtl8152 *rtl8152_class);
 void usbh_rtl8152_stop(struct usbh_rtl8152 *rtl8152_class);
 void usbh_rtl8152_link_changed(struct usbh_rtl8152 *rtl8152_class, int state);
 

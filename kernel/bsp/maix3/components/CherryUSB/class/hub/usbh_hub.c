@@ -29,6 +29,23 @@ extern int usbh_enumerate(struct usbh_hubport *hport);
 
 static const char *speed_table[] = { "error-speed", "low-speed", "full-speed", "high-speed", "wireless-speed", "super-speed", "superplus-speed" };
 
+#if CONFIG_USBHOST_MAX_EXTHUBS > 0
+static void usbh_hub_reset(struct usbh_hub *hub)
+{
+    uint8_t *hub_start = (uint8_t *)hub;
+    uint8_t *child_start = (uint8_t *)&hub->child[0];
+    uint8_t *child_end = child_start + sizeof(hub->child);
+
+    usb_memset(hub_start, 0, child_start - hub_start);
+    usb_memset(child_end, 0,
+               sizeof(struct usbh_hub) - (child_end - hub_start));
+
+    for (uint8_t port = 0; port < CONFIG_USBHOST_MAX_EHPORTS; port++) {
+        usbh_hubport_reset(&hub->child[port]);
+    }
+}
+#endif
+
 #ifdef CONFIG_USBHOST_XHCI
 struct usbh_hubport *usbh_get_roothub_port(unsigned int port)
 {
@@ -47,7 +64,7 @@ static struct usbh_hub *usbh_hub_class_alloc(void)
     for (devno = 0; devno < CONFIG_USBHOST_MAX_EXTHUBS; devno++) {
         if ((g_devinuse & (1 << devno)) == 0) {
             g_devinuse |= (1 << devno);
-            usb_memset(&g_hub_class[devno], 0, sizeof(struct usbh_hub));
+            usbh_hub_reset(&g_hub_class[devno]);
             g_hub_class[devno].index = EXTHUB_FIRST_INDEX + devno;
             return &g_hub_class[devno];
         }
@@ -62,7 +79,7 @@ static void usbh_hub_class_free(struct usbh_hub *hub_class)
     if (devno >= 0 && devno < 32) {
         g_devinuse &= ~(1 << devno);
     }
-    usb_memset(hub_class, 0, sizeof(struct usbh_hub));
+    usbh_hub_reset(hub_class);
 }
 #endif
 
@@ -284,6 +301,8 @@ static int usbh_hub_set_depth(struct usbh_hub *hub, uint16_t depth)
 
 static void usbh_hubport_release(struct usbh_hubport *child)
 {
+    child->connection_lost = true;
+    child->connection_generation++;
     if (child->connected) {
         child->connected = false;
         usbh_free_devaddr(child);
@@ -310,7 +329,6 @@ extern int dwc2_hcd_endpoint_disable(struct usbh_hcd *hcd, struct usb_host_endpo
             }
         }
 #endif
-        usb_osal_mutex_delete(child->mutex);
     }
 }
 
@@ -713,13 +731,21 @@ static void usbh_hub_events(struct usbh_hub *hub)
                     /** release child sources first */
                     usbh_hubport_release(child);
 
-                    usb_memset(child, 0, sizeof(struct usbh_hubport));
+                    usbh_hubport_reset(child);
                     child->parent = hub;
                     child->connected = true;
                     child->port = port + 1;
                     child->speed = speed;
                     child->bus = hub->bus;
-                    child->mutex = usb_osal_mutex_create();
+                    if (child->mutex == NULL) {
+                        child->mutex = usb_osal_mutex_create();
+                    }
+                    if (child->mutex == NULL) {
+                        child->connected = false;
+                        USB_LOG_ERR("Failed to create port %u mutex\r\n",
+                                    port + 1);
+                        continue;
+                    }
 #ifdef CHERRY_USB_HC_DRV_DWC2
                     if (hub->parent) {
                         if (speed != USB_SPEED_HIGH &&
@@ -776,13 +802,20 @@ static void usbh_hub_events(struct usbh_hub *hub)
                         if (!(portstatus & HUB_PORT_STATUS_ENABLE))
                             break;
 
-                        usb_memset(child, 0, sizeof(struct usbh_hubport));
+                        usbh_hubport_reset(child);
                         child->parent = hub;
                         child->connected = true;
                         child->port = port + 1;
                         child->speed = speed;
                         child->bus = hub->bus;
-                        child->mutex = usb_osal_mutex_create();
+                        if (child->mutex == NULL) {
+                            child->mutex = usb_osal_mutex_create();
+                        }
+                        if (child->mutex == NULL) {
+                            child->connected = false;
+                            ret = -USB_ERR_NOMEM;
+                            break;
+                        }
 #ifdef CHERRY_USB_HC_DRV_DWC2
                         if (hub->parent) {
                             if (speed != USB_SPEED_HIGH &&

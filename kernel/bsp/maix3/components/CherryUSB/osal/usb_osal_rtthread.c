@@ -15,8 +15,18 @@
 usb_osal_thread_t usb_osal_thread_create(const char *name, uint32_t stack_size, uint32_t prio, usb_thread_entry_t entry, void *args)
 {
     rt_thread_t htask;
+    rt_err_t result;
+
     htask = rt_thread_create(name, entry, args, stack_size, prio, 10);
-    rt_thread_startup(htask);
+    if (htask == RT_NULL) {
+        return NULL;
+    }
+
+    result = rt_thread_startup(htask);
+    if (result != RT_EOK) {
+        rt_thread_delete(htask);
+        return NULL;
+    }
     return (usb_osal_thread_t)htask;
 }
 

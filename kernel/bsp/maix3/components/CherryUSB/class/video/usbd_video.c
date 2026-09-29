@@ -719,8 +719,8 @@ void usbd_video_probe_and_commit_controls_init(uint8_t busid, uint32_t dwFrameIn
     g_usbd_video[busid].probe.wDelay = 0;
     g_usbd_video[busid].probe.dwMaxVideoFrameSize = dwMaxVideoFrameSize;
     g_usbd_video[busid].probe.dwMaxPayloadTransferSize = dwMaxPayloadTransferSize;
-    g_usbd_video[busid].probe.dwClockFrequency = 0;
-    g_usbd_video[busid].probe.bmFramingInfo = 0;
+    g_usbd_video[busid].probe.dwClockFrequency = 48000000;
+    g_usbd_video[busid].probe.bmFramingInfo = 0x03;
     g_usbd_video[busid].probe.bPreferedVersion = 0;
     g_usbd_video[busid].probe.bMinVersion = 0;
     g_usbd_video[busid].probe.bMaxVersion = 0;
@@ -737,8 +737,8 @@ void usbd_video_probe_and_commit_controls_init(uint8_t busid, uint32_t dwFrameIn
     g_usbd_video[busid].commit.wDelay = 0;
     g_usbd_video[busid].commit.dwMaxVideoFrameSize = dwMaxVideoFrameSize;
     g_usbd_video[busid].commit.dwMaxPayloadTransferSize = dwMaxPayloadTransferSize;
-    g_usbd_video[busid].commit.dwClockFrequency = 0;
-    g_usbd_video[busid].commit.bmFramingInfo = 0;
+    g_usbd_video[busid].commit.dwClockFrequency = 48000000;
+    g_usbd_video[busid].commit.bmFramingInfo = 0x03;
     g_usbd_video[busid].commit.bPreferedVersion = 0;
     g_usbd_video[busid].commit.bMinVersion = 0;
     g_usbd_video[busid].commit.bMaxVersion = 0;

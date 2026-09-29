@@ -3183,11 +3183,12 @@ void dwc2_hcd_disconnect(struct dwc2_hsotg *hsotg, bool force)
 {
     u32 intr;
     u32 hprt0;
-    struct usb_bus *bus;
+    struct usb_bus *bus = hcd_to_bus(hsotg->priv);
 
     /* Set status flags for the hub driver */
     hsotg->flags.b.port_connect_status_change = 1;
     hsotg->flags.b.port_connect_status = 0;
+    bus->hcd.roothub.child[0].connection_lost = true;
 
     /*
      * Shutdown any transfers in process by clearing the Tx FIFO Empty
@@ -3225,7 +3226,6 @@ void dwc2_hcd_disconnect(struct dwc2_hsotg *hsotg, bool force)
     dwc2_host_disconnect(hsotg);
 #endif
 
-    bus = hcd_to_bus(hsotg->priv);
     bus->hcd.roothub.int_buffer[0] = (1 << 1);
     usbh_hub_thread_wakeup(&bus->hcd.roothub);
 
@@ -3522,7 +3522,8 @@ int usbh_submit_urb(struct usbh_urb *urb)
 
     hsotg = dwc2_hcd_to_hsotg(&urb->hport->bus->hcd);
     hprt0 = dwc2_readl(hsotg, HPRT0);
-    if ((!(hprt0 & HPRT0_CONNSTS)) || !urb->hport->connected) {
+    if ((!(hprt0 & HPRT0_CONNSTS)) || !urb->hport->connected ||
+        urb->hport->connection_lost) {
         ret = -USB_ERR_NOTCONN;
         goto out_2;
     }

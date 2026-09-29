@@ -1232,7 +1232,10 @@ rt_err_t eth_device_linkchange(struct eth_device* dev, rt_bool_t up)
     rt_uint32_t level;
     rt_err_t result;
 
-    RT_ASSERT(dev != RT_NULL);
+    if (dev == RT_NULL || dev->netif == RT_NULL)
+    {
+        return -RT_EINVAL;
+    }
     if (!eth_device_io_begin(dev))
     {
         return -RT_EBUSY;
@@ -1260,6 +1263,10 @@ rt_err_t eth_device_linkchange(struct eth_device* dev, rt_bool_t up)
 {
     rt_err_t result;
 
+    if (dev == RT_NULL || dev->netif == RT_NULL)
+    {
+        return -RT_EINVAL;
+    }
     if (!eth_device_io_begin(dev))
     {
         return -RT_EBUSY;
@@ -1331,10 +1338,13 @@ static void eth_rx_thread_entry(void* parameter)
                 device->link_changed = 0x00;
                 rt_hw_interrupt_enable(level);
 
-                if (status)
-                    netifapi_netif_set_link_up(device->netif);
-                else
-                    netifapi_netif_set_link_down(device->netif);
+                if (device->netif != RT_NULL)
+                {
+                    if (status)
+                        netifapi_netif_set_link_up(device->netif);
+                    else
+                        netifapi_netif_set_link_down(device->netif);
+                }
             }
 
             /* receive all of buffer */

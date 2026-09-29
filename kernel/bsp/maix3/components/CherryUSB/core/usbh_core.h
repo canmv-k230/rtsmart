@@ -143,6 +143,8 @@ struct usb_tt {
 
 struct usbh_hubport {
     bool connected;   /* True: device connected; false: disconnected */
+    volatile bool connection_lost; /* Physical disconnect seen for this attachment */
+    volatile uint32_t connection_generation; /* Reject transfers queued for an older attachment */
     uint8_t port;     /* Hub port index */
     uint8_t dev_addr; /* device address */
     uint8_t speed;    /* device speed */
@@ -342,6 +344,7 @@ int usbh_get_string_desc(struct usbh_hubport *hport, uint8_t index, uint8_t *out
  */
 int usbh_set_interface(struct usbh_hubport *hport, uint8_t intf, uint8_t altsetting);
 
+void usbh_hubport_reset(struct usbh_hubport *hport);
 int usbh_initialize(uint8_t busid, uint32_t reg_base);
 int usbh_deinitialize(uint8_t busid);
 void *usbh_find_class_instance(const char *devname);

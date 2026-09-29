@@ -17,6 +17,8 @@
 
 #define CONFIG_USBHOST_RTL8152_ETH_MAX_RX_SEGSZE (16 * 1024)
 #define CONFIG_USBHOST_RTL8152_ETH_MAX_SEGSZE    (2048)
+#define VENDOR_ID_SR9900                         0x0fe6
+#define PRODUCT_ID_SR9900                        0x9900
 
 static USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t
     g_rtl8152_rx_buffer[RTL8152_MAX_RX][CONFIG_USBHOST_RTL8152_ETH_MAX_RX_SEGSZE];
@@ -45,9 +47,38 @@ struct rtl8152_rx_context {
 static struct rtl8152_tx_context g_rtl8152_tx_context[RTL8152_MAX_TX];
 static struct rtl8152_rx_context g_rtl8152_rx_context[RTL8152_MAX_RX];
 
+struct rtl8152_stats {
+    uint32_t tx_submitted;
+    uint32_t tx_completed;
+    uint32_t tx_errors;
+    uint32_t rx_submitted;
+    uint32_t rx_completed;
+    uint32_t rx_bytes;
+    uint32_t rx_zero_length;
+    uint32_t rx_errors;
+    uint32_t rx_queue_drops;
+    uint32_t rx_frames;
+    uint32_t rx_crc_errors;
+    uint32_t rx_descriptor_errors;
+    uint32_t rx_pbuf_errors;
+    uint32_t rx_input_errors;
+    uint32_t rx_context_completed[RTL8152_MAX_RX];
+};
+
+static struct rtl8152_stats g_rtl8152_stats;
+
+static bool usbh_rtl8152_is_sr9900(struct usbh_rtl8152 *rtl8152_class)
+{
+    return rtl8152_class->hport &&
+           rtl8152_class->hport->device_desc.idVendor == VENDOR_ID_SR9900 &&
+           rtl8152_class->hport->device_desc.idProduct == PRODUCT_ID_SR9900;
+}
+
 static bool usbh_rtl8152_is_active(struct usbh_rtl8152 *rtl8152_class)
 {
     return rtl8152_class->plug && !rtl8152_class->stop_requested &&
+           rtl8152_class->hport && rtl8152_class->hport->connected &&
+           !rtl8152_class->hport->connection_lost &&
            usbh_find_class_instance(DEV_FORMAT) == rtl8152_class;
 }
 
@@ -75,8 +106,13 @@ static void usbh_rtl8152_tx_complete(void *arg, int nbytes)
     context->busy = false;
     usb_osal_leave_critical_section(flags);
 
-    if (nbytes < 0 && usbh_rtl8152_is_active(&g_rtl8152_class)) {
-        g_rtl8152_class.connect_status = false;
+    if (nbytes < 0) {
+        g_rtl8152_stats.tx_errors++;
+        if (usbh_rtl8152_is_active(&g_rtl8152_class)) {
+            g_rtl8152_class.connect_status = false;
+        }
+    } else {
+        g_rtl8152_stats.tx_completed++;
     }
     usb_osal_sem_give(g_rtl8152_tx_available);
 }
@@ -85,10 +121,20 @@ static void usbh_rtl8152_rx_complete(void *arg, int nbytes)
 {
     struct rtl8152_rx_context *context = arg;
 
+    g_rtl8152_stats.rx_completed++;
+    g_rtl8152_stats.rx_context_completed[context->index]++;
+    if (nbytes < 0) {
+        g_rtl8152_stats.rx_errors++;
+    } else if (nbytes == 0) {
+        g_rtl8152_stats.rx_zero_length++;
+    } else {
+        g_rtl8152_stats.rx_bytes += (uint32_t)nbytes;
+    }
     context->status = nbytes;
     context->length = nbytes > 0 ? (uint32_t)nbytes : 0;
     context->submitted = false;
     if (usb_osal_mq_send(g_rtl8152_rx_queue, (uintptr_t)context) < 0) {
+        g_rtl8152_stats.rx_queue_drops++;
         USB_LOG_ERR("RTL8152 RX completion queue full\r\n");
     }
 }
@@ -121,6 +167,8 @@ static int usbh_rtl8152_submit_rx(struct usbh_rtl8152 *rtl8152_class,
     ret = usbh_submit_urb(urb);
     if (ret < 0) {
         context->submitted = false;
+    } else {
+        g_rtl8152_stats.rx_submitted++;
     }
     usb_osal_mutex_give(g_rtl8152_rx_mutex);
     return ret;
@@ -176,7 +224,6 @@ static void usbh_rtl8152_kill_rx_urbs(struct usbh_rtl8152 *rtl8152_class)
 #define VENDOR_ID_TPLINK    0x2357
 #define VENDOR_ID_DLINK     0x2001
 #define VENDOR_ID_ASUS      0x0b05
-
 #define R8152_PHY_ID 32
 
 #define PLA_IDR              0xc000
@@ -1076,9 +1123,20 @@ static int usbh_rtl8152_read_regs(struct usbh_rtl8152 *rtl8152_class,
                                   uint16_t size,
                                   void *data)
 {
-    struct usb_setup_packet *setup = rtl8152_class->hport->setup;
+    struct usb_setup_packet *setup;
     int ret;
 
+    if (rtl8152_class->io_error < 0) {
+        return rtl8152_class->io_error;
+    }
+    if (!rtl8152_class->hport || !rtl8152_class->hport->connected ||
+        rtl8152_class->hport->connection_lost ||
+        !rtl8152_class->hport->setup) {
+        rtl8152_class->io_error = -USB_ERR_NOTCONN;
+        return rtl8152_class->io_error;
+    }
+
+    setup = rtl8152_class->hport->setup;
     setup->bmRequestType = USB_REQUEST_DIR_IN | USB_REQUEST_VENDOR | USB_REQUEST_RECIPIENT_DEVICE;
     setup->bRequest = RTL8152_REQ_GET_REGS;
     setup->wValue = value;
@@ -1086,10 +1144,15 @@ static int usbh_rtl8152_read_regs(struct usbh_rtl8152 *rtl8152_class,
     setup->wLength = size;
 
     ret = usbh_control_transfer(rtl8152_class->hport, setup, g_rtl8152_buf);
-    if (ret < 8) {
-        return ret;
+    if (ret < 0) {
+        rtl8152_class->io_error = ret;
+        return rtl8152_class->io_error;
     }
-    usb_memcpy(data, g_rtl8152_buf, ret - 8);
+    if (ret != (int)(USB_SIZEOF_SETUP_PACKET + size)) {
+        rtl8152_class->io_error = -USB_ERR_IO;
+        return rtl8152_class->io_error;
+    }
+    usb_memcpy(data, g_rtl8152_buf, size);
 
     return ret;
 }
@@ -1100,8 +1163,20 @@ static int usbh_rtl8152_write_regs(struct usbh_rtl8152 *rtl8152_class,
                                    uint16_t size,
                                    void *data)
 {
-    struct usb_setup_packet *setup = rtl8152_class->hport->setup;
+    struct usb_setup_packet *setup;
+    int ret;
 
+    if (rtl8152_class->io_error < 0) {
+        return rtl8152_class->io_error;
+    }
+    if (!rtl8152_class->hport || !rtl8152_class->hport->connected ||
+        rtl8152_class->hport->connection_lost ||
+        !rtl8152_class->hport->setup) {
+        rtl8152_class->io_error = -USB_ERR_NOTCONN;
+        return rtl8152_class->io_error;
+    }
+
+    setup = rtl8152_class->hport->setup;
     setup->bmRequestType = USB_REQUEST_DIR_OUT | USB_REQUEST_VENDOR | USB_REQUEST_RECIPIENT_DEVICE;
     setup->bRequest = RTL8152_REQ_SET_REGS;
     setup->wValue = value;
@@ -1109,7 +1184,16 @@ static int usbh_rtl8152_write_regs(struct usbh_rtl8152 *rtl8152_class,
     setup->wLength = size;
 
     usb_memcpy(g_rtl8152_buf, data, size);
-    return usbh_control_transfer(rtl8152_class->hport, setup, g_rtl8152_buf);
+    ret = usbh_control_transfer(rtl8152_class->hport, setup, g_rtl8152_buf);
+    if (ret < 0) {
+        rtl8152_class->io_error = ret;
+        return rtl8152_class->io_error;
+    }
+    if (ret != (int)(USB_SIZEOF_SETUP_PACKET + size)) {
+        rtl8152_class->io_error = -USB_ERR_IO;
+        return rtl8152_class->io_error;
+    }
+    return ret;
 }
 
 static int generic_ocp_read(struct usbh_rtl8152 *tp, uint16_t index, uint16_t size,
@@ -1238,7 +1322,7 @@ static inline int usb_ocp_write(struct usbh_rtl8152 *tp, uint16_t index, uint16_
 
 static uint32_t ocp_read_dword(struct usbh_rtl8152 *tp, uint16_t type, uint16_t index)
 {
-    uint32_t data;
+    uint32_t data = 0;
 
     generic_ocp_read(tp, index, sizeof(data), &data, type);
 
@@ -1255,7 +1339,7 @@ static void ocp_write_dword(struct usbh_rtl8152 *tp, uint16_t type, uint16_t ind
 static uint16_t ocp_read_word(struct usbh_rtl8152 *tp, uint16_t type, uint16_t index)
 {
     uint32_t data;
-    uint32_t tmp;
+    uint32_t tmp = 0;
     uint16_t byen = BYTE_EN_WORD;
     uint8_t shift = index & 2;
 
@@ -1295,7 +1379,7 @@ static void ocp_write_word(struct usbh_rtl8152 *tp, uint16_t type, uint16_t inde
 static uint8_t ocp_read_byte(struct usbh_rtl8152 *tp, uint16_t type, uint16_t index)
 {
     uint32_t data;
-    uint32_t tmp;
+    uint32_t tmp = 0;
     uint8_t shift = index & 3;
 
     index &= ~3;
@@ -1371,7 +1455,7 @@ static inline int r8152_mdio_read(struct usbh_rtl8152 *tp, uint32_t reg_addr)
 static uint8_t usbh_rtl8152_get_version(struct usbh_rtl8152 *rtl8152_class)
 {
     uint8_t version;
-    uint32_t temp;
+    uint32_t temp = 0;
     uint32_t ocp_data;
 
     usbh_rtl8152_read_regs(rtl8152_class, PLA_TCR0, MCU_TYPE_PLA, 4, &temp);
@@ -1596,7 +1680,8 @@ static void rtl8152_nic_reset(struct usbh_rtl8152 *tp)
             ocp_write_byte(tp, MCU_TYPE_PLA, PLA_CR, CR_RST);
 
             for (i = 0; i < 1000; i++) {
-                if (!(ocp_read_byte(tp, MCU_TYPE_PLA, PLA_CR) & CR_RST))
+                if (!(ocp_read_byte(tp, MCU_TYPE_PLA, PLA_CR) & CR_RST) ||
+                    tp->io_error < 0)
                     break;
                 usb_osal_msleep(1);
             }
@@ -1617,13 +1702,14 @@ static void rtl_disable(struct usbh_rtl8152 *tp)
 
     for (i = 0; i < 1000; i++) {
         ocp_data = ocp_read_byte(tp, MCU_TYPE_PLA, PLA_OOB_CTRL);
-        if ((ocp_data & FIFO_EMPTY) == FIFO_EMPTY)
+        if ((ocp_data & FIFO_EMPTY) == FIFO_EMPTY || tp->io_error < 0)
             break;
         usb_osal_msleep(1);
     }
 
     for (i = 0; i < 1000; i++) {
-        if (ocp_read_word(tp, MCU_TYPE_PLA, PLA_TCR0) & TCR0_TX_EMPTY)
+        if ((ocp_read_word(tp, MCU_TYPE_PLA, PLA_TCR0) & TCR0_TX_EMPTY) ||
+            tp->io_error < 0)
             break;
         usb_osal_msleep(1);
     }
@@ -1678,7 +1764,7 @@ static void wait_oob_link_list_ready(struct usbh_rtl8152 *tp)
 
     for (i = 0; i < 1000; i++) {
         ocp_data = ocp_read_byte(tp, MCU_TYPE_PLA, PLA_OOB_CTRL);
-        if (ocp_data & LINK_LIST_READY)
+        if ((ocp_data & LINK_LIST_READY) || tp->io_error < 0)
             break;
         usb_osal_msleep(1);
     }
@@ -1897,7 +1983,7 @@ static int rtl_enable(struct usbh_rtl8152 *tp)
 
     rxdy_gated_en(tp, false);
 
-    return 0;
+    return tp->io_error;
 }
 
 static int rtl8152_enable(struct usbh_rtl8152 *tp)
@@ -2069,7 +2155,7 @@ static int rtl8152_set_speed(struct usbh_rtl8152 *tp, uint8_t autoneg, uint16_t 
     r8152_mdio_write(tp, MII_ADVERTISE, anar);
     r8152_mdio_write(tp, MII_BMCR, bmcr);
 
-    return 0;
+    return tp->io_error;
 }
 
 int r8152_write_hwaddr(struct usbh_rtl8152 *tp, unsigned char *mac)
@@ -2079,7 +2165,7 @@ int r8152_write_hwaddr(struct usbh_rtl8152 *tp, unsigned char *mac)
     ocp_write_byte(tp, MCU_TYPE_PLA, PLA_CRWECR, CRWECR_CONFIG);
     pla_ocp_write(tp, PLA_IDR, BYTE_EN_SIX_BYTES, 8, enetaddr);
     ocp_write_byte(tp, MCU_TYPE_PLA, PLA_CRWECR, CRWECR_NORAML);
-    return 0;
+    return tp->io_error;
 }
 
 static int usbh_rtl8152_read_link_status(struct usbh_rtl8152 *rtl8152_class,
@@ -2171,16 +2257,26 @@ static int usbh_rtl8152_connect(struct usbh_hubport *hport, uint8_t intf)
 
     rtl8152_class->hport = hport;
     rtl8152_class->intf = intf;
+    rtl8152_class->rx_urb_count =
+        usbh_rtl8152_is_sr9900(rtl8152_class) ? 1 : RTL8152_MAX_RX;
     rtl8152_class->plug = true;
     rtl8152_class->stop_requested = false;
 
-    hport->config.intf[intf].priv = rtl8152_class;
+    if (hport->connection_lost) {
+        ret = -USB_ERR_NOTCONN;
+        goto probe_failed;
+    }
 
     rtl8152_class->version = usbh_rtl8152_get_version(rtl8152_class);
 
+    if (rtl8152_class->io_error < 0) {
+        ret = rtl8152_class->io_error;
+        goto probe_failed;
+    }
     if (rtl8152_class->version == RTL_VER_UNKNOWN) {
         USB_LOG_ERR("Unknown version 0x%04x\r\n", rtl8152_class->version);
-        return -USB_ERR_NOTSUPP;
+        ret = -USB_ERR_NOTSUPP;
+        goto probe_failed;
     } else {
         USB_LOG_INFO("rtl8152 version 0x%04x\r\n", rtl8152_class->version);
     }
@@ -2215,23 +2311,42 @@ static int usbh_rtl8152_connect(struct usbh_hubport *hport, uint8_t intf)
     }
 
     rtl8152_class->saved_wolopts = __rtl_get_wol(rtl8152_class);
-    if (rtl_ops_init(rtl8152_class) < 0) {
-        return -USB_ERR_NODEV;
+    if (rtl8152_class->io_error < 0) {
+        ret = rtl8152_class->io_error;
+        goto probe_failed;
+    }
+    ret = rtl_ops_init(rtl8152_class);
+    if (ret < 0) {
+        goto probe_failed;
     }
 
     rtl8152_class->rtl_ops.init(rtl8152_class);
-    rtl8152_set_speed(rtl8152_class, AUTONEG_ENABLE, rtl8152_class->supports_gmii ? SPEED_1000 : SPEED_100, DUPLEX_FULL);
+    if (rtl8152_class->io_error < 0) {
+        ret = rtl8152_class->io_error;
+        goto probe_failed;
+    }
+    ret = rtl8152_set_speed(rtl8152_class, AUTONEG_ENABLE,
+                            rtl8152_class->supports_gmii ? SPEED_1000 : SPEED_100,
+                            DUPLEX_FULL);
+    if (ret < 0) {
+        goto probe_failed;
+    }
     rtl8152_class->rtl_ops.up(rtl8152_class);
+    if (rtl8152_class->io_error < 0) {
+        ret = rtl8152_class->io_error;
+        goto probe_failed;
+    }
 
     if (rtl8152_class->rx_buf_sz > CONFIG_USBHOST_RTL8152_ETH_MAX_RX_SEGSZE) {
         USB_LOG_ERR("rx_buf_sz is overflow, default is %d\r\n", CONFIG_USBHOST_RTL8152_ETH_MAX_RX_SEGSZE);
-        return -USB_ERR_NOMEM;
+        ret = -USB_ERR_NOMEM;
+        goto probe_failed;
     }
 
     usb_memset(mac_buffer, 0, 12);
     ret = usbh_get_string_desc(rtl8152_class->hport, 3, (uint8_t *)mac_buffer, sizeof(mac_buffer));
     if (ret < 0) {
-        return ret;
+        goto probe_failed;
     }
 
     for (int i = 0, j = 0; i < 12; i += 2, j++) {
@@ -2251,7 +2366,10 @@ static int usbh_rtl8152_connect(struct usbh_hubport *hport, uint8_t intf)
     rtl8152_class->mac[4] = (trng_data>>8) & 0xff;
     rtl8152_class->mac[5] = (trng_data>>16) & 0xff;
     
-    r8152_write_hwaddr(rtl8152_class, rtl8152_class->mac);
+    ret = r8152_write_hwaddr(rtl8152_class, rtl8152_class->mac);
+    if (ret < 0) {
+        goto probe_failed;
+    }
 
     USB_LOG_INFO("RTL8152 MAC address %02x:%02x:%02x:%02x:%02x:%02x\r\n",
                  rtl8152_class->mac[0],
@@ -2268,7 +2386,8 @@ static int usbh_rtl8152_connect(struct usbh_hubport *hport, uint8_t intf)
             if (ep_desc->bEndpointAddress & 0x80) {
                 USBH_EP_INIT(rtl8152_class->intin, ep_desc);
             } else {
-                return -USB_ERR_NOTSUPP;
+                ret = -USB_ERR_NOTSUPP;
+                goto probe_failed;
             }
         } else {
             if (ep_desc->bEndpointAddress & 0x80) {
@@ -2279,12 +2398,24 @@ static int usbh_rtl8152_connect(struct usbh_hubport *hport, uint8_t intf)
         }
     }
 
+    hport->config.intf[intf].priv = rtl8152_class;
     usb_memcpy(hport->config.intf[intf].devname, DEV_FORMAT, CONFIG_USBHOST_DEV_NAMELEN);
 
     USB_LOG_INFO("Register RTL8152 Class:%s\r\n", hport->config.intf[intf].devname);
 
-    usbh_rtl8152_run(rtl8152_class);
+    ret = usbh_rtl8152_run(rtl8152_class);
+    if (ret < 0) {
+        hport->config.intf[intf].priv = NULL;
+        hport->config.intf[intf].devname[0] = '\0';
+        goto probe_failed;
+    }
     return 0;
+
+probe_failed:
+    rtl8152_class->connect_status = false;
+    rtl8152_class->stop_requested = true;
+    rtl8152_class->plug = false;
+    return ret;
 }
 
 static int usbh_rtl8152_disconnect(struct usbh_hubport *hport, uint8_t intf)
@@ -2366,10 +2497,11 @@ static void rtl8152_link_check(struct rt_work *work, void *work_data)
     (void)work;
     (void)work_data;
 
-    if (g_rtl8152_class.plug) {
+    if (usbh_rtl8152_is_active(&g_rtl8152_class)) {
         bool link_up;
         int ret;
 
+        g_rtl8152_class.io_error = 0;
         ret = usbh_rtl8152_read_link_status(&g_rtl8152_class, &link_up);
         if (ret >= 0) {
             if (link_up) {
@@ -2445,6 +2577,7 @@ find_class:
     if (!usbh_rtl8152_is_active(&g_rtl8152_class)) {
         goto delete;
     }
+    g_rtl8152_class.io_error = 0;
 
     while (!g_rtl8152_class.stop_requested && g_rtl8152_class.connect_status == false) {
         ret = usbh_rtl8152_get_connect_status(&g_rtl8152_class);
@@ -2475,6 +2608,10 @@ find_class:
     }
 
     rtl8152_set_rx_mode(&g_rtl8152_class);
+    if (g_rtl8152_class.io_error < 0) {
+        usbh_rtl8152_prepare_recovery(&g_rtl8152_class, false, true);
+        goto find_class;
+    }
 
     transfer_size = g_rtl8152_class.rx_buf_sz;
     if (transfer_size == 0 ||
@@ -2484,7 +2621,7 @@ find_class:
 
     while (usb_osal_mq_recv(g_rtl8152_rx_queue, &message, 0) == 0) {
     }
-    for (unsigned int i = 0; i < RTL8152_MAX_RX; i++) {
+    for (unsigned int i = 0; i < g_rtl8152_class.rx_urb_count; i++) {
         ret = usbh_rtl8152_submit_rx(&g_rtl8152_class,
                                      &g_rtl8152_rx_context[i],
                                      transfer_size);
@@ -2553,6 +2690,7 @@ find_class:
             if (packet_length < ETH_FCS_LEN ||
                 packet_length + sizeof(struct rx_desc) >
                     rx_length - data_offset) {
+                g_rtl8152_stats.rx_descriptor_errors++;
                 USB_LOG_ERR("RTL8152 RX descriptor len invalid (%u, remaining %u)\r\n",
                             (unsigned)packet_length,
                             (unsigned)(rx_length - data_offset));
@@ -2574,11 +2712,17 @@ find_class:
                         err = netif->input(p, netif);
                     }
                     if (err != ERR_OK) {
+                        g_rtl8152_stats.rx_input_errors++;
                         pbuf_free(p);
+                    } else {
+                        g_rtl8152_stats.rx_frames++;
                     }
                 } else {
+                    g_rtl8152_stats.rx_pbuf_errors++;
                     USB_LOG_ERR("No memory to alloc pbuf for rtl8152 rx\r\n");
                 }
+            } else {
+                g_rtl8152_stats.rx_crc_errors++;
             }
 
             advance = sizeof(struct rx_desc) +
@@ -2695,12 +2839,55 @@ err_t usbh_rtl8152_linkoutput(struct netif *netif, struct pbuf *p)
         return ERR_BUF;
     }
 
+    g_rtl8152_stats.tx_submitted++;
+
     usb_osal_mutex_give(g_rtl8152_tx_mutex);
     return ERR_OK;
 }
 
-__WEAK void usbh_rtl8152_run(struct usbh_rtl8152 *rtl8152_class)
+static int rtl8152_stats_cmd(int argc, char **argv)
 {
+    unsigned int i;
+
+    if (argc > 1 && strcmp(argv[1], "reset") == 0) {
+        usb_memset(&g_rtl8152_stats, 0, sizeof(g_rtl8152_stats));
+        rt_kprintf("rtl8152 stats reset\n");
+        return 0;
+    }
+
+    rt_kprintf("rtl8152 active=%d link=%d io_error=%d\n",
+               usbh_rtl8152_is_active(&g_rtl8152_class),
+               g_rtl8152_class.connect_status,
+               g_rtl8152_class.io_error);
+    rt_kprintf("tx submitted=%u completed=%u errors=%u\n",
+               g_rtl8152_stats.tx_submitted,
+               g_rtl8152_stats.tx_completed,
+               g_rtl8152_stats.tx_errors);
+    rt_kprintf("rx submitted=%u completed=%u bytes=%u zero=%u errors=%u queue_drops=%u\n",
+               g_rtl8152_stats.rx_submitted,
+               g_rtl8152_stats.rx_completed,
+               g_rtl8152_stats.rx_bytes,
+               g_rtl8152_stats.rx_zero_length,
+               g_rtl8152_stats.rx_errors,
+               g_rtl8152_stats.rx_queue_drops);
+    rt_kprintf("rx frames=%u crc_errors=%u descriptor_errors=%u pbuf_errors=%u input_errors=%u\n",
+               g_rtl8152_stats.rx_frames,
+               g_rtl8152_stats.rx_crc_errors,
+               g_rtl8152_stats.rx_descriptor_errors,
+               g_rtl8152_stats.rx_pbuf_errors,
+               g_rtl8152_stats.rx_input_errors);
+    rt_kprintf("rx context completions:");
+    for (i = 0; i < RTL8152_MAX_RX; i++) {
+        rt_kprintf(" %u", g_rtl8152_stats.rx_context_completed[i]);
+    }
+    rt_kprintf("\n");
+    return 0;
+}
+MSH_CMD_EXPORT_ALIAS(rtl8152_stats_cmd, rtl8152_stats, show or reset RTL8152 statistics);
+
+__WEAK int usbh_rtl8152_run(struct usbh_rtl8152 *rtl8152_class)
+{
+    return 0;
 }
 
 __WEAK void usbh_rtl8152_stop(struct usbh_rtl8152 *rtl8152_class)
@@ -2732,7 +2919,7 @@ CLASS_INFO_DEFINE const struct usbh_class_info sr9900_rtl8152_class_info = {
     .class = 0xff,
     .subclass = 0x00,
     .protocol = 0x00,
-    .vid = 0x0FE6,
-    .pid = 0x9900,
+    .vid = VENDOR_ID_SR9900,
+    .pid = PRODUCT_ID_SR9900,
     .class_driver = &rtl8152_class_driver
 };

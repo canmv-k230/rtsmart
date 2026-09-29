@@ -5,6 +5,8 @@
  */
 #include "usbh_core.h"
 
+#include <stddef.h>
+
 #undef USB_DBG_TAG
 #define USB_DBG_TAG "usbh_core"
 #include "usb_log.h"
@@ -18,6 +20,15 @@ USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t ep0_request_buffer[CONFIG_USBHOST
 USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX struct usb_setup_packet g_setup_buffer[CONFIG_USBHOST_MAX_BUS][CONFIG_USBHOST_MAX_EXTHUBS + 1][CONFIG_USBHOST_MAX_EHPORTS];
 
 struct usbh_bus g_usbhost_bus[CONFIG_USBHOST_MAX_BUS];
+
+void usbh_hubport_reset(struct usbh_hubport *hport)
+{
+    uint32_t connection_generation = hport->connection_generation;
+
+    /* EP0 and its mutex belong to the port slot, not one attachment. */
+    usb_memset(hport, 0, offsetof(struct usbh_hubport, ep0_urb));
+    hport->connection_generation = connection_generation;
+}
 
 /* general descriptor field offsets */
 #define DESC_bLength         0 /** Length offset */
@@ -717,6 +728,13 @@ int usbh_enumerate(struct usbh_hubport *hport)
         hport->config.intf[i].class_driver = class_driver;
         USB_LOG_INFO("Loading %s class driver\r\n", class_driver->driver_name);
         ret = CLASS_CONNECT(hport, i);
+        if (ret < 0) {
+            if (hport->config.intf[i].priv && class_driver->disconnect) {
+                CLASS_DISCONNECT(hport, i);
+            }
+            hport->config.intf[i].class_driver = NULL;
+            goto errout;
+        }
     }
 
 errout:
@@ -729,9 +747,18 @@ errout:
 
 static void usbh_bus_init(struct usbh_bus *bus, uint8_t busid, uint32_t reg_base)
 {
-    struct usbh_hub *hub;
+    struct usbh_hub *hub = &bus->hcd.roothub;
+    uint8_t *bus_start = (uint8_t *)bus;
+    uint8_t *child_start = (uint8_t *)&hub->child[0];
+    uint8_t *child_end = child_start + sizeof(hub->child);
 
-    usb_memset(bus, 0, sizeof(struct usbh_bus));
+    usb_memset(bus_start, 0, child_start - bus_start);
+    usb_memset(child_end, 0,
+               sizeof(struct usbh_bus) - (child_end - bus_start));
+    for (uint8_t port = 0; port < CONFIG_USBHOST_MAX_EHPORTS; port++) {
+        usbh_hubport_reset(&hub->child[port]);
+    }
+
     bus->busid = busid;
     bus->hcd.hcd_id = busid;
     bus->hcd.reg_base = reg_base;
@@ -741,7 +768,6 @@ static void usbh_bus_init(struct usbh_bus *bus, uint8_t busid, uint32_t reg_base
 
     usb_slist_init(&bus->hub_list);
 
-    hub = &bus->hcd.roothub;
     hub->connected = true;
     hub->index = 1;
     hub->is_roothub = true;
@@ -809,11 +835,32 @@ int usbh_deinitialize(uint8_t busid)
 int usbh_control_transfer(struct usbh_hubport *hport, struct usb_setup_packet *setup, uint8_t *buffer)
 {
     struct usbh_urb *urb;
+    usb_osal_mutex_t mutex;
+    uint32_t connection_generation;
     int ret;
+
+    if (!hport || !setup) {
+        return -USB_ERR_INVAL;
+    }
+    mutex = hport->mutex;
+    connection_generation = hport->connection_generation;
+    if (!hport->connected || hport->connection_lost || !mutex) {
+        return -USB_ERR_NOTCONN;
+    }
 
     urb = &hport->ep0_urb;
 
-    usb_osal_mutex_take(hport->mutex);
+    ret = usb_osal_mutex_take(mutex);
+    if (ret < 0) {
+        return ret;
+    }
+
+    if (hport->mutex != mutex || !hport->connected ||
+        hport->connection_lost ||
+        hport->connection_generation != connection_generation) {
+        ret = -USB_ERR_NOTCONN;
+        goto out;
+    }
 
     usb_memset(urb, 0, sizeof(struct usbh_urb));
     usbh_control_urb_fill(urb, hport, setup, buffer, setup->wLength, CONFIG_USBHOST_CONTROL_TRANSFER_TIMEOUT, NULL, NULL);
@@ -822,7 +869,8 @@ int usbh_control_transfer(struct usbh_hubport *hport, struct usb_setup_packet *s
         ret = urb->actual_length;
     }
 
-    usb_osal_mutex_give(hport->mutex);
+out:
+    usb_osal_mutex_give(mutex);
     return ret;
 }
 

@@ -6,7 +6,9 @@
 
 #define MAX_PAYLOAD_SIZE        1024 // for high speed with one transaction every microframe
 #define UVC_FS_MAX_PAYLOAD_SIZE 1023
-#define UVC_PAYLOAD_HEADER_SIZE  12U
+#define UVC_CLOCK_FREQUENCY      48000000U
+#define UVC_PAYLOAD_HEADER_SIZE  2U
+#define UVC_PAYLOAD_PTS_HEADER_SIZE 6U
 #define VIDEO_PACKET_SIZE       (unsigned int)(((MAX_PAYLOAD_SIZE / 1)) | (0x00 << 11))
 
 // #define MAX_PAYLOAD_SIZE  2048 // for high speed with two transcations every one micro frame
@@ -32,7 +34,7 @@
 #define CANMV_USB_UVC_CONFIG_DESCRIPTOR_INIT(descriptor_type, max_packet_size)                        \
     CANMV_USB_CONFIG_DESCRIPTOR_INIT(descriptor_type, USB_VIDEO_DESC_SIZ, 0x02, 0x01,                \
                                      USB_CONFIG_BUS_POWERED, USBD_MAX_POWER),                        \
-    VIDEO_VC_DESCRIPTOR_INIT(0x00, 0, 0x0100, VC_TERMINAL_SIZ, 48000000, 0x02),                     \
+    VIDEO_VC_DESCRIPTOR_INIT(0x00, 0, 0x0100, VC_TERMINAL_SIZ, UVC_CLOCK_FREQUENCY, 0x02),          \
     VIDEO_VS_DESCRIPTOR_INIT(0x01, 0x00, 0x00),                                                      \
     VIDEO_VS_HEADER_DESCRIPTOR_INIT(0x01, VS_HEADER_SIZ, VIDEO_IN_EP, 0x00),                         \
     VIDEO_VS_FORMAT_MJPEG_DESCRIPTOR_INIT(0x01, 0x01),                                               \
