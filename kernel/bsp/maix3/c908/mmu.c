@@ -607,3 +607,47 @@ void *rt_hw_mmu_v2p(rt_mmu_info *mmu_info,void *v_addr)
     rt_hw_interrupt_enable(level);
     return ret;
 }
+
+static int _rt_hw_mmu_user_writable(rt_mmu_info *mmu_info, void *v_addr)
+{
+    rt_size_t l1_off, l2_off, l3_off;
+    rt_size_t *mmu_l1, *mmu_l2, *mmu_l3;
+    rt_size_t pte;
+
+    if (!mmu_info)
+        return 0;
+
+    l1_off = GET_L1((rt_size_t)v_addr);
+    l2_off = GET_L2((rt_size_t)v_addr);
+    l3_off = GET_L3((rt_size_t)v_addr);
+    mmu_l1 = ((rt_size_t *)mmu_info->vtable) + l1_off;
+
+    pte = *mmu_l1;
+    if (!PTE_USED(pte))
+        return 0;
+    if (PAGE_IS_LEAF(pte))
+        return (pte & (PTE_U | PTE_W)) == (PTE_U | PTE_W);
+
+    mmu_l2 = (rt_size_t *)PPN_TO_VPN(GET_PADDR(pte), mmu_info->pv_off);
+    pte = *(mmu_l2 + l2_off);
+    if (!PTE_USED(pte))
+        return 0;
+    if (PAGE_IS_LEAF(pte))
+        return (pte & (PTE_U | PTE_W)) == (PTE_U | PTE_W);
+
+    mmu_l3 = (rt_size_t *)PPN_TO_VPN(GET_PADDR(pte), mmu_info->pv_off);
+    pte = *(mmu_l3 + l3_off);
+    return PTE_USED(pte) && PAGE_IS_LEAF(pte) &&
+           (pte & (PTE_U | PTE_W)) == (PTE_U | PTE_W);
+}
+
+int rt_hw_mmu_user_writable(rt_mmu_info *mmu_info, void *v_addr)
+{
+    rt_base_t level;
+    int writable;
+
+    level = rt_hw_interrupt_disable();
+    writable = _rt_hw_mmu_user_writable(mmu_info, v_addr);
+    rt_hw_interrupt_enable(level);
+    return writable;
+}

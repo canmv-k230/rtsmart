@@ -645,6 +645,26 @@ static const char *get_exception_msg(int id)
     return msg;
 }
 
+#ifdef RT_USING_USERSPACE
+static int user_exception_signal(rt_size_t id)
+{
+    switch (id)
+    {
+    case EP_ILLEGAL_INSTRUCTION:
+        return SIGILL;
+    case EP_BREAKPOINT:
+        return SIGTRAP;
+    case EP_LOAD_ADDRESS_MISALIGNED:
+    case EP_LOAD_ACCESS_FAULT:
+    case EP_STORE_ADDRESS_MISALIGNED:
+    case EP_STORE_ACCESS_FAULT:
+        return SIGBUS;
+    default:
+        return SIGSEGV;
+    }
+}
+#endif
+
 void handle_user(rt_size_t scause, rt_size_t stval, rt_size_t sepc, struct rt_hw_stack_frame *sp)
 {
     rt_size_t id = __MASKVALUE(scause, __MASK(63UL));
@@ -676,6 +696,10 @@ if(0x00 == rt_strncmp("micropython", rt_thread_self()->name, sizeof("micropython
     }
 #endif
 
+#ifdef RT_USING_USERSPACE
+    lwp_terminate_with_status(lwp_self(),
+                              LWP_WAIT_STATUS_SIGNAL(user_exception_signal(id)));
+#endif
     sys_exit(-1);
 }
 

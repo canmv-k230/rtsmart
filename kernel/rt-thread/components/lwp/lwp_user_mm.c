@@ -206,7 +206,8 @@ static void *_lwp_map_user(struct rt_lwp *lwp, void *map_va, size_t map_size, in
     rt_mmu_info *m_info = &lwp->mmu_info;
     int area_type;
 
-    va = rt_hw_mmu_map_auto(m_info, map_va, map_size, MMU_MAP_U_RWCB);
+    va = rt_hw_mmu_map_auto(m_info, map_va, map_size,
+                             text ? MMU_MAP_U_RO : MMU_MAP_U_RWCB);
     if (!va)
     {
         rt_kprintf("Memory exhaustion!\r\n");
@@ -552,7 +553,11 @@ static void *_lwp_map_user_type(struct rt_lwp *lwp, void *map_va, void *map_pa, 
     size_t attr = 0;
     int ret = 0;
 
-    if (cached)
+    if (type == MM_AREA_TYPE_TEXT)
+    {
+        attr = MMU_MAP_U_RO;
+    }
+    else if (cached)
     {
         attr = MMU_MAP_U_RWCB;
         if (type == MM_AREA_TYPE_PHY)
@@ -805,6 +810,12 @@ size_t lwp_put_to_user(void *dst, void *src, size_t size)
 {
     struct rt_lwp *lwp = RT_NULL;
     rt_mmu_info *m_info = RT_NULL;
+    size_t copy_len = 0;
+    void *addr_start;
+    void *addr_end;
+#ifdef RT_HW_MMU_USER_WRITABLE
+    void *next_page;
+#endif
 
     if (!lwp_user_range_valid(dst, size))
     {
@@ -817,7 +828,44 @@ size_t lwp_put_to_user(void *dst, void *src, size_t size)
         return 0;
     }
     m_info = &lwp->mmu_info;
-    return lwp_data_put(m_info, dst, src, size);
+    rt_mm_lock();
+#ifdef RT_HW_MMU_USER_WRITABLE
+    addr_start = dst;
+    addr_end = (void *)((char *)dst + size);
+    next_page = (void *)(((size_t)addr_start + ARCH_PAGE_SIZE) &
+                         ~(ARCH_PAGE_SIZE - 1));
+    while (addr_start < addr_end)
+    {
+        if (!rt_hw_mmu_user_writable(m_info, addr_start))
+            goto out;
+        addr_start = next_page;
+        next_page = (void *)((char *)next_page + ARCH_PAGE_SIZE);
+    }
+#else
+    addr_start = dst;
+    addr_end = (void *)((char *)dst + size);
+    while (addr_start < addr_end)
+    {
+        struct lwp_avl_struct *node;
+        struct rt_mm_area_struct *area;
+        void *area_end;
+
+        node = lwp_map_find(lwp->map_area, (size_t)addr_start);
+        if (!node)
+            goto out;
+        area = (struct rt_mm_area_struct *)node->data;
+        if (area->type == MM_AREA_TYPE_TEXT)
+            goto out;
+        area_end = (void *)(area->addr + area->size);
+        if (area_end <= addr_start)
+            goto out;
+        addr_start = area_end;
+    }
+#endif
+    copy_len = lwp_data_put(m_info, dst, src, size);
+out:
+    rt_mm_unlock();
+    return copy_len;
 }
  
 int lwp_put_to_user_ex(void *dst, void *src, size_t size)

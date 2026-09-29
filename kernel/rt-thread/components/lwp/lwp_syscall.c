@@ -520,10 +520,8 @@ void sys_exit(int value)
     main_thread = rt_list_entry(lwp->t_grp.prev, struct rt_thread, sibling);
     if (main_thread == tid)
     {
-        lwp_terminate(lwp);
+        lwp_terminate_with_status(lwp, LWP_WAIT_STATUS_EXIT(value));
         lwp_wait_subthread_exit();
-        if (value)
-            lwp->lwp_ret = value;
     }
 #else
     main_thread = rt_list_entry(lwp->t_grp.prev, struct rt_thread, sibling);
@@ -532,7 +530,7 @@ void sys_exit(int value)
         rt_thread_t sub_thread;
         rt_list_t *list;
 
-        lwp_terminate(lwp);
+        lwp_terminate_with_status(lwp, LWP_WAIT_STATUS_EXIT(value));
 
         /* delete all subthread */
         while ((list = tid->sibling.prev) != &lwp->t_grp)
@@ -541,7 +539,6 @@ void sys_exit(int value)
             rt_list_remove(&sub_thread->sibling);
             rt_thread_delete(sub_thread);
         }
-        lwp->lwp_ret = value;
     }
 #endif /* ARCH_MM_MMU */
 
@@ -563,8 +560,7 @@ void sys_exit_group(int status)
     lwp = (struct rt_lwp *)tid->lwp;
 
     level = rt_hw_interrupt_disable();
-    lwp_terminate(lwp);
-    lwp->lwp_ret = status;
+    lwp_terminate_with_status(lwp, LWP_WAIT_STATUS_EXIT(status));
     rt_hw_interrupt_enable(level);
 
     return;
@@ -4124,16 +4120,25 @@ int32_t sys_waitpid(int32_t pid, int *status, int options)
 {
     int ret = -1;
 #ifdef RT_USING_USERSPACE
-    if (!lwp_user_accessable((void *)status, sizeof(int)))
+    int status_k;
+
+    if (status && !lwp_user_accessable((void *)status, sizeof(int)))
     {
         return -EFAULT;
     }
-    else
+    ret = lwp_waitpid_prepare(pid, status ? &status_k : RT_NULL, options);
+    if (ret != -1 && status &&
+        lwp_put_to_user(status, &status_k, sizeof(status_k)) != sizeof(status_k))
     {
-        ret = waitpid(pid, status, options);
+        lwp_waitpid_finalize(ret, 0);
+        return -EFAULT;
+    }
+    if (ret != -1 && lwp_waitpid_finalize(ret, 1) != 0)
+    {
+        return -ECHILD;
     }
 #else
-    if (!lwp_user_accessable((void *)status, sizeof(int)))
+    if (status && !lwp_user_accessable((void *)status, sizeof(int)))
     {
         return -EFAULT;
     }

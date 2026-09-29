@@ -57,6 +57,9 @@ extern "C" {
 
 #define LWP_ARG_MAX         8
 
+#define LWP_WAIT_STATUS_EXIT(code)   (((code) & 0xff) << 8)
+#define LWP_WAIT_STATUS_SIGNAL(sig)  ((sig) & 0x7f)
+
 struct rt_lwp
 {
 #ifdef RT_USING_USERSPACE
@@ -83,6 +86,8 @@ struct rt_lwp
     rt_list_t wait_list;
     int32_t  finish;
     int  lwp_ret;
+    int  wait_status_set;
+    int  wait_in_progress;
 
     void *text_entry;
     uint32_t text_size;
@@ -142,6 +147,7 @@ char *lwp_getcwd(void);
 void lwp_request_thread_exit(rt_thread_t thread_to_exit);
 int  lwp_check_exit_request(void);
 void lwp_terminate(struct rt_lwp *lwp);
+void lwp_terminate_with_status(struct rt_lwp *lwp, int status);
 void lwp_wait_subthread_exit(void);
 
 int lwp_tid_get(void);

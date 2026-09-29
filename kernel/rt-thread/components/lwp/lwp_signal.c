@@ -256,7 +256,6 @@ rt_inline int _lwp_check_ignore(int sig)
     return 0;
 }
 
-void sys_exit(int value);
 lwp_sighandler_t lwp_sighandler_get(int sig, siginfo_t *info)
 {
     lwp_sighandler_t func = RT_NULL;
@@ -288,7 +287,7 @@ lwp_sighandler_t lwp_sighandler_get(int sig, siginfo_t *info)
         }
         if (thread->signal_in_process)
         {
-            lwp_terminate(lwp);
+            lwp_terminate_with_status(lwp, LWP_WAIT_STATUS_SIGNAL(sig));
         }
         sys_exit(0);
     }
@@ -568,6 +567,14 @@ int lwp_kill_ext(pid_t pid, int sig, siginfo_t *info)
     if (!lwp || lwp->finish)
     {
         rt_set_errno(ESRCH);
+        goto out;
+    }
+    if (sig == SIGKILL)
+    {
+        /* SIGKILL is process-wide and cannot wait for one selected thread to
+         * return to userspace before the remaining threads are terminated. */
+        lwp_terminate_with_status(lwp, LWP_WAIT_STATUS_SIGNAL(sig));
+        ret = 0;
         goto out;
     }
     for (list = lwp->t_grp.prev; list != &lwp->t_grp; list = list->prev)

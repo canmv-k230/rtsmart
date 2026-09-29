@@ -622,7 +622,7 @@ int lwp_getpid(void)
     return ((struct rt_lwp *)self->lwp)->pid;
 }
 
-pid_t waitpid(pid_t pid, int *status, int options)
+pid_t lwp_waitpid_prepare(pid_t pid, int *status, int options)
 {
     pid_t ret = -1;
     rt_base_t level;
@@ -646,6 +646,11 @@ pid_t waitpid(pid_t pid, int *status, int options)
     {
         goto quit;
     }
+    if (lwp->wait_in_progress || !rt_list_isempty(&lwp->wait_list))
+    {
+        goto quit;
+    }
+    lwp->wait_in_progress = 1;
 
     if (lwp->finish)
     {
@@ -653,10 +658,6 @@ pid_t waitpid(pid_t pid, int *status, int options)
     }
     else
     {
-        if (!rt_list_isempty(&lwp->wait_list))
-        {
-            goto quit;
-        }
         thread = rt_thread_self();
         rt_thread_suspend_with_flag(thread, RT_UNINTERRUPTIBLE);
         rt_list_insert_before(&lwp->wait_list, &(thread->tlist));
@@ -669,9 +670,41 @@ pid_t waitpid(pid_t pid, int *status, int options)
 
     if (ret != -1)
     {
+        if (status)
+        {
+            *status = lwp->lwp_ret;
+        }
+    }
+    else
+    {
+        lwp->wait_in_progress = 0;
+    }
+
+quit:
+    rt_hw_interrupt_enable(level);
+    return ret;
+}
+
+int lwp_waitpid_finalize(pid_t pid, int reap)
+{
+    int ret = -1;
+    rt_base_t level;
+    struct rt_lwp *lwp;
+    struct rt_lwp *lwp_self;
+
+    level = rt_hw_interrupt_disable();
+    lwp = lwp_from_pid(pid);
+    lwp_self = (struct rt_lwp *)rt_thread_self()->lwp;
+    if (!lwp || !lwp_self || lwp->parent != lwp_self ||
+        !lwp->wait_in_progress)
+    {
+        goto quit;
+    }
+
+    if (reap)
+    {
         struct rt_lwp **lwp_node;
 
-        *status = lwp->lwp_ret;
         lwp_node = &lwp_self->first_child;
         while (*lwp_node != lwp)
         {
@@ -683,9 +716,26 @@ pid_t waitpid(pid_t pid, int *status, int options)
         lwp_pid_put(pid);
         rt_free(lwp);
     }
+    else
+    {
+        lwp->wait_in_progress = 0;
+    }
+    ret = 0;
 
 quit:
     rt_hw_interrupt_enable(level);
+    return ret;
+}
+
+pid_t waitpid(pid_t pid, int *status, int options)
+{
+    pid_t ret;
+
+    ret = lwp_waitpid_prepare(pid, status, options);
+    if (ret != -1 && lwp_waitpid_finalize(ret, 1) != 0)
+    {
+        return -1;
+    }
     return ret;
 }
 
@@ -830,20 +880,37 @@ static int cmd_kill(int argc, char** argv)
 
     if (argc < 2)
     {
-        rt_kprintf("kill pid or kill pid -s signal\n");
+        rt_kprintf("kill pid, kill -signal pid, or kill pid -s signal\n");
         return -EINVAL;
     }
 
-    pid = atoi(argv[1]);
-    if (argc >= 4)
+    if (argv[1][0] == '-')
     {
-        if (argv[2][0] == '-' && argv[2][1] == 's')
+        if (argv[1][1] == 's' && argv[1][2] == '\0')
         {
-            sig = atoi(argv[3]);
+            if (argc < 4)
+                return -EINVAL;
+            sig = atoi(argv[2]);
+            pid = atoi(argv[3]);
+        }
+        else
+        {
+            if (argc < 3)
+                return -EINVAL;
+            sig = atoi(&argv[1][1]);
+            pid = atoi(argv[2]);
         }
     }
-    lwp_kill(pid, sig);
-    return 0;
+    else
+    {
+        pid = atoi(argv[1]);
+        if (argc >= 4 && argv[2][0] == '-' && argv[2][1] == 's' && argv[2][2] == '\0')
+            sig = atoi(argv[3]);
+    }
+
+    if (pid <= 0)
+        return -EINVAL;
+    return lwp_kill(pid, sig);
 }
 MSH_CMD_EXPORT_ALIAS(cmd_kill, kill, send a signal to a process);
 
@@ -990,18 +1057,10 @@ finish:
     return;
 }
 
-void lwp_terminate(struct rt_lwp *lwp)
+static void _lwp_terminate_locked(struct rt_lwp *lwp)
 {
-    rt_base_t level;
     rt_list_t *list;
 
-    if (!lwp)
-    {
-        /* kernel thread not support */
-        return;
-    }
-
-    level = rt_hw_interrupt_disable();
     for (list = lwp->t_grp.next; list != &lwp->t_grp; list = list->next)
     {
         rt_thread_t thread;
@@ -1021,6 +1080,40 @@ void lwp_terminate(struct rt_lwp *lwp)
             }
         }
     }
+}
+
+void lwp_terminate(struct rt_lwp *lwp)
+{
+    rt_base_t level;
+
+    if (!lwp)
+    {
+        /* kernel thread not support */
+        return;
+    }
+
+    level = rt_hw_interrupt_disable();
+    _lwp_terminate_locked(lwp);
+    rt_hw_interrupt_enable(level);
+}
+
+void lwp_terminate_with_status(struct rt_lwp *lwp, int status)
+{
+    rt_base_t level;
+
+    if (!lwp)
+    {
+        /* kernel thread not support */
+        return;
+    }
+
+    level = rt_hw_interrupt_disable();
+    if (!lwp->wait_status_set)
+    {
+        lwp->lwp_ret = status;
+        lwp->wait_status_set = 1;
+    }
+    _lwp_terminate_locked(lwp);
     rt_hw_interrupt_enable(level);
 }
 

@@ -1407,9 +1407,24 @@ static void _lwp_thread_entry(void *parameter)
 
     if (lwp->debug)
     {
-        lwp->bak_first_ins = *(uint32_t *)lwp->text_entry;
-        *(uint32_t *)lwp->text_entry = dbg_get_ins();
-        rt_hw_cpu_dcache_ops(RT_HW_CACHE_FLUSH, lwp->text_entry, sizeof(uint32_t));
+        uint32_t *text_entry = (uint32_t *)lwp->text_entry;
+
+#ifdef ARCH_MM_MMU
+        text_entry = (uint32_t *)rt_hw_mmu_v2p(&lwp->mmu_info, text_entry);
+        if (text_entry)
+        {
+            text_entry = (uint32_t *)((char *)text_entry - PV_OFFSET);
+        }
+#endif
+        if (!text_entry)
+        {
+            LOG_E("failed to translate debug entry point");
+            sys_exit(-1);
+            return;
+        }
+        lwp->bak_first_ins = *text_entry;
+        *text_entry = dbg_get_ins();
+        rt_hw_cpu_dcache_ops(RT_HW_CACHE_FLUSH, text_entry, sizeof(uint32_t));
         icache_invalid_all();
     }
 
