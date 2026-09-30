@@ -535,6 +535,7 @@ struct sdhci_host
 
 void kd_sdhci_change(int id);
 int kd_sdhci_wait_card(int id, int timeout);
+rt_err_t kd_sdhci_reset_host(int id);
 rt_err_t kd_sdhci0_reset(int value);
 
 #endif /*__DRV_SDHCI__*/

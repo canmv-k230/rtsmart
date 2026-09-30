@@ -32,10 +32,6 @@
 
 #include <drivers/spi.h>
 
-#if defined(RT_USING_LWP) && defined(RT_USING_USERSPACE)
-#include <lwp_user_mm.h>
-#endif
-
 #include "board.h"
 #include "cache.h"
 #include "drv_fpioa.h"
@@ -318,93 +314,6 @@ static void* dw_spi_get_pio_buf(void** cached_buf, rt_size_t* cached_size, rt_si
 static rt_bool_t dw_spi_buf_aligned(const void* buf, uint8_t cell_size)
 {
     return cell_size <= 1 || ((uintptr_t)buf % cell_size) == 0;
-}
-
-static rt_bool_t dw_spi_is_user_buf(const void* buf, rt_size_t size)
-{
-#if defined(RT_USING_LWP) && defined(RT_USING_USERSPACE)
-    if (buf == RT_NULL || size == 0 || lwp_self() == RT_NULL) {
-        return RT_FALSE;
-    }
-
-    return lwp_user_accessable((void*)buf, size) ? RT_TRUE : RT_FALSE;
-#else
-    return RT_FALSE;
-#endif
-}
-
-static rt_err_t dw_spi_copy_from_user_buf(void* dst, const void* src, rt_size_t size)
-{
-#if defined(RT_USING_LWP) && defined(RT_USING_USERSPACE)
-    if (size != lwp_get_from_user(dst, (void*)src, size)) {
-        return -RT_EINVAL;
-    }
-#else
-    rt_memcpy(dst, src, size);
-#endif
-
-    return RT_EOK;
-}
-
-static rt_err_t dw_spi_copy_to_user_buf(void* dst, const void* src, rt_size_t size)
-{
-#if defined(RT_USING_LWP) && defined(RT_USING_USERSPACE)
-    if (size != lwp_put_to_user(dst, (void*)src, size)) {
-        return -RT_EINVAL;
-    }
-#else
-    rt_memcpy(dst, src, size);
-#endif
-
-    return RT_EOK;
-}
-
-static rt_err_t dw_spi_prepare_user_xfer(struct rt_qspi_message* msg, void** tx_alloc, void** rx_alloc)
-{
-    rt_size_t len;
-
-    *tx_alloc = RT_NULL;
-    *rx_alloc = RT_NULL;
-    len       = msg->parent.length;
-
-    if (len == 0) {
-        return RT_EOK;
-    }
-
-    if (dw_spi_is_user_buf(msg->parent.send_buf, len)) {
-        *tx_alloc = rt_malloc_align(len, RT_CPU_CACHE_LINE_SZ);
-        if (*tx_alloc == RT_NULL) {
-            return -RT_ENOMEM;
-        }
-        if (dw_spi_copy_from_user_buf(*tx_alloc, msg->parent.send_buf, len) != RT_EOK) {
-            return -RT_EINVAL;
-        }
-        msg->parent.send_buf = *tx_alloc;
-    }
-
-    if (dw_spi_is_user_buf(msg->parent.recv_buf, len)) {
-        *rx_alloc = rt_malloc_align(len, RT_CPU_CACHE_LINE_SZ);
-        if (*rx_alloc == RT_NULL) {
-            return -RT_ENOMEM;
-        }
-        msg->parent.recv_buf = *rx_alloc;
-    }
-
-    return RT_EOK;
-}
-
-static rt_err_t dw_spi_finish_user_xfer(const struct rt_qspi_message* msg, void* user_recv_buf, rt_uint32_t length,
-                                        void* rx_alloc)
-{
-    if (rx_alloc == RT_NULL || length == 0) {
-        return RT_EOK;
-    }
-
-    if (length > msg->parent.length) {
-        length = (rt_uint32_t)msg->parent.length;
-    }
-
-    return dw_spi_copy_to_user_buf(user_recv_buf, rx_alloc, length);
 }
 
 static rt_err_t dw_spi_fifo_push_limit(dw_spi_xfer_state_t* xfer, dw_spi_reg_t* spi, rt_size_t max_level)
@@ -943,10 +852,16 @@ static rt_err_t drv_spi_configure(struct rt_spi_device* device, struct rt_spi_co
     dfs = configuration->data_width - 1;
 
     max_hz = configuration->max_hz;
+    if (max_hz == 0) {
+        return -RT_EINVAL;
+    }
     if (max_hz > spi_bus->hw->max_hz) {
         max_hz = spi_bus->hw->max_hz;
     }
     spi_clock = sysctl_clk_get_leaf_freq(spi_bus->hw->clk);
+    if (spi_clock == 0) {
+        return -RT_ERROR;
+    }
     div       = spi_clock / max_hz;
 
     mode = configuration->mode & RT_SPI_MODE_3;
@@ -978,40 +893,16 @@ static rt_err_t drv_spi_configure(struct rt_spi_device* device, struct rt_spi_co
 
 static rt_uint32_t drv_spi_xfer(struct rt_spi_device* device, struct rt_spi_message* message)
 {
-    dw_spi_bus_t*                 spi_bus       = (dw_spi_bus_t*)device->bus;
-    struct rt_qspi_device*        dev           = (struct rt_qspi_device*)device;
-    struct rt_qspi_message*       msg           = (struct rt_qspi_message*)message;
-    struct rt_qspi_message        kmsg          = *msg;
-    struct rt_qspi_configuration* cfg           = (struct rt_qspi_configuration*)&dev->config;
-    void*                         tx_alloc      = RT_NULL;
-    void*                         rx_alloc      = RT_NULL;
-    void*                         user_recv_buf = msg->parent.recv_buf;
-    rt_uint32_t                   length;
+    dw_spi_bus_t*                 spi_bus = (dw_spi_bus_t*)device->bus;
+    struct rt_qspi_device*        dev     = (struct rt_qspi_device*)device;
+    struct rt_qspi_message*       msg     = (struct rt_qspi_message*)message;
+    struct rt_qspi_configuration* cfg     = (struct rt_qspi_configuration*)&dev->config;
 
-    if (dw_spi_prepare_user_xfer(&kmsg, &tx_alloc, &rx_alloc) != RT_EOK) {
-        length = 0;
-        goto cleanup;
+    if (msg->qspi_data_lines > 1) {
+        return drv_spi_xfer_enhanced(spi_bus, cfg, msg);
     }
 
-    if (kmsg.qspi_data_lines > 1) {
-        length = drv_spi_xfer_enhanced(spi_bus, cfg, &kmsg);
-    } else {
-        length = drv_spi_xfer_standard(spi_bus, cfg, &kmsg);
-    }
-
-    if (dw_spi_finish_user_xfer(&kmsg, user_recv_buf, length, rx_alloc) != RT_EOK) {
-        length = 0;
-    }
-
-cleanup:
-    if (tx_alloc != RT_NULL) {
-        rt_free_align(tx_alloc);
-    }
-    if (rx_alloc != RT_NULL) {
-        rt_free_align(rx_alloc);
-    }
-
-    return length;
+    return drv_spi_xfer_standard(spi_bus, cfg, msg);
 }
 
 static rt_uint32_t drv_spi_xfer_enhanced(dw_spi_bus_t* spi_bus, struct rt_qspi_configuration* cfg, struct rt_qspi_message* msg)
@@ -1544,6 +1435,8 @@ static rt_err_t dw_spi_register_bus(dw_spi_bus_t* spi_bus, const dw_spi_hw_info_
     rt_err_t ret;
 
     spi_bus->base = rt_ioremap((void*)info->base, SPI_OPI_IO_SIZE);
+    if (spi_bus->base == RT_NULL)
+        return -RT_ENOMEM;
     spi_bus->hw   = info;
     spi_bus->rdse = 0;
     spi_bus->rdsd = rdsd;
@@ -1551,10 +1444,19 @@ static rt_err_t dw_spi_register_bus(dw_spi_bus_t* spi_bus, const dw_spi_hw_info_
     ret = rt_qspi_bus_register(&spi_bus->dev, info->name, &spi_ops);
     if (ret) {
         LOG_E("%s register fail", info->name);
+        rt_iounmap(spi_bus->base);
+        spi_bus->base = RT_NULL;
         return ret;
     }
 
-    rt_event_init(&spi_bus->event, info->name, RT_IPC_FLAG_PRIO);
+    ret = rt_event_init(&spi_bus->event, info->name, RT_IPC_FLAG_PRIO);
+    if (ret != RT_EOK) {
+        rt_device_unregister(&spi_bus->dev.parent);
+        rt_mutex_detach(&spi_bus->dev.lock);
+        rt_iounmap(spi_bus->base);
+        spi_bus->base = RT_NULL;
+        return ret;
+    }
     for (rt_size_t i = 0; i < sizeof(dw_spi_irq_offsets) / sizeof(dw_spi_irq_offsets[0]); i++) {
         int irq = info->irq_base + dw_spi_irq_offsets[i];
 
@@ -1605,6 +1507,222 @@ static void dw_spi_set_soft_cs(struct rt_qspi_configuration* cfg, rt_bool_t asse
     active_high = !!(cfg->parent.mode & RT_SPI_CS_HIGH);
     kd_pin_write(cs_pin, asserted == active_high ? GPIO_PV_HIGH : GPIO_PV_LOW);
 }
+
+#if defined(RT_USING_MSH) && defined(RT_SPI1_ENABLE_LOOPBACK_TEST)
+#define SPI1_LOOPBACK_PIN_COUNT 4
+#define SPI1_LOOPBACK_MAX_SIZE  1024
+
+typedef struct {
+    uint32_t hz;
+    uint8_t  mode;
+} spi1_loopback_case_t;
+
+static struct rt_qspi_device spi1_loopback_device;
+static rt_bool_t             spi1_loopback_attached;
+
+static rt_err_t spi1_loopback_attach(void)
+{
+    rt_err_t ret;
+
+    if (spi1_loopback_attached) {
+        return RT_EOK;
+    }
+
+    rt_memset(&spi1_loopback_device, 0, sizeof(spi1_loopback_device));
+    ret = rt_spi_bus_attach_device(&spi1_loopback_device.parent, "spi1_loop", "spi1", RT_NULL);
+    if (ret == RT_EOK) {
+        spi1_loopback_attached = RT_TRUE;
+    }
+
+    return ret;
+}
+
+static rt_bool_t spi1_loopback_config_unchanged(const struct rt_qspi_configuration* expected)
+{
+    const struct rt_qspi_configuration* actual = &spi1_loopback_device.config;
+    const struct rt_spi_configuration*  parent = &spi1_loopback_device.parent.config;
+
+    return parent->mode == expected->parent.mode && parent->data_width == expected->parent.data_width &&
+           parent->reserved == expected->parent.reserved && parent->max_hz == expected->parent.max_hz &&
+           actual->parent.mode == expected->parent.mode && actual->parent.data_width == expected->parent.data_width &&
+           actual->parent.reserved == expected->parent.reserved && actual->parent.max_hz == expected->parent.max_hz &&
+           actual->medium_size == expected->medium_size && actual->ddr_mode == expected->ddr_mode &&
+           actual->qspi_dl_width == expected->qspi_dl_width &&
+           spi1_loopback_device.parent.bus->owner == &spi1_loopback_device.parent;
+}
+
+static int spi1_loopback(void)
+{
+    static const int          pins[SPI1_LOOPBACK_PIN_COUNT] = { 14, 15, 16, 17 };
+    static const fpioa_func_t funcs[SPI1_LOOPBACK_PIN_COUNT]
+        = { QSPI0_CS0, QSPI0_CLK, QSPI0_D0, QSPI0_D1 };
+    static const rt_size_t lengths[] = { 1, 15, 16, 17, 63, 64, 65, 255, 256, 257, SPI1_LOOPBACK_MAX_SIZE };
+    static const spi1_loopback_case_t cases[] = {
+        { 1000000, RT_SPI_MODE_0 },
+        { 10000000, RT_SPI_MODE_0 },
+        { 10000000, RT_SPI_MODE_3 },
+        { 25000000, RT_SPI_MODE_0 },
+    };
+    struct rt_qspi_configuration cfg = {
+        .parent = {
+            .mode       = RT_SPI_MASTER | RT_SPI_MSB | RT_SPI_MODE_0,
+            .data_width = 8,
+            .hard_cs    = 1,
+            .soft_cs    = 0,
+            .max_hz     = 1000000,
+        },
+        .medium_size  = 0,
+        .ddr_mode     = 0,
+        .qspi_dl_width = 1,
+    };
+    struct rt_qspi_configuration bad_cfg;
+    uint32_t                     saved_pin_cfg[SPI1_LOOPBACK_PIN_COUNT];
+    uint8_t*                     tx_buf = RT_NULL;
+    uint8_t*                     rx_buf = RT_NULL;
+    rt_size_t                    tests = 0;
+    rt_size_t                    bytes = 0;
+    rt_bool_t                    pins_saved = RT_FALSE;
+    rt_err_t                     ret = RT_EOK;
+
+    for (rt_size_t i = 0; i < SPI1_LOOPBACK_PIN_COUNT; i++) {
+        int mapped_pin = drv_fpioa_find_pin_by_func(funcs[i]);
+
+        if (mapped_pin >= 0 && mapped_pin != pins[i]) {
+            rt_kprintf("SPI1_LOOPBACK_RESULT FAIL stage=pin_busy func=%d pin=%d\n", funcs[i], mapped_pin);
+            return -RT_EBUSY;
+        }
+        if (drv_fpioa_get_pin_cfg(pins[i], &saved_pin_cfg[i]) != 0) {
+            rt_kprintf("SPI1_LOOPBACK_RESULT FAIL stage=pin_save pin=%d\n", pins[i]);
+            return -RT_ERROR;
+        }
+    }
+    pins_saved = RT_TRUE;
+
+    for (rt_size_t i = 0; i < SPI1_LOOPBACK_PIN_COUNT; i++) {
+        if (drv_fpioa_set_pin_func(pins[i], funcs[i]) != 0) {
+            rt_kprintf("SPI1_LOOPBACK_RESULT FAIL stage=pin_setup pin=%d func=%d\n", pins[i], funcs[i]);
+            ret = -RT_ERROR;
+            goto cleanup;
+        }
+    }
+
+    ret = spi1_loopback_attach();
+    if (ret != RT_EOK) {
+        rt_kprintf("SPI1_LOOPBACK_RESULT FAIL stage=attach ret=%d\n", ret);
+        goto cleanup;
+    }
+
+    tx_buf = rt_malloc_align(SPI1_LOOPBACK_MAX_SIZE, RT_CPU_CACHE_LINE_SZ);
+    rx_buf = rt_malloc_align(SPI1_LOOPBACK_MAX_SIZE, RT_CPU_CACHE_LINE_SZ);
+    if (tx_buf == RT_NULL || rx_buf == RT_NULL) {
+        rt_kprintf("SPI1_LOOPBACK_RESULT FAIL stage=alloc\n");
+        ret = -RT_ENOMEM;
+        goto cleanup;
+    }
+
+    ret = rt_qspi_configure(&spi1_loopback_device, &cfg);
+    if (ret != RT_EOK) {
+        rt_kprintf("SPI1_LOOPBACK_RESULT FAIL stage=configure ret=%d\n", ret);
+        goto cleanup;
+    }
+
+    bad_cfg                    = cfg;
+    bad_cfg.parent.data_width = 0;
+    ret                        = rt_qspi_configure(&spi1_loopback_device, &bad_cfg);
+    tests++;
+    if (ret != -RT_EINVAL || !spi1_loopback_config_unchanged(&cfg)) {
+        rt_kprintf("SPI1_LOOPBACK_RESULT FAIL stage=reconfigure ret=%d unchanged=%d\n", ret,
+                   spi1_loopback_config_unchanged(&cfg));
+        ret = -RT_ERROR;
+        goto cleanup;
+    }
+
+    for (rt_size_t case_index = 0; case_index < sizeof(cases) / sizeof(cases[0]); case_index++) {
+        cfg.parent.max_hz = cases[case_index].hz;
+        cfg.parent.mode   = RT_SPI_MASTER | RT_SPI_MSB | cases[case_index].mode;
+        ret               = rt_qspi_configure(&spi1_loopback_device, &cfg);
+        if (ret != RT_EOK) {
+            rt_kprintf("SPI1_LOOPBACK_RESULT FAIL stage=configure hz=%u mode=%u ret=%d\n", cases[case_index].hz,
+                       cases[case_index].mode, ret);
+            goto cleanup;
+        }
+
+        /* Exercise the QSPI owner's full-configuration restore path. */
+        spi1_loopback_device.parent.bus->owner = RT_NULL;
+
+        for (rt_size_t length_index = 0; length_index < sizeof(lengths) / sizeof(lengths[0]); length_index++) {
+            struct rt_qspi_message msg;
+            rt_size_t              length = lengths[length_index];
+            rt_size_t              transferred;
+            rt_size_t              mismatch;
+
+            for (rt_size_t i = 0; i < length; i++) {
+                tx_buf[i] = (uint8_t)(i * 37U + length * 11U + case_index * 23U);
+                rx_buf[i] = 0;
+            }
+
+            rt_memset(&msg, 0, sizeof(msg));
+            msg.parent.send_buf   = tx_buf;
+            msg.parent.recv_buf   = rx_buf;
+            msg.parent.length     = length;
+            msg.parent.cs_take    = 1;
+            msg.parent.cs_release = 1;
+            msg.parent.next       = RT_NULL;
+            msg.qspi_data_lines   = 1;
+
+            transferred = rt_qspi_transfer_message(&spi1_loopback_device, &msg);
+            tests++;
+            if (transferred != length) {
+                rt_kprintf("SPI1_LOOPBACK_RESULT FAIL stage=transfer hz=%u mode=%u len=%u got=%u errno=%d\n",
+                           cases[case_index].hz, cases[case_index].mode, (uint32_t)length, (uint32_t)transferred,
+                           rt_get_errno());
+                ret = -RT_EIO;
+                goto cleanup;
+            }
+
+            for (mismatch = 0; mismatch < length; mismatch++) {
+                if (tx_buf[mismatch] != rx_buf[mismatch]) {
+                    break;
+                }
+            }
+            if (mismatch != length) {
+                rt_kprintf("SPI1_LOOPBACK_RESULT FAIL stage=compare hz=%u mode=%u len=%u offset=%u tx=%02x rx=%02x\n",
+                           cases[case_index].hz, cases[case_index].mode, (uint32_t)length, (uint32_t)mismatch,
+                           tx_buf[mismatch], rx_buf[mismatch]);
+                ret = -RT_EIO;
+                goto cleanup;
+            }
+            bytes += length;
+        }
+    }
+
+    ret = RT_EOK;
+
+cleanup:
+    if (tx_buf != RT_NULL) {
+        rt_free_align(tx_buf);
+    }
+    if (rx_buf != RT_NULL) {
+        rt_free_align(rx_buf);
+    }
+    if (pins_saved) {
+        for (rt_size_t i = 0; i < SPI1_LOOPBACK_PIN_COUNT; i++) {
+            if (drv_fpioa_set_pin_cfg(pins[i], saved_pin_cfg[i]) != 0 && ret == RT_EOK) {
+                ret = -RT_ERROR;
+            }
+        }
+    }
+
+    if (ret == RT_EOK) {
+        rt_kprintf("SPI1_LOOPBACK_RESULT PASS tests=%u bytes=%u\n", (uint32_t)tests, (uint32_t)bytes);
+    } else {
+        rt_kprintf("SPI1_LOOPBACK_RESULT FAIL tests=%u bytes=%u ret=%d\n", (uint32_t)tests, (uint32_t)bytes, ret);
+    }
+
+    return ret;
+}
+MSH_CMD_EXPORT(spi1_loopback, run SPI1 GPIO16-GPIO17 loopback test);
+#endif
 
 int rt_hw_spi_bus_init(void)
 {

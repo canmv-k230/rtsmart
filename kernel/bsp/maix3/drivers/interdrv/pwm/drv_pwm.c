@@ -108,6 +108,10 @@ static uint32_t _pwm_dev_inst_type;
 
 static struct pwm_inst_wrap pwm_inst_wrap;
 
+static void kd_pwm_write_pulse(struct pwm_inst* inst, int channel,
+                               uint32_t period, uint32_t pulse,
+                               uint32_t scale);
+
 /* PWM Channel Mapping */
 #define PWM_CHANNEL_TO_INST(ch)  ((ch) / 3) /* 0-2: instance 0, 3-5: instance 1 */
 #define PWM_CHANNEL_TO_SUBCH(ch) ((ch) % 3) /* Sub-channel within instance */
@@ -130,13 +134,18 @@ static int pwm_start(struct pwm_inst* inst, int channel)
     uint32_t scale  = inst->scale;
     uint32_t pulse  = inst->pulses[channel];
 
+    if (period == 0) {
+        LOG_E("Channel %d has no configured period", channel);
+        return -RT_EINVAL;
+    }
+
     /* Configure PWM scale and period */
     curr_cfg = read32(&inst->reg->pwmcfg);
     write32(&inst->reg->pwmcfg, (curr_cfg & (~0x0F) | scale));
     write32(&inst->reg->pwmcmp0, period >> scale);
 
     /* Set pulse width */
-    write32(&inst->reg->pwm_chn_pulse[channel], (period - pulse) >> scale);
+    kd_pwm_write_pulse(inst, channel, period, pulse, scale);
 
     /* Enable PWM */
     curr_cfg = read32(&inst->reg->pwmcfg);
@@ -209,6 +218,20 @@ static rt_err_t kd_pwm_get(struct pwm_inst* inst, rt_uint8_t channel, struct rt_
     return RT_EOK;
 }
 
+static void kd_pwm_write_pulse(struct pwm_inst* inst, int channel,
+                               uint32_t period, uint32_t pulse,
+                               uint32_t scale)
+{
+    if (pulse == 0) { /* duty 0 */
+        write32(&inst->reg->pwm_chn_pulse[channel], UINT32_MAX);
+    } else if (pulse >= period) { /* duty 100 */
+        write32(&inst->reg->pwm_chn_pulse[channel], 0);
+    } else { /* duty 0 ~ 100 */
+        write32(&inst->reg->pwm_chn_pulse[channel],
+                (period - pulse) >> scale);
+    }
+}
+
 /**
  * @brief Set PWM configuration
  * @param inst PWM instance
@@ -218,6 +241,12 @@ static rt_err_t kd_pwm_get(struct pwm_inst* inst, rt_uint8_t channel, struct rt_
  */
 static int kd_pwm_set(struct pwm_inst* inst, int channel, struct rt_pwm_configuration* configuration)
 {
+    uint32_t new_pulses[3];
+    uint32_t old_period;
+    bool period_changed;
+    bool any_enabled = false;
+    int i;
+
     if (!inst || !configuration || channel > 2) {
         return -RT_EINVAL;
     }
@@ -231,7 +260,7 @@ static int kd_pwm_set(struct pwm_inst* inst, int channel, struct rt_pwm_configur
     period = configuration->period ? (uint64_t)configuration->period * pwm_pclock / NSEC_PER_SEC : 0;
 
     /* Validate parameters */
-    if (pulse > period || period > ((1 << (15 + 16)) - 1LL)) {
+    if (period == 0 || pulse > period || period > ((1ULL << (15 + 16)) - 1ULL)) {
         LOG_E("Invalid config for channel %d (pulse=%llu, period=%llu)", channel, pulse, period);
         return -RT_EINVAL;
     }
@@ -242,7 +271,7 @@ static int kd_pwm_set(struct pwm_inst* inst, int channel, struct rt_pwm_configur
     }
 
     /* Calculate appropriate scale factor */
-    pwmcmpx_max = (1 << 16) - 1;
+    pwmcmpx_max = (1U << 16) - 1U;
     while ((period >> pwmscale) > pwmcmpx_max) {
         pwmscale++;
 
@@ -252,26 +281,52 @@ static int kd_pwm_set(struct pwm_inst* inst, int channel, struct rt_pwm_configur
         }
     }
 
-    /* Update hardware if channel is active */
-    if (inst->enable[channel]) {
-        if (period != inst->period) {
+    old_period = inst->period;
+    period_changed = period != old_period;
+
+    /* All three channels share period and scale. Keep sibling duty ratios
+     * coherent when one channel changes the instance frequency.
+     */
+    for (i = 0; i < 3; i++) {
+        new_pulses[i] = inst->pulses[i];
+        any_enabled = any_enabled || inst->enable[i];
+
+        if (i == channel || !period_changed)
+            continue;
+
+        if (old_period == 0 || period == 0) {
+            new_pulses[i] = 0;
+        } else if (inst->pulses[i] >= old_period) {
+            new_pulses[i] = (uint32_t)period;
+        } else {
+            new_pulses[i] = (uint32_t)(period * inst->pulses[i] /
+                                       old_period);
+        }
+    }
+    new_pulses[channel] = (uint32_t)pulse;
+
+    if (period_changed) {
+        if (any_enabled) {
             write32(&inst->reg->pwmcfg, (read32(&inst->reg->pwmcfg) & (~0x0F)) | pwmscale);
             write32(&inst->reg->pwmcmp0, period >> pwmscale);
-        }
 
-        if (0x00 == pulse) { /* duty 0 */
-            write32(&inst->reg->pwm_chn_pulse[channel], UINT32_MAX);
-        } else if (pulse >= period) { /* duty 100 */
-            write32(&inst->reg->pwm_chn_pulse[channel], 0);
-        } else { /* duty 0 ~ 100 */
-            write32(&inst->reg->pwm_chn_pulse[channel], (period - pulse) >> pwmscale);
+            for (i = 0; i < 3; i++) {
+                if (inst->enable[i]) {
+                    kd_pwm_write_pulse(inst, i, (uint32_t)period,
+                                       new_pulses[i], pwmscale);
+                }
+            }
         }
+    } else if (inst->enable[channel]) {
+        kd_pwm_write_pulse(inst, channel, (uint32_t)period,
+                           new_pulses[channel], pwmscale);
     }
 
     /* Store current settings */
-    inst->scale           = pwmscale;
-    inst->period          = period;
-    inst->pulses[channel] = pulse;
+    inst->scale  = pwmscale;
+    inst->period = (uint32_t)period;
+    for (i = 0; i < 3; i++)
+        inst->pulses[i] = new_pulses[i];
 
     return RT_EOK;
 }

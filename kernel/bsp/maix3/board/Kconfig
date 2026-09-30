@@ -22,10 +22,12 @@ menu "Board Configuration"
     config RT_BOARD_ENABLE_PINMUX
         bool "Enable Pinmux Configure"
         select RT_BOARD_ENABLE_PIN_INIT_SEQUENCE
+        select RT_USING_FPIOA
         default n
 
     config RT_BOARD_ENABLE_PIN_INIT_SEQUENCE
         bool "Enable Board Specific Pin Init Sequence"
+        select RT_USING_FPIOA
         default n
         help
             Build the board pin init hook without applying the full pinmux table.

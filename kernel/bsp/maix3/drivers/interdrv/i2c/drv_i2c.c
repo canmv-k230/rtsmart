@@ -27,13 +27,16 @@
 
 #include "ioremap.h"
 #include "mmu.h"
+#include <riscv_io.h>
 
+#if defined(RT_USING_MSH) && defined(RT_I2C_ENABLE_BUILTIN_CMD)
 #include <stdlib.h>
 #include <string.h>
+#include "drv_fpioa.h"
+#endif
 
 #include <rtdevice.h>
 #include <rtthread.h>
-#include "drv_fpioa.h"
 
 #define DBG_TAG "i2c"
 #define DBG_LVL DBG_WARNING
@@ -67,6 +70,20 @@ static struct dw_i2c_master k230_i2c_ctrls[] = {
 #endif
 };
 
+static void k230_i2c_init_cleanup(struct dw_i2c_master *master,
+                                  rt_bool_t event_initialized)
+{
+    if (master->regs) {
+        rt_hw_interrupt_mask(master->irq);
+        writel(0, &master->regs->ic_intr_mask.reg);
+        k230_i2c_ctrl_enable(master, RT_FALSE);
+        if (event_initialized)
+            rt_event_detach(&master->event);
+        rt_iounmap((void *)master->regs);
+        master->regs = RT_NULL;
+    }
+}
+
 int rt_hw_i2c_init(void)
 {
     rt_err_t result;
@@ -91,8 +108,10 @@ int rt_hw_i2c_init(void)
         master->irq = DW_I2C_IRQ_BASE + master->index;
         if (master->is_slave) {
             result = k230_i2c_slave_register(master);
-            if (result != RT_EOK)
+            if (result != RT_EOK) {
+                k230_i2c_init_cleanup(master, RT_FALSE);
                 continue;
+            }
         } else {
             master->bus.ops = &k230_i2c_bus_ops;
 
@@ -100,6 +119,8 @@ int rt_hw_i2c_init(void)
             if (result != RT_EOK) {
                 LOG_E("i2c%d: init failed %d",
                       master->index, result);
+                rt_iounmap((void *)master->regs);
+                master->regs = RT_NULL;
                 continue;
             }
 
@@ -108,6 +129,8 @@ int rt_hw_i2c_init(void)
             if (result != RT_EOK) {
                 LOG_E("i2c%d: bus register failed %d",
                       master->index, result);
+                rt_mutex_detach(&master->bus.lock);
+                k230_i2c_init_cleanup(master, RT_TRUE);
                 continue;
             }
         }
@@ -116,8 +139,8 @@ int rt_hw_i2c_init(void)
             i2c4 = master;
     }
 
-#ifdef CONFIG_BOARD_K230_LABPLUS_1956
-    /* Board-specific override: run i2c4 at standard speed */
+#if defined(CONFIG_BOARD_K230_LABPLUS_1956)
+    /* These camera buses require standard-mode timing on i2c4. */
     if (i2c4)
         k230_i2c_config_speed(i2c4, DW_I2C_SPEED_STANDARD);
 #endif
@@ -126,6 +149,7 @@ int rt_hw_i2c_init(void)
 }
 INIT_DEVICE_EXPORT(rt_hw_i2c_init);
 
+#if defined(RT_USING_MSH) && defined(RT_I2C_ENABLE_BUILTIN_CMD)
 static struct rt_i2c_bus_device *i2c_get_bus(const char *arg)
 {
     char *end = RT_NULL;
@@ -462,3 +486,4 @@ static void i2cdetect(int argc, char **argv)
     }
 }
 MSH_CMD_EXPORT(i2cdetect, i2c scan tool)
+#endif

@@ -24,6 +24,8 @@
 #endif
 #include <rtdbg.h>
 
+#define RT_I2C_RDWR_MAX_MSGS 42U
+
 static rt_size_t i2c_bus_device_read(rt_device_t dev,
                                      rt_off_t    pos,
                                      void       *buffer,
@@ -72,6 +74,7 @@ static rt_err_t i2c_bus_device_control(rt_device_t dev,
     struct rt_i2c_priv_data *priv_data;
     struct rt_i2c_bus_device *bus = (struct rt_i2c_bus_device *)dev->user_data;
     rt_uint32_t bus_clock;
+    rt_uint32_t timeout;
 
     RT_ASSERT(bus != RT_NULL);
 
@@ -91,13 +94,22 @@ static rt_err_t i2c_bus_device_control(rt_device_t dev,
         {
             return -RT_EINVAL;
         }
-        if (LWP_GET_FROM_USER(&bus->timeout, args, rt_uint32_t) != 0)
+        if (LWP_GET_FROM_USER(&timeout, args, rt_uint32_t) != 0)
         {
             return -RT_EINVAL;
         }
 #else
-        bus->timeout = *(rt_uint32_t *)args;
+        if (args == RT_NULL)
+        {
+            return -RT_EINVAL;
+        }
+        timeout = *(rt_uint32_t *)args;
 #endif
+        if (timeout == 0)
+        {
+            return -RT_EINVAL;
+        }
+        bus->timeout = timeout;
         break;
     case RT_I2C_DEV_CTRL_RW:
     {
@@ -118,7 +130,8 @@ static rt_err_t i2c_bus_device_control(rt_device_t dev,
             return -RT_EINVAL;
         }
 
-        if (user_priv.msgs == RT_NULL || user_priv.number == 0)
+        if (user_priv.msgs == RT_NULL || user_priv.number == 0 ||
+            user_priv.number > RT_I2C_RDWR_MAX_MSGS)
         {
             return -RT_EINVAL;
         }
@@ -232,6 +245,11 @@ __i2c_rw_cleanup:
         }
 #else
         priv_data = (struct rt_i2c_priv_data *)args;
+        if (priv_data == RT_NULL || priv_data->msgs == RT_NULL ||
+            priv_data->number == 0 || priv_data->number > RT_I2C_RDWR_MAX_MSGS)
+        {
+            return -RT_EINVAL;
+        }
         ret = rt_i2c_transfer(bus, priv_data->msgs, priv_data->number);
         if (ret < 0)
         {

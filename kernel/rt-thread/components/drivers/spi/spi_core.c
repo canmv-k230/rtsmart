@@ -72,28 +72,31 @@ rt_err_t rt_spi_bus_attach_device(struct rt_spi_device *device,
 rt_err_t rt_spi_configure(struct rt_spi_device        *device,
                           struct rt_spi_configuration *cfg)
 {
-    rt_err_t result;
+    rt_err_t result = -RT_EINVAL;
 
     RT_ASSERT(device != RT_NULL);
-
-    /* set configuration */
-    device->config.data_width = cfg->data_width;
-    device->config.mode       = cfg->mode & RT_SPI_MODE_MASK ;
-    device->config.max_hz     = cfg->max_hz ;
+    RT_ASSERT(cfg != RT_NULL);
 
     if (device->bus != RT_NULL)
     {
         result = rt_mutex_take(&(device->bus->lock), RT_WAITING_FOREVER);
         if (result == RT_EOK)
         {
-            device->bus->ops->configure(device, cfg);
-            device->bus->owner = device;
+            result = device->bus->ops->configure(device, cfg);
+            if (result == RT_EOK)
+            {
+                device->config.data_width = cfg->data_width;
+                device->config.mode       = cfg->mode & RT_SPI_MODE_MASK;
+                device->config.reserved   = cfg->reserved;
+                device->config.max_hz     = cfg->max_hz;
+                device->bus->owner = device;
+            }
             /* release lock */
             rt_mutex_release(&(device->bus->lock));
         }
     }
 
-    return RT_EOK;
+    return result;
 }
 
 rt_err_t rt_spi_send_then_send(struct rt_spi_device *device,

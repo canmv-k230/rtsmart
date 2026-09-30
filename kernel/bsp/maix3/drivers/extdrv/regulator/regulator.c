@@ -120,7 +120,8 @@ int regulator_dev_register(struct regulator_dev *pdev,
     return ret;
 }
 
-int regulator_debug(int argc, char **argv)
+#if defined(RT_USING_MSH) && defined(RT_REGULATOR_ENABLE_BUILTIN_CMD)
+static int regulator_debug(int argc, char **argv)
 {
     if (argc < 3) {
         rt_kprintf("\nUsage:\t%s dev_name op(e|s|g|t) [data]\n"
@@ -217,3 +218,4 @@ int regulator_debug(int argc, char **argv)
 }
 
 MSH_CMD_EXPORT(regulator_debug, regulator debug program);
+#endif

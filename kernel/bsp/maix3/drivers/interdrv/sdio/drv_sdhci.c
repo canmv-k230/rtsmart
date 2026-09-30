@@ -1614,6 +1614,24 @@ int kd_sdhci_wait_card(int id, int timeout)
     return mmcsd_wait_host_ready(host, timeout);
 }
 
+rt_err_t kd_sdhci_reset_host(int id)
+{
+    struct rt_mmcsd_host *mmcsd = kd_sdhci_get_host(id);
+    struct sdhci_host *host;
+    rt_err_t result;
+
+    if (!mmcsd)
+        return -RT_EINVAL;
+    host = (struct sdhci_host *)mmcsd->private_data;
+    mmcsd_host_lock(mmcsd);
+    if (mmcsd->card)
+        result = -RT_EBUSY;
+    else
+        result = sdhci_init(host);
+    mmcsd_host_unlock(mmcsd);
+    return result;
+}
+
 #ifdef RT_USING_SDIO0
 static rt_err_t kd_sdhci_init_host0(void *hi_sys_virt_addr)
 {

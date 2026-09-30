@@ -1931,7 +1931,8 @@ int pufs_device_init(void)
     lock_ret = rt_mutex_init(&pufs_dev.lock, "pufs_lock", RT_IPC_FLAG_PRIO);
     if (lock_ret != RT_EOK) {
         LOG_E("failed to initialize pufs lock\n");
-        return lock_ret;
+        ret = lock_ret;
+        goto unmap_base;
     }
 
     /* Pre-allocate aligned DMA buffers for zero-bounce one-shot operations */
@@ -1942,14 +1943,15 @@ int pufs_device_init(void)
         if (pufs_dma_in) rt_free_align(pufs_dma_in);
         if (pufs_dma_out) rt_free_align(pufs_dma_out);
         pufs_dma_in = pufs_dma_out = NULL;
-        return -RT_ENOMEM;
+        ret = -RT_ENOMEM;
+        goto detach_lock;
     }
 
     pufs_dev.dev.ops = &pufs_ops;
     ret = rt_device_register(&pufs_dev.dev, "pufs", RT_DEVICE_FLAG_RDWR);
     if (ret != RT_EOK) {
         LOG_E("failed to register pufs device\n");
-        return ret;
+        goto free_dma;
     }
 
     pufs_module_init((uintptr_t)pufs_dev.base, SECURITY_BASE_ADDR, SECURITY_IO_SIZE);
@@ -1969,9 +1971,25 @@ int pufs_device_init(void)
     pufs_drbg_module_init(SP90A_ADDR_OFFSET);
     pufs_rt_cde_init(CDE_ADDR_OFFSET);
 
-    rt_device_register(&hwrng_dev, "hwrng", RT_DEVICE_FLAG_RDWR);
     hwrng_dev.ops = &hwrng_ops;
+    ret = rt_device_register(&hwrng_dev, "hwrng", RT_DEVICE_FLAG_RDWR);
+    if (ret != RT_EOK) {
+        /* PUFS remains usable when another random provider owns this name. */
+        LOG_W("failed to register hwrng device: %d\n", ret);
+        return RT_EOK;
+    }
 
+    return RT_EOK;
+
+free_dma:
+    rt_free_align(pufs_dma_in);
+    rt_free_align(pufs_dma_out);
+    pufs_dma_in = pufs_dma_out = NULL;
+detach_lock:
+    rt_mutex_detach(&pufs_dev.lock);
+unmap_base:
+    rt_iounmap(pufs_dev.base);
+    pufs_dev.base = RT_NULL;
     return ret;
 }
 INIT_DEVICE_EXPORT(pufs_device_init);

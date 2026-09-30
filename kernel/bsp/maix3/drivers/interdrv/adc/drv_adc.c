@@ -47,6 +47,9 @@
 #define DBG_TAG "drv_adc"
 #include <rtdbg.h>
 
+#define K230_ADC_START_TIMEOUT_US      200
+#define K230_ADC_IDLE_TIMEOUT_US       1000
+
 struct adc_inst {
     struct rt_adc_device device;
     struct rt_mutex      mutex;
@@ -172,26 +175,37 @@ static rt_err_t k230_adc_read(rt_uint32_t channel, rt_uint32_t* value)
 
     rt_mutex_take(&k230_adc_inst.mutex, RT_WAITING_FOREVER);
 
-    ret = readl_poll_timeout(&k230_adc_inst.reg->cfg, cfg.data, (0x00 == cfg.bits.busy), 1, 200);
+    ret = readl_poll_timeout(&k230_adc_inst.reg->cfg, cfg.data,
+                             (0x00 == cfg.bits.busy), 1,
+                             K230_ADC_IDLE_TIMEOUT_US);
     if (0x00 != ret) {
-        LOG_E("Wait adc done timeout 1, %d", ret);
+        LOG_E("Wait adc idle timeout, %d", ret);
         rt_mutex_release(&k230_adc_inst.mutex);
-
         return ret;
     }
 
-    cfg.data               = 0;
-    cfg.bits.start_of_conv = 1;
-    cfg.bits.in_sel        = channel;
+    cfg.data        = 0;
+    cfg.bits.in_sel = channel;
     writel(cfg.data, &k230_adc_inst.reg->cfg);
 
-    uint64_t start = cpu_ticks_us();
+    cfg.bits.start_of_conv = 1;
+    writel(cfg.data, &k230_adc_inst.reg->cfg);
 
-    ret = readl_poll_timeout(&k230_adc_inst.reg->cfg, cfg.data, cfg.bits.outen && cfg.bits.end_of_conv, 1, 200);
+    ret = readl_poll_timeout(&k230_adc_inst.reg->cfg, cfg.data,
+                             (0x00 != cfg.bits.busy), 1,
+                             K230_ADC_START_TIMEOUT_US);
     if (0x00 != ret) {
-        LOG_E("Wait adc done timeout 2, %d", ret);
+        LOG_E("ADC channel %u did not start, %d", channel, ret);
         rt_mutex_release(&k230_adc_inst.mutex);
+        return ret;
+    }
 
+    ret = readl_poll_timeout(&k230_adc_inst.reg->cfg, cfg.data,
+                             (0x00 == cfg.bits.busy), 1,
+                             K230_ADC_IDLE_TIMEOUT_US);
+    if (0x00 != ret) {
+        LOG_E("ADC channel %u remains busy, %d", channel, ret);
+        rt_mutex_release(&k230_adc_inst.mutex);
         return ret;
     }
 

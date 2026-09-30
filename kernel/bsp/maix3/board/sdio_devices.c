@@ -38,6 +38,22 @@ static int board_sdio_boot_host(void)
 #define BOARD_SDIO_SECOND_CARD_MOUNT_POINT "/ext_data"
 
 #ifdef MOUNT_SECOND_CARD
+static const char *board_sdio_storage_device(int host)
+{
+    const char *partition_name = host == 0 ? "sd00" : "sd10";
+    const char *disk_name = host == 0 ? "sd0" : "sd1";
+
+    if (rt_device_find(partition_name))
+    {
+        return partition_name;
+    }
+    if (rt_device_find(disk_name))
+    {
+        return disk_name;
+    }
+    return RT_NULL;
+}
+
 int board_sdio_cd_mount(int host)
 {
     const char *device_name;
@@ -54,13 +70,14 @@ int board_sdio_cd_mount(int host)
         return result;
     }
 
-    device_name = host == 0 ? "sd00" : "sd10";
-    device = rt_device_find(device_name);
-    if (!device)
+    device_name = board_sdio_storage_device(host);
+    if (!device_name)
     {
-        LOG_E("secondary card device %s was not registered", device_name);
+        LOG_E("secondary card block device was not registered on SDIO%d",
+              host);
         return -RT_ERROR;
     }
+    device = rt_device_find(device_name);
 
     mounted_path = dfs_filesystem_get_mounted_path(device);
     if (mounted_path)
@@ -101,6 +118,87 @@ int board_sdio_cd_mount(int host)
           BOARD_SDIO_SECOND_CARD_MOUNT_POINT);
     return RT_EOK;
 }
+
+static int board_sdio_secondary_host(void)
+{
+    int boot_host = board_sdio_boot_host();
+
+    if (boot_host < 0)
+    {
+        return boot_host;
+    }
+    return boot_host == 0 ? 1 : 0;
+}
+
+static int board_sdio_reprobe(int host)
+{
+    int result;
+
+    if (host != board_sdio_secondary_host())
+    {
+        LOG_E("refusing to reprobe non-secondary SDIO%d", host);
+        return -RT_EINVAL;
+    }
+
+    kd_sdhci_change(host);
+    result = kd_sdhci_wait_card(
+        host, rt_tick_from_millisecond(BOARD_SDIO_CD_MOUNT_TIMEOUT_MS));
+    if (result != MMCSD_HOST_UNPLUGED)
+    {
+        LOG_E("failed to quiesce secondary card on SDIO%d: %d",
+              host, result);
+        return result == MMCSD_HOST_PLUGED ? -RT_EBUSY : result;
+    }
+
+    result = kd_sdhci_reset_host(host);
+    if (result != RT_EOK)
+    {
+        LOG_E("failed to reset SDIO%d controller: %d", host, result);
+        return result;
+    }
+
+    kd_sdhci_change(host);
+    result = kd_sdhci_wait_card(
+        host, rt_tick_from_millisecond(BOARD_SDIO_CD_MOUNT_TIMEOUT_MS));
+    if (result != MMCSD_HOST_PLUGED)
+    {
+        LOG_E("failed to reprobe secondary card on SDIO%d: %d",
+              host, result);
+        return result;
+    }
+
+    return board_sdio_cd_mount(host);
+}
+
+#if defined(RT_USING_MSH) && defined(RT_SDIO_ENABLE_REPROBE_CMD)
+static int sdio_reprobe(int argc, char **argv)
+{
+    int host;
+    int result;
+
+    (void)argv;
+    if (argc != 1)
+    {
+        rt_kprintf("Usage: sdio_reprobe\n");
+        return -RT_EINVAL;
+    }
+
+    host = board_sdio_secondary_host();
+    if (host < 0)
+    {
+        rt_kprintf("No secondary SD/MMC controller is available\n");
+        return -RT_ENOSYS;
+    }
+
+    result = board_sdio_reprobe(host);
+    if (result == RT_EOK)
+    {
+        rt_kprintf("SDIO%d secondary card reprobe PASS\n", host);
+    }
+    return result;
+}
+MSH_CMD_EXPORT(sdio_reprobe, reset and remount secondary SD card);
+#endif
 #endif
 
 #if defined(MOUNT_SECOND_CARD) && defined(SECOND_CARD_CD_GPIO) && \

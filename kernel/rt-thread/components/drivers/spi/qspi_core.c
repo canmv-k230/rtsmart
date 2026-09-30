@@ -18,13 +18,14 @@ rt_err_t rt_qspi_configure(struct rt_qspi_device *device, struct rt_qspi_configu
     struct rt_qspi_device *qspi_device = (struct rt_qspi_device *)device;
     rt_err_t result = RT_EOK;
 
-    /* copy configuration items */
-    qspi_device->config.parent = cfg->parent;
-    qspi_device->config.medium_size = cfg->medium_size;
-    qspi_device->config.ddr_mode = cfg->ddr_mode;
-    qspi_device->config.qspi_dl_width = cfg->qspi_dl_width;
-
     result = rt_spi_configure(&device->parent, &cfg->parent);
+    if (result == RT_EOK)
+    {
+        qspi_device->config.parent = device->parent.config;
+        qspi_device->config.medium_size = cfg->medium_size;
+        qspi_device->config.ddr_mode = cfg->ddr_mode;
+        qspi_device->config.qspi_dl_width = cfg->qspi_dl_width;
+    }
 
     return result;
 }
@@ -65,7 +66,7 @@ rt_size_t rt_qspi_transfer_message(struct rt_qspi_device  *device, struct rt_qsp
     if (device->parent.bus->owner != &device->parent)
     {
         /* not the same owner as current, re-configure SPI bus */
-        result = device->parent.bus->ops->configure(&device->parent, &device->parent.config);
+        result = device->parent.bus->ops->configure(&device->parent, &device->config.parent);
         if (result == RT_EOK)
         {
             /* set SPI bus owner */

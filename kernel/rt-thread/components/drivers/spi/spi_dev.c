@@ -11,6 +11,126 @@
 #include <rtthread.h>
 #include <drivers/spi.h>
 
+#ifdef RT_USING_USERSPACE
+#include <lwp_user_mm.h>
+
+static rt_bool_t _spi_user_buffer_valid(const void *buffer, rt_size_t length)
+{
+    if (buffer == RT_NULL || length == 0 || lwp_self() == RT_NULL)
+    {
+        return RT_TRUE;
+    }
+
+    return lwp_user_accessable((void *)buffer, length) ? RT_TRUE : RT_FALSE;
+}
+
+static rt_bool_t _spi_user_message_valid(const struct rt_spi_message *message)
+{
+    return _spi_user_buffer_valid(message->send_buf, message->length) &&
+           _spi_user_buffer_valid(message->recv_buf, message->length);
+}
+
+static rt_err_t _spi_user_message_prepare(struct rt_spi_message *message,
+                                          void **send_alloc,
+                                          void **recv_alloc,
+                                          void **user_recv_buf)
+{
+    *send_alloc = RT_NULL;
+    *recv_alloc = RT_NULL;
+    *user_recv_buf = message->recv_buf;
+
+    if (lwp_self() == RT_NULL || message->length == 0)
+    {
+        return RT_EOK;
+    }
+    if (!_spi_user_message_valid(message))
+    {
+        return -RT_EINVAL;
+    }
+
+    if (message->send_buf != RT_NULL)
+    {
+        *send_alloc = rt_malloc(message->length);
+        if (*send_alloc == RT_NULL)
+        {
+            return -RT_ENOMEM;
+        }
+        if (lwp_get_from_user(*send_alloc, (void *)message->send_buf,
+                              message->length) != message->length)
+        {
+            return -RT_EINVAL;
+        }
+        message->send_buf = *send_alloc;
+    }
+
+    if (message->recv_buf != RT_NULL)
+    {
+        *recv_alloc = rt_malloc(message->length);
+        if (*recv_alloc == RT_NULL)
+        {
+            return -RT_ENOMEM;
+        }
+        message->recv_buf = *recv_alloc;
+    }
+
+    return RT_EOK;
+}
+
+static rt_err_t _spi_user_message_finish(const struct rt_spi_message *message,
+                                         void *user_recv_buf,
+                                         void *recv_alloc,
+                                         rt_size_t transferred)
+{
+    if (recv_alloc == RT_NULL || transferred == 0)
+    {
+        return RT_EOK;
+    }
+    if (transferred > message->length)
+    {
+        transferred = message->length;
+    }
+
+    return lwp_put_to_user(user_recv_buf, recv_alloc, transferred) == transferred ?
+           RT_EOK : -RT_EINVAL;
+}
+
+static void _spi_user_message_release(void *send_alloc, void *recv_alloc)
+{
+    if (send_alloc != RT_NULL)
+    {
+        rt_free(send_alloc);
+    }
+    if (recv_alloc != RT_NULL)
+    {
+        rt_free(recv_alloc);
+    }
+}
+#endif
+
+static rt_size_t _spidev_transfer(struct rt_spi_device *device,
+                                  const void *send_buf,
+                                  void *recv_buf,
+                                  rt_size_t size)
+{
+    if (device->bus->mode & RT_SPI_BUS_MODE_QSPI)
+    {
+        struct rt_qspi_message message;
+
+        rt_memset(&message, 0, sizeof(message));
+        message.parent.send_buf = send_buf;
+        message.parent.recv_buf = recv_buf;
+        message.parent.length = size;
+        message.parent.cs_take = 1;
+        message.parent.cs_release = 1;
+        message.qspi_data_lines = 1;
+
+        return rt_qspi_transfer_message((struct rt_qspi_device *)device,
+                                        &message);
+    }
+
+    return rt_spi_transfer(device, send_buf, recv_buf, size);
+}
+
 /* SPI bus device interface, compatible with RT-Thread 0.3.x/1.0.x */
 static rt_size_t _spi_bus_device_read(rt_device_t dev,
                                       rt_off_t    pos,
@@ -52,6 +172,15 @@ static rt_err_t _spi_bus_device_control(rt_device_t dev,
 {
     struct rt_spi_bus *bus;
     rt_err_t ret = -RT_EINVAL;
+#ifdef RT_USING_USERSPACE
+    struct rt_qspi_configuration qspi_cfg;
+    struct rt_spi_configuration spi_cfg;
+    struct rt_qspi_message qspi_msg;
+    struct rt_spi_message spi_msg;
+    void *send_alloc;
+    void *recv_alloc;
+    void *user_recv_buf;
+#endif
 
     bus = (struct rt_spi_bus *)dev;
     RT_ASSERT(bus != RT_NULL);
@@ -60,6 +189,28 @@ static rt_err_t _spi_bus_device_control(rt_device_t dev,
     switch (cmd)
     {
         case RT_SPI_DEV_CTRL_CONFIG:
+#ifdef RT_USING_USERSPACE
+            if (args == RT_NULL)
+            {
+                return -RT_EINVAL;
+            }
+            if (bus->mode & RT_SPI_BUS_MODE_QSPI)
+            {
+                if (LWP_GET_FROM_USER(&qspi_cfg, args, struct rt_qspi_configuration) != 0)
+                {
+                    return -RT_EINVAL;
+                }
+                ret = rt_qspi_configure(bus->parent.user_data, &qspi_cfg);
+            }
+            else
+            {
+                if (LWP_GET_FROM_USER(&spi_cfg, args, struct rt_spi_configuration) != 0)
+                {
+                    return -RT_EINVAL;
+                }
+                ret = rt_spi_configure(bus->parent.user_data, &spi_cfg);
+            }
+#else
             if (bus->mode & RT_SPI_BUS_MODE_QSPI)
             {
                 ret = rt_qspi_configure(bus->parent.user_data, args);
@@ -68,8 +219,73 @@ static rt_err_t _spi_bus_device_control(rt_device_t dev,
             {
                 ret = rt_spi_configure(bus->parent.user_data, args);
             }
+#endif
             break;
         case RT_SPI_DEV_CTRL_RW:
+#ifdef RT_USING_USERSPACE
+            if (args == RT_NULL)
+            {
+                return -RT_EINVAL;
+            }
+            if (bus->mode & RT_SPI_BUS_MODE_QSPI)
+            {
+                if (LWP_GET_FROM_USER(&qspi_msg, args, struct rt_qspi_message) != 0)
+                {
+                    return -RT_EINVAL;
+                }
+                if (qspi_msg.parent.next != RT_NULL)
+                {
+                    return -RT_EINVAL;
+                }
+                ret = _spi_user_message_prepare(&qspi_msg.parent, &send_alloc,
+                                                &recv_alloc, &user_recv_buf);
+                if (ret != RT_EOK)
+                {
+                    _spi_user_message_release(send_alloc, recv_alloc);
+                    return ret;
+                }
+                ret = rt_qspi_transfer_message(bus->parent.user_data, &qspi_msg);
+                if (ret > 0 && _spi_user_message_finish(&qspi_msg.parent,
+                                                        user_recv_buf, recv_alloc,
+                                                        ret) != RT_EOK)
+                {
+                    ret = -RT_EINVAL;
+                }
+                _spi_user_message_release(send_alloc, recv_alloc);
+            }
+            else
+            {
+                if (LWP_GET_FROM_USER(&spi_msg, args, struct rt_spi_message) != 0)
+                {
+                    return -RT_EINVAL;
+                }
+                if (spi_msg.next != RT_NULL)
+                {
+                    return -RT_EINVAL;
+                }
+                ret = _spi_user_message_prepare(&spi_msg, &send_alloc,
+                                                &recv_alloc, &user_recv_buf);
+                if (ret != RT_EOK)
+                {
+                    _spi_user_message_release(send_alloc, recv_alloc);
+                    return ret;
+                }
+                if(RT_NULL != rt_spi_transfer_message(bus->parent.user_data, &spi_msg))
+                {
+                    ret = RT_ERROR;
+                }
+                else
+                {
+                    ret = RT_EOK;
+                    if (_spi_user_message_finish(&spi_msg, user_recv_buf,
+                                                 recv_alloc, spi_msg.length) != RT_EOK)
+                    {
+                        ret = -RT_EINVAL;
+                    }
+                }
+                _spi_user_message_release(send_alloc, recv_alloc);
+            }
+#else
             if (bus->mode & RT_SPI_BUS_MODE_QSPI)
             {
                 ret = rt_qspi_transfer_message(bus->parent.user_data, args);
@@ -85,6 +301,7 @@ static rt_err_t _spi_bus_device_control(rt_device_t dev,
                     ret = RT_EOK;
                 }
             }
+#endif
             break;
         default:
             break;
@@ -228,7 +445,7 @@ static rt_size_t _spidev_device_read(rt_device_t dev,
     RT_ASSERT(device != RT_NULL);
     RT_ASSERT(device->bus != RT_NULL);
 
-    return rt_spi_transfer(device, RT_NULL, buffer, size);
+    return _spidev_transfer(device, RT_NULL, buffer, size);
 }
 
 static rt_size_t _spidev_device_write(rt_device_t dev,
@@ -242,7 +459,7 @@ static rt_size_t _spidev_device_write(rt_device_t dev,
     RT_ASSERT(device != RT_NULL);
     RT_ASSERT(device->bus != RT_NULL);
 
-    return rt_spi_transfer(device, buffer, RT_NULL, size);
+    return _spidev_transfer(device, buffer, RT_NULL, size);
 }
 
 static rt_err_t _spidev_device_control(rt_device_t dev,
