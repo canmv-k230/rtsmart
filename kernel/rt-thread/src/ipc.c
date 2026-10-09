@@ -973,6 +973,7 @@ static rt_err_t _rt_mutex_take(rt_mutex_t mutex, rt_int32_t timeout, int suspend
                                             thread->name));
 
                 /* suspend current thread */
+                thread->error = -RT_EINTR;
                 ret = rt_ipc_list_suspend(&(mutex->parent.suspend_thread),
                                     thread,
                                     mutex->parent.parent.flag,
@@ -1025,11 +1026,12 @@ static rt_err_t _rt_mutex_take(rt_mutex_t mutex, rt_int32_t timeout, int suspend
                 else
                 {
                     /* the mutex has not been taken and thread has detach from the pending list. */
+                    thread->pending_object = RT_NULL;
 
                     rt_bool_t need_update = RT_FALSE;
 
                     /* should change the priority of mutex owner thread */
-                    if (mutex->owner->current_priority == thread->current_priority)
+                    if (mutex->owner && mutex->owner->current_priority == thread->current_priority)
                         need_update = RT_TRUE;
 
                     /* update the priority of mutex */
@@ -1188,6 +1190,7 @@ rt_err_t rt_mutex_release(rt_mutex_t mutex)
             next_thread->pending_object = RT_NULL;
 
             /* resume thread */
+            next_thread->error = RT_EOK;
             rt_thread_resume(next_thread);
 
             /* update mutex priority */
