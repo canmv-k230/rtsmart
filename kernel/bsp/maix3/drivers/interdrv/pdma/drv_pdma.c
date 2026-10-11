@@ -62,11 +62,11 @@
 #define PDMA_UART_FCR_RX_TRIGGER_16 0x87U
 
 /* interrupt mask */
-#define PDONE_INT 0x00000001
-#define PITEM_INT 0x00000100
-#define PPAUSE_INT 0x00010000
-#define PTOUT_INT 0x01000000
-#define PALL_INT 0x01010101
+#define PDONE_INT 0x00000001U
+#define PITEM_INT 0x00000100U
+#define PPAUSE_INT 0x00010000U
+#define PTOUT_INT 0x01000000U
+#define PALL_INT 0x01010101U
 
 /* register structure */
 typedef struct pdma_ch_reg {
@@ -115,6 +115,8 @@ typedef struct {
         char* name;
         void (*callback)(void* param);
         void* param;
+        pdma_completion_mode_t completion_mode;
+        pdma_completion_snapshot_t completion_snapshot;
         rt_bool_t configured;
         rt_bool_t running;
         rt_uint32_t generation;
@@ -144,6 +146,12 @@ static rt_bool_t pdma_chan_active(int chan)
 static rt_uint32_t pdma_chan_int_mask(int chan)
 {
     return PALL_INT << chan;
+}
+
+/* Caller holds state_lock. Callback-only channels have no done() consumer. */
+static rt_bool_t pdma_completion_queued(int chan)
+{
+    return pdma_dev.chan[chan].completion_mode != PDMA_COMPLETION_CALLBACK_ONLY;
 }
 
 static void pdma_completion_reset(int chan)
@@ -273,6 +281,10 @@ int rt_dma_chan_request(char* name)
         pdma_dev.chan[chan].name = chan_name;
         pdma_dev.chan[chan].callback = RT_NULL;
         pdma_dev.chan[chan].param = RT_NULL;
+        pdma_dev.chan[chan].completion_mode = PDMA_COMPLETION_WAIT;
+        pdma_dev.chan[chan].completion_snapshot.generation = 0;
+        pdma_dev.chan[chan].completion_snapshot.raw_irq_status = 0;
+        pdma_dev.chan[chan].completion_snapshot.hardware_timeouts = 0;
         pdma_dev.chan[chan].configured = RT_FALSE;
         pdma_dev.chan[chan].running = RT_FALSE;
         pdma_dev.chan[chan].generation = 0;
@@ -373,7 +385,8 @@ int rt_dma_chan_start(int chan)
         pdma_spin_unlock(level);
         return -RT_EINVAL;
     }
-    if (pdma_dev.chan[chan].completion_count >=
+    if (pdma_completion_queued(chan) &&
+        pdma_dev.chan[chan].completion_count >=
         PDMA_COMPLETION_QUEUE_DEPTH) {
         pdma_spin_unlock(level);
         return -RT_EBUSY;
@@ -486,6 +499,7 @@ int rt_dma_chan_done(int chan, int timeout)
 
     level = pdma_spin_lock();
     if (!pdma_chan_active(chan) ||
+        !pdma_completion_queued(chan) ||
         (!pdma_dev.chan[chan].running &&
          pdma_dev.chan[chan].completion_count == 0) ||
         pdma_dev.chan[chan].waiter_active) {
@@ -599,9 +613,18 @@ int rt_dma_chan_done(int chan, int timeout)
 
 int rt_dma_chan_callback(int chan, void (*callback)(void* param), void* param)
 {
+    return rt_dma_chan_callback_ex(chan, callback, param,
+        callback ? PDMA_COMPLETION_CALLBACK_ONLY : PDMA_COMPLETION_WAIT);
+}
+
+int rt_dma_chan_callback_ex(int chan, void (*callback)(void* param), void* param,
+                           pdma_completion_mode_t mode)
+{
     rt_base_t level;
 
-    if (!pdma_chan_valid(chan))
+    if (!pdma_chan_valid(chan) ||
+        mode < PDMA_COMPLETION_WAIT || mode > PDMA_COMPLETION_HYBRID ||
+        ((mode == PDMA_COMPLETION_WAIT) != (callback == RT_NULL)))
         return -RT_EINVAL;
 
     level = pdma_spin_lock();
@@ -610,13 +633,35 @@ int rt_dma_chan_callback(int chan, void (*callback)(void* param), void* param)
         return -RT_EINVAL;
     }
     if (pdma_dev.chan[chan].running ||
-        pdma_dev.chan[chan].callback_count != 0) {
+        pdma_dev.chan[chan].waiter_active ||
+        pdma_dev.chan[chan].callback_count != 0 ||
+        pdma_dev.chan[chan].completion_count != 0) {
         pdma_spin_unlock(level);
         return -RT_EBUSY;
     }
 
     pdma_dev.chan[chan].callback = callback;
     pdma_dev.chan[chan].param = param;
+    pdma_dev.chan[chan].completion_mode = mode;
+    pdma_spin_unlock(level);
+
+    return 0;
+}
+
+int rt_dma_chan_get_completion_snapshot(int chan,
+                                      pdma_completion_snapshot_t* snapshot)
+{
+    rt_base_t level;
+
+    if (!pdma_chan_valid(chan) || snapshot == RT_NULL)
+        return -RT_EINVAL;
+
+    level = pdma_spin_lock();
+    if (!pdma_chan_active(chan)) {
+        pdma_spin_unlock(level);
+        return -RT_EINVAL;
+    }
+    *snapshot = pdma_dev.chan[chan].completion_snapshot;
     pdma_spin_unlock(level);
 
     return 0;
@@ -629,6 +674,7 @@ static void pdma_irq(int irq, void* param)
     rt_bool_t active = RT_FALSE;
     rt_bool_t terminal = RT_FALSE;
     rt_bool_t callbacks_done = RT_FALSE;
+    rt_bool_t notify_waiters = RT_FALSE;
     void (*callback)(void* param) = RT_NULL;
     void* callback_param = RT_NULL;
     int ch = (rt_uint64_t)param;
@@ -639,11 +685,21 @@ static void pdma_irq(int irq, void* param)
         pdma_dev.reg->dma_int_stat = stat;
         active = pdma_chan_active(ch);
         if (active) {
+            /* Bind event ownership before callback dispatch. Callback-only
+             * IRQs must not leak old PITEM/PAUSE into a later WAIT/HYBRID mode. */
+            notify_waiters = pdma_completion_queued(ch);
             terminal = (stat & ((PDONE_INT | PTOUT_INT) << ch)) != 0U;
             if (terminal) {
                 /* Completion callbacks may immediately configure the next transfer. */
                 pdma_dev.chan[ch].running = RT_FALSE;
-                if (!pdma_completion_push(ch,
+                pdma_dev.chan[ch].completion_snapshot.generation =
+                    pdma_dev.chan[ch].generation;
+                pdma_dev.chan[ch].completion_snapshot.raw_irq_status = stat;
+                if ((stat & (PTOUT_INT << ch)) &&
+                    pdma_dev.chan[ch].completion_snapshot.hardware_timeouts <
+                        RT_UINT32_MAX)
+                    pdma_dev.chan[ch].completion_snapshot.hardware_timeouts++;
+                if (pdma_completion_queued(ch) && !pdma_completion_push(ch,
                         pdma_dev.chan[ch].generation, stat))
                     RT_ASSERT(0);
                 if (pdma_dev.chan[ch].waiter_active &&
@@ -670,7 +726,8 @@ static void pdma_irq(int irq, void* param)
             if (callbacks_done)
                 rt_completion_done(&pdma_dev.chan[ch].callbacks_done);
         }
-        rt_event_send(&pdma_dev.event, stat);
+        if (notify_waiters)
+            rt_event_send(&pdma_dev.event, stat);
     }
 }
 
@@ -891,13 +948,24 @@ static int pdma_test_uart2_callback_rearm(void)
     cfg.ch_cfg.ch_dev_tout = 0xfff;
 
     ret = rt_dma_chan_callback(chan, pdma_test_callback, &done);
-    for (int transfer = 0; ret == 0 && transfer < 2; transfer++) {
+    /* Cross the previous eight-completion failure threshold repeatedly. */
+    for (int transfer = 0; ret == 0 && transfer < 64; transfer++) {
         ret = rt_dma_chan_config(chan, &cfg);
         if (ret == 0)
             ret = rt_dma_chan_start(chan);
         if (ret == 0 && rt_sem_take(&done,
                 rt_tick_from_millisecond(PDMA_SELFTEST_TIMEOUT_MS)) != RT_EOK)
             ret = -RT_ETIMEOUT;
+        if (ret == 0) {
+            pdma_completion_snapshot_t snapshot;
+
+            ret = rt_dma_chan_get_completion_snapshot(chan, &snapshot);
+            if (ret == 0 &&
+                (snapshot.generation != (rt_uint32_t)transfer + 1U ||
+                 snapshot.raw_irq_status != (PDONE_INT << chan) ||
+                 snapshot.hardware_timeouts != 0))
+                ret = -RT_ERROR;
+        }
     }
 
     if (ret != 0)
@@ -984,8 +1052,8 @@ static int pdma_test_done_callback_rearm(void)
     context.cfg = &cfg;
     context.rearm_result = -RT_ERROR;
 
-    ret = rt_dma_chan_callback(chan, pdma_test_done_rearm_callback,
-        &context);
+    ret = rt_dma_chan_callback_ex(chan, pdma_test_done_rearm_callback,
+        &context, PDMA_COMPLETION_HYBRID);
     if (ret == 0)
         ret = rt_dma_chan_config(chan, &cfg);
     if (ret == 0)

@@ -134,12 +134,52 @@ typedef struct {
     pdma_ch_cfg_t ch_cfg;
 } pdma_transfer_cfg_t;
 
+/* Completion ownership is explicit; it is not inferred from an active waiter. */
+typedef enum {
+    PDMA_COMPLETION_WAIT = 0,
+    PDMA_COMPLETION_CALLBACK_ONLY,
+    PDMA_COMPLETION_HYBRID,
+} pdma_completion_mode_t;
+
+typedef struct {
+    /* Zero until the first terminal IRQ after channel allocation. */
+    rt_uint32_t generation;
+    /* Raw channel-shifted PDMA IRQ bits: DONE=bit chan, TIMEOUT=bit (24+chan). */
+    rt_uint32_t raw_irq_status;
+    /* Saturates at RT_UINT32_MAX; counts hardware timeout IRQs, not wait timeouts. */
+    rt_uint32_t hardware_timeouts;
+} pdma_completion_snapshot_t;
+
 int rt_dma_chan_request(char* name);
 int rt_dma_chan_release(int chan);
 int rt_dma_chan_start(int chan);
 int rt_dma_chan_stop(int chan);
 int rt_dma_chan_config(int chan, pdma_transfer_cfg_t* cfg);
+/* WAIT/HYBRID consume the oldest completion; CALLBACK_ONLY returns -RT_EINVAL. */
 int rt_dma_chan_done(int chan, int timeout);
+/*
+ * Legacy registration selects CALLBACK_ONLY for a non-null callback, WAIT for
+ * null. Callback + later done users must migrate to callback_ex(HYBRID).
+ * Callback means terminal IRQ (including hardware timeout), not success.
+ */
 int rt_dma_chan_callback(int chan, void (*callback)(void* param), void* param);
+/*
+ * WAIT requires a null callback; CALLBACK_ONLY/HYBRID require a non-null one.
+ * Returns -RT_EBUSY while running, waiting, inside a callback, or with queued
+ * completions. No registration change silently discards queued results.
+ * The callback runs in IRQ context and may configure/start the next transfer.
+ * CALLBACK_ONLY does not publish done() events; its old PITEM/PAUSE IRQs cannot
+ * be mistaken for progress in a later WAIT/HYBRID generation.
+ */
+int rt_dma_chan_callback_ex(int chan, void (*callback)(void* param), void* param,
+                           pdma_completion_mode_t mode);
+/*
+ * Non-consuming, IRQ-safe snapshot of the latest terminal IRQ plus a lifetime
+ * timeout count. This is not a per-transfer queue. A later completion can replace
+ * generation/status; hardware_timeouts retains errors across successful IRQs.
+ * Stop and mode changes retain the snapshot; a fresh request resets it.
+ */
+int rt_dma_chan_get_completion_snapshot(int chan,
+                                      pdma_completion_snapshot_t* snapshot);
 
 #endif
