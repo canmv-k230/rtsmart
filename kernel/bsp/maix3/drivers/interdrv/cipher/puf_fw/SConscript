@@ -5,6 +5,7 @@ path = []
 src = []
 
 path += [cwd]
+path += [cwd + '/../../k230_pm']
 src += Glob('*.c')
 path += [cwd + '/pufs_common']
 src += Glob('pufs_common/*.c')

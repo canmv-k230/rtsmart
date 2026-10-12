@@ -22,6 +22,7 @@
 
 #include "sysctl_clk.h"
 
+#include "k230_pm.h"
 #include "drv_uart.h"
 #include "math.h"
 
@@ -179,7 +180,7 @@ static uint32_t drv_uart_calc_baud_divisor(struct uart_inst* inst, uint32_t baud
     const unsigned int bits_per_char = 10; // 8N1 format
     RT_ASSERT(inst);
 
-    uint32_t clock     = sysctl_clk_get_leaf_freq(SYSCTL_CLK_UART_0_CLK + inst->uart.index);
+    uint32_t clock     = sysctl_clk_get_leaf_freq(SYSCTL_CLK_UART0_CLK + inst->uart.index);
     float    exact_div = (float)clock / (mode_x_div * baudrate);
     uint16_t int_div   = (uint16_t)exact_div;
     float    frac      = exact_div - int_div;
@@ -260,7 +261,7 @@ static rt_err_t drv_uart_configure(struct rt_serial_device* serial, struct seria
     if (0x00 == inst->uart.clock_en) {
         inst->uart.clock_en = 1;
 
-        sysctl_clk_set_leaf_div(SYSCTL_CLK_UART_0_CLK + inst->uart.index, 1, 1);
+        sysctl_clk_set_leaf_div(SYSCTL_CLK_UART0_CLK + inst->uart.index, 1, 1);
     }
 
 #if 0
@@ -543,10 +544,18 @@ int rt_hw_uart_init(void)
 
     for (size_t i = 0; i < sizeof(uart_devs) / sizeof(uart_devs[0]); i++) {
         struct uart_inst* inst = &uart_devs[i];
+        int pm_ret;
+
+        pm_ret = k230_pm_get((enum k230_pm_dev_id)(K230_PM_DEV_UART0 + inst->uart.index));
+        if (pm_ret != 0) {
+            LOG_E("pm get failed for UART%d: %d", inst->uart.index, pm_ret);
+            continue;
+        }
 
         inst->reg = rt_ioremap((void*)(uint64_t)inst->uart.addr, 0x1000);
         if (!inst->reg) {
             LOG_E("ioremap failed for UART%d", inst->uart.index);
+            (void)k230_pm_put((enum k230_pm_dev_id)(K230_PM_DEV_UART0 + inst->uart.index));
             continue;
         }
 
@@ -566,7 +575,16 @@ int rt_hw_uart_init(void)
         rt_hw_interrupt_install(inst->uart.irqno, drv_uart_irq_handler, inst, dev_name);
         rt_hw_interrupt_umask(inst->uart.irqno);
 
-        rt_hw_serial_register(&inst->device, dev_name, RT_DEVICE_FLAG_RDWR | RT_DEVICE_FLAG_INT_RX, inst);
+        if (rt_hw_serial_register(&inst->device, dev_name,
+                                  RT_DEVICE_FLAG_RDWR | RT_DEVICE_FLAG_INT_RX,
+                                  inst) != RT_EOK) {
+            LOG_E("register failed for UART%d", inst->uart.index);
+            rt_hw_interrupt_mask(inst->uart.irqno);
+            rt_iounmap(inst->reg);
+            inst->reg = RT_NULL;
+            (void)k230_pm_put((enum k230_pm_dev_id)
+                              (K230_PM_DEV_UART0 + inst->uart.index));
+        }
     }
 
 #ifdef RT_USING_CONSOLE

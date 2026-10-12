@@ -14,6 +14,8 @@ menu "Board Configuration"
     config RT_USING_MPP
         bool "Use Kendryte MPP"
         default y
+        select RT_USING_HWTIMER
+        select RT_USING_HW_TIMER5
 
     config RT_FASTBOOT
         bool "Fastboot, disable some log output"

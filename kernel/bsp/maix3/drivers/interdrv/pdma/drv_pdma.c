@@ -31,6 +31,7 @@
 #include "riscv_io.h"
 #include "board.h"
 #include "drv_pdma.h"
+#include "k230_pm.h"
 
 #define DBG_TAG "pdma"
 #ifdef RT_DEBUG
@@ -1238,11 +1239,18 @@ int rt_hw_pdma_device_init(void)
 {
     rt_err_t ret;
 
+    ret = k230_pm_get(K230_PM_DEV_PDMA);
+    if (ret != RT_EOK) {
+        LOG_E("pdma pm get failed: %d", ret);
+        return ret;
+    }
+
     pdma_dev.reg = rt_ioremap((void*)PDMA_BASE_ADDR, PDMA_IO_SIZE);
 
     if (RT_NULL == pdma_dev.reg) {
         LOG_E("pdma module ioremap error!\n");
-        return -RT_ERROR;
+        ret = -RT_ERROR;
+        goto err_pm_put;
     }
 
     ret = rt_mutex_init(&pdma_dev.lifecycle_lock, "pdma",
@@ -1273,6 +1281,8 @@ err_mutex_detach:
 err_iounmap:
     rt_iounmap(pdma_dev.reg);
     pdma_dev.reg = RT_NULL;
+err_pm_put:
+    k230_pm_put(K230_PM_DEV_PDMA);
     return ret;
 }
-INIT_PREV_EXPORT(rt_hw_pdma_device_init);
+INIT_DEVICE_EXPORT(rt_hw_pdma_device_init);

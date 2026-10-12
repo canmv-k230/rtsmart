@@ -36,6 +36,7 @@
 #include "board.h"
 #include "drv_wdt.h"
 #include "sysctl_clk.h"
+#include "k230_pm.h"
 
 #define DBG_TAG "wdt"
 #define DBG_LVL DBG_WARNING
@@ -166,7 +167,7 @@ static const struct kd_wdt_config kd_wdt_config = {
     .addr        = WDT1_BASE_ADDR,
     .reg_size    = WDT1_IO_SIZE,
     .irqno       = IRQN_WDT1,
-    .clock_id    = SYSCTL_CLK_WDT_1_CLK,
+    .clock_id    = SYSCTL_CLK_WDT1_CLK,
 };
 
 static struct kd_wdt_inst kd_wdt_dev = {
@@ -916,9 +917,16 @@ int rt_hw_wdt_init(void)
         return 0;
     }
 
+    ret = k230_pm_get(K230_PM_DEV_WDT1);
+    if (ret != 0) {
+        LOG_E("pm get failed for %s: %d", inst->config->name, ret);
+        return ret;
+    }
+
     inst->reg = rt_ioremap((void*)inst->config->addr, inst->config->reg_size);
     if (inst->reg == RT_NULL) {
         LOG_E("ioremap failed for %s", inst->config->name);
+        (void)k230_pm_put(K230_PM_DEV_WDT1);
         return -RT_ENOMEM;
     }
 
@@ -941,6 +949,9 @@ int rt_hw_wdt_init(void)
     ret = rt_device_register(&inst->device, inst->config->name, RT_DEVICE_FLAG_RDWR | RT_DEVICE_FLAG_STANDALONE);
     if (ret != RT_EOK) {
         LOG_E("register %s failed %d", inst->config->name, ret);
+        rt_iounmap(inst->reg);
+        inst->reg = RT_NULL;
+        (void)k230_pm_put(K230_PM_DEV_WDT1);
         return ret;
     }
 
@@ -952,6 +963,13 @@ int rt_hw_wdt_init(void)
     ret = kd_wdt_init(inst);
     if (ret != RT_EOK) {
         LOG_E("init %s failed %d", inst->config->name, ret);
+#if KD_WDT_ENABLE_PRETIMEOUT
+        rt_hw_interrupt_mask(inst->config->irqno);
+#endif
+        rt_device_unregister(&inst->device);
+        rt_iounmap(inst->reg);
+        inst->reg = RT_NULL;
+        (void)k230_pm_put(K230_PM_DEV_WDT1);
         return ret;
     }
 

@@ -23,6 +23,7 @@
 #include <cache.h>
 
 #include "tick.h"
+#include "k230_pm.h"
 
 #ifdef RT_USING_SDIO
 
@@ -1640,13 +1641,19 @@ static rt_err_t kd_sdhci_init_host0(void *hi_sys_virt_addr)
     struct sdhci_host *sdhci;
     struct rt_mmcsd_host *mmcsd;
 
+    ret = k230_pm_get(K230_PM_DEV_SDIO0);
+    if (ret != 0)
+        return ret;
+
     val = readl(hi_sys_virt_addr + 0);
     val |= 1 << 6 | 1 << 4;
     writel(val, hi_sys_virt_addr + 0);
 
     sdhci = rt_malloc(sizeof(*sdhci));
-    if (!sdhci)
-        return -RT_ENOMEM;
+    if (!sdhci) {
+        ret = -RT_ENOMEM;
+        goto release_pm;
+    }
 
     rt_memset(sdhci, 0, sizeof(*sdhci));
     sdhci->mapbase = (void*)rt_ioremap((void*)SDEMMC0_BASE, 0x1000);
@@ -1739,6 +1746,8 @@ unmap_sdhci:
     rt_iounmap(sdhci->mapbase);
 free_sdhci:
     rt_free(sdhci);
+release_pm:
+    (void)k230_pm_put(K230_PM_DEV_SDIO0);
     return ret;
 }
 #endif
@@ -1751,13 +1760,19 @@ static rt_err_t kd_sdhci_init_host1(void *hi_sys_virt_addr)
     struct sdhci_host *sdhci;
     struct rt_mmcsd_host *mmcsd;
 
+    ret = k230_pm_get(K230_PM_DEV_SDIO1);
+    if (ret != 0)
+        return ret;
+
     val = readl(hi_sys_virt_addr + 8);
     val |= 1 << 2 | 1 << 0;
     writel(val, hi_sys_virt_addr + 8);
 
     sdhci = rt_malloc(sizeof(*sdhci));
-    if (!sdhci)
-        return -RT_ENOMEM;
+    if (!sdhci) {
+        ret = -RT_ENOMEM;
+        goto release_pm;
+    }
 
     rt_memset(sdhci, 0, sizeof(*sdhci));
     sdhci->mapbase = (void*)rt_ioremap((void*)SDEMMC1_BASE, 0x1000);
@@ -1821,6 +1836,8 @@ unmap_sdhci:
     rt_iounmap(sdhci->mapbase);
 free_sdhci:
     rt_free(sdhci);
+release_pm:
+    (void)k230_pm_put(K230_PM_DEV_SDIO1);
     return ret;
 }
 #endif

@@ -1,0 +1,27 @@
+# RT-Thread building script for K230 power-management resource tables
+
+from building import *
+
+cwd = GetCurrentDir()
+src = [
+    'k230_pm_core.c',
+    'k230_pm_tables.c',
+]
+CPPPATH = [cwd]
+
+if GetDepend('K230_PM_CMD'):
+    src += ['k230_pm_cmd.c']
+
+if GetDepend('K230_PM_DVFS'):
+    src += [
+        'k230_pm_pid.c',
+        'k230_pm_dvfs.c',
+        'k230_pm_uapi.c',
+    ]
+
+if GetDepend('K230_PM_DVFS') and GetDepend('K230_PM_THERMAL_PROTECT'):
+    src += ['k230_pm_thermal.c']
+
+group = DefineGroup('K230_PM', src, depend = ['K230_PM_RUNTIME'], CPPPATH = CPPPATH)
+
+Return('group')

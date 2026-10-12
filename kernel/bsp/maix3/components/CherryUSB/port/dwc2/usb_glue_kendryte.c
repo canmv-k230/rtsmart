@@ -8,8 +8,10 @@
 #include "usb_config.h"
 #include "usb_log.h"
 #include <riscv_io.h>
+#include <ioremap.h>
 
 #include "sysctl_rst.h"
+#include "k230_pm.h"
 
 #ifdef ENABLE_CHERRY_USB
 #define DEFAULT_USB_HCLK_FREQ_MHZ 200
@@ -70,12 +72,17 @@ uint32_t usbh_get_dwc2_gccfg_conf(uint32_t reg_base)
 #if defined (CHERRY_USB_HOST_USING_DEV0)
 void usb_hc_low_level_init(void)
 {
-    // sysctl_reset_hw_done((volatile uint32_t *)0x9110103c, 0, 28);
-    if (!sysctl_reset(SYSCTL_RESET_USB0)) {
-        USB_LOG_ERR("reset usb0 fail\n");
+    if (k230_pm_get(K230_PM_DEV_USB0) != 0) {
+        USB_LOG_ERR("pm get usb0 fail\n");
+        return;
     }
 
     uint32_t *hs_reg = (uint32_t *)rt_ioremap((void *)(0x91585000 + 0x7C), 0x1000);
+    if (hs_reg == RT_NULL) {
+        USB_LOG_ERR("ioremap usb0 control register fail\n");
+        (void)k230_pm_put(K230_PM_DEV_USB0);
+        return;
+    }
     uint32_t usb_ctl3 = *hs_reg;
 
     *hs_reg = usb_ctl3 | (USB_DMPULLDOWN0 | USB_DPPULLDOWN0);
@@ -89,16 +96,22 @@ void usb_hc_low_level_init(void)
 void usb_hc_low_level_deinit(void)
 {
     rt_hw_interrupt_mask(173);
+    (void)k230_pm_put(K230_PM_DEV_USB0);
 }
 #elif defined (CHERRY_USB_HOST_USING_DEV1)
 void usb_hc_low_level_init(void)
 {
-    // sysctl_reset_hw_done((volatile uint32_t *)0x9110103c, 1, 29);
-    if (!sysctl_reset(SYSCTL_RESET_USB1)) {
-        USB_LOG_ERR("reset usb1 fail\n");
+    if (k230_pm_get(K230_PM_DEV_USB1) != 0) {
+        USB_LOG_ERR("pm get usb1 fail\n");
+        return;
     }
 
     uint32_t *hs_reg = (uint32_t *)rt_ioremap((void *)(0x91585000 + 0x9C), 0x1000);
+    if (hs_reg == RT_NULL) {
+        USB_LOG_ERR("ioremap usb1 control register fail\n");
+        (void)k230_pm_put(K230_PM_DEV_USB1);
+        return;
+    }
     uint32_t usb_ctl3 = *hs_reg;
 
     *hs_reg = usb_ctl3 | (USB_DMPULLDOWN0 | USB_DPPULLDOWN0);
@@ -112,6 +125,7 @@ void usb_hc_low_level_init(void)
 void usb_hc_low_level_deinit(void)
 {
     rt_hw_interrupt_mask(174);
+    (void)k230_pm_put(K230_PM_DEV_USB1);
 }
 #else
 #error "Usb device select error"
@@ -133,12 +147,17 @@ uint32_t usbd_get_dwc2_gccfg_conf(uint32_t reg_base)
 #if defined (CHERRY_USB_DEVICE_USING_DEV0)
 void usb_dc_low_level_init(void)
 {
-    // sysctl_reset_hw_done((volatile uint32_t *)0x9110103c, 0, 28);
-    if (!sysctl_reset(SYSCTL_RESET_USB0)) {
-        USB_LOG_ERR("reset usb0 fail\n");
+    if (k230_pm_get(K230_PM_DEV_USB0) != 0) {
+        USB_LOG_ERR("pm get usb0 fail\n");
+        return;
     }
 
     uint32_t *hs_reg = (uint32_t *)rt_ioremap((void *)(0x91585000 + 0x7C), 0x1000);
+    if (hs_reg == RT_NULL) {
+        USB_LOG_ERR("ioremap usb0 control register fail\n");
+        (void)k230_pm_put(K230_PM_DEV_USB0);
+        return;
+    }
     *hs_reg = 0x37;
     rt_iounmap(hs_reg);
 
@@ -149,16 +168,22 @@ void usb_dc_low_level_init(void)
 void usb_dc_low_level_deinit(void)
 {
     rt_hw_interrupt_mask(173);
+    (void)k230_pm_put(K230_PM_DEV_USB0);
 }
 #elif defined(CHERRY_USB_DEVICE_USING_DEV1)
 void usb_dc_low_level_init(void)
 {
-    // sysctl_reset_hw_done((volatile uint32_t *)0x9110103c, 1, 29);
-    if (!sysctl_reset(SYSCTL_RESET_USB1)) {
-        USB_LOG_ERR("reset usb1 fail\n");
+    if (k230_pm_get(K230_PM_DEV_USB1) != 0) {
+        USB_LOG_ERR("pm get usb1 fail\n");
+        return;
     }
 
     uint32_t *hs_reg = (uint32_t *)rt_ioremap((void *)(0x91585000 + 0x9C), 0x1000);
+    if (hs_reg == RT_NULL) {
+        USB_LOG_ERR("ioremap usb1 control register fail\n");
+        (void)k230_pm_put(K230_PM_DEV_USB1);
+        return;
+    }
     *hs_reg = 0x37;
     rt_iounmap(hs_reg);
 
@@ -169,6 +194,7 @@ void usb_dc_low_level_init(void)
 void usb_dc_low_level_deinit(void)
 {
     rt_hw_interrupt_mask(174);
+    (void)k230_pm_put(K230_PM_DEV_USB1);
 }
 #else
 #error "Usb device select error"

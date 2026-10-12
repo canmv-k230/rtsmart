@@ -24,6 +24,7 @@
  */
 #include "drv_i2c.h"
 #include "drv_i2c_core.h"
+#include "k230_pm.h"
 
 #include "ioremap.h"
 #include "mmu.h"
@@ -82,6 +83,8 @@ static void k230_i2c_init_cleanup(struct dw_i2c_master *master,
         rt_iounmap((void *)master->regs);
         master->regs = RT_NULL;
     }
+    (void)k230_pm_put((enum k230_pm_dev_id)
+                      (K230_PM_DEV_I2C0 + master->index));
 }
 
 int rt_hw_i2c_init(void)
@@ -92,6 +95,13 @@ int rt_hw_i2c_init(void)
 
     for (i = 0; i < (rt_uint32_t)ARRAY_SIZE(k230_i2c_ctrls); i++) {
         struct dw_i2c_master *master = &k230_i2c_ctrls[i];
+        int pm_ret;
+
+        pm_ret = k230_pm_get((enum k230_pm_dev_id)(K230_PM_DEV_I2C0 + master->index));
+        if (pm_ret != 0) {
+            LOG_E("i2c%u: pm get failed %d", master->index, pm_ret);
+            continue;
+        }
 
         rt_snprintf(master->name, sizeof(master->name),
                     "i2c%u%s", master->index,
@@ -102,6 +112,7 @@ int rt_hw_i2c_init(void)
             0x1000);
         if (!master->regs) {
             LOG_E("i2c%d: rt_ioremap failed", master->index);
+            (void)k230_pm_put((enum k230_pm_dev_id)(K230_PM_DEV_I2C0 + master->index));
             continue;
         }
 
@@ -121,6 +132,8 @@ int rt_hw_i2c_init(void)
                       master->index, result);
                 rt_iounmap((void *)master->regs);
                 master->regs = RT_NULL;
+                (void)k230_pm_put((enum k230_pm_dev_id)
+                                  (K230_PM_DEV_I2C0 + master->index));
                 continue;
             }
 

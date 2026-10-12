@@ -36,6 +36,7 @@
 
 #include "sysctl_clk.h"
 #include "sysctl_rst.h"
+#include "k230_pm.h"
 
 #ifdef RT_DEBUG
 #define DBG_LVL DBG_LOG
@@ -94,9 +95,9 @@ static int k230_adc_init(void)
     rt_mutex_take(&k230_adc_inst.mutex, RT_WAITING_FOREVER);
 
 #if 0
-    sysctl_clk_set_leaf_en(SYSCTL_CLK_ADC_PCLK_GATE, 0);
+    sysctl_clk_set_leaf_en(SYSCTL_CLK_ADC_PCLK, 0);
     cpu_ticks_delay_us(1);
-    sysctl_clk_set_leaf_en(SYSCTL_CLK_ADC_PCLK_GATE, 1);
+    sysctl_clk_set_leaf_en(SYSCTL_CLK_ADC_PCLK, 1);
     cpu_ticks_delay_us(1);
 
     // enable adc
@@ -256,6 +257,12 @@ int k230_adc_dev_init(void)
         goto _failed_init_mutex;
     }
 
+    if (k230_pm_get(K230_PM_DEV_ADC) != 0) {
+        LOG_E("pm get failed");
+
+        goto _failed_pm_get;
+    }
+
     k230_adc_inst.reg = rt_ioremap_nocache((void*)ADC_BASE_ADDR, ADC_IO_SIZE);
     if (!k230_adc_inst.reg) {
         LOG_E("ioremap failed");
@@ -287,6 +294,8 @@ _failed_init:
         k230_adc_inst.reg = NULL;
     }
 _failed_remap:
+    (void)k230_pm_put(K230_PM_DEV_ADC);
+_failed_pm_get:
     rt_mutex_detach(&k230_adc_inst.mutex);
 _failed_init_mutex:
 

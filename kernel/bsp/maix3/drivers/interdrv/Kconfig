@@ -1,9 +1,10 @@
 menu "InterDriver"
-    menuconfig RT_USING_ADC
-        bool "Using ADC device drivers"
-        default n
+    menuconfig RT_USING_K230_ADC
+        bool "Enable Kendryte K230 ADC hardware driver"
+        select RT_USING_ADC
+        default y
 
-        if RT_USING_ADC
+        if RT_USING_K230_ADC
             config RT_ADC_ENABLE_ACODEC_HP_DETECT
                 bool "Enable acodec headphone detect"
                 default n
@@ -523,6 +524,55 @@ menu "InterDriver"
                     Enable the spi1_loopback MSH command. The test temporarily
                     reconfigures GPIO14-GPIO17 and requires GPIO16 and GPIO17
                     to be connected.
+        endif
+
+
+    config K230_PM_RUNTIME
+        bool
+        default y
+        help
+            Enable the K230 PM resource-table layer and read-only msh dump
+            commands used to audit clocks, power domains, resets and device
+            bindings before runtime get/put migration.
+
+        if K230_PM_RUNTIME
+            config K230_PM_DEBUG
+                bool "Enable K230 PM debug traces"
+                default n
+                depends on RT_USING_MSH
+
+            config K230_PM_CMD
+                bool "Enable K230 PM msh commands"
+                default y
+                depends on RT_USING_MSH
+                help
+                    Build k230_pm command helpers such as k230_clk_dump,
+                    k230_pd_dump, k230_pm_dump, k230_pm_release_boot,
+                    k230_pm_dvfs_dump and k230_pm_selftest.
+
+            config K230_PM_AGGRESSIVE_DEFAULT
+                bool "Release runtime-manageable boot pins late in boot"
+                default y
+                help
+                    Drop boot-seeded references for clocks and power domains marked
+                    runtime-manageable after drivers have registered their gets.
+
+            config K230_PM_DVFS
+                bool "Enable K230 DVFS policy layer and /dev/pm"
+                default y
+                depends on RT_USING_PM
+                select RT_USING_USAGE
+                help
+                    Provide the PM policy layer, DVFS profiles, governors, thermal
+                    protection and the userspace-compatible /dev/pm device from the
+                    k230_pm driver.
+
+            config K230_PM_THERMAL_PROTECT
+                bool "Enable K230 PM thermal protection"
+                default y
+                depends on K230_PM_DVFS
+                select RT_USING_TS
+
         endif
 
     menuconfig DRV_SYSCTL_BOOT_FORCE_MODE

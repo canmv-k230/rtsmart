@@ -38,6 +38,7 @@
 
 #include "sysctl_clk.h"
 #include "sysctl_rst.h"
+#include "k230_pm.h"
 
 #include "board.h"
 
@@ -71,25 +72,25 @@ static void kd_timer_clk_set(rt_hwtimer_t* timer)
 {
     struct kd_timer_Type* kd_timer = (struct kd_timer_Type*)timer->parent.user_data;
     uint8_t               id       = kd_timer->id;
-    sysctl_clk_node_e     clk, src;
+    sysctl_clk_node_e     clk;
     uint32_t              div;
 
     if (id >= 0 && id <= 5) {
-        clk = SYSCTL_CLK_TIMER_0_CLK + id * 2;
-        src = SYSCTL_CLK_TIMER_0_SRC + id * 2;
+        clk = SYSCTL_CLK_TIMER0_CLK + id;
 
-        sysctl_clk_set_leaf_parent(clk, src);
         if (timer->freq < timer->info->minfreq) {
             timer->freq = timer->info->minfreq;
-            sysctl_clk_set_leaf_div(src, 1, 8);
+            div = 8;
         } else if (timer->freq > timer->info->maxfreq) {
             timer->freq = timer->info->maxfreq;
-            sysctl_clk_set_leaf_div(src, 1, 1);
+            div = 1;
         } else {
             div = timer->info->maxfreq / (timer->freq + 1) + 1;
-            sysctl_clk_set_leaf_div(src, 1, div);
             timer->freq = timer->info->maxfreq / div;
         }
+        if (k230_clk_set_parent_div(clk, SYSCTL_CLK_PLL0_OCLK_DIV16,
+                                    1, div) != 0)
+            LOG_E("timer%d clock configuration failed", id);
     }
 }
 
@@ -295,7 +296,52 @@ void kd_hwtimer_isr(int vector, void* param)
 
 int rt_hw_timer_init(void)
 {
-    volatile void* addr = (void*)rt_ioremap((void*)HW_TIMER_BASE_ADDR, HW_TIMER_IO_SIZE);
+    volatile void* addr;
+    uint32_t pm_acquired = 0;
+    int ret = -1;
+
+#ifdef RT_USING_HW_TIMER0
+    ret = k230_pm_get(K230_PM_DEV_TIMER0);
+    if (ret != 0)
+        goto pm_rollback;
+    pm_acquired |= 1U << 0;
+#endif
+#ifdef RT_USING_HW_TIMER1
+    ret = k230_pm_get(K230_PM_DEV_TIMER1);
+    if (ret != 0)
+        goto pm_rollback;
+    pm_acquired |= 1U << 1;
+#endif
+#ifdef RT_USING_HW_TIMER2
+    ret = k230_pm_get(K230_PM_DEV_TIMER2);
+    if (ret != 0)
+        goto pm_rollback;
+    pm_acquired |= 1U << 2;
+#endif
+#ifdef RT_USING_HW_TIMER3
+    ret = k230_pm_get(K230_PM_DEV_TIMER3);
+    if (ret != 0)
+        goto pm_rollback;
+    pm_acquired |= 1U << 3;
+#endif
+#ifdef RT_USING_HW_TIMER4
+    ret = k230_pm_get(K230_PM_DEV_TIMER4);
+    if (ret != 0)
+        goto pm_rollback;
+    pm_acquired |= 1U << 4;
+#endif
+#ifdef RT_USING_HW_TIMER5
+    ret = k230_pm_get(K230_PM_DEV_TIMER5);
+    if (ret != 0)
+        goto pm_rollback;
+    pm_acquired |= 1U << 5;
+#endif
+
+    addr = (void*)rt_ioremap((void*)HW_TIMER_BASE_ADDR, HW_TIMER_IO_SIZE);
+    if (addr == RT_NULL) {
+        ret = -RT_ENOMEM;
+        goto pm_rollback;
+    }
 
 #ifdef RT_USING_HW_TIMER0
     static rt_hwtimer_t         _timer0;
@@ -388,5 +434,12 @@ int rt_hw_timer_init(void)
 #endif
 
     return 0;
+
+pm_rollback:
+    for (int i = 5; i >= 0; i--) {
+        if (pm_acquired & (1U << i))
+            (void)k230_pm_put((enum k230_pm_dev_id)(K230_PM_DEV_TIMER0 + i));
+    }
+    return ret;
 }
 INIT_DEVICE_EXPORT(rt_hw_timer_init);

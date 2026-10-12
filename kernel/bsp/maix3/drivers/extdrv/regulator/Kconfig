@@ -16,6 +16,15 @@ menuconfig RT_USING_REGULATOR
             bool "Use TPS6286X"
             default n
 
+        config RT_USING_REGULATOR_DUMMY
+            bool "Use dummy regulator devices"
+            default n
+            depends on !RT_USING_REGULATOR_TPS6286X
+            help
+                Register no-op regulator_cpu and regulator_kpu devices for tests.
+                Production DVFS should run frequency-only when no real regulator
+                provider is enabled.
+
         menuconfig RT_USING_REGULATOR_CPU
             bool "Enable regulator for CPU"
 

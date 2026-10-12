@@ -28,7 +28,7 @@
 #include "io.h"
 #include <ioremap.h>
 #include "board.h"
-#include "drv_hardlock.h"
+#include "k230_pm.h"
 
 #ifdef RT_USING_POSIX
 #include <dfs_posix.h>
@@ -39,7 +39,6 @@
 #define GNNE_LOG_ENABLE
 struct gnne_dev_handle {
     rt_wqueue_t *wait;
-    rt_bool_t is_lock;
 };
 
 
@@ -64,11 +63,18 @@ struct gnne_dev_handle {
 #define GNNE_CMD_LOCK       0
 #define GNNE_CMD_TRYLOCK    1
 #define GNNE_CMD_UNLOCK     2
+#define GNNE_LOCK_RELEASED  0x01U
+#define IRQN_GNNE_INTERRUPT (16 + 173)
 
 static struct rt_device g_gnne_device = {0};
 static struct rt_event g_gnne_event = {0};
+static struct rt_event g_gnne_lock_event = {0};
+static struct rt_mutex g_gnne_lock_mutex = {0};
+static struct rt_mutex g_gnne_pm_mutex = {0};
+static struct gnne_dev_handle *g_gnne_lock_owner = RT_NULL;
+static rt_uint32_t g_gnne_open_count;
+static rt_bool_t g_gnne_pm_vote_held;
 void *gnne_base_addr = RT_NULL;
-static hardlock_type g_kpu_lock = HARDLOCK_MAX;
 
 #define KPU_DATA_SET_REG_ADDR     0x91301d8cU
 #define KPU_DATA_BW_REG_ADDR      0x91301d90U
@@ -105,19 +111,132 @@ static int gnne_setup_kpu_bandwidth(void)
     return RT_EOK;
 }
 
+static void gnne_clear_interrupt(void)
+{
+    volatile void *write_addr;
+
+    if (gnne_base_addr == RT_NULL)
+        return;
+
+    write_addr = (void *)((char *)gnne_base_addr + 0x128);
+    __iowmb();
+    *(rt_uint64_t *)write_addr = 0x400000004;
+}
+
+static int gnne_device_lock(struct gnne_dev_handle *handle, rt_bool_t wait)
+{
+    rt_uint32_t event;
+    rt_err_t ret;
+
+    if (handle == RT_NULL)
+        return -RT_EINVAL;
+
+    while (1) {
+        ret = rt_mutex_take(&g_gnne_lock_mutex, RT_WAITING_FOREVER);
+        if (ret != RT_EOK)
+            return -RT_ERROR;
+
+        if (g_gnne_lock_owner == RT_NULL) {
+            g_gnne_lock_owner = handle;
+            rt_mutex_release(&g_gnne_lock_mutex);
+            return 0;
+        }
+
+        if (g_gnne_lock_owner == handle) {
+            rt_mutex_release(&g_gnne_lock_mutex);
+            return 0;
+        }
+
+        rt_mutex_release(&g_gnne_lock_mutex);
+        if (!wait)
+            return -RT_EBUSY;
+
+        ret = rt_event_recv(&g_gnne_lock_event, GNNE_LOCK_RELEASED,
+            RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, &event);
+        if (ret != RT_EOK)
+            return -RT_ERROR;
+    }
+}
+
+static int gnne_device_unlock(struct gnne_dev_handle *handle)
+{
+    rt_bool_t released = RT_FALSE;
+    rt_err_t ret;
+
+    if (handle == RT_NULL)
+        return -RT_EINVAL;
+
+    ret = rt_mutex_take(&g_gnne_lock_mutex, RT_WAITING_FOREVER);
+    if (ret != RT_EOK)
+        return -RT_ERROR;
+
+    if (g_gnne_lock_owner == handle) {
+        g_gnne_lock_owner = RT_NULL;
+        released = RT_TRUE;
+    }
+    rt_mutex_release(&g_gnne_lock_mutex);
+
+    if (released)
+        rt_event_send(&g_gnne_lock_event, GNNE_LOCK_RELEASED);
+
+    return 0;
+}
+
 static int gnne_device_open(struct dfs_fd *file)
 {
     struct gnne_dev_handle *handle;
     rt_device_t device;
+    int ret;
 
-    handle = rt_malloc(sizeof (struct gnne_dev_handle));
+    handle = rt_malloc(sizeof(struct gnne_dev_handle));
     if(handle == RT_NULL) {
         gnne_err("malloc failed\n");
         return -1;
     }
+
+    ret = rt_mutex_take(&g_gnne_pm_mutex, RT_WAITING_FOREVER);
+    if (ret != RT_EOK) {
+        rt_free(handle);
+        return -RT_ERROR;
+    }
+
+    if (g_gnne_open_count == 0) {
+        if (g_gnne_pm_vote_held) {
+            ret = k230_pm_put(K230_PM_DEV_AI);
+            if (ret != 0) {
+                rt_mutex_release(&g_gnne_pm_mutex);
+                rt_free(handle);
+                return ret;
+            }
+            g_gnne_pm_vote_held = RT_FALSE;
+        }
+
+        ret = k230_pm_get(K230_PM_DEV_AI);
+        if (ret != 0) {
+            rt_mutex_release(&g_gnne_pm_mutex);
+            rt_free(handle);
+            return ret;
+        }
+        g_gnne_pm_vote_held = RT_TRUE;
+
+        ret = gnne_setup_kpu_bandwidth();
+        if (ret != RT_EOK) {
+            if (k230_pm_put(K230_PM_DEV_AI) == 0)
+                g_gnne_pm_vote_held = RT_FALSE;
+            rt_mutex_release(&g_gnne_pm_mutex);
+            rt_free(handle);
+            return ret;
+        }
+        gnne_clear_interrupt();
+        rt_event_recv(&g_gnne_event, 0x01,
+            RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, 0, RT_NULL);
+        rt_hw_interrupt_umask(IRQN_GNNE_INTERRUPT);
+    }
+    g_gnne_open_count++;
+    rt_mutex_release(&g_gnne_pm_mutex);
+
     device = (rt_device_t)file->fnode->data;
     handle->wait = &device->wait_queue;
-    handle->is_lock = RT_FALSE;
     file->data = (void*)handle;
     return RT_EOK;
 }
@@ -125,61 +244,86 @@ static int gnne_device_open(struct dfs_fd *file)
 static int gnne_device_close(struct dfs_fd *file)
 {
     struct gnne_dev_handle *handle;
+    int ret;
+    int pm_ret;
 
     handle = (struct gnne_dev_handle *)file->data;
     if(handle == RT_NULL) {
         gnne_err("try to close a invalid handle");
         return -RT_EINVAL;
     }
-    if(handle->is_lock)
-        kd_hardlock_unlock(g_kpu_lock);
+    gnne_device_unlock(handle);
+
+    ret = rt_mutex_take(&g_gnne_pm_mutex, RT_WAITING_FOREVER);
+    if (ret != RT_EOK) {
+        rt_free(handle);
+        file->data = RT_NULL;
+        return -RT_ERROR;
+    }
+
+    if (g_gnne_open_count == 0) {
+        rt_mutex_release(&g_gnne_pm_mutex);
+        rt_free(handle);
+        file->data = RT_NULL;
+        return -RT_EINVAL;
+    }
+
+    g_gnne_open_count--;
+    if (g_gnne_open_count == 0) {
+        rt_hw_interrupt_mask(IRQN_GNNE_INTERRUPT);
+        gnne_clear_interrupt();
+        pm_ret = k230_pm_put(K230_PM_DEV_AI);
+        if (pm_ret == 0)
+            g_gnne_pm_vote_held = RT_FALSE;
+    } else {
+        pm_ret = 0;
+    }
+    rt_mutex_release(&g_gnne_pm_mutex);
+
     rt_free(handle);
     file->data = RT_NULL;
-    return RT_EOK;
+    return pm_ret == 0 ? RT_EOK : pm_ret;
 }
 
 static int gnne_device_ioctl(struct dfs_fd *file, int cmd, void *args)
 {
     struct gnne_dev_handle *handle;
-    int ret = -1;
+    int ret;
+
+    (void)args;
     handle = (struct gnne_dev_handle *)file->data;
-    if((g_kpu_lock == HARDLOCK_MAX))
-        return ret;
-    if(cmd == GNNE_CMD_LOCK) {
-        if(handle->is_lock == RT_TRUE)
-            return 0;
-        while(0 != kd_hardlock_lock(g_kpu_lock));
-        handle->is_lock = RT_TRUE;
-        ret = 0;
-    } else if(cmd == GNNE_CMD_UNLOCK) {
-        if(handle->is_lock == RT_FALSE)
-            return 0;
-        kd_hardlock_unlock(g_kpu_lock);
-        handle->is_lock = RT_FALSE;
-        ret = 0;
-    } else if(cmd == GNNE_CMD_TRYLOCK) {
-        if(handle->is_lock == RT_TRUE)
-            return 0;
-        if(!kd_hardlock_lock(g_kpu_lock)) {
-            handle->is_lock = RT_TRUE;
-            ret = 0;
-        }
+    if (handle == RT_NULL)
+        return -RT_EINVAL;
+
+    switch (cmd) {
+    case GNNE_CMD_LOCK:
+        return gnne_device_lock(handle, RT_TRUE);
+    case GNNE_CMD_UNLOCK:
+        return gnne_device_unlock(handle);
+    case GNNE_CMD_TRYLOCK:
+        ret = gnne_device_lock(handle, RT_FALSE);
+        return (ret == 0) ? 0 : -1;
+    default:
+        return -RT_EINVAL;
     }
-    return ret;
 }
 
 int gnne_device_poll(struct dfs_fd *file, struct rt_pollreq *req)
 {
     struct gnne_dev_handle *handle;
-    unsigned int flags;
+    rt_uint32_t event;
+
     handle = (struct gnne_dev_handle*)file->data;
     if (!handle) {
         gnne_err("gnne_dev_handle NULL!");
         return -EINVAL;
     }
-    rt_event_recv(&g_gnne_event, 0x01, RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, RT_WAITING_FOREVER, NULL);
     rt_poll_add(handle->wait, req);
-    return POLLIN;
+    if (rt_event_recv(&g_gnne_event, 0x01,
+        RT_EVENT_FLAG_OR | RT_EVENT_FLAG_CLEAR, 0, &event) == RT_EOK)
+        return POLLIN;
+
+    return 0;
 }
 
 static const struct dfs_file_ops gnne_input_fops = {
@@ -189,17 +333,16 @@ static const struct dfs_file_ops gnne_input_fops = {
     .poll = gnne_device_poll,
 };
 
-#define IRQN_GNNE_INTERRUPT    (16 + 173)
 static void irq_callback(int irq, void *data)
 {
     rt_wqueue_t *wait = (rt_wqueue_t *)data;
-    volatile void *write_addr = (void *)((char *)gnne_base_addr + 0x128);
+
     if(gnne_base_addr == RT_NULL) {
         gnne_err("gnne interrupts while the hardware is not yet initialized\n");
+        return;
     }
-    /*clear kpu intr*/
-    __iowmb();
-    *(rt_uint64_t *)write_addr = 0x400000004;
+
+    gnne_clear_interrupt();
     rt_wqueue_wakeup(wait, (void*)POLLIN);
     rt_event_send(&g_gnne_event, 0x1);
 }
@@ -215,10 +358,34 @@ int gnne_device_init(void)
         return -ENOMEM;
     }
 
+    ret = rt_event_init(&g_gnne_lock_event, "gnne_lkev", RT_IPC_FLAG_PRIO);
+    if (ret) {
+        gnne_err("lock event init failed\n");
+        rt_event_detach(&g_gnne_event);
+        return -ENOMEM;
+    }
+
+    ret = rt_mutex_init(&g_gnne_lock_mutex, "gnne_lk", RT_IPC_FLAG_PRIO);
+    if (ret) {
+        gnne_err("lock mutex init failed\n");
+        rt_event_detach(&g_gnne_lock_event);
+        rt_event_detach(&g_gnne_event);
+        return -ENOMEM;
+    }
+
+    ret = rt_mutex_init(&g_gnne_pm_mutex, "gnne_pm", RT_IPC_FLAG_PRIO);
+    if (ret) {
+        gnne_err("pm mutex init failed\n");
+        rt_mutex_detach(&g_gnne_lock_mutex);
+        rt_event_detach(&g_gnne_lock_event);
+        rt_event_detach(&g_gnne_event);
+        return -ENOMEM;
+    }
+
     ret = rt_device_register(gnne_device, "gnne_device", RT_DEVICE_FLAG_RDWR);
     if(ret) {
         gnne_err("gnne_device register fail\n");
-        return ret;
+        goto err_ipc_detach;
     }
 
 
@@ -226,30 +393,28 @@ int gnne_device_init(void)
     gnne_base_addr = rt_ioremap((void *)KPU_BASE_ADDR, (KPU_IO_SIZE + FFT_IO_SIZE + AI2D_IO_SIZE));
     if(gnne_base_addr == RT_NULL) {
         gnne_err("gnne ioremap error\n");
-        return -1;
+        ret = -RT_ENOMEM;
+        goto err_device_unregister;
     }
 
     rt_wqueue_init(&gnne_device->wait_queue);
     rt_hw_interrupt_install(IRQN_GNNE_INTERRUPT, irq_callback, &gnne_device->wait_queue, "gnne_irq");
-    rt_hw_interrupt_umask(IRQN_GNNE_INTERRUPT);
+    rt_hw_interrupt_mask(IRQN_GNNE_INTERRUPT);
 
     gnne_device->fops = &gnne_input_fops;
-
-    if(kd_request_lock(HARDLOCK_KPU)) {
-        gnne_err("fail to request hardlock-%d\n", HARDLOCK_KPU);
-    } else {
-        g_kpu_lock  = HARDLOCK_KPU;
-    }
-
-    ret = gnne_setup_kpu_bandwidth();
-    if (ret != RT_EOK) {
-        gnne_err("setup kpu bandwidth failed, ret=%d\n", ret);
-        return ret;
-    }
 
 #ifndef RT_FASTBOOT
     gnne_info("%s done.\n", __func__);
 #endif
 
+    return ret;
+
+err_device_unregister:
+    rt_device_unregister(gnne_device);
+err_ipc_detach:
+    rt_mutex_detach(&g_gnne_pm_mutex);
+    rt_mutex_detach(&g_gnne_lock_mutex);
+    rt_event_detach(&g_gnne_lock_event);
+    rt_event_detach(&g_gnne_event);
     return ret;
 }

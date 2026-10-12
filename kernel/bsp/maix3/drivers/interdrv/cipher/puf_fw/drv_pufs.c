@@ -19,6 +19,7 @@
 #include "rvv_ops.h"
 
 #include "drv_pufs.h"
+#include "k230_pm.h"
 #include "drv_pufs_internal.h"
 
 #include "pufs_dma.h"
@@ -1922,9 +1923,18 @@ int pufs_device_init(void)
     int ret;
     rt_err_t lock_ret;
 
+    /* PUFS/HWRNG is a low-power, always-on service. Keep SEC clock resources
+     * held for the lifetime of the registered driver. */
+    ret = k230_pm_get(K230_PM_DEV_SEC);
+    if (ret != 0) {
+        LOG_E("failed to enable SEC clocks ret=%d", ret);
+        return ret;
+    }
+
     pufs_dev.base = rt_ioremap((void *)SECURITY_BASE_ADDR, SECURITY_IO_SIZE);
     if (!pufs_dev.base) {
         LOG_E("failed to ioremap security base\n");
+        (void)k230_pm_put(K230_PM_DEV_SEC);
         return -RT_ENOMEM;
     }
 
@@ -1990,6 +2000,7 @@ detach_lock:
 unmap_base:
     rt_iounmap(pufs_dev.base);
     pufs_dev.base = RT_NULL;
+    (void)k230_pm_put(K230_PM_DEV_SEC);
     return ret;
 }
 INIT_DEVICE_EXPORT(pufs_device_init);

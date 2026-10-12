@@ -77,7 +77,7 @@ void sysctl_boot_set_pll_lock(void)
 
 void sysctl_boot_set_spi2axi(void)
 {
-    sysctl_boot->soc_boot_ctl |= 1 < 2;
+    sysctl_boot->soc_boot_ctl |= 1 << 2;
 }
 
 void sysctl_boot_reset_soc(void)

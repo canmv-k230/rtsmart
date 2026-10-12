@@ -107,32 +107,6 @@ static int mpp_base_init(void)
     return 0;
 }
 
-/*************media freq device**********************/
-int __attribute__((weak)) media_freq_init(void)
-{
-    rt_kprintf("no media_freq_init library!\n");
-    return -1;
-}
-extern int media_freq_init(void);
-
-/*************virtual video input device*************/
-int __attribute__((weak)) vvi_init(void)
-{
-    rt_kprintf("no vvi_init library!\n");
-    return -1;
-}
-extern int vvi_init(void);
-/****************************************************/
-
-/*************virtual video input device*************/
-int __attribute__((weak)) vvo_init(void)
-{
-    rt_kprintf("no vvo_init library!\n");
-    return -1;
-}
-extern int vvo_init(void);
-/****************************************************/
-
 /*********************dma device*********************/
 int __attribute__((weak)) dma_init(void)
 {
@@ -229,13 +203,6 @@ extern int dpu_init(void);
 
 /****************************************************/
 
-/************* vdss device*************/
-int __attribute__((weak)) vdss_init(void)
-{
-	rt_kprintf("no vdss_init library!\n");
-    return -1;
-}
-extern int vdss_init(void);
 /*************vicap device*************/
 int __attribute__((weak)) vicap_init(void)
 {
@@ -250,15 +217,6 @@ int __attribute__((weak)) dewarp_init(void)
     return -1;
 }
 extern int dewarp_init(void);
-/****************************************************/
-
-/*************pm device*************/
-int __attribute__((weak)) pm_core_init(void)
-{
-    rt_kprintf("no pm_core_init library!\n");
-    return -1;
-}
-extern int pm_core_init(void);
 /****************************************************/
 
 /****************************************************/
@@ -276,11 +234,9 @@ extern int nonai_2d_init(void);
 
 static int mpp_device_init(void)
 {
-    media_freq_init();
     vicap_init();
-    vvi_init();
-    vvo_init();
     dma_init();
+    nonai_2d_init();
     venc_init();
     vdec_init();
     ai_init();
@@ -290,11 +246,8 @@ static int mpp_device_init(void)
     acodec_init();
     kd_vo_init();
     connector_device_init();
-    vdss_init();
     dpu_init();
     dewarp_init();
-    pm_core_init();
-    nonai_2d_init();
     return 0;
 }
 

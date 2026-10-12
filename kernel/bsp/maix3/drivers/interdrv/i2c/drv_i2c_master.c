@@ -298,7 +298,7 @@ rt_err_t k230_i2c_config_speed(struct dw_i2c_master *master,
     if (!speed_hz)
         return -RT_EINVAL;
 
-    clock = sysctl_clk_get_leaf_freq(SYSCTL_CLK_I2C_0_CLK +
+    clock = sysctl_clk_get_leaf_freq(SYSCTL_CLK_I2C0_CLK +
                                      master->index);
     if (!clock)
         return -RT_ERROR;

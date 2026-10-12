@@ -1,3 +1,4 @@
+#include "rtdef.h"
 #include <rthw.h>
 #include <rtthread.h>
 #include <rtdevice.h>
@@ -18,4 +19,4 @@ rt_int32_t sdk_kernel_init(void)
     return RT_EOK;
 }
 
-INIT_APP_EXPORT(sdk_kernel_init);
+INIT_APP_EXPORT_SEQ(sdk_kernel_init, 999);

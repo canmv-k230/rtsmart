@@ -17,5 +17,6 @@
 rt_uint8_t sys_cpu_usage(rt_uint8_t cpu_id);
 rt_uint8_t sys_thread_usage(int tid);
 rt_err_t usage_set_period(int mill_sec);
+rt_err_t usage_set_worker_priority(rt_uint8_t priority);
 
 #endif /* __DRV_UART_H__ */

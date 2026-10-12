@@ -30,10 +30,13 @@ extern int ai_2d_device_init(void);
 
 int ai_module_init(void)
 {
-    gnne_device_init();
-    ai_2d_device_init();
+    int ret;
 
-    return 0;
+    ret = gnne_device_init();
+    if (ret != 0)
+        return ret;
+
+    return ai_2d_device_init();
 }
 
 // Make it later than sdk_kernel_init, because it will enable and disable the kpu powerdomain.

@@ -119,46 +119,54 @@ typedef struct
     volatile uint32_t cpu_repair_tim;       /* 0x178 */
 } sysctl_pwr_s;
 
-typedef enum 
+typedef enum
 {
+    /* Power-controller registers are laid out in this order. */
+    SYSCTL_PD_CPU0,
     SYSCTL_PD_CPU1,
     SYSCTL_PD_AI,
     SYSCTL_PD_DISP,
+    SYSCTL_PD_SHRM,
     SYSCTL_PD_VPU,
+    SYSCTL_PD_MCTL,
     SYSCTL_PD_DPU,
-    SYSCTL_PD_CPU0,
+    SYSCTL_PD_HI,
+    SYSCTL_PD_LS,
+    SYSCTL_PD_SEC,
+    SYSCTL_PD_ISP,
+    SYSCTL_PD_PMU,
     SYSCTL_PD_MAX,
 } sysctl_pwr_domain_e;
 
 
 typedef enum
 {
-    SYSCTL_PWR_ACK_TO_TIM,  /* idleReq to idleAck max time */
-    SYSCTL_PWR_IDLE_TO_TIM, /* idleAck to idle max time */
-    SYSCTL_PWR_IDLE_HD_TIM, /* idle hold tim, from idle to cancel idleReq min time */
-    SYSCTL_PWR_ISO_SU_TIM,  /* isolation setup tim */
-    SYSCTL_PWR_PD_HD_TIM,   /* power done hardware tim */
-    SYSCTL_PWR_SU_TIM,      /* Power bringup tim */
-    SYSCTL_PWR_WFI_TIM,     /* wait for interrupt tim*/
+    SYSCTL_PWR_WFI_TIM,     /* CPU WFI to power transition */
+    SYSCTL_PWR_SU_TIM,      /* power bringup */
+    SYSCTL_PWR_PD_HD_TIM,   /* power-down hold */
+    SYSCTL_PWR_ISO_SU_TIM,  /* isolation setup */
+    SYSCTL_PWR_IDLE_HD_TIM, /* idle hold */
+    SYSCTL_PWR_IDLE_TO_TIM, /* idle acknowledge to idle */
+    SYSCTL_PWR_ACK_TO_TIM,  /* idle request to idle acknowledge */
     SYSCTL_PWR_MAX_TIM,
-}sysctl_pwr_tim_e;
+} sysctl_pwr_tim_e;
 
 
-bool sysctl_pwr_set_iso_su_tim(volatile uint32_t *reg, uint32_t iso_su_tim);
-bool sysctl_pwr_set_pd_hd_tim(volatile uint32_t *reg, uint32_t pd_hd_tim);
-bool sysctl_pwr_set_pwr_su_tim(volatile uint32_t *reg, uint32_t pwr_su_tim);
-bool sysctl_pwr_set_ack_to_tim(volatile uint32_t *reg, uint32_t ack_to_tim);
-bool sysctl_pwr_set_idle_to_tim(volatile uint32_t *reg, uint32_t idle_to_tim);
-bool sysctl_pwr_set_idle_hd_tim(volatile uint32_t *reg, uint32_t idle_hd_tim);
 bool sysctl_pwr_set_wfi_tim(volatile uint32_t *reg, uint32_t wfi_tim);
+bool sysctl_pwr_set_pwr_su_tim(volatile uint32_t *reg, uint32_t pwr_su_tim);
+bool sysctl_pwr_set_pd_hd_tim(volatile uint32_t *reg, uint32_t pd_hd_tim);
+bool sysctl_pwr_set_iso_su_tim(volatile uint32_t *reg, uint32_t iso_su_tim);
+bool sysctl_pwr_set_idle_hd_tim(volatile uint32_t *reg, uint32_t idle_hd_tim);
+bool sysctl_pwr_set_idle_to_tim(volatile uint32_t *reg, uint32_t idle_to_tim);
+bool sysctl_pwr_set_ack_to_tim(volatile uint32_t *reg, uint32_t ack_to_tim);
 bool sysctl_pwr_set_tim(sysctl_pwr_domain_e powerdomain, sysctl_pwr_tim_e timtype, uint32_t tim_value);
-bool sysctl_pwr_get_iso_su_tim(volatile uint32_t *reg, uint32_t *iso_su_tim);
-bool sysctl_pwr_get_pd_hd_tim(volatile uint32_t *reg, uint32_t *pd_hd_tim);
-bool sysctl_pwr_get_pwr_su_tim(volatile uint32_t *reg, uint32_t *pwr_su_tim);
-bool sysctl_pwr_get_ack_to_tim(volatile uint32_t *reg, uint32_t *ack_to_tim);
-bool sysctl_pwr_get_idle_to_tim(volatile uint32_t *reg, uint32_t *idle_to_tim);
-bool sysctl_pwr_get_idle_hd_tim(volatile uint32_t *reg, uint32_t *idle_hd_tim);
 bool sysctl_pwr_get_wfi_tim(volatile uint32_t *reg, uint32_t *wfi_tim);
+bool sysctl_pwr_get_pwr_su_tim(volatile uint32_t *reg, uint32_t *pwr_su_tim);
+bool sysctl_pwr_get_pd_hd_tim(volatile uint32_t *reg, uint32_t *pd_hd_tim);
+bool sysctl_pwr_get_iso_su_tim(volatile uint32_t *reg, uint32_t *iso_su_tim);
+bool sysctl_pwr_get_idle_hd_tim(volatile uint32_t *reg, uint32_t *idle_hd_tim);
+bool sysctl_pwr_get_idle_to_tim(volatile uint32_t *reg, uint32_t *idle_to_tim);
+bool sysctl_pwr_get_ack_to_tim(volatile uint32_t *reg, uint32_t *ack_to_tim);
 bool sysctl_pwr_get_tim(sysctl_pwr_domain_e powerdomain, sysctl_pwr_tim_e timtype, uint32_t *tim_value);
 bool sysctl_pwr_set_poweroff_keep_reset(sysctl_pwr_domain_e powerdomain, bool enable);
 bool sysctl_pwr_get_poweroff_keep_reset(sysctl_pwr_domain_e powerdomain, bool *enable);

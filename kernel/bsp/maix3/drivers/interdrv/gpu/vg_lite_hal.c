@@ -66,13 +66,12 @@
 
 #include "board.h"
 #include "ioremap.h"
+#include "k230_pm.h"
 #include "lwp_mm.h"
 #include "lwp_mm_area.h"
 #include "lwp_user_mm.h"
 #include "mmu.h"
 #include "page.h"
-#include "sysctl_clk.h"
-#include "sysctl_pwr.h"
 #include "sysctl_rst.h"
 #include "tick.h"
 #include "vg_lite_platform.h"
@@ -757,17 +756,19 @@ static size_t gpu_ioctl_command_size(vg_lite_kernel_command_t command)
 }
 
 static int gpu_open(struct dfs_fd *file) {
+    int ret;
+
     rt_kprintf("vg_lite open\n");
     if (rt_mutex_take(&device->open_lock, RT_WAITING_FOREVER) != RT_EOK) {
         return -EINTR;
     }
 
     if (device->open_count == 0) {
-        /* Turn on the power. */
-        sysctl_pwr_up(SYSCTL_PD_DISP);
-        /* Turn on the clock. */
-        sysctl_clk_set_disp_gpu_en(true);
-        sysctl_reset(SYSCTL_RESET_GPU);
+        ret = k230_pm_get(K230_PM_DEV_GPU2D);
+        if (ret != 0) {
+            rt_mutex_release(&device->open_lock);
+            return ret;
+        }
         clear_interrupt_state();
         rt_hw_interrupt_umask(irq_num);
     }
@@ -780,6 +781,7 @@ static int gpu_close(struct dfs_fd *file)
 {
     int has_reference;
     int last_close = 0;
+    int ret = 0;
 
     if (rt_mutex_take(&device->open_lock, RT_WAITING_FOREVER) != RT_EOK) {
         return -EINTR;
@@ -814,12 +816,11 @@ static int gpu_close(struct dfs_fd *file)
         } else {
             clear_software_interrupt_state();
         }
-        sysctl_clk_set_disp_gpu_en(false);
-        sysctl_pwr_off(SYSCTL_PD_DISP);
+        ret = k230_pm_put(K230_PM_DEV_GPU2D);
     }
 
     rt_mutex_release(&device->open_lock);
-    return 0;
+    return ret;
 }
 
 static int gpu_ioctl(struct dfs_fd *file, int cmd, void *args) {

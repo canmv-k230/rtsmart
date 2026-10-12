@@ -542,6 +542,26 @@ rt_err_t usage_set_period(int mill_sec)
     return RT_ERROR;
 }
 
+rt_err_t usage_set_worker_priority(rt_uint8_t priority)
+{
+    rt_err_t ret;
+
+    if (g_usage_thread == RT_NULL || priority >= RT_THREAD_PRIORITY_MAX) {
+        rt_kprintf("%s priority:%u failed\n", __func__, priority);
+        return RT_ERROR;
+    }
+
+    ret = rt_thread_control(g_usage_thread, RT_THREAD_CTRL_CHANGE_PRIORITY,
+        &priority);
+    if (ret != RT_EOK) {
+        rt_kprintf("%s priority:%u failed: %d\n", __func__, priority, ret);
+        return ret;
+    }
+
+    rt_kprintf("%s priority:%u success\n", __func__, priority);
+    return RT_EOK;
+}
+
 rt_int32_t cpu_usage_init(void)
 {
 #ifdef RT_USING_SMP

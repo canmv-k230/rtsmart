@@ -6,7 +6,7 @@ import os
 cwd = GetCurrentDir()
 src = Glob('*.c')
 
-CPPPATH = [cwd]
+CPPPATH = [cwd, cwd + '/../k230_pm']
 
 group = DefineGroup('FFT', src, depend = ['RT_USING_FFT', 'RT_USING_MPP'], CPPPATH = CPPPATH)
 

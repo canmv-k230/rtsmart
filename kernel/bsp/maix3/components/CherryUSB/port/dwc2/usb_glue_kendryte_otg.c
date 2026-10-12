@@ -7,6 +7,7 @@
 
 #include "drv_gpio.h"
 #include "sysctl_rst.h"
+#include "k230_pm.h"
 #include "usb_config.h"
 #include "usb_log.h"
 #include "usb_otg.h"
@@ -54,8 +55,10 @@ static int kendryte_usb_irq(uint8_t dev)
 
 static int kendryte_usb_reset(uint8_t dev)
 {
-    if (!sysctl_reset(dev ? SYSCTL_RESET_USB1 : SYSCTL_RESET_USB0)) {
-        USB_LOG_ERR("reset usb%u fail\n", dev);
+    int ret = k230_pm_get(dev ? K230_PM_DEV_USB1 : K230_PM_DEV_USB0);
+
+    if (ret != 0) {
+        USB_LOG_ERR("pm get usb%u fail %d\n", dev, ret);
         return -1;
     }
 
@@ -270,6 +273,7 @@ void usb_hc_low_level_deinit(struct usbh_bus *bus)
     (void)bus;
     kendryte_usb_irq_mask(CHERRY_USB_OTG_USING_DEV);
     kendryte_usb_host_power(false);
+    (void)k230_pm_put(CHERRY_USB_OTG_USING_DEV ? K230_PM_DEV_USB1 : K230_PM_DEV_USB0);
 }
 #endif /* ENABLE_CHERRY_USB_HOST */
 
@@ -302,6 +306,7 @@ void usb_dc_low_level_init(void)
 void usb_dc_low_level_deinit(void)
 {
     kendryte_usb_irq_mask(CHERRY_USB_OTG_USING_DEV);
+    (void)k230_pm_put(CHERRY_USB_OTG_USING_DEV ? K230_PM_DEV_USB1 : K230_PM_DEV_USB0);
 }
 #endif /* ENABLE_CHERRY_USB_DEVICE */
 

@@ -305,9 +305,6 @@ static void auto_exec_trusted_preload(const char *cmd_line)
 }
 
 int main(void) {
-  sysctl_pwr_off(SYSCTL_PD_CPU0);
-  sysctl_pwr_off(SYSCTL_PD_DPU);
-
   rt_kprintf("\n#############SDK VERSION######################################\n");
   rt_kprintf("SDK   : %s\n", SDK_VERSION_);
 #ifdef CONFIG_SDK_ENABLE_CANMV

@@ -32,6 +32,7 @@
 
 #include "sysctl_clk.h"
 #include "sysctl_rst.h"
+#include "k230_pm.h"
 
 #include "drv_gzip_decomp.h"
 
@@ -44,13 +45,12 @@
 #define PV_OFFSET 0x0
 #endif
 
-/* ---- GSDMA exported functions (linked from MPP kernel module) ---- */
+/* GSDMA exported functions are linked from the MPP kernel module. */
 extern int  gsdma_sdma_reserve_channel(uint8_t ch_num);
+extern int  gsdma_sdma_abort_channel(uint8_t ch_num);
 extern void gsdma_sdma_release_channel(uint8_t ch_num);
-extern int  gsdma_sdma_ch_submit(uint8_t ch_num, uint32_t ch_cfg_value, uint32_t llt_phys_addr, void (*callback)(void* arg),
-                                 void* arg);
-extern int  gsdma_sdma_ch_transfer(uint8_t ch_num, uint32_t src_phys, uint32_t dst_phys, uint32_t len, uint32_t ch_cfg_value,
-                                   void (*callback)(void* arg), void* arg);
+extern int  gsdma_sdma_ch_submit(uint8_t ch_num, uint32_t ch_cfg_value, uint32_t llt_phys_addr,
+                                 void (*callback)(void* arg), void* arg);
 
 /* ---- Hardware constants ---- */
 #define UGZIP_BASE 0x80808000UL
@@ -116,6 +116,41 @@ struct gzip_decomp_dev {
 };
 
 static struct gzip_decomp_dev g_gzip_decomp_dev;
+
+static uint32_t gzip_get_le32(const uint8_t* data)
+{
+    return (uint32_t)data[0] | ((uint32_t)data[1] << 8) | ((uint32_t)data[2] << 16) | ((uint32_t)data[3] << 24);
+}
+
+static int gzip_dma_range_valid(uint64_t phys, uint32_t len)
+{
+    uint64_t span = ((uint64_t)len + ZIP_LINE_SIZE - 1) & ~((uint64_t)ZIP_LINE_SIZE - 1);
+
+    return span != 0 && phys <= UINT32_MAX && phys + span - 1 <= UINT32_MAX;
+}
+
+static int gzip_validate_stream(uint64_t src_phys, uint32_t src_len, uint64_t dst_phys, uint32_t dst_len)
+{
+    const uint8_t* src;
+
+    if (!src_phys || src_len < 18 || !dst_phys || !dst_len)
+        return -RT_EINVAL;
+    if (!gzip_dma_range_valid(src_phys, src_len) || !gzip_dma_range_valid(dst_phys, dst_len))
+        return -RT_EINVAL;
+
+    src = (const uint8_t*)(uintptr_t)(src_phys - PV_OFFSET);
+    rt_hw_cpu_dcache_clean((void*)src, src_len);
+
+    /* User space normalizes the private 0x09 marker and optional fields
+     * before issuing the ioctl. Validate the exact stream shape expected by
+     * hardware, including output size, before any DMA can touch dst_phys. */
+    if (src[0] != 0x1f || src[1] != 0x8b || src[2] != 0x08 || src[3] != 0)
+        return -RT_EINVAL;
+    if (gzip_get_le32(src + src_len - 4) != dst_len)
+        return -RT_EINVAL;
+
+    return RT_EOK;
+}
 
 /* Callback for SDMA read channel — no-op, just prevents ch_submit from blocking */
 static void gzip_rd_done_callback(void* arg) { (void)arg; }
@@ -202,25 +237,28 @@ static int gzip_decomp_do_gunzip(struct gzip_decomp_dev* dev, uint64_t src_phys,
     struct rt_semaphore wr_done_sem;
     uint32_t            rd_count = 0, wr_count = 0;
     uint32_t            decomp_intstat;
+    int                 rd_reserved = 0;
+    int                 wr_reserved = 0;
+    int                 sem_initialized = 0;
+    int                 pm_held = 0;
     int                 ret;
 
-    if (!src_phys || !src_len || !dst_phys || !dst_len)
-        return -RT_EINVAL;
+    ret = gzip_validate_stream(src_phys, src_len, dst_phys, dst_len);
+    if (ret != RT_EOK)
+        return ret;
 
     rt_mutex_take(&dev->mutex, RT_WAITING_FOREVER);
 
     LOG_D("gunzip: src=0x%08x len=%u dst=0x%08x len=%u", (uint32_t)src_phys, src_len, (uint32_t)dst_phys, dst_len);
 
     /* 1. Enable clocks and reset decompress block */
-    sysctl_clk_set_leaf_en(SYSCTL_CLK_SHRM_SRC, true);
-    sysctl_clk_set_leaf_en(SYSCTL_CLK_DECOMPRESS_ACLK_GATE, true);
-
-    if (!sysctl_reset(SYSCTL_RESET_DECOMPRESS)) {
-        LOG_E("sysctl_reset(DECOMPRESS) failed");
+    ret = k230_pm_get(K230_PM_DEV_GZIP);
+    if (ret != 0) {
+        LOG_E("pm get gzip failed: %d", ret);
         ret = -RT_ERROR;
         goto out;
     }
-    sysctl_clk_set_leaf_en(SYSCTL_CLK_DECOMPRESS_ACLK_GATE, true);
+    pm_held = 1;
 
     /* 2. Reserve SDMA CH0 (read) and CH1 (write) */
     if (gsdma_sdma_reserve_channel(ZIP_RD_CH) != 0) {
@@ -228,17 +266,15 @@ static int gzip_decomp_do_gunzip(struct gzip_decomp_dev* dev, uint64_t src_phys,
         ret = -RT_EBUSY;
         goto out;
     }
+    rd_reserved = 1;
     if (gsdma_sdma_reserve_channel(ZIP_WR_CH) != 0) {
         LOG_E("Failed to reserve SDMA CH%d", ZIP_WR_CH);
-        gsdma_sdma_release_channel(ZIP_RD_CH);
         ret = -RT_EBUSY;
-        goto out;
+        goto out_release;
     }
+    wr_reserved = 1;
 
-    /* 3. Flush source data cache */
-    rt_hw_cpu_dcache_clean((void*)(uintptr_t)(src_phys - PV_OFFSET), src_len);
-
-    /* 4. Build SDMA LLI chains */
+    /* 3. Build SDMA LLI chains */
     rd_llt = build_rd_llt((uint32_t)src_phys, src_len, &rd_count);
     if (!rd_llt) {
         ret = -RT_ENOMEM;
@@ -252,25 +288,34 @@ static int gzip_decomp_do_gunzip(struct gzip_decomp_dev* dev, uint64_t src_phys,
 
     LOG_D("rd_llt cnt=%u wr_llt cnt=%u", rd_count, wr_count);
 
-    /* 5. Init completion semaphore for write channel */
-    rt_sem_init(&wr_done_sem, "gz_wr", 0, RT_IPC_FLAG_PRIO);
+    /* 4. Init completion semaphore for write channel */
+    if (rt_sem_init(&wr_done_sem, "gz_wr", 0, RT_IPC_FLAG_PRIO) != RT_EOK) {
+        ret = -RT_ERROR;
+        goto out_release;
+    }
+    sem_initialized = 1;
 
-    /* 6. Prepare UGZIP: set src_size with bit31 to reset internal state */
+    /* 5. Prepare UGZIP: set src_size with bit31 to reset internal state */
     writel(0x80000000, &dev->reg->gzip_src_size);
 
-    /* 7. Submit SDMA channels via GSDMA driver workflow:
+    /* 6. Submit SDMA channels via GSDMA driver workflow:
      *    CH0 (read): src DDR → SRAM_RD, dec_en=1 for gzip handshake
      *    CH1 (write): SRAM_WR → dst DDR, callback releases semaphore */
-    gsdma_sdma_ch_submit(ZIP_RD_CH, SDMA_CH_CFG_RD, (uint32_t)((uint64_t)rd_llt + PV_OFFSET), gzip_rd_done_callback, RT_NULL);
-    gsdma_sdma_ch_submit(ZIP_WR_CH, SDMA_CH_CFG_WR, (uint32_t)((uint64_t)wr_llt + PV_OFFSET), gzip_wr_done_callback,
-                         &wr_done_sem);
+    if (gsdma_sdma_ch_submit(ZIP_RD_CH, SDMA_CH_CFG_RD, (uint32_t)((uint64_t)rd_llt + PV_OFFSET),
+                             gzip_rd_done_callback, RT_NULL) != 0 ||
+        gsdma_sdma_ch_submit(ZIP_WR_CH, SDMA_CH_CFG_WR, (uint32_t)((uint64_t)wr_llt + PV_OFFSET),
+                             gzip_wr_done_callback, &wr_done_sem) != 0) {
+        LOG_E("Failed to submit SDMA channels");
+        ret = -RT_ERROR;
+        goto out_reset;
+    }
 
-    /* 8. Configure UGZIP and start decompression */
+    /* 7. Configure UGZIP and start decompression */
     writel(src_len | (0x1u << 31), &dev->reg->gzip_src_size);
     writel(dst_len, &dev->reg->dma_out_size);
     writel(0x3, &dev->reg->decomp_start);
 
-    /* 9. Wait for write channel completion via IRQ callback */
+    /* 8. Wait for write channel completion via IRQ callback */
     ret = rt_sem_take(&wr_done_sem, rt_tick_from_millisecond(timeout_ms > 0 ? timeout_ms : GZIP_DEFAULT_TIMEOUT_MS));
 
     if (ret == RT_EOK) {
@@ -279,7 +324,7 @@ static int gzip_decomp_do_gunzip(struct gzip_decomp_dev* dev, uint64_t src_phys,
             LOG_D("CRC OK: decomp_intstat=0x%08x", decomp_intstat);
             ret = RT_EOK;
         } else {
-            LOG_E("CRC error: decomp_intstat=0x%08x", decomp_intstat);
+            LOG_E("Decompression failed: decomp_intstat=0x%08x", decomp_intstat);
             ret = -RT_ERROR;
         }
     } else {
@@ -287,20 +332,30 @@ static int gzip_decomp_do_gunzip(struct gzip_decomp_dev* dev, uint64_t src_phys,
         ret = -RT_ETIMEOUT;
     }
 
-    rt_sem_detach(&wr_done_sem);
-
-    /* 10. Invalidate destination cache */
+    /* 9. Invalidate destination cache */
     rt_hw_cpu_dcache_invalidate((void*)(uintptr_t)(dst_phys - PV_OFFSET), dst_len);
 
-    /* 11. Clean up */
+    /* 10. Stop the engine before aborting DMA on an error. */
+out_reset:
     writel(0, &dev->reg->gzip_src_size);
 
     if (ret != RT_EOK)
         sysctl_reset(SYSCTL_RESET_DECOMPRESS);
 
 out_release:
-    gsdma_sdma_release_channel(ZIP_RD_CH);
-    gsdma_sdma_release_channel(ZIP_WR_CH);
+    if (wr_reserved) {
+        if (ret != RT_EOK)
+            gsdma_sdma_abort_channel(ZIP_WR_CH);
+        gsdma_sdma_release_channel(ZIP_WR_CH);
+    }
+    if (rd_reserved) {
+        if (ret != RT_EOK)
+            gsdma_sdma_abort_channel(ZIP_RD_CH);
+        gsdma_sdma_release_channel(ZIP_RD_CH);
+    }
+
+    if (sem_initialized)
+        rt_sem_detach(&wr_done_sem);
 
     if (wr_llt)
         rt_free_align(wr_llt);
@@ -308,6 +363,12 @@ out_release:
         rt_free_align(rd_llt);
 
 out:
+    if (pm_held) {
+        int pm_ret = k230_pm_put(K230_PM_DEV_GZIP);
+
+        if (ret == RT_EOK && pm_ret != 0)
+            ret = pm_ret;
+    }
     rt_mutex_release(&dev->mutex);
     return ret;
 }

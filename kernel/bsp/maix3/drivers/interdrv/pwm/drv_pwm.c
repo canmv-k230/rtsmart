@@ -37,6 +37,7 @@
 
 #include "drv_pwm.h"
 #include "sysctl_clk.h"
+#include "k230_pm.h"
 
 #ifdef RT_DEBUG
 #define DBG_LVL DBG_LOG
@@ -198,7 +199,7 @@ static rt_err_t kd_pwm_get(struct pwm_inst* inst, rt_uint8_t channel, struct rt_
     }
 
     uint64_t pulse, period;
-    uint32_t pwm_pclock = sysctl_clk_get_leaf_freq(SYSCTL_CLK_PWM_PCLK_GATE);
+    uint32_t pwm_pclock = sysctl_clk_get_leaf_freq(SYSCTL_CLK_PWM_PCLK);
 
     // if (inst->enable[channel]) {
     //     uint32_t scale = read32(&inst->reg->pwmcfg) & 0x0f;
@@ -252,7 +253,7 @@ static int kd_pwm_set(struct pwm_inst* inst, int channel, struct rt_pwm_configur
     }
 
     uint64_t pulse, period, pwmcmpx_max;
-    uint32_t pwm_pclock = sysctl_clk_get_leaf_freq(SYSCTL_CLK_PWM_PCLK_GATE);
+    uint32_t pwm_pclock = sysctl_clk_get_leaf_freq(SYSCTL_CLK_PWM_PCLK);
     uint32_t pwmscale   = 0;
 
     /* Convert from nanoseconds to clock cycles */
@@ -438,10 +439,16 @@ int rt_hw_pwm_init(void)
         return -RT_ERROR;
     }
 
+    if (k230_pm_get(K230_PM_DEV_PWM) != 0) {
+        LOG_E("PWM pm get failed");
+        return -RT_ERROR;
+    }
+
     /* Map PWM registers */
     void* reg = rt_ioremap((void*)PWM_BASE_ADDR, PWM_IO_SIZE);
     if (!reg) {
         LOG_E("PWM ioremap failed");
+        (void)k230_pm_put(K230_PM_DEV_PWM);
         return -RT_ERROR;
     }
 
@@ -462,6 +469,7 @@ int rt_hw_pwm_init(void)
     if (rt_device_pwm_register(&pwm_inst_wrap.device, "pwm", &drv_ops, &pwm_inst_wrap) != RT_EOK) {
         LOG_E("PWM device registration failed");
         rt_iounmap(reg);
+        (void)k230_pm_put(K230_PM_DEV_PWM);
         return -RT_ERROR;
     }
 

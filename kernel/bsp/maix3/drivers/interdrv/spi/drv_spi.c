@@ -43,6 +43,7 @@
 #include "sysctl_rst.h"
 #include "tick.h"
 
+#include "k230_pm.h"
 #include "drv_spi.h"
 
 #define DBG_TAG "spi"
@@ -1468,9 +1469,9 @@ static rt_err_t dw_spi_register_bus(dw_spi_bus_t* spi_bus, const dw_spi_hw_info_
 }
 
 static const dw_spi_hw_info_t dw_spi_hw_info[] = {
-    { "spi0", SPI_OPI_BASE_ADDR, IRQN_SPI0, SYSCTL_CLK_SSI_0_CLK, 0, 8, 200000000 },
-    { "spi1", SPI_QOPI_BASE_ADDR, IRQN_SPI1, SYSCTL_CLK_SSI_1_CLK, 1, 4, 100000000 },
-    { "spi2", SPI_QOPI_BASE_ADDR + SPI_OPI_IO_SIZE, IRQN_SPI2, SYSCTL_CLK_SSI_2_CLK, 2, 4, 100000000 },
+    { "spi0", SPI_OPI_BASE_ADDR, IRQN_SPI0, SYSCTL_CLK_SSI0_CLK, 0, 8, 200000000 },
+    { "spi1", SPI_QOPI_BASE_ADDR, IRQN_SPI1, SYSCTL_CLK_SSI1_CLK, 1, 4, 100000000 },
+    { "spi2", SPI_QOPI_BASE_ADDR + SPI_OPI_IO_SIZE, IRQN_SPI2, SYSCTL_CLK_SSI2_CLK, 2, 4, 100000000 },
 };
 
 static uint32_t dw_spi_get_ser(dw_spi_bus_t* spi_bus, struct rt_qspi_configuration* cfg)
@@ -1729,21 +1730,36 @@ int rt_hw_spi_bus_init(void)
     rt_err_t ret;
 #ifdef RT_USING_SPI0
     static dw_spi_bus_t spi_bus0;
-    ret = dw_spi_register_bus(&spi_bus0, &dw_spi_hw_info[0], RT_SPI0_RXSD);
+    ret = k230_pm_get(K230_PM_DEV_SPI0);
     if (ret)
         return ret;
+    ret = dw_spi_register_bus(&spi_bus0, &dw_spi_hw_info[0], RT_SPI0_RXSD);
+    if (ret) {
+        (void)k230_pm_put(K230_PM_DEV_SPI0);
+        return ret;
+    }
 #endif
 #ifdef RT_USING_SPI1
     static dw_spi_bus_t spi_bus1;
-    ret = dw_spi_register_bus(&spi_bus1, &dw_spi_hw_info[1], RT_SPI1_RXSD);
+    ret = k230_pm_get(K230_PM_DEV_SPI1);
     if (ret)
         return ret;
+    ret = dw_spi_register_bus(&spi_bus1, &dw_spi_hw_info[1], RT_SPI1_RXSD);
+    if (ret) {
+        (void)k230_pm_put(K230_PM_DEV_SPI1);
+        return ret;
+    }
 #endif
 #ifdef RT_USING_SPI2
     static dw_spi_bus_t spi_bus2;
-    ret = dw_spi_register_bus(&spi_bus2, &dw_spi_hw_info[2], RT_SPI2_RXSD);
+    ret = k230_pm_get(K230_PM_DEV_SPI2);
     if (ret)
         return ret;
+    ret = dw_spi_register_bus(&spi_bus2, &dw_spi_hw_info[2], RT_SPI2_RXSD);
+    if (ret) {
+        (void)k230_pm_put(K230_PM_DEV_SPI2);
+        return ret;
+    }
 #endif
     return 0;
 }

@@ -42,6 +42,7 @@
 #endif
 
 #include "k_gsdma_comm.h"
+#include "k230_pm.h"
 
 // #define DBG_LVL DBG_LOG
 #define DBG_LVL DBG_WARNING
@@ -85,6 +86,7 @@ typedef struct {
     volatile fft_reg_st* reg;
     rt_uint32_t          last_event;
     rt_bool_t            inited;
+    rt_bool_t            pm_vote_held;
 } fft_device_t;
 
 static fft_device_t g_fft_dev;
@@ -294,6 +296,11 @@ int k230_fft_run(const k_fft_run_request* req)
 
     LOG_D("mutex take");
     rt_mutex_take(&dev->lock, RT_WAITING_FOREVER);
+    if (!dev->pm_vote_held) {
+        rt_mutex_release(&dev->lock);
+        LOG_E("run rejected: FFT device is not open");
+        return -EIO;
+    }
     ret = fft_run_locked(dev, req);
     rt_mutex_release(&dev->lock);
     LOG_D("run complete ret=%d", ret);
@@ -303,21 +310,58 @@ int k230_fft_run(const k_fft_run_request* req)
 
 static rt_err_t fft_device_open(rt_device_t dev, rt_uint16_t oflag)
 {
-    (void)dev;
+    fft_device_t* fft = (fft_device_t*)dev->user_data;
+    int ret;
+
     (void)oflag;
 
     LOG_D("device open");
+
+    rt_mutex_take(&fft->lock, RT_WAITING_FOREVER);
+    if (fft->pm_vote_held) {
+        rt_mutex_release(&fft->lock);
+        return -RT_EBUSY;
+    }
+
+    /* FFT belongs to the KPU/AI clock and power/reset domain. */
+    ret = k230_pm_get(K230_PM_DEV_AI);
+    if (ret != 0) {
+        rt_mutex_release(&fft->lock);
+        LOG_E("enable AI/FFT clock failed ret=%d", ret);
+        return ret;
+    }
+
+    fft_disable(fft);
+    writeq(1, &fft->reg->int_clr);
+    fft->pm_vote_held = RT_TRUE;
+    rt_hw_interrupt_umask(FFT_IRQN);
+    rt_mutex_release(&fft->lock);
 
     return RT_EOK;
 }
 
 static rt_err_t fft_device_close(rt_device_t dev)
 {
-    (void)dev;
+    fft_device_t* fft = (fft_device_t*)dev->user_data;
+    int ret;
 
     LOG_D("device close");
 
-    return RT_EOK;
+    rt_mutex_take(&fft->lock, RT_WAITING_FOREVER);
+    if (!fft->pm_vote_held) {
+        rt_mutex_release(&fft->lock);
+        return -RT_EINVAL;
+    }
+
+    rt_hw_interrupt_mask(FFT_IRQN);
+    fft_disable(fft);
+    writeq(1, &fft->reg->int_clr);
+    ret = k230_pm_put(K230_PM_DEV_AI);
+    if (ret == 0)
+        fft->pm_vote_held = RT_FALSE;
+    rt_mutex_release(&fft->lock);
+
+    return ret == 0 ? RT_EOK : ret;
 }
 
 static rt_err_t fft_device_control(rt_device_t dev, int cmd, void* args)
@@ -429,8 +473,6 @@ int k230_fft_dev_init(void)
     LOG_D("init reg=%p base=0x%lx size=0x%lx sdma_send_transfer=%p", dev->reg, (unsigned long)FFT_BASE_ADDR,
           (unsigned long)FFT_IO_SIZE, sdma_send_transfer);
 
-    fft_disable(dev);
-
     dev->parent.type      = RT_Device_Class_Char;
     dev->parent.user_data = dev;
 
@@ -457,7 +499,7 @@ int k230_fft_dev_init(void)
 #endif
 
     rt_hw_interrupt_install(FFT_IRQN, fft_irq_handler, dev, "fft");
-    rt_hw_interrupt_umask(FFT_IRQN);
+    rt_hw_interrupt_mask(FFT_IRQN);
 
     dev->inited = RT_TRUE;
     return 0;

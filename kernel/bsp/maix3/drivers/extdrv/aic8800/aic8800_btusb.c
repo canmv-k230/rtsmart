@@ -618,6 +618,15 @@ static int aic_btusb_connect(struct usbh_hubport *hport, rt_uint8_t intf)
     rt_err_t result;
     rt_uint8_t index;
 
+    setting = &hport->config.intf[intf].altsetting[0];
+    if (setting->intf_desc.bInterfaceNumber != 0)
+    {
+        /* Interface 1 carries the optional Bluetooth SCO endpoints.  The HCI
+         * transport does not consume it, but it has the same class tuple as
+         * interface 0 and therefore reaches this callback. */
+        return 0;
+    }
+
     /* The HCI device is registered by aic8800_usb_component_init() before
      * USB host enumeration starts.  Do not register it from this callback: CherryUSB
      * invokes class connect from the hub thread and the device registration
@@ -650,18 +659,9 @@ static int aic_btusb_connect(struct usbh_hubport *hport, rt_uint8_t intf)
     context->hport = hport;
     context->interface_slot = intf;
     context->interface_number =
-        hport->config.intf[intf].altsetting[0].intf_desc.bInterfaceNumber;
+        setting->intf_desc.bInterfaceNumber;
     context->vendor_id = hport->device_desc.idVendor;
     context->product_id = hport->device_desc.idProduct;
-    setting = &hport->config.intf[intf].altsetting[0];
-    if (context->interface_number != 0)
-    {
-        LOG_E("%04x:%04x HCI interface number %u is unsupported",
-              context->vendor_id, context->product_id,
-              context->interface_number);
-        result = -RT_EIO;
-        goto fail;
-    }
     for (index = 0; index < setting->intf_desc.bNumEndpoints; index++)
     {
         struct usb_endpoint_descriptor *endpoint =

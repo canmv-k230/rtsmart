@@ -3,10 +3,15 @@
 from building import *
 
 cwd     = GetCurrentDir()
-src     = Glob('*.c') + Glob('*.S')
+src     = []
 CPPPATH = [cwd]
 
-group = DefineGroup('ADC', src, depend = ['RT_USING_ADC'], CPPPATH = CPPPATH)
+if GetDepend(['RT_USING_K230_ADC']):
+    src = ['drv_adc.c']
+elif GetDepend(['RT_USING_ADC']):
+    src = ['drv_adc_dummy.c']
+
+group = DefineGroup('ADC', src, depend = [''], CPPPATH = CPPPATH)
 
 objs = [group]
 
