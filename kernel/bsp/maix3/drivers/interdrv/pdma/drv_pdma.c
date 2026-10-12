@@ -57,6 +57,8 @@
 #define PDMA_SELFTEST_UART3_TX_ADDR (UART3_BASE_ADDR + 0x30U)
 #define PDMA_UART_LOOPBACK_SIZE RT_CPU_CACHE_LINE_SZ
 #define PDMA_SELFTEST_REARM_SIZE 32U
+#define PDMA_SELFTEST_CALLBACK_TRANSFERS \
+    (PDMA_COMPLETION_QUEUE_DEPTH + 2U)
 #define PDMA_SELFTEST_TIMEOUT_MS 1000
 #define PDMA_UART_FCR_OFFSET 0x08U
 #define PDMA_UART_FCR_FIFO_RESET 0x07U
@@ -100,6 +102,7 @@ typedef struct pdma_llt {
 typedef struct {
     rt_uint32_t generation;
     rt_uint32_t status;
+    rt_bool_t callback_delivered;
 } pdma_completion_t;
 
 typedef struct {
@@ -168,7 +171,8 @@ static rt_bool_t pdma_completion_peek(int chan, rt_uint32_t* generation,
 }
 
 static rt_bool_t pdma_completion_push(int chan, rt_uint32_t generation,
-                                      rt_uint32_t status)
+                                      rt_uint32_t status,
+                                      rt_bool_t callback_delivered)
 {
     rt_uint32_t tail;
 
@@ -181,6 +185,8 @@ static rt_bool_t pdma_completion_push(int chan, rt_uint32_t generation,
            PDMA_COMPLETION_QUEUE_DEPTH;
     pdma_dev.chan[chan].completions[tail].generation = generation;
     pdma_dev.chan[chan].completions[tail].status = status;
+    pdma_dev.chan[chan].completions[tail].callback_delivered =
+        callback_delivered;
     pdma_dev.chan[chan].completion_count++;
     return RT_TRUE;
 }
@@ -194,6 +200,23 @@ static rt_bool_t pdma_completion_pop(int chan, rt_uint32_t generation)
 
     head = pdma_dev.chan[chan].completion_head;
     if (pdma_dev.chan[chan].completions[head].generation != generation)
+        return RT_FALSE;
+
+    pdma_dev.chan[chan].completion_head =
+        (head + 1U) % PDMA_COMPLETION_QUEUE_DEPTH;
+    pdma_dev.chan[chan].completion_count--;
+    return RT_TRUE;
+}
+
+static rt_bool_t pdma_completion_drop_oldest_callback(int chan)
+{
+    rt_uint32_t head;
+
+    if (pdma_dev.chan[chan].completion_count == 0)
+        return RT_FALSE;
+
+    head = pdma_dev.chan[chan].completion_head;
+    if (!pdma_dev.chan[chan].completions[head].callback_delivered)
         return RT_FALSE;
 
     pdma_dev.chan[chan].completion_head =
@@ -375,7 +398,8 @@ int rt_dma_chan_start(int chan)
         return -RT_EINVAL;
     }
     if (pdma_dev.chan[chan].completion_count >=
-        PDMA_COMPLETION_QUEUE_DEPTH) {
+            PDMA_COMPLETION_QUEUE_DEPTH &&
+        !pdma_completion_drop_oldest_callback(chan)) {
         pdma_spin_unlock(level);
         return -RT_EBUSY;
     }
@@ -644,15 +668,16 @@ static void pdma_irq(int irq, void* param)
             if (terminal) {
                 /* Completion callbacks may immediately configure the next transfer. */
                 pdma_dev.chan[ch].running = RT_FALSE;
+                callback = pdma_dev.chan[ch].callback;
+                callback_param = pdma_dev.chan[ch].param;
                 if (!pdma_completion_push(ch,
-                        pdma_dev.chan[ch].generation, stat))
+                        pdma_dev.chan[ch].generation, stat,
+                        callback != RT_NULL))
                     RT_ASSERT(0);
                 if (pdma_dev.chan[ch].waiter_active &&
                     pdma_dev.chan[ch].waiter_generation ==
                         pdma_dev.chan[ch].generation)
                     pdma_dev.chan[ch].waiter_status = stat;
-                callback = pdma_dev.chan[ch].callback;
-                callback_param = pdma_dev.chan[ch].param;
                 if (callback)
                     pdma_dev.chan[ch].callback_count++;
             }
@@ -842,6 +867,21 @@ static void pdma_test_callback(void* param)
     rt_sem_release((rt_sem_t)param);
 }
 
+static int pdma_test_wait_idle(int chan)
+{
+    for (int waited = 0; waited < PDMA_SELFTEST_TIMEOUT_MS; waited++) {
+        rt_base_t level = pdma_spin_lock();
+        rt_bool_t running = pdma_dev.chan[chan].running;
+
+        pdma_spin_unlock(level);
+        if (!running)
+            return 0;
+        rt_thread_mdelay(1);
+    }
+
+    return -RT_ETIMEOUT;
+}
+
 static int pdma_test_uart2_callback_rearm(void)
 {
     pdma_transfer_cfg_t cfg = {0};
@@ -892,7 +932,122 @@ static int pdma_test_uart2_callback_rearm(void)
     cfg.ch_cfg.ch_dev_tout = 0xfff;
 
     ret = rt_dma_chan_callback(chan, pdma_test_callback, &done);
-    for (int transfer = 0; ret == 0 && transfer < 2; transfer++) {
+    for (rt_uint32_t transfer = 0;
+         ret == 0 && transfer < PDMA_SELFTEST_CALLBACK_TRANSFERS;
+         transfer++) {
+        ret = rt_dma_chan_config(chan, &cfg);
+        if (ret == 0)
+            ret = rt_dma_chan_start(chan);
+        if (ret == 0 && rt_sem_take(&done,
+                rt_tick_from_millisecond(PDMA_SELFTEST_TIMEOUT_MS)) != RT_EOK)
+            ret = -RT_ETIMEOUT;
+    }
+
+    if (ret != 0)
+        (void)rt_dma_chan_stop(chan);
+    if (rt_dma_chan_release(chan) != 0 && ret == 0)
+        ret = -RT_ERROR;
+
+out_sem:
+    if (sem_initialized)
+        rt_sem_detach(&done);
+out_free:
+    rt_free(data);
+out_close:
+    if (rt_device_close(uart) != RT_EOK && ret == 0)
+        ret = -RT_ERROR;
+
+    return ret;
+}
+
+static int pdma_test_callback_preserves_pending_completion(void)
+{
+    pdma_transfer_cfg_t cfg = {0};
+    struct rt_semaphore done;
+    rt_device_t uart;
+    rt_uint8_t* data;
+    rt_bool_t sem_initialized = RT_FALSE;
+    int chan = -1;
+    int ret;
+
+    uart = rt_device_find("uart2");
+    if (uart == RT_NULL)
+        return -RT_ENOSYS;
+
+    ret = rt_device_open(uart, RT_DEVICE_FLAG_RDWR);
+    if (ret != RT_EOK)
+        return ret;
+
+    data = rt_malloc(PDMA_SELFTEST_REARM_SIZE);
+    if (data == RT_NULL) {
+        ret = -RT_ENOMEM;
+        goto out_close;
+    }
+    for (rt_size_t i = 0; i < PDMA_SELFTEST_REARM_SIZE; i++)
+        data[i] = (rt_uint8_t)('A' + (i % 26));
+    rt_hw_cpu_dcache_clean(data, PDMA_SELFTEST_REARM_SIZE);
+
+    ret = rt_sem_init(&done, "pdmapend", 0, RT_IPC_FLAG_PRIO);
+    if (ret != RT_EOK)
+        goto out_free;
+    sem_initialized = RT_TRUE;
+
+    chan = rt_dma_chan_request("pdma_pending");
+    if (chan < 0) {
+        ret = chan;
+        goto out_sem;
+    }
+
+    cfg.device = UART2_TX;
+    cfg.src_addr = data;
+    cfg.dst_addr = (void*)PDMA_SELFTEST_UART2_TX_ADDR;
+    cfg.length = PDMA_SELFTEST_REARM_SIZE;
+    cfg.ch_cfg.ch_src_type = TX;
+    cfg.ch_cfg.ch_dev_hsize = PSBYTE1;
+    cfg.ch_cfg.ch_dat_endian = PDEFAULT;
+    cfg.ch_cfg.ch_dev_blen = PBURST_LEN_1;
+    cfg.ch_cfg.ch_priority = 7;
+    cfg.ch_cfg.ch_dev_tout = 0xfff;
+
+    ret = rt_dma_chan_config(chan, &cfg);
+    if (ret == 0)
+        ret = rt_dma_chan_start(chan);
+    if (ret == 0)
+        ret = pdma_test_wait_idle(chan);
+    if (ret == 0)
+        ret = rt_dma_chan_callback(chan, pdma_test_callback, &done);
+
+    for (rt_uint32_t transfer = 0;
+         ret == 0 && transfer < PDMA_COMPLETION_QUEUE_DEPTH - 1U;
+         transfer++) {
+        ret = rt_dma_chan_config(chan, &cfg);
+        if (ret == 0)
+            ret = rt_dma_chan_start(chan);
+        if (ret == 0 && rt_sem_take(&done,
+                rt_tick_from_millisecond(PDMA_SELFTEST_TIMEOUT_MS)) != RT_EOK)
+            ret = -RT_ETIMEOUT;
+    }
+
+    if (ret == 0)
+        ret = rt_dma_chan_config(chan, &cfg);
+    if (ret == 0) {
+        int start_ret = rt_dma_chan_start(chan);
+
+        if (start_ret == 0) {
+            (void)rt_sem_take(&done,
+                rt_tick_from_millisecond(PDMA_SELFTEST_TIMEOUT_MS));
+            ret = -RT_ERROR;
+        } else if (start_ret != -RT_EBUSY) {
+            ret = start_ret;
+        }
+    }
+
+    if (ret == 0)
+        ret = rt_dma_chan_done(chan,
+            rt_tick_from_millisecond(PDMA_SELFTEST_TIMEOUT_MS));
+
+    for (rt_uint32_t transfer = 0; ret == 0 && transfer < 2U;
+         transfer++) {
         ret = rt_dma_chan_config(chan, &cfg);
         if (ret == 0)
             ret = rt_dma_chan_start(chan);
@@ -1217,6 +1372,8 @@ static int pdma_selftest(void)
         "PDMA timeout quiesces and recovers", &passed, &failed);
     pdma_test_expect(pdma_test_uart2_callback_rearm() == 0,
         "PDMA callback transfer rearms", &passed, &failed);
+    pdma_test_expect(pdma_test_callback_preserves_pending_completion() == 0,
+        "PDMA callback mode preserves pending completion", &passed, &failed);
     pdma_test_expect(pdma_test_done_callback_rearm() == 0,
         "PDMA completion survives callback rearm", &passed, &failed);
 
