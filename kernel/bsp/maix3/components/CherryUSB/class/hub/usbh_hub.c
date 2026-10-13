@@ -16,6 +16,7 @@
 #define HUB_DEBOUNCE_STEP      25
 #define HUB_DEBOUNCE_STABLE    100
 #define DELAY_TIME_AFTER_RESET 200
+#define HUB_PORT_RESET_RETRIES 5
 #define DELAY_TIME_BEFORE_ENUMERATE 20
 #define DELAY_TIME_ENUM_NOTCONN_BACKOFF 100
 
@@ -621,14 +622,14 @@ static void usbh_hub_events(struct usbh_hub *hub)
         /* First, clear all change bits */
         mask = 1;
         feat = HUB_PORT_FEATURE_C_CONNECTION;
-        while (portchange) {
+        while (portchange && mask) {
             if (portchange & mask) {
                 ret = usbh_hub_clear_feature(hub, port + 1, feat);
                 if (ret < 0) {
                     USB_LOG_ERR("Failed to clear port %u, change mask:%04x, errorcode:%d\r\n", port + 1, mask, ret);
-                    continue;
+                } else {
+                    portchange &= (~mask);
                 }
-                portchange &= (~mask);
             }
             mask <<= 1;
             feat++;
@@ -679,27 +680,42 @@ static void usbh_hub_events(struct usbh_hub *hub)
 
             /* Last, check connect status */
             if (portstatus & HUB_PORT_STATUS_CONNECTION) {
-                ret = usbh_hub_set_feature(hub, port + 1, HUB_PORT_FEATURE_RESET);
+                for (uint8_t reset_retry = 0; reset_retry < HUB_PORT_RESET_RETRIES; reset_retry++) {
+                    ret = usbh_hub_set_feature(hub, port + 1, HUB_PORT_FEATURE_RESET);
+                    if (ret < 0) {
+                        USB_LOG_ERR("Failed to reset port %u, errorcode: %d\r\n", port + 1, ret);
+                        break;
+                    }
+
+                    usb_osal_msleep(DELAY_TIME_AFTER_RESET);
+                    ret = usbh_hub_get_portstatus(hub, port + 1, &port_status);
+                    if (ret < 0) {
+                        USB_LOG_ERR("Failed to read port %u status, errorcode: %d\r\n", port + 1, ret);
+                        break;
+                    }
+
+                    portstatus = port_status.wPortStatus;
+                    portchange = port_status.wPortChange;
+                    if (!(portstatus & HUB_PORT_STATUS_RESET) &&
+                        (portstatus & HUB_PORT_STATUS_ENABLE)) {
+                        break;
+                    }
+                    if (!(portstatus & HUB_PORT_STATUS_CONNECTION)) {
+                        break;
+                    }
+
+                    USB_LOG_DBG("Port %u reset attempt %u did not enable, status:0x%04x, change:0x%04x\r\n",
+                                port + 1, reset_retry + 1, portstatus, portchange);
+                }
                 if (ret < 0) {
-                    USB_LOG_ERR("Failed to reset port %u,errorcode:%d\r\n", port, ret);
                     continue;
                 }
 
-                usb_osal_msleep(DELAY_TIME_AFTER_RESET);
-                /* Read hub port status */
-                ret = usbh_hub_get_portstatus(hub, port + 1, &port_status);
-                if (ret < 0) {
-                    USB_LOG_ERR("Failed to read port %u status, errorcode: %d\r\n", port + 1, ret);
-                    continue;
-                }
-
-                portstatus = port_status.wPortStatus;
-                portchange = port_status.wPortChange;
                 if (!(portstatus & HUB_PORT_STATUS_RESET) && (portstatus & HUB_PORT_STATUS_ENABLE)) {
                     if (portchange & HUB_PORT_STATUS_C_RESET) {
                         ret = usbh_hub_clear_feature(hub, port + 1, HUB_PORT_FEATURE_C_RESET);
                         if (ret < 0) {
-                            USB_LOG_ERR("Failed to clear port %u reset change, errorcode: %d\r\n", port, ret);
+                            USB_LOG_ERR("Failed to clear port %u reset change, errorcode: %d\r\n", port + 1, ret);
                         }
                     }
 
@@ -841,8 +857,19 @@ static void usbh_hub_events(struct usbh_hub *hub)
                     /** release child sources */
                     usbh_hubport_release(child);
 
-                    /** some USB 3.0 ip may failed to enable USB 2.0 port for USB 3.0 device */
-                    USB_LOG_WRN("Failed to enable port %u\r\n", port + 1);
+                    if (portchange & HUB_PORT_STATUS_C_RESET) {
+                        ret = usbh_hub_clear_feature(hub, port + 1, HUB_PORT_FEATURE_C_RESET);
+                        if (ret < 0) {
+                            USB_LOG_ERR("Failed to clear port %u reset change, errorcode: %d\r\n", port + 1, ret);
+                        }
+                    }
+
+                    if (portstatus & HUB_PORT_STATUS_CONNECTION) {
+                        USB_LOG_WRN("Port %u failed to enable after %u reset attempts, status:0x%04x, change:0x%04x\r\n",
+                                    port + 1, HUB_PORT_RESET_RETRIES, portstatus, portchange);
+                    } else {
+                        USB_LOG_DBG("Port %u disconnected during reset\r\n", port + 1);
+                    }
 
                     continue;
                 }
