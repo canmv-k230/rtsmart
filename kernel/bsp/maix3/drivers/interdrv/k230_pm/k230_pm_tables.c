@@ -276,7 +276,11 @@ const struct k230_clk_desc k230_clk_desc[] = {
     CLK(SYSCTL_CLK_USB_TEST_CLK_GATE, K230_CLK_PARENT_NONE, CLK_BOOT_OK),
     CLK(SYSCTL_CLK_DPHY_TEST_CLK, SYSCTL_CLK_PLL0_OCLK, CLK_BOOT_OK),
     CLK(SYSCTL_CLK_NOC_SPI2AXI_ACLK, SYSCTL_CLK_PLL0_OCLK_DIV4, 0),
-    CLK(SYSCTL_CLK_SPI2AXI_ACLK, SYSCTL_CLK_NOC_SPI2AXI_ACLK, CLK_BOOT_OK),
+    /* Must stay pinned: the PMU shutdown-wakeup resume path reads firmware back
+     * from SPI flash through the SPI2AXI bridge. Dropping its boot ref lets the
+     * device power off but never wake (cold boot is fine; warm resume is not).
+     * Not BOOT_PINNED_OK, so k230_pm_release_boot leaves it running. */
+    CLK(SYSCTL_CLK_SPI2AXI_ACLK, SYSCTL_CLK_NOC_SPI2AXI_ACLK, K230_CLK_F_GATEABLE),
 
     /* Topology-only CPU aliases retained for distinct clock-tree branches. */
     CLK(SYSCTL_CLK_NOC_CPU1_CLK, SYSCTL_CLK_CPU1_CORE_CLK_ROOT, 0),
