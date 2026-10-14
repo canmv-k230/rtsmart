@@ -269,7 +269,7 @@ static void auto_exec_trusted_preload(const char *cmd_line)
 {
   char *cmd_copy;
   char *cursor;
-  char *argv[8];
+  char *argv[FINSH_ARG_MAX];
   int argc = 0;
 
   cmd_copy = rt_strdup(cmd_line);
