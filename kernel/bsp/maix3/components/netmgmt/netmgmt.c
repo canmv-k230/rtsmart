@@ -619,7 +619,7 @@ static rt_err_t _net_mgmt_dev_cmd_net_ifconfig(void* mgmt_dev, void* args)
 {
     struct ifconfig {
         enum rt_netif_t net_if; /* 0: sta, 1: ap, 2:... */
-        uint16_t        func; /* 0: get ip info, 1: disable dhcp, set static ip, 2: enable dhcp */
+        uint16_t        func; /* 0: get ip info, 1: disable dhcp, set static ip, 2: enable dhcp, 3: dhcp renew */
         ip_addr_t       ip; /* IP address */
         ip_addr_t       gw; /* gateway */
         ip_addr_t       netmask; /* subnet mask */
@@ -670,6 +670,8 @@ static rt_err_t _net_mgmt_dev_cmd_net_ifconfig(void* mgmt_dev, void* args)
             LOG_E("Set itf %s enable dhcp failed\n", netdev->name);
             return -RT_ERROR;
         }
+    } else if (0x03 == ifconfig.func) { /* dhcp renew: re-DISCOVER */
+        return netdev_dhcp_renew(netdev);
     }
 
     return RT_EOK;

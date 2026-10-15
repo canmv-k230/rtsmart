@@ -181,6 +181,24 @@ static int lwip_netdev_set_dhcp(struct netdev *netif, rt_bool_t is_enabled)
 }
 #endif /* RT_LWIP_DHCP */
 
+/* Force an immediate DHCP re-DISCOVER (lwIP resets tries and discovers now),
+ * instead of waiting out the exponential retransmit back-off. Meant to be
+ * called the moment an upstream data path becomes ready (e.g. 4G modem dial). */
+int netdev_dhcp_renew(struct netdev *netdev)
+{
+#ifdef RT_LWIP_DHCP
+    if (netdev == RT_NULL || netdev->user_data == RT_NULL)
+    {
+        return -RT_ERROR;
+    }
+    dhcp_network_changed((struct netif *)netdev->user_data);
+    return RT_EOK;
+#else
+    (void)netdev;
+    return -RT_ERROR;
+#endif /* RT_LWIP_DHCP */
+}
+
 #ifdef RT_USING_FINSH
 #ifdef RT_LWIP_USING_PING
 extern int lwip_ping_recv(int s, int *ttl);

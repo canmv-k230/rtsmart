@@ -182,6 +182,7 @@ rt_bool_t netdev_can_be_default(const struct netdev *netdev);
 int netdev_set_up(struct netdev *netdev);
 int netdev_set_down(struct netdev *netdev);
 int netdev_dhcp_enabled(struct netdev *netdev, rt_bool_t is_enabled);
+int netdev_dhcp_renew(struct netdev *netdev);
 
 /* Get network interface device status */
 #define netdev_is_up(netdev) (((netdev)->flags & NETDEV_FLAG_UP) ? (uint8_t)1 : (uint8_t)0)
