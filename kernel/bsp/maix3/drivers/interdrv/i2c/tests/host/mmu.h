@@ -1,0 +1,1 @@
+/* The tested driver does not call an MMU interface directly. */

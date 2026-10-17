@@ -39,6 +39,14 @@
 #include <rtdevice.h>
 #include <rtthread.h>
 
+#if defined(CONFIG_BOARD_K230_CANMV_V3P0) && !defined(RT_USING_SMP)
+#include "sysctl_clk.h"
+#include "sysctl_rst.h"
+
+/* Mapped by INIT_BOARD_EXPORT(rt_hw_sysctl_rst_init). */
+extern volatile sysctl_rst_t *sysctl_rst;
+#endif
+
 #define DBG_TAG "i2c"
 #define DBG_LVL DBG_WARNING
 #include <rtdbg.h>
@@ -70,6 +78,27 @@ static struct dw_i2c_master k230_i2c_ctrls[] = {
     { .index = 4, .is_slave = I2C4_MODE },
 #endif
 };
+
+#if defined(CONFIG_BOARD_K230_CANMV_V3P0) && !defined(RT_USING_SMP)
+static void k230_i2c1_boot_reset(struct dw_i2c_master *master)
+{
+    static rt_bool_t attempted;
+
+    if (master->index != 1U || attempted)
+        return;
+    attempted = RT_TRUE;
+
+    if (!sysctl_rst ||
+        !sysctl_clk_get_leaf_en(SYSCTL_CLK_I2C_1_PCLK_GATE) ||
+        !sysctl_clk_get_leaf_en(SYSCTL_CLK_I2C_1_CLK))
+        return;
+
+    /* INIT_DEVICE runs in the scheduled init thread. Reset before the IRQ
+     * handler is installed or the bus is registered; the official API supplies
+     * the one-tick reset pulse. Do not retry it during normal transfers. */
+    (void)sysctl_reset(SYSCTL_RESET_I2C1);
+}
+#endif
 
 static void k230_i2c_init_cleanup(struct dw_i2c_master *master,
                                   rt_bool_t event_initialized)
@@ -126,6 +155,9 @@ int rt_hw_i2c_init(void)
         } else {
             master->bus.ops = &k230_i2c_bus_ops;
 
+#if defined(CONFIG_BOARD_K230_CANMV_V3P0) && !defined(RT_USING_SMP)
+            k230_i2c1_boot_reset(master);
+#endif
             result = k230_i2c_hw_init(master);
             if (result != RT_EOK) {
                 LOG_E("i2c%d: init failed %d",
