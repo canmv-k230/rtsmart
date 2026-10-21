@@ -143,7 +143,12 @@ static int reset(struct drv_touch_dev* dev)
     return 0;
 }
 
+#if defined(CONFIG_BOARD_K230_CANMV_ROCKBASE)
+/* RockBase display is rotated 270 (see CanMV DisplayConfig); match touch. */
+static int get_default_rotate(struct drv_touch_dev* dev) { return RT_TOUCH_ROTATE_DEGREE_90; }
+#else
 static int get_default_rotate(struct drv_touch_dev* dev) { return RT_TOUCH_ROTATE_DEGREE_270; }
+#endif
 
 int drv_touch_probe_ft5x16(struct drv_touch_dev* dev)
 {
