@@ -974,23 +974,30 @@ int k230_pm_dvfs_init(void)
 
     if (!k230_dvfs_domains_initialized) {
         for (i = 0; i < k230_dvfs_domain_desc_count; i++) {
+            const struct k230_dvfs_domain_desc *desc =
+                &k230_dvfs_domain_desc[i];
             struct k230_dvfs_domain *dvfs = &k230_dvfs_domains[i];
 
-            if (k230_dvfs_domain_desc[i].step_count == 0 ||
-                k230_dvfs_domain_desc[i].step_count > K230_DVFS_MAX_PROFILES)
-                return K230_ERR_PM_ILLEGAL_PARAM;
+            rt_mutex_init(&dvfs->mutex, "dvfs", RT_IPC_FLAG_PRIO);
 
-            dvfs->desc = &k230_dvfs_domain_desc[i];
+            /* Leave a bad domain unregistered (desc == NULL) so lookups
+             * report it as missing, but keep the others usable. */
+            if (desc->step_count == 0 ||
+                desc->step_count > K230_DVFS_MAX_PROFILES) {
+                rt_kprintf("k230_pm_dvfs: %s has invalid step count %u (max %u), skipped\n",
+                    desc->name, desc->step_count, K230_DVFS_MAX_PROFILES);
+                continue;
+            }
+
+            dvfs->desc = desc;
             dvfs->actual_profile_idx = 0;
             dvfs->profile_valid = k230_dvfs_read_hw_profile(dvfs,
                 &dvfs->actual_profile_idx);
-            dvfs->manual_profile_idx = dvfs->profile_valid ?
-                dvfs->actual_profile_idx : 0;
+            dvfs->manual_profile_idx = 0;
             dvfs->expect_profile_idx = dvfs->manual_profile_idx;
             dvfs->governor = K230_PM_GOVERNOR_MANUAL;
             dvfs->thermal_protect_temp = K230_DVFS_THERMAL_DEFAULT_TEMP;
             dvfs->thermal_protect_idx = dvfs->desc->step_count - 1;
-            rt_mutex_init(&dvfs->mutex, "dvfs", RT_IPC_FLAG_PRIO);
 
             if (dvfs->desc->regulator_name) {
                 dvfs->regulator = (struct regulator_dev *)
@@ -1003,6 +1010,21 @@ int k230_pm_dvfs_init(void)
 
         k230_dvfs_thermal_shutdown = K230_DVFS_SHUTDOWN_DEFAULT_TEMP;
         k230_dvfs_domains_initialized = true;
+    }
+
+    for (i = 0; i < k230_dvfs_domain_desc_count; i++) {
+        struct k230_dvfs_domain *dvfs = &k230_dvfs_domains[i];
+
+        if (dvfs->desc == RT_NULL)
+            continue;
+
+        /* Best effort: a failed default apply must not take down PM init. */
+        rt_mutex_take(&dvfs->mutex, RT_WAITING_FOREVER);
+        ret = k230_dvfs_set_actual_profile_locked(dvfs);
+        rt_mutex_release(&dvfs->mutex);
+        if (ret != 0)
+            rt_kprintf("k230_pm_dvfs: %s default profile apply failed: %d\n",
+                dvfs->desc->name, ret);
     }
 
     ret = k230_pm_thermal_init();
