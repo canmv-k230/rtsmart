@@ -24,6 +24,8 @@ struct usbh_ec200m {
 
     rt_uint16_t bufsz;
 
+    rt_uint32_t rx_err_cnt; /* consecutive bulk-in errors (reset on data/NAK) */
+
     uint8_t intf;
     uint8_t minor;
 };

@@ -4,6 +4,7 @@
 
 #define EC200M_MAX_TTY_INTF (7)
 #define EC200M_FIFO_SIZE (512)
+#define EC200M_RX_ERR_MAX (32) /* consecutive bulk-in errors before giving up */
 #define ALIGN_SIZE (64)
 #define INTF_DISCONNECT (0xffff)
 
@@ -51,17 +52,28 @@ static void usbh_ec200m_indat_callback(void *arg, int nbytes)
     rt_base_t level;
 
     if (nbytes > 0) {
-
         level = rt_hw_interrupt_disable();
         rt_serial_put_rxfifo(&ec200m->serial, ec200m->bulkin_buffer, nbytes);
         rt_hw_interrupt_enable(level);
         rt_hw_serial_isr(&ec200m->serial, RT_SERIAL_EVENT_RX_DMADONE);
+    }
 
+    if (nbytes >= 0 || nbytes == -USB_ERR_NAK) {
+        ec200m->rx_err_cnt = 0;
         usbh_submit_urb(&ec200m->bulkin_urb);
-    } else if (nbytes == -USB_ERR_NAK) {
+        return;
+    }
+
+    if (nbytes == -USB_ERR_SHUTDOWN || nbytes == -USB_ERR_NOTCONN) {
+        USB_LOG_INFO("%s stop: errorcode = %d\n", __func__, nbytes);
+        return;
+    }
+
+    if (++ec200m->rx_err_cnt <= EC200M_RX_ERR_MAX) {
         usbh_submit_urb(&ec200m->bulkin_urb);
     } else {
-        USB_LOG_INFO("%s, ret = %d\n", __func__, nbytes);
+        USB_LOG_INFO("%s stop: errorcode = %d, err_cnt = %u\n", __func__, nbytes,
+                    (unsigned int)ec200m->rx_err_cnt);
     }
 }
 
@@ -69,6 +81,8 @@ static int usbh_ec200m_bulk_in_transfer(struct usbh_ec200m *ec200m)
 {
     int ret = 0;
     struct usbh_urb *urb = &ec200m->bulkin_urb;
+
+    ec200m->rx_err_cnt = 0; /* fresh (re)start, e.g. reopen after a stop */
 
     usbh_bulk_urb_fill(urb, ec200m->hport, ec200m->bulkin, ec200m->bulkin_buffer,
                        USB_GET_MAXPACKETSIZE(ec200m->bulkin->wMaxPacketSize),
