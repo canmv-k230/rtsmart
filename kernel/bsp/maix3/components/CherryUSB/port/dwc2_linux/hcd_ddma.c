@@ -270,13 +270,14 @@ static void dwc2_init_non_isoc_dma_desc(struct dwc2_hsotg *hsotg,
         if (qh->ep_type == USB_ENDPOINT_XFER_CONTROL)
             break;
         /* CherryUSB marks independently submitted URBs for immediate
-         * giveback. Do not merge OUT URBs into one descriptor-DMA
-         * transaction: bulk clients rely on the short packet or ZLP at the
-         * end of each request to preserve device protocol record boundaries.
-         * IN URBs can be chained safely and need that batching to avoid one
-         * host-channel interrupt per received network frame.
+         * giveback. Keep each of them as its own descriptor-DMA transaction.
+         * A short packet retires only the descriptor it lands in. With IOC
+         * solely on the last descriptor of a chained list, an earlier IN
+         * frame stays invisible until a later URB fills and the whole chain
+         * interrupts together. One host-channel interrupt per received frame
+         * is the cost of reporting that frame on time.
          */
-        if (!chan->ep_is_in && (qtd->urb->flags & URB_GIVEBACK_ASAP))
+        if (qtd->urb->flags & URB_GIVEBACK_ASAP)
             break;
         if (n_desc == MAX_DMA_DESC_NUM_GENERIC)
             break;
