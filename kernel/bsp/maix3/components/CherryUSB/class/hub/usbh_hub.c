@@ -800,8 +800,13 @@ static void usbh_hub_events(struct usbh_hub *hub)
                             usb_osal_msleep(DELAY_TIME_ENUM_NOTCONN_BACKOFF);
                         }
 
-                        USB_LOG_WRN("Port %u enumerate attempt %u failed (%d), re-resetting\r\n",
-                                    child->port, enum_retry + 1, ret);
+                        USB_LOG_WRN("Port %u enumerate attempt %u failed (%d)%s\r\n",
+                                    child->port, enum_retry + 1, ret,
+                                    enum_retry < 2 ? ", re-resetting" : "");
+                        /* Keep the last enumeration error for final cleanup.
+                         * A successful reset is not a successful enumeration. */
+                        if (enum_retry == 2)
+                            break;
                         usbh_hubport_release(child);
 
                         /* Re-reset the port so the PHY re-initialises */
@@ -815,8 +820,15 @@ static void usbh_hub_events(struct usbh_hub *hub)
                         if (ret < 0)
                             break;
                         portstatus = port_status.wPortStatus;
-                        if (!(portstatus & HUB_PORT_STATUS_ENABLE))
+                        if (!(portstatus & HUB_PORT_STATUS_CONNECTION)) {
+                            ret = -USB_ERR_NOTCONN;
                             break;
+                        }
+                        if ((portstatus & HUB_PORT_STATUS_RESET) ||
+                            !(portstatus & HUB_PORT_STATUS_ENABLE)) {
+                            ret = -USB_ERR_IO;
+                            break;
+                        }
 
                         usbh_hubport_reset(child);
                         child->parent = hub;
@@ -836,8 +848,10 @@ static void usbh_hub_events(struct usbh_hub *hub)
                         if (hub->parent) {
                             if (speed != USB_SPEED_HIGH &&
                                 hub->parent->speed == USB_SPEED_HIGH) {
-                                if (!hub->tt.hub)
+                                if (!hub->tt.hub) {
+                                    ret = -USB_ERR_INVAL;
                                     break;
+                                }
                                 child->tt = &hub->tt;
                                 child->ttport = port + 1;
                             }

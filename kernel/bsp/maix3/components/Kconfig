@@ -297,6 +297,23 @@ menu "Components Configuration"
 
                 if ENABLE_CHERRY_USB_HOST
 
+                    config CHERRY_USB_K230_HOST_COMPDISTUNE
+                        int "K230 host PHY disconnect threshold override"
+                        depends on !ENABLE_CHERRY_USB_OTG
+                        range -1 7
+                        default 4
+                        help
+                            Override only COMPDISTUNE in the selected host PHY's CTL0.
+                            -1 preserves the bootloader setting; 3 is the PHY design
+                            default. All boards default to 4 (+3%).
+                            Codes 0..7 adjust the disconnect threshold by
+                            -9%, -6%, -4%, 0%, +3%, +7%, +10%, +12% respectively.
+                            This does not limit USB speed or change the device port.
+                            COMPDISTUNE is for host disconnect detection; USB device
+                            bus reset events do not use this threshold.
+                            A passing reboot test alone does not qualify a setting:
+                            verify signal levels and real unplug detection as well.
+
                     choice CHERRY_USB_HOST_CONTROLLER_DRV
                         bool "CherryUSB Host Controller Driver"
                         default CHERRY_USB_HC_DRV_DWC2
@@ -307,6 +324,13 @@ menu "Components Configuration"
                                 config DWC2_DRV_DMA_DESC_ENABLE
                                     bool "Enable descriptor DMA mode"
                                     default n
+
+                                config CHERRY_USB_DWC2_TIMEOUT_DEBUG
+                                    bool "Enable DWC2 timeout register dumps"
+                                    default n
+                                    help
+                                        Dump controller and channel registers before cancelling
+                                        a timed-out transfer. Ordinary error logs remain enabled.
                             endif
 
                         config CHERRY_USB_HC_DRV_ORG
@@ -374,13 +398,49 @@ menu "Components Configuration"
                                 endif
 
                             menuconfig CHERRY_USB_HOST_ENABLE_CLASS_NET_RTL8152
-                                bool "Enable net RTL8152"
+                                bool "Enable RTL8152 / SR9900 USB Ethernet"
                                 default n
 
                                 if CHERRY_USB_HOST_ENABLE_CLASS_NET_RTL8152
                                     config CHERRY_USB_RTL8152_LINKCHECK
-                                        bool "Enable Link Down Check"
+                                        bool "Monitor RTL8152 / SR9900 carrier"
                                         default n
+                                        help
+                                            Poll carrier every 500 ms in the receive thread.
+                                            After five consecutive link-down samples, stop
+                                            transfers and disable the MAC. Restart MAC/RX
+                                            before notifying the network stack of link-up.
+
+                                    config CHERRY_USB_RTL8152_EEE
+                                        bool "Enable RTL8152 Energy Efficient Ethernet"
+                                        default y
+                                        help
+                                            Enable EEE on supported RTL8152/SR9900 devices.
+                                            Disabling clears MAC/PHY EEE, its advertisement,
+                                            and the separate 10 Mbps EEE+ mode. Normal speed
+                                            autonegotiation and ALDPS policy are unchanged.
+                                            Defaults on to preserve the driver's PHY setup.
+                                            Disable only for a controlled comparison when
+                                            investigating link negotiation.
+
+                                    config CHERRY_USB_RTL8152_STATS
+                                        bool "Enable RTL8152 statistics shell command"
+                                        depends on RT_USING_MSH
+                                        default n
+                                        help
+                                            Collect software counters and export rtl8152_stats
+                                            (and rtl8152_stats reset) for RTL8152/SR9900 debugging.
+                                            The command reads cached state, not PHY registers.
+
+                                    config CHERRY_USB_RTL8152_DEBUG
+                                        bool "Enable RTL8152 startup and PHY diagnostics"
+                                        default n
+                                        help
+                                            Log startup timing and read PHY registers every ten
+                                            seconds while waiting for initial carrier. Read back
+                                            EEE configuration before and after PHY reset. These
+                                            extra USB transfers and logs can affect timing.
+                                            Enable statistics too for first-TX logs and counters.
                                 endif
 
                             choice

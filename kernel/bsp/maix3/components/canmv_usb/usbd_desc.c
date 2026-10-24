@@ -107,11 +107,13 @@ static void prepare_usb_descriptor(void)
 
 void board_usb_device_event_handler(uint8_t busid, uint8_t event)
 {
-    (void)busid;
-
     switch (event) {
         case USBD_EVENT_RESET:
-            rt_kprintf("usb disconnect\n");
+            /* A host-issued bus reset also occurs during normal enumeration. */
+            g_usb_device_connected = false;
+            break;
+        case USBD_EVENT_DISCONNECTED:
+            rt_kprintf("usb device bus=%u disconnected\n", (unsigned)busid);
             /* fall through */
         case USBD_EVENT_DEINIT:
             g_usb_device_connected = false;

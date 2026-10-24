@@ -9,14 +9,13 @@
 #undef USB_DBG_TAG
 #define USB_DBG_TAG "rtl8152"
 #include "usb_log.h"
-#ifdef CHERRY_USB_RTL8152_LINKCHECK
-#include "ipc/workqueue.h"
-#endif
 
 #define DEV_FORMAT "/dev/rtl8152"
 
 #define CONFIG_USBHOST_RTL8152_ETH_MAX_RX_SEGSZE (16 * 1024)
 #define CONFIG_USBHOST_RTL8152_ETH_MAX_SEGSZE    (2048)
+#define VENDOR_ID_REALTEK                        0x0bda
+#define PRODUCT_ID_RTL8152                       0x8152
 #define VENDOR_ID_SR9900                         0x0fe6
 #define PRODUCT_ID_SR9900                        0x9900
 
@@ -47,10 +46,19 @@ struct rtl8152_rx_context {
 static struct rtl8152_tx_context g_rtl8152_tx_context[RTL8152_MAX_TX];
 static struct rtl8152_rx_context g_rtl8152_rx_context[RTL8152_MAX_RX];
 
+#ifdef CHERRY_USB_RTL8152_STATS
 struct rtl8152_stats {
     uint32_t tx_submitted;
     uint32_t tx_completed;
     uint32_t tx_errors;
+    uint32_t tx_submit_errors;
+    uint32_t tx_not_ready;
+    int tx_last_submit_error;
+    uint32_t phy_link_reads;
+    uint32_t phy_link_errors;
+    uint32_t phy_last_status;
+    uint32_t phy_last_tick;
+    uint32_t link_wait_ticks;
     uint32_t rx_submitted;
     uint32_t rx_completed;
     uint32_t rx_bytes;
@@ -66,6 +74,10 @@ struct rtl8152_stats {
 };
 
 static struct rtl8152_stats g_rtl8152_stats;
+#define RTL8152_STAT(statement) ((void)(statement))
+#else
+#define RTL8152_STAT(statement) ((void)0)
+#endif
 
 static bool usbh_rtl8152_is_sr9900(struct usbh_rtl8152 *rtl8152_class)
 {
@@ -91,36 +103,46 @@ static bool usbh_rtl8152_can_xmit(struct usbh_rtl8152 *rtl8152_class)
 }
 
 static void usbh_rtl8152_prepare_recovery(struct usbh_rtl8152 *rtl8152_class,
-                                          bool cancel_work,
                                           bool device_alive);
 
 static void usbh_rtl8152_kill_tx_urbs(struct usbh_rtl8152 *rtl8152_class);
 static void usbh_rtl8152_kill_rx_urbs(struct usbh_rtl8152 *rtl8152_class);
 
-static void usbh_rtl8152_tx_complete(void *arg, int nbytes)
+static void usbh_rtl8152_release_tx(struct rtl8152_tx_context *context)
 {
-    struct rtl8152_tx_context *context = arg;
+    bool busy;
     size_t flags;
 
     flags = usb_osal_enter_critical_section();
+    busy = context->busy;
     context->busy = false;
     usb_osal_leave_critical_section(flags);
 
+    if (busy)
+        usb_osal_sem_give(g_rtl8152_tx_available);
+}
+
+static void usbh_rtl8152_tx_complete(void *arg, int nbytes)
+{
+    struct rtl8152_tx_context *context = arg;
+
     if (nbytes < 0) {
-        g_rtl8152_stats.tx_errors++;
+        RTL8152_STAT(g_rtl8152_stats.tx_errors++);
         if (usbh_rtl8152_is_active(&g_rtl8152_class)) {
             g_rtl8152_class.connect_status = false;
+            usb_osal_mq_send(g_rtl8152_rx_queue, 0);
         }
     } else {
-        g_rtl8152_stats.tx_completed++;
+        RTL8152_STAT(g_rtl8152_stats.tx_completed++);
     }
-    usb_osal_sem_give(g_rtl8152_tx_available);
+    usbh_rtl8152_release_tx(context);
 }
 
 static void usbh_rtl8152_rx_complete(void *arg, int nbytes)
 {
     struct rtl8152_rx_context *context = arg;
 
+#ifdef CHERRY_USB_RTL8152_STATS
     g_rtl8152_stats.rx_completed++;
     g_rtl8152_stats.rx_context_completed[context->index]++;
     if (nbytes < 0) {
@@ -130,11 +152,12 @@ static void usbh_rtl8152_rx_complete(void *arg, int nbytes)
     } else {
         g_rtl8152_stats.rx_bytes += (uint32_t)nbytes;
     }
+#endif
     context->status = nbytes;
     context->length = nbytes > 0 ? (uint32_t)nbytes : 0;
     context->submitted = false;
     if (usb_osal_mq_send(g_rtl8152_rx_queue, (uintptr_t)context) < 0) {
-        g_rtl8152_stats.rx_queue_drops++;
+        RTL8152_STAT(g_rtl8152_stats.rx_queue_drops++);
         USB_LOG_ERR("RTL8152 RX completion queue full\r\n");
     }
 }
@@ -148,12 +171,13 @@ static int usbh_rtl8152_submit_rx(struct usbh_rtl8152 *rtl8152_class,
 
     usb_osal_mutex_take(g_rtl8152_rx_mutex);
     if (!usbh_rtl8152_is_active(rtl8152_class) ||
-        !rtl8152_class->connect_status || !rtl8152_class->hport ||
-        !rtl8152_class->bulkin) {
+        !rtl8152_class->hport || !rtl8152_class->bulkin) {
         usb_osal_mutex_give(g_rtl8152_rx_mutex);
         return -USB_ERR_NOTCONN;
     }
 
+    /* RX is prepared before carrier is published to DHCP/TX. The RX
+     * owner controls this lifecycle; connect_status only gates transmit. */
     context->submitted = true;
     usbh_bulk_urb_fill(urb,
                        rtl8152_class->hport,
@@ -168,7 +192,7 @@ static int usbh_rtl8152_submit_rx(struct usbh_rtl8152 *rtl8152_class,
     if (ret < 0) {
         context->submitted = false;
     } else {
-        g_rtl8152_stats.rx_submitted++;
+        RTL8152_STAT(g_rtl8152_stats.rx_submitted++);
     }
     usb_osal_mutex_give(g_rtl8152_rx_mutex);
     return ret;
@@ -181,6 +205,11 @@ static void usbh_rtl8152_kill_tx_urbs(struct usbh_rtl8152 *rtl8152_class)
     for (i = 0; i < RTL8152_MAX_TX; i++) {
         if (g_rtl8152_tx_context[i].busy) {
             usbh_kill_urb(&rtl8152_class->bulkout_urb[i]);
+            /* Both controllers cancel synchronously, but the original DWC2
+             * driver does not call complete on cancellation. Return its TX
+             * credit here; the Linux DWC2 callback already returned its own.
+             * The caller holds the TX mutex, preventing reuse during cancel. */
+            usbh_rtl8152_release_tx(&g_rtl8152_tx_context[i]);
         }
     }
 }
@@ -1039,6 +1068,12 @@ enum rtl_version {
 #define MII_TPISTATUS   0x1b /* TPI status for 10mbps       */
 #define MII_NCONFIG     0x1c /* Network interface config    */
 
+/* Clause 45 auto-negotiation registers accessed through the OCP MMD window. */
+#define MDIO_MMD_AN       7
+#define MDIO_AN_EEE_ADV   0x003c
+#define MDIO_AN_EEE_LPABLE 0x003d
+#define MDIO_EEE_100TX    0x0002
+
 /* Basic mode control register. */
 #define BMCR_RESV      0x003f /* Unused...                   */
 #define BMCR_SPEED1000 0x0040 /* MSB of Speed (1000)         */
@@ -1553,14 +1588,235 @@ static uint32_t __rtl_get_wol(struct usbh_rtl8152 *tp)
     return wolopts;
 }
 
+#ifdef CHERRY_USB_RTL8152_DEBUG
+/* SR9900.sys uses PHYAR rather than the RTL OCP PHY window. Compare the
+ * independent access paths without writing PHY configuration or selecting
+ * a page. Only the startup/RX control owner may issue these requests. */
+static int sr9900_phyar_read(struct usbh_rtl8152 *tp, uint8_t reg,
+                             uint16_t *value)
+{
+    uint32_t data = (reg & 0x1f) << 16;
+    int ret;
+
+    /* Match the vendor's dword read-command write: request 05, index 010f. */
+    ret = usbh_rtl8152_write_regs(tp, PLA_PHYAR, MCU_TYPE_PLA | 0x0f,
+                                 sizeof(data), &data);
+    if (ret < 0)
+        return ret;
+    for (unsigned int i = 0; i < 20; i++) {
+        usb_osal_msleep(1);
+        ret = usbh_rtl8152_read_regs(tp, PLA_PHYAR, MCU_TYPE_PLA,
+                                    sizeof(data), &data);
+        if (ret < 0)
+            return ret;
+        if (data & PHYAR_FLAG) {
+            *value = data & 0xffff;
+            return 0;
+        }
+    }
+    /* An unsupported/busy diagnostic interface must not change PHY policy. */
+    return -USB_ERR_TIMEOUT;
+}
+
+static void sr9900_log_phy_access(struct usbh_rtl8152 *tp, const char *stage)
+{
+    uint16_t page, bmcr, bmsr, aldps, id1, id2;
+    uint16_t ocp_bmcr, ocp_bmsr, ocp_aldps;
+    int ret;
+
+    if (!usbh_rtl8152_is_sr9900(tp) || tp->io_error < 0)
+        return;
+    ret = sr9900_phyar_read(tp, 0x1f, &page);
+    if (ret < 0)
+        goto failed;
+    if (page != 0) {
+        rt_kprintf("[I/rtl8152] PHY access %s page=%04x (comparison skipped)\n",
+                   stage, page);
+        return;
+    }
+    /* Read BMSR twice on each interface to clear latched status and compare
+     * the current state. The first value is deliberately discarded. */
+    ocp_bmcr = r8152_mdio_read(tp, MII_BMCR);
+    r8152_mdio_read(tp, MII_BMSR);
+    ocp_bmsr = r8152_mdio_read(tp, MII_BMSR);
+    ocp_aldps = ocp_reg_read(tp, OCP_ALDPS_CONFIG);
+    if (tp->io_error < 0) {
+        ret = tp->io_error;
+        goto failed;
+    }
+    if ((ret = sr9900_phyar_read(tp, MII_BMCR, &bmcr)) < 0 ||
+        (ret = sr9900_phyar_read(tp, MII_BMSR, &bmsr)) < 0 ||
+        (ret = sr9900_phyar_read(tp, MII_BMSR, &bmsr)) < 0 ||
+        (ret = sr9900_phyar_read(tp, 0x18, &aldps)) < 0 ||
+        (ret = sr9900_phyar_read(tp, MII_PHYSID1, &id1)) < 0 ||
+        (ret = sr9900_phyar_read(tp, MII_PHYSID2, &id2)) < 0)
+        goto failed;
+    rt_kprintf("[I/rtl8152] PHY access %s page=%04x ocp=%04x/%04x/%04x phyar=%04x/%04x/%04x id=%04x:%04x\n",
+               stage, page, ocp_bmcr, ocp_bmsr, ocp_aldps,
+               bmcr, bmsr, aldps, id1, id2);
+    return;
+failed:
+    rt_kprintf("[I/rtl8152] PHY access %s error=%d\n", stage, ret);
+}
+#endif
+
 static void r8152_aldps_en(struct usbh_rtl8152 *tp, bool enable)
 {
-    if (enable) {
-        ocp_reg_write(tp, OCP_ALDPS_CONFIG, ENPWRSAVE | ENPDNPS | LINKENA | DIS_SDSAVE);
-    } else {
-        ocp_reg_write(tp, OCP_ALDPS_CONFIG, ENPDNPS | LINKENA | DIS_SDSAVE);
+    ocp_reg_write(tp, OCP_ALDPS_CONFIG,
+                  (enable ? ENPWRSAVE : 0) | ENPDNPS | LINKENA | DIS_SDSAVE);
+    if (!enable)
         usb_osal_msleep(20);
+}
+
+static void sr9900_aldps_en(struct usbh_rtl8152 *tp, bool enable)
+{
+    /* Preserve the current SR9900 experiment, including transition delays.
+     * The Windows reference enables ALDPS; this policy still needs DUT
+     * validation and must not change the genuine RTL8152 policy. */
+    ocp_reg_write(tp, OCP_ALDPS_CONFIG, ENPDNPS | LINKENA | DIS_SDSAVE);
+    if (!enable)
+        usb_osal_msleep(20);
+}
+
+static void r8152_mmd_select(struct usbh_rtl8152 *tp, uint16_t dev, uint16_t reg)
+{
+    ocp_reg_write(tp, OCP_EEE_AR, FUN_ADDR | dev);
+    ocp_reg_write(tp, OCP_EEE_DATA, reg);
+    ocp_reg_write(tp, OCP_EEE_AR, FUN_DATA | dev);
+}
+
+static uint16_t r8152_mmd_read(struct usbh_rtl8152 *tp, uint16_t dev, uint16_t reg)
+{
+    uint16_t value;
+
+    r8152_mmd_select(tp, dev, reg);
+    value = ocp_reg_read(tp, OCP_EEE_DATA);
+    ocp_reg_write(tp, OCP_EEE_AR, 0);
+    return value;
+}
+
+static void r8152_mmd_write(struct usbh_rtl8152 *tp, uint16_t dev,
+                            uint16_t reg, uint16_t value)
+{
+    r8152_mmd_select(tp, dev, reg);
+    ocp_reg_write(tp, OCP_EEE_DATA, value);
+    ocp_reg_write(tp, OCP_EEE_AR, 0);
+}
+
+static void rtl_eee_plus_en(struct usbh_rtl8152 *tp, bool enable)
+{
+    uint32_t ocp_data;
+
+    ocp_data = ocp_read_word(tp, MCU_TYPE_PLA, PLA_EEEP_CR);
+    if (enable)
+        ocp_data |= EEEP_CR_EEEP_TX;
+    else
+        ocp_data &= ~EEEP_CR_EEEP_TX;
+    ocp_write_word(tp, MCU_TYPE_PLA, PLA_EEEP_CR, ocp_data);
+}
+
+static void r8152_eee_en(struct usbh_rtl8152 *tp, bool enable)
+{
+    uint16_t value;
+
+    value = ocp_read_word(tp, MCU_TYPE_PLA, PLA_EEE_CR);
+    value &= ~(EEE_RX_EN | EEE_TX_EN);
+    if (enable)
+        value |= EEE_RX_EN | EEE_TX_EN;
+    ocp_write_word(tp, MCU_TYPE_PLA, PLA_EEE_CR, value);
+
+    value = ocp_reg_read(tp, OCP_EEE_CONFIG1);
+    value &= ~sd_rise_time_mask;
+    if (enable) {
+        value |= EEE_10_CAP | EEE_NWAY_EN | TX_QUIET_EN | RX_QUIET_EN | sd_rise_time(1);
+    } else {
+        value &= ~(EEE_10_CAP | EEE_NWAY_EN | TX_QUIET_EN | RX_QUIET_EN);
+        value |= sd_rise_time(7);
     }
+    ocp_reg_write(tp, OCP_EEE_CONFIG1, value);
+
+    value = ocp_reg_read(tp, OCP_EEE_CONFIG2);
+    value &= ~(RG_DACQUIET_EN | RG_LDVQUIET_EN);
+    if (enable)
+        value |= RG_DACQUIET_EN | RG_LDVQUIET_EN;
+    ocp_reg_write(tp, OCP_EEE_CONFIG2, value);
+
+    value = ocp_reg_read(tp, OCP_EEE_CONFIG3);
+    value &= ~fast_snr_mask;
+    value |= enable ? fast_snr(42) : fast_snr(511);
+    ocp_reg_write(tp, OCP_EEE_CONFIG3, value);
+}
+
+static void sr9900_eee_en(struct usbh_rtl8152 *tp, bool enable)
+{
+    uint16_t value = ocp_read_word(tp, MCU_TYPE_PLA, PLA_EEE_CR);
+
+    value &= ~(EEE_RX_EN | EEE_TX_EN);
+    if (enable)
+        value |= EEE_RX_EN | EEE_TX_EN;
+    ocp_write_word(tp, MCU_TYPE_PLA, PLA_EEE_CR, value);
+
+    /* SR9900.sys 2.0.7.0 programs all three PHY words before negotiation:
+     * f31f/7630/1566. Do not inherit reset-dependent fields from the RTL
+     * read/modify/write path. The disabled policy uses the same baseline. */
+    value = RG_TXLPI_MSK_HFDUP | RG_MATCLR_EN | RG_RXLPI_MSK_HFDUP | SDFALLTIME;
+    value |= enable ? (EEE_10_CAP | EEE_NWAY_EN | TX_QUIET_EN | RX_QUIET_EN |
+                       sd_rise_time(1)) : sd_rise_time(7);
+    ocp_reg_write(tp, OCP_EEE_CONFIG1, value);
+
+    value = RG_LPIHYS_NUM | RG_CKRSEL | RG_EEEPRG_EN;
+    if (enable)
+        value |= RG_DACQUIET_EN | RG_LDVQUIET_EN;
+    ocp_reg_write(tp, OCP_EEE_CONFIG2, value);
+    ocp_reg_write(tp, OCP_EEE_CONFIG3,
+                  RG_LFS_SEL | MSK_PH | (enable ? fast_snr(42) : fast_snr(511)));
+}
+
+#ifdef CHERRY_USB_RTL8152_DEBUG
+static void rtl8152_log_eee_config(struct usbh_rtl8152 *tp, const char *stage)
+{
+    uint16_t config1 = ocp_reg_read(tp, OCP_EEE_CONFIG1);
+    uint16_t config2 = ocp_reg_read(tp, OCP_EEE_CONFIG2);
+    uint16_t config3 = ocp_reg_read(tp, OCP_EEE_CONFIG3);
+
+    rt_kprintf("[I/rtl8152] PHY EEE %s config=%04x/%04x/%04x io_error=%d\n",
+               stage, config1, config2, config3, tp->io_error);
+    sr9900_log_phy_access(tp, stage);
+}
+#endif
+
+static void r8152b_hw_phy_cfg(struct usbh_rtl8152 *tp)
+{
+    uint16_t advertise, eee_adv, aldps;
+
+    /* Complete the 10/100 PHY setup before set_speed resets the PHY and
+     * starts negotiation, as in Linux r8152b_hw_phy_cfg(). These revisions
+     * (RTL_VER_01/02/07) do not use a firmware blob in Linux rtl_fw_init(). */
+    tp->chip_ops->set_eee(tp, tp->eee_en);
+    /* EEE+ is separate from standard EEE. Clear any boot-time state before
+     * negotiation too; MAC enable must not restore it when EEE is disabled. */
+    if (!tp->eee_en)
+        rtl_eee_plus_en(tp, false);
+    r8152_mmd_write(tp, MDIO_MMD_AN, MDIO_AN_EEE_ADV,
+                    tp->eee_en ? tp->eee_adv : 0);
+    tp->chip_ops->set_aldps(tp, true);
+
+    advertise = r8152_mdio_read(tp, MII_ADVERTISE);
+    advertise |= ADVERTISE_PAUSE_CAP | ADVERTISE_PAUSE_ASYM;
+    r8152_mdio_write(tp, MII_ADVERTISE, advertise);
+    if (tp->io_error >= 0)
+        tp->phy_reset_pending = true;
+
+    eee_adv = r8152_mmd_read(tp, MDIO_MMD_AN, MDIO_AN_EEE_ADV);
+    advertise = r8152_mdio_read(tp, MII_ADVERTISE);
+    aldps = ocp_reg_read(tp, OCP_ALDPS_CONFIG);
+    if (tp->io_error >= 0) {
+        USB_LOG_INFO("[I/rtl8152] PHY configured version=%u eee=%u eee_adv=%04x advertise=%04x aldps=%04x\n",
+                   (unsigned)tp->version, (unsigned)tp->eee_en, eee_adv, advertise, aldps);
+    }
+#ifdef CHERRY_USB_RTL8152_DEBUG
+    rtl8152_log_eee_config(tp, "configured");
+#endif
 }
 
 static void r8152_power_cut_en(struct usbh_rtl8152 *tp, bool enable)
@@ -1622,21 +1878,9 @@ static inline uint16_t rtl8152_get_speed(struct usbh_rtl8152 *tp)
     return ocp_read_word(tp, MCU_TYPE_PLA, PLA_PHYSTATUS);
 }
 
-static void rtl_eee_plus_en(struct usbh_rtl8152 *tp, bool enable)
-{
-    uint32_t ocp_data;
-
-    ocp_data = ocp_read_word(tp, MCU_TYPE_PLA, PLA_EEEP_CR);
-    if (enable)
-        ocp_data |= EEEP_CR_EEEP_TX;
-    else
-        ocp_data &= ~EEEP_CR_EEEP_TX;
-    ocp_write_word(tp, MCU_TYPE_PLA, PLA_EEEP_CR, ocp_data);
-}
-
 static void rtl_set_eee_plus(struct usbh_rtl8152 *tp)
 {
-    if (rtl8152_get_speed(tp) & _10bps)
+    if (tp->eee_en && (rtl8152_get_speed(tp) & _10bps))
         rtl_eee_plus_en(tp, true);
     else
         rtl_eee_plus_en(tp, false);
@@ -1928,7 +2172,7 @@ static void r8152b_init(struct usbh_rtl8152 *tp)
         r8152_mdio_write(tp, MII_BMCR, data);
     }
 
-    r8152_aldps_en(tp, false);
+    tp->chip_ops->set_aldps(tp, false);
 
     if (tp->version == RTL_VER_01) {
         ocp_data = ocp_read_word(tp, MCU_TYPE_PLA, PLA_LED_FEATURE);
@@ -1995,80 +2239,24 @@ static int rtl8152_enable(struct usbh_rtl8152 *tp)
 
 static void rtl8152_disable(struct usbh_rtl8152 *tp)
 {
-    r8152_aldps_en(tp, false);
+    tp->chip_ops->set_aldps(tp, false);
     rtl_disable(tp);
-    r8152_aldps_en(tp, true);
+    tp->chip_ops->set_aldps(tp, true);
 }
 
 static void rtl8152_up(struct usbh_rtl8152 *tp)
 {
-    r8152_aldps_en(tp, false);
+    tp->chip_ops->set_aldps(tp, false);
     r8152b_exit_oob(tp);
-    r8152_aldps_en(tp, true);
+    tp->chip_ops->set_aldps(tp, true);
 }
 
 static void rtl8152_down(struct usbh_rtl8152 *tp)
 {
     r8152_power_cut_en(tp, false);
-    r8152_aldps_en(tp, false);
+    tp->chip_ops->set_aldps(tp, false);
     r8152b_enter_oob(tp);
-    r8152_aldps_en(tp, true);
-}
-
-static int rtl_ops_init(struct usbh_rtl8152 *tp)
-{
-    struct rtl_ops *ops = &tp->rtl_ops;
-    int ret = 0;
-
-    switch (tp->version) {
-        case RTL_VER_01:
-        case RTL_VER_02:
-        case RTL_VER_07:
-            ops->init = r8152b_init;
-            ops->enable = rtl8152_enable;
-            ops->disable = rtl8152_disable;
-            ops->up = rtl8152_up;
-            ops->down = rtl8152_down;
-            // ops->unload = rtl8152_unload;
-            // ops->eee_get		= r8152_get_eee;
-            // ops->eee_set		= r8152_set_eee;
-            // ops->in_nway = rtl8152_in_nway;
-            // ops->hw_phy_cfg = r8152b_hw_phy_cfg;
-            // ops->autosuspend_en = rtl_runtime_suspend_enable;
-            tp->rx_buf_sz = 16 * 1024;
-            tp->eee_en = true;
-            //tp->eee_adv		= MDIO_EEE_100TX;
-            break;
-
-            // case RTL_VER_03:
-            // case RTL_VER_04:
-            // case RTL_VER_05:
-            // case RTL_VER_06:
-            //     break;
-
-            // case RTL_VER_08:
-            // case RTL_VER_09:
-            //     break;
-
-            // case RTL_VER_11:
-            // case RTL_VER_10:
-            //     break;
-
-            // case RTL_VER_12:
-            // case RTL_VER_13:
-            // case RTL_VER_15:
-            //     break;
-
-            // case RTL_VER_14:
-            //     break;
-
-        default:
-            ret = -USB_ERR_NODEV;
-            USB_LOG_ERR("Unsupport rtl version:%d\r\n", tp->version);
-            break;
-    }
-
-    return ret;
+    tp->chip_ops->set_aldps(tp, true);
 }
 
 static void rtl8152_set_rx_mode(struct usbh_rtl8152 *tp)
@@ -2090,28 +2278,19 @@ static void rtl8152_set_rx_mode(struct usbh_rtl8152 *tp)
 
 static int rtl8152_set_speed(struct usbh_rtl8152 *tp, uint8_t autoneg, uint16_t speed, uint8_t duplex)
 {
-    uint16_t bmcr, anar, gbcr;
+    uint16_t bmcr;
 
-    anar = r8152_mdio_read(tp, MII_ADVERTISE);
-    anar &= ~(ADVERTISE_10HALF | ADVERTISE_10FULL |
-              ADVERTISE_100HALF | ADVERTISE_100FULL);
-    if (tp->supports_gmii) {
-        gbcr = r8152_mdio_read(tp, MII_CTRL1000);
-        gbcr &= ~(ADVERTISE_1000FULL | ADVERTISE_1000HALF);
-    } else {
-        gbcr = 0;
-    }
+    if ((autoneg != AUTONEG_ENABLE && autoneg != AUTONEG_DISABLE) ||
+        (duplex != DUPLEX_HALF && duplex != DUPLEX_FULL))
+        return -USB_ERR_INVAL;
 
     if (autoneg == AUTONEG_DISABLE) {
         if (speed == SPEED_10) {
             bmcr = 0;
-            anar |= ADVERTISE_10HALF | ADVERTISE_10FULL;
         } else if (speed == SPEED_100) {
             bmcr = BMCR_SPEED100;
-            anar |= ADVERTISE_100HALF | ADVERTISE_100FULL;
         } else if (speed == SPEED_1000 && tp->supports_gmii) {
             bmcr = BMCR_SPEED1000;
-            gbcr |= ADVERTISE_1000FULL | ADVERTISE_1000HALF;
         } else {
             return -USB_ERR_INVAL;
         }
@@ -2119,6 +2298,19 @@ static int rtl8152_set_speed(struct usbh_rtl8152 *tp, uint8_t autoneg, uint16_t 
         if (duplex == DUPLEX_FULL)
             bmcr |= BMCR_FULLDPLX;
     } else {
+        uint16_t anar, gbcr, old_anar, old_gbcr;
+
+        /* Advertisement registers apply only to autonegotiation. */
+        old_anar = anar = r8152_mdio_read(tp, MII_ADVERTISE);
+        anar &= ~(ADVERTISE_10HALF | ADVERTISE_10FULL |
+                  ADVERTISE_100HALF | ADVERTISE_100FULL);
+        if (tp->supports_gmii) {
+            old_gbcr = gbcr = r8152_mdio_read(tp, MII_CTRL1000);
+            gbcr &= ~(ADVERTISE_1000FULL | ADVERTISE_1000HALF);
+        } else {
+            old_gbcr = gbcr = 0;
+        }
+
         if (speed == SPEED_10) {
             if (duplex == DUPLEX_FULL)
                 anar |= ADVERTISE_10HALF | ADVERTISE_10FULL;
@@ -2146,14 +2338,47 @@ static int rtl8152_set_speed(struct usbh_rtl8152 *tp, uint8_t autoneg, uint16_t 
             return -USB_ERR_INVAL;
         }
 
-        bmcr = BMCR_ANENABLE | BMCR_ANRESTART | BMCR_RESET;
+        if (tp->supports_gmii && gbcr != old_gbcr)
+            r8152_mdio_write(tp, MII_CTRL1000, gbcr);
+        if (anar != old_anar)
+            r8152_mdio_write(tp, MII_ADVERTISE, anar);
+
+        bmcr = BMCR_ANENABLE | BMCR_ANRESTART;
     }
 
-    if (tp->supports_gmii)
-        r8152_mdio_write(tp, MII_CTRL1000, gbcr);
-
-    r8152_mdio_write(tp, MII_ADVERTISE, anar);
+    /* Reset only after a configuration change marked it necessary. */
+    if (tp->phy_reset_pending)
+        bmcr |= BMCR_RESET;
     r8152_mdio_write(tp, MII_BMCR, bmcr);
+
+    if (tp->io_error < 0)
+        return tp->io_error;
+
+    if (bmcr & BMCR_RESET) {
+        /* PHY reset is asynchronous. Finish it before the caller restores
+         * power policy or publishes the device. Match the Linux r8152 reset
+         * polling interval, but report a reset that never completes. */
+        for (unsigned int i = 0; i < 50; i++) {
+            usb_osal_msleep(20);
+            bmcr = r8152_mdio_read(tp, MII_BMCR);
+            /* Register helpers return zero on IO failure; that must not be
+             * mistaken for a cleared reset bit. */
+            if (tp->io_error < 0)
+                return tp->io_error;
+            if (!(bmcr & BMCR_RESET)) {
+                tp->phy_reset_pending = false;
+#ifdef CHERRY_USB_RTL8152_DEBUG
+                rt_kprintf("[I/rtl8152] PHY reset complete tick=%u polls=%u bmcr=%04x\n",
+                           (unsigned)rt_tick_get(), i + 1, bmcr);
+                rtl8152_log_eee_config(tp, "after-reset");
+#endif
+                return tp->io_error;
+            }
+        }
+        USB_LOG_ERR("PHY reset timeout tick=%u bmcr=%04x\r\n",
+                    (unsigned)rt_tick_get(), bmcr);
+        return -USB_ERR_TIMEOUT;
+    }
 
     return tp->io_error;
 }
@@ -2168,6 +2393,61 @@ int r8152_write_hwaddr(struct usbh_rtl8152 *tp, unsigned char *mac)
     return tp->io_error;
 }
 
+static bool rtl8152_valid_mac(const uint8_t *mac)
+{
+    uint8_t any = 0;
+
+    for (unsigned int i = 0; i < 6; i++)
+        any |= mac[i];
+    return any != 0 && !(mac[0] & 1);
+}
+
+static int rtl8152_read_mac(struct usbh_rtl8152 *tp, uint16_t reg, uint8_t *mac)
+{
+    uint8_t addr[8] = { 0 };
+    int ret = pla_ocp_read(tp, reg, sizeof(addr), addr);
+
+    if (ret < 0)
+        return ret;
+    if (!rtl8152_valid_mac(addr)) {
+        /* As in Linux, retain a valid adapter address and generate one
+         * only as a fallback. Use the existing K230 TRNG with a locally
+         * administered unicast prefix, not Realtek's global OUI. */
+        uint32_t random = *(volatile uint32_t *)0x91213300;
+        addr[0] = 0x02;
+        addr[1] = 0xe0;
+        addr[2] = 0x4c;
+        addr[3] = random;
+        addr[4] = random >> 8;
+        addr[5] = random >> 16;
+    }
+    usb_memcpy(mac, addr, 6);
+    return 0;
+}
+
+static int rtl8152_get_mac(struct usbh_rtl8152 *tp, uint8_t *mac)
+{
+    /* Linux determine_ethernet_addr(): revision 1 uses the active IDR;
+     * later revisions keep the factory address in the backup registers. */
+    return rtl8152_read_mac(tp, tp->version == RTL_VER_01 ? PLA_IDR : PLA_BACKUP, mac);
+}
+
+/* SR9900.sys reads and writes the station address at c2f0/c2f4. */
+#define SR9900_IDR 0xc2f0
+
+static int sr9900_get_mac(struct usbh_rtl8152 *tp, uint8_t *mac)
+{
+    return rtl8152_read_mac(tp, SR9900_IDR, mac);
+}
+
+static int sr9900_set_mac(struct usbh_rtl8152 *tp, unsigned char *mac)
+{
+    uint8_t addr[8] = { 0 };
+
+    usb_memcpy(addr, mac, 6);
+    return pla_ocp_write(tp, SR9900_IDR, BYTE_EN_DWORD, sizeof(addr), addr);
+}
+
 static int usbh_rtl8152_read_link_status(struct usbh_rtl8152 *rtl8152_class,
                                          bool *connected)
 {
@@ -2179,32 +2459,261 @@ static int usbh_rtl8152_read_link_status(struct usbh_rtl8152 *rtl8152_class,
      * carrier detection and periodic checks. */
     ret = generic_ocp_read(rtl8152_class, PLA_PHYSTATUS,
                            sizeof(phystatus), &phystatus, MCU_TYPE_PLA);
+    RTL8152_STAT(g_rtl8152_stats.phy_link_reads++);
+    RTL8152_STAT(g_rtl8152_stats.phy_last_tick = (uint32_t)rt_tick_get());
     if (ret < 0)
     {
+        RTL8152_STAT(g_rtl8152_stats.phy_link_errors++);
         return ret;
     }
 
+    RTL8152_STAT(g_rtl8152_stats.phy_last_status = phystatus);
     *connected = (phystatus & LINK_STATUS) != 0;
     return 0;
 }
 
-int usbh_rtl8152_get_connect_status(struct usbh_rtl8152 *rtl8152_class)
+#ifdef CHERRY_USB_RTL8152_DEBUG
+/* Snapshot before changing MAC state, so later recovery writes cannot be
+ * mistaken for the cause of the original carrier loss. RX owner only. */
+static void rtl8152_log_phy_event(struct usbh_rtl8152 *tp, const char *event)
 {
-    bool connected;
+    uint16_t status = rtl8152_get_speed(tp);
+    uint16_t bmcr = r8152_mdio_read(tp, MII_BMCR);
+    uint16_t bmsr_latched = r8152_mdio_read(tp, MII_BMSR);
+    uint16_t bmsr = r8152_mdio_read(tp, MII_BMSR);
+    uint16_t partner = r8152_mdio_read(tp, MII_LPA);
+    uint16_t aldps = ocp_reg_read(tp, OCP_ALDPS_CONFIG);
+
+    if (tp->io_error < 0) {
+        rt_kprintf("[I/rtl8152] PHY event=%s tick=%u io_error=%d\n",
+                   event, (unsigned)rt_tick_get(), tp->io_error);
+        return;
+    }
+    rt_kprintf("[I/rtl8152] PHY event=%s tick=%u status=%04x bmcr=%04x bmsr_latched=%04x bmsr=%04x partner=%04x aldps=%04x io_error=0\n",
+               event, (unsigned)rt_tick_get(), status, bmcr, bmsr_latched,
+               bmsr, partner, aldps);
+    sr9900_log_phy_access(tp, event);
+}
+
+/* Called only by the RX thread while waiting for carrier.
+ * Shell diagnostics use cached counters to preserve control-IO ownership. */
+static void rtl8152_log_link_wait(struct usbh_rtl8152 *tp, rt_tick_t waited)
+{
+    uint16_t bmcr = r8152_mdio_read(tp, MII_BMCR);
+    uint16_t bmsr_latched = r8152_mdio_read(tp, MII_BMSR);
+    uint16_t bmsr = r8152_mdio_read(tp, MII_BMSR);
+    uint16_t advertise = r8152_mdio_read(tp, MII_ADVERTISE);
+    uint16_t partner = r8152_mdio_read(tp, MII_LPA);
+    uint16_t aldps = ocp_reg_read(tp, OCP_ALDPS_CONFIG);
+    uint16_t eee_cr = ocp_read_word(tp, MCU_TYPE_PLA, PLA_EEE_CR);
+    uint16_t eee_adv = r8152_mmd_read(tp, MDIO_MMD_AN, MDIO_AN_EEE_ADV);
+    uint16_t eee_partner = r8152_mmd_read(tp, MDIO_MMD_AN, MDIO_AN_EEE_LPABLE);
+
+    /* Read BMSR twice because link status can be latched low. */
+#ifdef CHERRY_USB_RTL8152_STATS
+    USB_LOG_WRN("Link wait tick=%u waited_ticks=%u phy=%08x reads=%u errors=%u\r\n",
+                (unsigned)rt_tick_get(), (unsigned)waited,
+                g_rtl8152_stats.phy_last_status,
+                g_rtl8152_stats.phy_link_reads,
+                g_rtl8152_stats.phy_link_errors);
+#else
+    USB_LOG_WRN("Link wait tick=%u waited_ticks=%u\r\n",
+                (unsigned)rt_tick_get(), (unsigned)waited);
+#endif
+    USB_LOG_WRN("PHY bmcr=%04x bmsr_latched=%04x bmsr=%04x advertise=%04x partner=%04x aldps=%04x io_error=%d\r\n",
+                bmcr, bmsr_latched, bmsr, advertise, partner, aldps, tp->io_error);
+    USB_LOG_WRN("PHY EEE cr=%04x advertise=%04x partner=%04x io_error=%d\r\n",
+                eee_cr, eee_adv, eee_partner, tp->io_error);
+    rtl8152_log_eee_config(tp, "link-wait");
+}
+#endif
+
+
+struct rtl8152_link_recovery {
+    rt_tick_t last_attempt;
+    unsigned int attempts;
+};
+
+static int sr9900_recover_initial_link(struct usbh_rtl8152 *tp,
+                                       struct rtl8152_link_recovery *recovery)
+{
+    rt_tick_t now = rt_tick_get();
+    uint16_t bmcr, bmsr;
     int ret;
 
-    ret = usbh_rtl8152_read_link_status(rtl8152_class, &connected);
-    if (ret >= 0)
-    {
-        rtl8152_class->connect_status = connected;
+    /* SR9900 can remain in autonegotiation indefinitely after USB startup.
+     * Run only in the RX thread before starting RX, so indirect PHY
+     * accesses cannot race another register user. Bound the
+     * attempts per attachment: an unplugged cable must not cause a reset
+     * loop, and a healthy RTL8152 must retain its normal startup sequence. */
+    if (!usbh_rtl8152_is_active(tp) ||
+        tp->connect_status || recovery->attempts >= 2 ||
+        (rt_tick_t)(now - recovery->last_attempt) < rt_tick_from_millisecond(10000))
+        return 0;
+    if (tp->io_error < 0)
+        return tp->io_error;
+
+    recovery->last_attempt = now;
+    r8152_mdio_read(tp, MII_BMSR); /* Clear latched-low link status. */
+    bmsr = r8152_mdio_read(tp, MII_BMSR);
+    bmcr = r8152_mdio_read(tp, MII_BMCR);
+    if (tp->io_error < 0)
+        return tp->io_error;
+    if ((bmsr & BMSR_LSTATUS) || !(bmcr & BMCR_ANENABLE) ||
+        (bmcr & (BMCR_RESET | BMCR_PDOWN)))
+        return 0;
+
+    ++recovery->attempts;
+    USB_LOG_WRN("SR9900 link recovery attempt=%u tick=%u bmcr=%04x bmsr=%04x\r\n",
+                recovery->attempts, (unsigned)now, bmcr, bmsr);
+    if (recovery->attempts == 1) {
+        /* First retry normal negotiation without changing advertisement. */
+        r8152_mdio_write(tp, MII_BMCR, bmcr | BMCR_ANRESTART);
+    } else {
+        /* If restarting negotiation did not help, cycle PHY power and
+         * restore the configured PHY policy before its asynchronous reset.
+         * No USB reset or speed/duplex fallback is involved. */
+        r8152_mdio_write(tp, MII_BMCR, (bmcr & ~BMCR_ANRESTART) | BMCR_PDOWN);
+        if (tp->io_error < 0)
+            return tp->io_error;
+        usb_osal_msleep(20);
+        if (!usbh_rtl8152_is_active(tp))
+            return -USB_ERR_NODEV;
+        r8152_mdio_write(tp, MII_BMCR, bmcr & ~(BMCR_PDOWN | BMCR_ANRESTART));
+        if (tp->io_error < 0)
+            return tp->io_error;
+        usb_osal_msleep(20);
+        if (!usbh_rtl8152_is_active(tp))
+            return -USB_ERR_NODEV;
+        tp->chip_ops->hw_phy_cfg(tp);
+        if (tp->io_error < 0)
+            return tp->io_error;
+        ret = tp->chip_ops->set_speed(tp, AUTONEG_ENABLE, SPEED_100, DUPLEX_FULL);
+        if (ret < 0)
+            return ret;
+        /* PHY reset restores ALDPS defaults. Restore the configured policy
+         * here just as sr9900_start() does after the initial reset. */
+        tp->chip_ops->set_aldps(tp, true);
     }
-    return ret;
+    return tp->io_error;
+}
+
+static int rtl8152_start(struct usbh_rtl8152 *tp)
+{
+    int ret = tp->chip_ops->set_speed(tp, AUTONEG_ENABLE,
+                                    tp->supports_gmii ? SPEED_1000 : SPEED_100,
+                                    DUPLEX_FULL);
+    if (ret < 0)
+        return ret;
+    tp->chip_ops->up(tp);
+    return tp->io_error;
+}
+
+static int sr9900_start(struct usbh_rtl8152 *tp)
+{
+    int ret;
+
+    /* SR9900.sys 2.0.7.0 enables MAC RX/TX (PLA_CR = 0x0c) before
+     * restarting the PHY (BMCR = 0x9200). up() only prepares the FIFO and
+     * leaves the MAC disabled; complete that enable before negotiation.
+     * Carrier is still published only after the RX URBs have been posted.
+     * Keep the genuine RTL8152 startup in its own callback. */
+    tp->chip_ops->up(tp);
+    if (tp->io_error < 0)
+        return tp->io_error;
+    ret = tp->chip_ops->enable(tp);
+    if (ret < 0)
+        return ret;
+    ret = tp->chip_ops->set_speed(tp, AUTONEG_ENABLE, SPEED_100, DUPLEX_FULL);
+    if (ret < 0)
+        return ret;
+
+    /* Reset can restore ALDPS defaults. up() ran before reset, so it can no
+     * longer supply this final write; preserve the SR9900 disabled policy. */
+    tp->chip_ops->set_aldps(tp, true);
+    return tp->io_error;
+}
+
+static const struct rtl8152_chip_ops rtl8152_chip_ops = {
+    .name = "RTL8152",
+    .rx_urb_count = RTL8152_MAX_RX,
+    .init = r8152b_init,
+    .hw_phy_cfg = r8152b_hw_phy_cfg,
+    .start = rtl8152_start,
+    .set_eee = r8152_eee_en,
+    .set_aldps = r8152_aldps_en,
+    .set_speed = rtl8152_set_speed,
+    .get_mac = rtl8152_get_mac,
+    .set_mac = r8152_write_hwaddr,
+    .enable = rtl8152_enable,
+    .disable = rtl8152_disable,
+    .up = rtl8152_up,
+    .down = rtl8152_down,
+};
+
+static const struct rtl8152_chip_ops sr9900_chip_ops = {
+    .name = "SR9900",
+    .rx_urb_count = 1,
+    .init = r8152b_init,
+    .hw_phy_cfg = r8152b_hw_phy_cfg,
+    .start = sr9900_start,
+    .set_eee = sr9900_eee_en,
+    .set_aldps = sr9900_aldps_en,
+    .set_speed = rtl8152_set_speed,
+    .get_mac = sr9900_get_mac,
+    .set_mac = sr9900_set_mac,
+    .enable = rtl8152_enable,
+    .disable = rtl8152_disable,
+    .up = rtl8152_up,
+    .down = rtl8152_down,
+    .recover_initial_link = sr9900_recover_initial_link,
+};
+
+static int rtl_ops_init(struct usbh_rtl8152 *tp)
+{
+    /* Only the supported 10/100 revisions use these MAC/PHY operations.
+     * Do not bind a gigabit revision merely because its USB ID matches. */
+    switch (tp->version) {
+        case RTL_VER_01:
+        case RTL_VER_02:
+        case RTL_VER_07:
+            break;
+        default:
+            USB_LOG_ERR("Unsupported rtl version:%d\r\n", tp->version);
+            return -USB_ERR_NODEV;
+    }
+
+    if (usbh_rtl8152_is_sr9900(tp)) {
+        tp->chip_ops = &sr9900_chip_ops;
+    } else if (tp->hport &&
+               tp->hport->device_desc.idVendor == VENDOR_ID_REALTEK &&
+               tp->hport->device_desc.idProduct == PRODUCT_ID_RTL8152) {
+        tp->chip_ops = &rtl8152_chip_ops;
+    } else {
+        return -USB_ERR_NODEV;
+    }
+    tp->rx_urb_count = tp->chip_ops->rx_urb_count;
+    tp->rx_buf_sz = CONFIG_USBHOST_RTL8152_ETH_MAX_RX_SEGSZE;
+#ifdef CHERRY_USB_RTL8152_EEE
+    tp->eee_en = true;
+#else
+    tp->eee_en = false;
+#endif
+    tp->eee_adv = MDIO_EEE_100TX;
+    return 0;
+}
+
+static int rtl8152_recover_initial_link(struct usbh_rtl8152 *tp,
+                                       struct rtl8152_link_recovery *state)
+{
+    if (tp->chip_ops->recover_initial_link)
+        return tp->chip_ops->recover_initial_link(tp, state);
+    return 0;
 }
 
 static int usbh_rtl8152_connect(struct usbh_hubport *hport, uint8_t intf)
 {
     struct usb_endpoint_descriptor *ep_desc;
-    char mac_buffer[12];
     int ret;
 
     struct usbh_rtl8152 *rtl8152_class = &g_rtl8152_class;
@@ -2257,8 +2766,6 @@ static int usbh_rtl8152_connect(struct usbh_hubport *hport, uint8_t intf)
 
     rtl8152_class->hport = hport;
     rtl8152_class->intf = intf;
-    rtl8152_class->rx_urb_count =
-        usbh_rtl8152_is_sr9900(rtl8152_class) ? 1 : RTL8152_MAX_RX;
     rtl8152_class->plug = true;
     rtl8152_class->stop_requested = false;
 
@@ -2320,20 +2827,18 @@ static int usbh_rtl8152_connect(struct usbh_hubport *hport, uint8_t intf)
         goto probe_failed;
     }
 
-    rtl8152_class->rtl_ops.init(rtl8152_class);
+    rtl8152_class->chip_ops->init(rtl8152_class);
     if (rtl8152_class->io_error < 0) {
         ret = rtl8152_class->io_error;
         goto probe_failed;
     }
-    ret = rtl8152_set_speed(rtl8152_class, AUTONEG_ENABLE,
-                            rtl8152_class->supports_gmii ? SPEED_1000 : SPEED_100,
-                            DUPLEX_FULL);
+    rtl8152_class->chip_ops->hw_phy_cfg(rtl8152_class);
+    if (rtl8152_class->io_error < 0) {
+        ret = rtl8152_class->io_error;
+        goto probe_failed;
+    }
+    ret = rtl8152_class->chip_ops->start(rtl8152_class);
     if (ret < 0) {
-        goto probe_failed;
-    }
-    rtl8152_class->rtl_ops.up(rtl8152_class);
-    if (rtl8152_class->io_error < 0) {
-        ret = rtl8152_class->io_error;
         goto probe_failed;
     }
 
@@ -2343,35 +2848,15 @@ static int usbh_rtl8152_connect(struct usbh_hubport *hport, uint8_t intf)
         goto probe_failed;
     }
 
-    usb_memset(mac_buffer, 0, 12);
-    ret = usbh_get_string_desc(rtl8152_class->hport, 3, (uint8_t *)mac_buffer, sizeof(mac_buffer));
-    if (ret < 0) {
+    ret = rtl8152_class->chip_ops->get_mac(rtl8152_class, rtl8152_class->mac);
+    if (ret < 0)
         goto probe_failed;
-    }
-
-    for (int i = 0, j = 0; i < 12; i += 2, j++) {
-        char byte_str[3];
-        byte_str[0] = mac_buffer[i];
-        byte_str[1] = mac_buffer[i + 1];
-        byte_str[2] = '\0';
-
-        uint32_t byte = strtoul(byte_str, NULL, 16);
-        rtl8152_class->mac[j] = (unsigned char)byte;
-    }
-    uint32_t trng_data = *(uint32_t *)0x91213300;
-    rtl8152_class->mac[0] = 0x00;
-    rtl8152_class->mac[1] = 0xe0;
-    rtl8152_class->mac[2] = 0x4c;
-    rtl8152_class->mac[3] = trng_data & 0xff;
-    rtl8152_class->mac[4] = (trng_data>>8) & 0xff;
-    rtl8152_class->mac[5] = (trng_data>>16) & 0xff;
-    
-    ret = r8152_write_hwaddr(rtl8152_class, rtl8152_class->mac);
-    if (ret < 0) {
+    ret = rtl8152_class->chip_ops->set_mac(rtl8152_class, rtl8152_class->mac);
+    if (ret < 0)
         goto probe_failed;
-    }
 
-    USB_LOG_INFO("RTL8152 MAC address %02x:%02x:%02x:%02x:%02x:%02x\r\n",
+    USB_LOG_INFO("%s MAC address %02x:%02x:%02x:%02x:%02x:%02x\r\n",
+                 rtl8152_class->chip_ops->name,
                  rtl8152_class->mac[0],
                  rtl8152_class->mac[1],
                  rtl8152_class->mac[2],
@@ -2401,7 +2886,8 @@ static int usbh_rtl8152_connect(struct usbh_hubport *hport, uint8_t intf)
     hport->config.intf[intf].priv = rtl8152_class;
     usb_memcpy(hport->config.intf[intf].devname, DEV_FORMAT, CONFIG_USBHOST_DEV_NAMELEN);
 
-    USB_LOG_INFO("Register RTL8152 Class:%s\r\n", hport->config.intf[intf].devname);
+    USB_LOG_INFO("Register %s Class:%s\r\n", rtl8152_class->chip_ops->name,
+                 hport->config.intf[intf].devname);
 
     ret = usbh_rtl8152_run(rtl8152_class);
     if (ret < 0) {
@@ -2431,22 +2917,9 @@ static int usbh_rtl8152_disconnect(struct usbh_hubport *hport, uint8_t intf)
         registered = hport->config.intf[intf].devname[0] != '\0';
         hport->config.intf[intf].priv = NULL;
         hport->config.intf[intf].devname[0] = '\0';
-        /* Device is gone: never issue control transfers here (would block hub
-         * thread for many seconds on URB timeouts). Just drop the link state
-         * and clear the pending work flag; the work itself will see plug==0
-         * and bail out without touching the dead device. Do NOT call
-         * rt_work_cancel_sync from the hub disconnect context. */
-        usbh_rtl8152_prepare_recovery(rtl8152_class, false, false);
-
-        if (rtl8152_class->bulkin) {
-            usbh_rtl8152_kill_rx_urbs(rtl8152_class);
-        }
-
-        if (rtl8152_class->bulkout && g_rtl8152_tx_mutex) {
-            usb_osal_mutex_take(g_rtl8152_tx_mutex);
-            usbh_rtl8152_kill_tx_urbs(rtl8152_class);
-            usb_osal_mutex_give(g_rtl8152_tx_mutex);
-        }
+        usbh_rtl8152_prepare_recovery(rtl8152_class, false);
+        /* Wake the RX owner even if no receive URB is pending. */
+        usb_osal_mq_send(g_rtl8152_rx_queue, 0);
 
         if (rtl8152_class->intin) {
             usbh_kill_urb(&rtl8152_class->intin_urb);
@@ -2463,109 +2936,74 @@ static int usbh_rtl8152_disconnect(struct usbh_hubport *hport, uint8_t intf)
     return ret;
 }
 
+static void usbh_rtl8152_prepare_recovery(struct usbh_rtl8152 *tp,
+                                          bool device_alive)
+{
+    tp->connect_status = false;
+    usbh_rtl8152_link_changed(tp, 0);
+    usbh_rtl8152_kill_rx_urbs(tp);
+    if (g_rtl8152_tx_mutex) {
+        usb_osal_mutex_take(g_rtl8152_tx_mutex);
+        usbh_rtl8152_kill_tx_urbs(tp);
+        usb_osal_mutex_give(g_rtl8152_tx_mutex);
+    }
+    /* As in Linux set_carrier(), stop transfers before disabling the MAC.
+     * The RX thread owns live-device control IO. Disconnect only cancels
+     * transfers, so the hub never waits for a control timeout on a dead NIC. */
+    if (device_alive && usbh_rtl8152_is_active(tp) && tp->chip_ops)
+        tp->chip_ops->disable(tp);
+}
+
 #ifdef CHERRY_USB_RTL8152_LINKCHECK
+#define CHECK_LINK_DEBOUNCE_CNT 5
 
-#define CHECK_LINK_DEBOUNCE_CNT (5)
-static struct rt_delayed_work link_check;
-static uint8_t link_down_count;
-
-static void usbh_rtl8152_prepare_recovery(struct usbh_rtl8152 *rtl8152_class,
-                                          bool cancel_work,
-                                          bool device_alive)
+static int rtl8152_check_carrier(struct usbh_rtl8152 *tp, unsigned int *down_count)
 {
-    rtl8152_class->connect_status = false;
-    usbh_rtl8152_link_changed(rtl8152_class, 0);
+    bool link_up;
+    int ret = usbh_rtl8152_read_link_status(tp, &link_up);
 
-    if (cancel_work && rtl8152_class->submit_work) {
-        rtl8152_class->submit_work = false;
-        rt_work_cancel_sync(&link_check.work);
-    } else {
-        rtl8152_class->submit_work = false;
+    if (ret < 0)
+        return ret;
+    if (link_up) {
+        *down_count = 0;
+        /* A TX error may have stopped the data path despite PHY carrier.
+         * Re-enable the MAC/RX before publishing that link again. */
+        return tp->connect_status ? 0 : 1;
     }
-
-    /* Only touch the device when it is still attached. On a USB disconnect
-     * the control transfers will time out and the FIFO_EMPTY polling loops
-     * (1000 * 1ms each) will run to completion, blocking the hub thread for
-     * many seconds. */
-    if (device_alive && rtl8152_class->rtl_ops.disable) {
-        rtl8152_class->rtl_ops.disable(rtl8152_class);
-    }
-}
-
-static void rtl8152_link_check(struct rt_work *work, void *work_data)
-{
-    (void)work;
-    (void)work_data;
-
-    if (usbh_rtl8152_is_active(&g_rtl8152_class)) {
-        bool link_up;
-        int ret;
-
-        g_rtl8152_class.io_error = 0;
-        ret = usbh_rtl8152_read_link_status(&g_rtl8152_class, &link_up);
-        if (ret >= 0) {
-            if (link_up) {
-                link_down_count = 0;
-                if (!g_rtl8152_class.connect_status) {
-                    g_rtl8152_class.connect_status = true;
-                    usbh_rtl8152_link_changed(&g_rtl8152_class, 1);
-                    USB_LOG_INFO("Link up\r\n");
-                }
-            } else if (g_rtl8152_class.connect_status) {
-                if (++link_down_count >= CHECK_LINK_DEBOUNCE_CNT) {
-                    link_down_count = 0;
-                    g_rtl8152_class.connect_status = false;
-                    usbh_rtl8152_link_changed(&g_rtl8152_class, 0);
-                    USB_LOG_WRN("Link down\r\n");
-                }
-            } else {
-                link_down_count = 0;
-            }
-        }
-
-        if (g_rtl8152_class.submit_work) {
-            ret = rt_work_submit(&link_check.work, rt_tick_from_millisecond(500));
-            if (ret != RT_EOK) {
-                USB_LOG_ERR("submit a work fail = %d\n", ret);
-            }
-        }
-    }
-}
+    if (++*down_count < CHECK_LINK_DEBOUNCE_CNT)
+        return 0;
+#ifdef CHERRY_USB_RTL8152_DEBUG
+    rtl8152_log_phy_event(tp, "down");
 #endif
-
-#ifndef CHERRY_USB_RTL8152_LINKCHECK
-static void usbh_rtl8152_prepare_recovery(struct usbh_rtl8152 *rtl8152_class,
-                                          bool cancel_work,
-                                          bool device_alive)
-{
-    (void)cancel_work;
-    rtl8152_class->connect_status = false;
-    usbh_rtl8152_link_changed(rtl8152_class, 0);
-
-    if (device_alive && rtl8152_class->rtl_ops.disable) {
-        rtl8152_class->rtl_ops.disable(rtl8152_class);
-    }
+    USB_LOG_WRN("Link down\r\n");
+    return 1;
 }
 #endif
 
 void usbh_rtl8152_rx_thread(void *argument)
 {
+    struct rtl8152_link_recovery recovery = { .last_attempt = rt_tick_get() };
     uint32_t rx_length;
     uint32_t transfer_size;
     uintptr_t message;
     int ret;
     err_t err;
     uint32_t data_offset;
+#if defined(CHERRY_USB_RTL8152_STATS) || defined(CHERRY_USB_RTL8152_DEBUG)
+    rt_tick_t link_wait_start;
+#endif
+#ifdef CHERRY_USB_RTL8152_DEBUG
+    rt_tick_t link_wait_logged;
+#endif
     struct pbuf *p;
     struct netif *netif = (struct netif *)argument;
-    // uint32_t curr_time_stamp, last_check_link_state_time_stamp;
+#ifdef CHERRY_USB_RTL8152_LINKCHECK
+    rt_tick_t link_checked;
+    unsigned int link_down_count;
+#endif
 
     USB_LOG_INFO("Create rtl8152 rx thread\r\n");
     g_rtl8152_class.rx_thread_running = true;
-#ifdef CHERRY_USB_RTL8152_LINKCHECK
-    rt_delayed_work_init(&link_check, rtl8152_link_check, argument);
-    link_down_count = 0;
-#endif
     // clang-format off
 find_class:
     // clang-format on
@@ -2579,8 +3017,18 @@ find_class:
     }
     g_rtl8152_class.io_error = 0;
 
-    while (!g_rtl8152_class.stop_requested && g_rtl8152_class.connect_status == false) {
-        ret = usbh_rtl8152_get_connect_status(&g_rtl8152_class);
+#if defined(CHERRY_USB_RTL8152_STATS) || defined(CHERRY_USB_RTL8152_DEBUG)
+    link_wait_start = rt_tick_get();
+#endif
+    RTL8152_STAT(g_rtl8152_stats.link_wait_ticks = 0);
+#ifdef CHERRY_USB_RTL8152_DEBUG
+    link_wait_logged = link_wait_start;
+    rt_kprintf("[I/rtl8152] waiting for link tick=%u\n", (unsigned)rt_tick_get());
+#endif
+    while (!g_rtl8152_class.stop_requested) {
+        bool carrier;
+
+        ret = usbh_rtl8152_read_link_status(&g_rtl8152_class, &carrier);
         if (ret < 0) {
             if (!usbh_rtl8152_is_active(&g_rtl8152_class)) {
                 goto delete;
@@ -2588,7 +3036,24 @@ find_class:
             usb_osal_msleep(100);
             goto find_class;
         }
-        if (!g_rtl8152_class.connect_status) {
+        RTL8152_STAT(g_rtl8152_stats.link_wait_ticks = (rt_tick_t)(rt_tick_get() - link_wait_start));
+        if (carrier)
+            break;
+        {
+            ret = rtl8152_recover_initial_link(&g_rtl8152_class, &recovery);
+            if (ret < 0) {
+                USB_LOG_ERR("Initial link recovery failed: %d\r\n", ret);
+                usb_osal_msleep(100);
+                goto find_class;
+            }
+#ifdef CHERRY_USB_RTL8152_DEBUG
+            rt_tick_t now = rt_tick_get();
+
+            if ((rt_tick_t)(now - link_wait_logged) >= rt_tick_from_millisecond(10000)) {
+                link_wait_logged = now;
+                rtl8152_log_link_wait(&g_rtl8152_class, (rt_tick_t)(now - link_wait_start));
+            }
+#endif
             usb_osal_msleep(100);
         }
     }
@@ -2597,10 +3062,17 @@ find_class:
         goto delete;
     }
 
-    if (g_rtl8152_class.rtl_ops.enable) {
-        ret = g_rtl8152_class.rtl_ops.enable(&g_rtl8152_class);
+    /* Initial carrier has arrived. Keep the bounded PHY workaround out
+     * of later MAC/RX recovery; a cable disconnect must not reset the PHY. */
+    recovery.attempts = 2;
+
+#ifdef CHERRY_USB_RTL8152_DEBUG
+    rtl8152_log_phy_event(&g_rtl8152_class, "ready");
+#endif
+    if (g_rtl8152_class.chip_ops->enable) {
+        ret = g_rtl8152_class.chip_ops->enable(&g_rtl8152_class);
         if (ret < 0) {
-            usbh_rtl8152_prepare_recovery(&g_rtl8152_class, false, true);
+            usbh_rtl8152_prepare_recovery(&g_rtl8152_class, true);
             goto find_class;
         }
     } else {
@@ -2609,7 +3081,7 @@ find_class:
 
     rtl8152_set_rx_mode(&g_rtl8152_class);
     if (g_rtl8152_class.io_error < 0) {
-        usbh_rtl8152_prepare_recovery(&g_rtl8152_class, false, true);
+        usbh_rtl8152_prepare_recovery(&g_rtl8152_class, true);
         goto find_class;
     }
 
@@ -2626,8 +3098,7 @@ find_class:
                                      &g_rtl8152_rx_context[i],
                                      transfer_size);
         if (ret < 0) {
-            usbh_rtl8152_kill_rx_urbs(&g_rtl8152_class);
-            usbh_rtl8152_prepare_recovery(&g_rtl8152_class, true,
+            usbh_rtl8152_prepare_recovery(&g_rtl8152_class,
                                           usbh_rtl8152_is_active(&g_rtl8152_class));
             goto find_class;
         }
@@ -2635,16 +3106,15 @@ find_class:
 
     /* DHCP may transmit immediately from the link-up callback, so carrier
      * must not be published until all receive URBs are ready for the reply. */
+#ifdef CHERRY_USB_RTL8152_DEBUG
+    rt_kprintf("[I/rtl8152] RX ready, link up tick=%u rx_urbs=%u\n",
+               (unsigned)rt_tick_get(), (unsigned)g_rtl8152_class.rx_urb_count);
+#endif
+    g_rtl8152_class.connect_status = true;
     usbh_rtl8152_link_changed(&g_rtl8152_class, 1);
 
 #ifdef CHERRY_USB_RTL8152_LINKCHECK
-    g_rtl8152_class.submit_work = true;
-    ret = rt_work_submit(&link_check.work,
-                         rt_tick_from_millisecond(1000) *
-                         CHECK_LINK_DEBOUNCE_CNT);
-    if (ret != RT_EOK) {
-        USB_LOG_ERR("submit work fail = %d\n", ret);
-    }
+    link_checked = rt_tick_get();
 #endif
 
     while (g_rtl8152_class.plug && !g_rtl8152_class.stop_requested) {
@@ -2654,10 +3124,30 @@ find_class:
         if (!g_rtl8152_class.bulkin || !g_rtl8152_class.hport || !usbh_rtl8152_is_active(&g_rtl8152_class)) {
             goto find_class;
         }
+        if (!g_rtl8152_class.connect_status) {
+            /* A TX failure wakes this owner even with link polling off. */
+            usbh_rtl8152_prepare_recovery(&g_rtl8152_class, true);
+            goto find_class;
+        }
 
+#ifdef CHERRY_USB_RTL8152_LINKCHECK
+        /* One owner serializes PHY windows, MAC resets and RX submission.
+         * Check by elapsed time even under continuous packet traffic. */
+        if ((rt_tick_t)(rt_tick_get() - link_checked) >= rt_tick_from_millisecond(500)) {
+            link_checked = rt_tick_get();
+            ret = rtl8152_check_carrier(&g_rtl8152_class, &link_down_count);
+            if (ret != 0) {
+                usbh_rtl8152_prepare_recovery(&g_rtl8152_class,
+                                              usbh_rtl8152_is_active(&g_rtl8152_class));
+                goto find_class;
+            }
+        }
+        ret = usb_osal_mq_recv(g_rtl8152_rx_queue, &message, 500);
+#else
         ret = usb_osal_mq_recv(g_rtl8152_rx_queue, &message,
                                USB_OSAL_WAITING_FOREVER);
-        if (ret < 0) {
+#endif
+        if (ret < 0 || message == 0) {
             continue;
         }
         context = (struct rtl8152_rx_context *)message;
@@ -2669,8 +3159,7 @@ find_class:
             /* If we are here because the device was unplugged we must not
              * issue further IO on it; only treat the device as alive when the
              * hub still owns the class instance. */
-            usbh_rtl8152_kill_rx_urbs(&g_rtl8152_class);
-            usbh_rtl8152_prepare_recovery(&g_rtl8152_class, true,
+            usbh_rtl8152_prepare_recovery(&g_rtl8152_class,
                                           usbh_rtl8152_is_active(&g_rtl8152_class));
             goto find_class;
         }
@@ -2690,7 +3179,7 @@ find_class:
             if (packet_length < ETH_FCS_LEN ||
                 packet_length + sizeof(struct rx_desc) >
                     rx_length - data_offset) {
-                g_rtl8152_stats.rx_descriptor_errors++;
+                RTL8152_STAT(g_rtl8152_stats.rx_descriptor_errors++);
                 USB_LOG_ERR("RTL8152 RX descriptor len invalid (%u, remaining %u)\r\n",
                             (unsigned)packet_length,
                             (unsigned)(rx_length - data_offset));
@@ -2712,17 +3201,17 @@ find_class:
                         err = netif->input(p, netif);
                     }
                     if (err != ERR_OK) {
-                        g_rtl8152_stats.rx_input_errors++;
+                        RTL8152_STAT(g_rtl8152_stats.rx_input_errors++);
                         pbuf_free(p);
                     } else {
-                        g_rtl8152_stats.rx_frames++;
+                        RTL8152_STAT(g_rtl8152_stats.rx_frames++);
                     }
                 } else {
-                    g_rtl8152_stats.rx_pbuf_errors++;
+                    RTL8152_STAT(g_rtl8152_stats.rx_pbuf_errors++);
                     USB_LOG_ERR("No memory to alloc pbuf for rtl8152 rx\r\n");
                 }
             } else {
-                g_rtl8152_stats.rx_crc_errors++;
+                RTL8152_STAT(g_rtl8152_stats.rx_crc_errors++);
             }
 
             advance = sizeof(struct rx_desc) +
@@ -2736,8 +3225,7 @@ find_class:
         ret = usbh_rtl8152_submit_rx(&g_rtl8152_class, context,
                                      transfer_size);
         if (ret < 0) {
-            usbh_rtl8152_kill_rx_urbs(&g_rtl8152_class);
-            usbh_rtl8152_prepare_recovery(&g_rtl8152_class, true,
+            usbh_rtl8152_prepare_recovery(&g_rtl8152_class,
                                           usbh_rtl8152_is_active(&g_rtl8152_class));
             goto find_class;
         }
@@ -2745,12 +3233,7 @@ find_class:
     // clang-format off
 delete:
     USB_LOG_INFO("Delete rtl8152 rx thread\r\n");
-#ifdef CHERRY_USB_RTL8152_LINKCHECK
-    if (g_rtl8152_class.submit_work) {
-        g_rtl8152_class.submit_work = false;
-        rt_work_cancel_sync(&link_check.work);
-    }
-#endif
+    usbh_rtl8152_prepare_recovery(&g_rtl8152_class, false);
     g_rtl8152_class.rx_thread_running = false;
     usb_osal_thread_delete(NULL);
     // clang-format on
@@ -2780,6 +3263,15 @@ err_t usbh_rtl8152_linkoutput(struct netif *netif, struct pbuf *p)
     usb_osal_mutex_take(g_rtl8152_tx_mutex);
 
     if (!usbh_rtl8152_can_xmit(&g_rtl8152_class)) {
+        RTL8152_STAT(g_rtl8152_stats.tx_not_ready++);
+#if defined(CHERRY_USB_RTL8152_STATS) && defined(CHERRY_USB_RTL8152_DEBUG)
+        if (g_rtl8152_stats.tx_not_ready == 1) {
+            USB_LOG_WRN("TX not ready tick=%u active=%d link=%d\r\n",
+                        (unsigned)rt_tick_get(),
+                        usbh_rtl8152_is_active(&g_rtl8152_class),
+                        g_rtl8152_class.connect_status);
+        }
+#endif
         usb_osal_mutex_give(g_rtl8152_tx_mutex);
         usb_osal_sem_give(g_rtl8152_tx_available);
         return ERR_BUF;
@@ -2832,19 +3324,33 @@ err_t usbh_rtl8152_linkoutput(struct netif *netif, struct pbuf *p)
 
     ret = usbh_submit_urb(urb);
     if (ret < 0) {
+        RTL8152_STAT(g_rtl8152_stats.tx_errors++);
+        RTL8152_STAT(g_rtl8152_stats.tx_submit_errors++);
+        RTL8152_STAT(g_rtl8152_stats.tx_last_submit_error = ret);
+        USB_LOG_ERR("TX submit failed tick=%u ret=%d len=%u\r\n",
+                    (unsigned)rt_tick_get(), ret, (unsigned)tx_len);
         context->busy = false;
         g_rtl8152_class.connect_status = false;
+        usb_osal_mq_send(g_rtl8152_rx_queue, 0);
         usb_osal_mutex_give(g_rtl8152_tx_mutex);
         usb_osal_sem_give(g_rtl8152_tx_available);
         return ERR_BUF;
     }
 
-    g_rtl8152_stats.tx_submitted++;
+    RTL8152_STAT(g_rtl8152_stats.tx_submitted++);
+#if defined(CHERRY_USB_RTL8152_STATS) && defined(CHERRY_USB_RTL8152_DEBUG)
+    if (g_rtl8152_stats.tx_submitted == 1) {
+        rt_kprintf("[I/rtl8152] first TX submitted tick=%u len=%u\n",
+                   (unsigned)rt_tick_get(), (unsigned)tx_len);
+    }
+#endif
 
     usb_osal_mutex_give(g_rtl8152_tx_mutex);
     return ERR_OK;
 }
 
+#ifdef CHERRY_USB_RTL8152_STATS
+/* Software counters only: the RX thread owns register IO after probe. */
 static int rtl8152_stats_cmd(int argc, char **argv)
 {
     unsigned int i;
@@ -2855,6 +3361,9 @@ static int rtl8152_stats_cmd(int argc, char **argv)
         return 0;
     }
 
+    const struct rtl8152_chip_ops *chip_ops = g_rtl8152_class.chip_ops;
+
+    rt_kprintf("chip=%s\n", chip_ops ? chip_ops->name : "none");
     rt_kprintf("rtl8152 active=%d link=%d io_error=%d\n",
                usbh_rtl8152_is_active(&g_rtl8152_class),
                g_rtl8152_class.connect_status,
@@ -2863,6 +3372,16 @@ static int rtl8152_stats_cmd(int argc, char **argv)
                g_rtl8152_stats.tx_submitted,
                g_rtl8152_stats.tx_completed,
                g_rtl8152_stats.tx_errors);
+    rt_kprintf("tx submit_errors=%u not_ready=%u last_submit_error=%d\n",
+               g_rtl8152_stats.tx_submit_errors,
+               g_rtl8152_stats.tx_not_ready,
+               g_rtl8152_stats.tx_last_submit_error);
+    rt_kprintf("phy reads=%u errors=%u last_status=%08x last_tick=%u link_wait_ms=%u\n",
+               g_rtl8152_stats.phy_link_reads,
+               g_rtl8152_stats.phy_link_errors,
+               g_rtl8152_stats.phy_last_status,
+               g_rtl8152_stats.phy_last_tick,
+               (uint32_t)((uint64_t)g_rtl8152_stats.link_wait_ticks * 1000 / RT_TICK_PER_SECOND));
     rt_kprintf("rx submitted=%u completed=%u bytes=%u zero=%u errors=%u queue_drops=%u\n",
                g_rtl8152_stats.rx_submitted,
                g_rtl8152_stats.rx_completed,
@@ -2884,6 +3403,7 @@ static int rtl8152_stats_cmd(int argc, char **argv)
     return 0;
 }
 MSH_CMD_EXPORT_ALIAS(rtl8152_stats_cmd, rtl8152_stats, show or reset RTL8152 statistics);
+#endif
 
 __WEAK int usbh_rtl8152_run(struct usbh_rtl8152 *rtl8152_class)
 {

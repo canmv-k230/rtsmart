@@ -3481,22 +3481,81 @@ static int dwc2_hcd_urb_enqueue(struct dwc2_hsotg *hsotg,
 
 int usbh_enqueue_urb(struct usbh_urb *urb);
 
+#ifdef CHERRY_USB_DWC2_TIMEOUT_DEBUG
+static void dwc2_log_urb_timeout(struct dwc2_hsotg *hsotg, struct usbh_urb *urb)
+{
+    struct dwc2_hcd_urb *dwc2_urb;
+    struct dwc2_host_chan *chan = NULL;
+    rt_base_t level;
+    unsigned tick;
+    u32 gintsts, gintmsk, hprt = 0, haint = 0, haintmsk = 0;
+    u32 hcchar = 0, hcint = 0, hcintmsk = 0, hctsiz = 0, hcdma = 0;
+    int channel = -1;
+    bool host_mode;
+
+    if (!hsotg || !urb || !urb->hport || !urb->hport->bus || !urb->ep) {
+        USB_LOG_ERR("timeout state unavailable: invalid host or URB\n");
+        return;
+    }
+
+    /* Capture before cancellation removes the QTD/channel. Print after
+     * releasing the lock so UART output cannot block USB interrupts. */
+    level = rt_spin_lock_irqsave(&hsotg->lock);
+    tick = (unsigned)rt_tick_get();
+    gintsts = dwc2_readl(hsotg, GINTSTS);
+    gintmsk = dwc2_readl(hsotg, GINTMSK);
+    host_mode = dwc2_is_host_mode(hsotg);
+    if (host_mode) {
+        hprt = dwc2_readl(hsotg, HPRT0);
+        haint = dwc2_readl(hsotg, HAINT);
+        haintmsk = dwc2_readl(hsotg, HAINTMSK);
+        dwc2_urb = urb->hcpriv;
+        if (dwc2_urb && dwc2_urb->qtd && dwc2_urb->qtd->qh)
+            chan = dwc2_urb->qtd->qh->channel;
+        if (chan) {
+            channel = chan->hc_num;
+            hcchar = dwc2_readl(hsotg, HCCHAR(channel));
+            hcint = dwc2_readl(hsotg, HCINT(channel));
+            hcintmsk = dwc2_readl(hsotg, HCINTMSK(channel));
+            hctsiz = dwc2_readl(hsotg, HCTSIZ(channel));
+            hcdma = dwc2_readl(hsotg, HCDMA(channel));
+        }
+    }
+    rt_spin_unlock_irqrestore(&hsotg->lock, level);
+
+    USB_LOG_ERR("timeout state tick=%u bus=%u port=%u addr=%u ep=0x%02x host=%u connected=%u lost=%u\n",
+                tick, urb->hport->bus->busid, urb->hport->port,
+                urb->hport->dev_addr, urb->ep->bEndpointAddress,
+                host_mode, urb->hport->connected, urb->hport->connection_lost);
+    USB_LOG_ERR("GINTSTS=%08x GINTMSK=%08x HPRT0=%08x HAINT=%08x HAINTMSK=%08x\n",
+                gintsts, gintmsk, hprt, haint, haintmsk);
+    USB_LOG_ERR("channel=%d HCCHAR=%08x HCINT=%08x HCINTMSK=%08x HCTSIZ=%08x HCDMA=%08x\n",
+                channel, hcchar, hcint, hcintmsk, hctsiz, hcdma);
+    if (urb->setup) {
+        USB_LOG_ERR("setup type=%02x request=%02x value=%04x index=%04x length=%u\n",
+                    urb->setup->bmRequestType, urb->setup->bRequest,
+                    urb->setup->wValue, urb->setup->wIndex, urb->setup->wLength);
+    }
+}
+#endif
+
 int usbh_submit_urb(struct usbh_urb *urb)
 {
     int ret;
     rt_err_t result;
     uint32_t timeout = 0;
     struct rt_semaphore sem;
-    int ep_idx = USB_EP_GET_IDX(urb->ep->bEndpointAddress);
+    int ep_idx;
     struct dwc2_hsotg *hsotg;
     volatile uint32_t hprt0;
-
-    RT_ASSERT(ep_idx < 16);
 
     if (!urb || !urb->hport || !urb->ep || !urb->hport->bus) {
         ret = -USB_ERR_INVAL;
         goto out_2;
     }
+
+    ep_idx = USB_EP_GET_IDX(urb->ep->bEndpointAddress);
+    RT_ASSERT(ep_idx < 16);
 
     if (USB_EP_GET_DIR(urb->ep->bEndpointAddress)) {
         urb->hep = &urb->hport->hep_in[ep_idx];
@@ -3566,6 +3625,9 @@ int usbh_submit_urb(struct usbh_urb *urb)
 #endif
         if (ret < 0) {
             USB_LOG_ERR("urb timeout = %d, urb->hcpriv = %p\n", timeout, urb->hcpriv);
+#ifdef CHERRY_USB_DWC2_TIMEOUT_DEBUG
+            dwc2_log_urb_timeout(hsotg, urb);
+#endif
             usbh_kill_urb(urb);
             ret = -USB_ERR_TIMEOUT;
             goto out_1;

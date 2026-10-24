@@ -10,7 +10,6 @@
 #include <riscv_io.h>
 #include <ioremap.h>
 
-#include "sysctl_rst.h"
 #include "k230_pm.h"
 
 #ifdef ENABLE_CHERRY_USB
@@ -20,45 +19,47 @@ uint32_t SystemCoreClock = (DEFAULT_USB_HCLK_FREQ_MHZ * 1000 * 1000);
 uintptr_t g_usb_otg0_base = (uintptr_t)0x91500000UL;
 uintptr_t g_usb_otg1_base = (uintptr_t)0x91540000UL;
 
-#define SYSCTL_USB_DONE_SHIFT (28)
-#define SYSCTL_USB_DONE_MASK (0xF << SYSCTL_USB_DONE_SHIFT)
-
-#define SYSCTL_USB_RESET_SHIFT (0)
-#define SYSCTL_USB_RESET_MASK (0x3 << SYSCTL_USB_RESET_SHIFT)
-
-// static void sysctl_reset_hw_done(volatile uint32_t *reset_reg, uint8_t reset_bit, uint8_t done_bit)
-// {
-//     uint32_t val;
-//     rt_base_t level;
-//     uint32_t done = ((1 << done_bit) | (1 << (done_bit + 2)));
-//     uint32_t reset = (1 << reset_bit);
-
-//     level = rt_hw_interrupt_disable();
-
-//     /* clear done bit */
-//     val = readl(reset_reg);
-//     val &= ~(SYSCTL_USB_DONE_MASK | SYSCTL_USB_RESET_MASK);
-//     val |= done;
-//     writel(val, reset_reg);
-
-//     /* set reset bit */
-//     val = readl(reset_reg);
-//     val &= ~(SYSCTL_USB_DONE_MASK | SYSCTL_USB_RESET_MASK);
-//     val |= reset;
-//     writel(val, reset_reg);
-
-//     rt_hw_interrupt_enable(level);
-
-//     /* wait done bit */
-//    while ((readl(reset_reg) & done) != done);
-// }
-
-#define USB_IDPULLUP0 		(1<<4)
 #define USB_DMPULLDOWN0 	(1<<8)
 #define USB_DPPULLDOWN0 	(1<<9)
 
 // USB Host
 #ifdef ENABLE_CHERRY_USB_HOST
+#if defined(CHERRY_USB_K230_HOST_COMPDISTUNE) && (CHERRY_USB_K230_HOST_COMPDISTUNE >= 0)
+#define K230_USB0_PHY_CTL0             0x915850b0UL
+#define K230_USB_PHY_CTL_STRIDE        0x08U
+#define K230_USB_PHY_COMPDISTUNE_SHIFT 3U
+#define K230_USB_PHY_COMPDISTUNE_MASK  (7U << K230_USB_PHY_COMPDISTUNE_SHIFT)
+
+static void k230_usb_host_phy_tune(unsigned int port)
+{
+    uintptr_t address = K230_USB0_PHY_CTL0 + port * K230_USB_PHY_CTL_STRIDE;
+    volatile uint32_t *ctl0 = rt_ioremap((void *)address, sizeof(uint32_t));
+    uint32_t before, desired, after;
+
+    if (ctl0 == RT_NULL) {
+        USB_LOG_ERR("ioremap usb%u PHY control register fail\n", port);
+        return;
+    }
+
+    /* COMPDISTUNE controls host disconnect detection, not device bus resets. */
+    before = readl(ctl0);
+    desired = (before & ~K230_USB_PHY_COMPDISTUNE_MASK) |
+              ((uint32_t)CHERRY_USB_K230_HOST_COMPDISTUNE << K230_USB_PHY_COMPDISTUNE_SHIFT);
+    writel(desired, ctl0);
+    after = readl(ctl0);
+    rt_iounmap((void *)ctl0);
+
+    if (after != desired) {
+        USB_LOG_ERR("USB%u PHY CTL0 readback %08x, expected %08x\n", port, after, desired);
+    }
+    USB_LOG_INFO("usb host port=%u PHY override: COMPDISTUNE=%u ctl0=%08x->%08x\n",
+                 port, (after & K230_USB_PHY_COMPDISTUNE_MASK) >> K230_USB_PHY_COMPDISTUNE_SHIFT,
+                 before, after);
+}
+#else
+#define k230_usb_host_phy_tune(port) ((void)0)
+#endif
+
 static void usb_hc_interrupt_cb(int irq, void *arg_pv)
 {
     extern void USBH_IRQHandler(uint8_t busid);
@@ -76,6 +77,8 @@ void usb_hc_low_level_init(void)
         USB_LOG_ERR("pm get usb0 fail\n");
         return;
     }
+
+    k230_usb_host_phy_tune(0);
 
     uint32_t *hs_reg = (uint32_t *)rt_ioremap((void *)(0x91585000 + 0x7C), 0x1000);
     if (hs_reg == RT_NULL) {
@@ -105,6 +108,8 @@ void usb_hc_low_level_init(void)
         USB_LOG_ERR("pm get usb1 fail\n");
         return;
     }
+
+    k230_usb_host_phy_tune(1);
 
     uint32_t *hs_reg = (uint32_t *)rt_ioremap((void *)(0x91585000 + 0x9C), 0x1000);
     if (hs_reg == RT_NULL) {

@@ -12,6 +12,32 @@
 #define RTL8152_MAX_TX 4
 #define RTL8152_MAX_RX 4
 
+struct usbh_rtl8152;
+struct rtl8152_link_recovery;
+
+/* Chip policy. USB transport, packet framing and the RT-Thread netdev are
+ * shared; select this immutable table once when the adapter is attached. */
+struct rtl8152_chip_ops {
+    const char *name;
+    uint8_t rx_urb_count;
+    void (*init)(struct usbh_rtl8152 *tp);
+    void (*hw_phy_cfg)(struct usbh_rtl8152 *tp);
+    /* Order MAC preparation and the final PHY reset for this chip. */
+    int (*start)(struct usbh_rtl8152 *tp);
+    void (*set_eee)(struct usbh_rtl8152 *tp, bool enable);
+    void (*set_aldps)(struct usbh_rtl8152 *tp, bool enable);
+    int (*set_speed)(struct usbh_rtl8152 *tp, uint8_t autoneg,
+                     uint16_t speed, uint8_t duplex);
+    int (*get_mac)(struct usbh_rtl8152 *tp, uint8_t *mac);
+    int (*set_mac)(struct usbh_rtl8152 *tp, unsigned char *mac);
+    int (*enable)(struct usbh_rtl8152 *tp);
+    void (*disable)(struct usbh_rtl8152 *tp);
+    void (*up)(struct usbh_rtl8152 *tp);
+    void (*down)(struct usbh_rtl8152 *tp);
+    int (*recover_initial_link)(struct usbh_rtl8152 *tp,
+                                struct rtl8152_link_recovery *state);
+};
+
 struct usbh_rtl8152 {
     struct usbh_hubport *hport;
     struct usb_endpoint_descriptor *bulkin;  /* Bulk IN endpoint */
@@ -30,9 +56,6 @@ struct usbh_rtl8152 {
     bool rx_thread_running;
     bool plug;
     int io_error;
-#ifdef CHERRY_USB_RTL8152_LINKCHECK
-    bool submit_work;
-#endif
     uint32_t speed[2];
 
     ip_addr_t ipaddr;
@@ -48,26 +71,13 @@ struct usbh_rtl8152 {
     uint16_t ocp_base;
     uint32_t saved_wolopts;
     uint32_t rx_buf_sz;
-
-    struct rtl_ops {
-        void (*init)(struct usbh_rtl8152 *tp);
-        int (*enable)(struct usbh_rtl8152 *tp);
-        void (*disable)(struct usbh_rtl8152 *tp);
-        void (*up)(struct usbh_rtl8152 *tp);
-        void (*down)(struct usbh_rtl8152 *tp);
-        void (*unload)(struct usbh_rtl8152 *tp);
-        bool (*in_nway)(struct usbh_rtl8152 *tp);
-        void (*hw_phy_cfg)(struct usbh_rtl8152 *tp);
-        void (*autosuspend_en)(struct usbh_rtl8152 *tp, bool enable);
-        void (*change_mtu)(struct usbh_rtl8152 *tp);
-    } rtl_ops;
+    bool phy_reset_pending;
+    const struct rtl8152_chip_ops *chip_ops;
 };
 
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-int usbh_rtl8152_get_connect_status(struct usbh_rtl8152 *rtl8152_class);
 
 int usbh_rtl8152_run(struct usbh_rtl8152 *rtl8152_class);
 void usbh_rtl8152_stop(struct usbh_rtl8152 *rtl8152_class);
