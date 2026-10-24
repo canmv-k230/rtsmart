@@ -74,22 +74,8 @@ RTM_EXPORT(open);
 int close(int fd)
 {
     int result;
-    struct dfs_fd *d;
 
-    d = fd_get(fd);
-    if (d == NULL)
-    {
-        rt_set_errno(-EBADF);
-
-        return -1;
-    }
-
-    result = dfs_file_close(d);
-
-    if (result >= 0 || (d->flags & DFS_F_CLOSE_TERMINAL))
-    {
-        fd_release(fd);
-    }
+    result = fdt_fd_close(dfs_fdtable_get(), fd, -1);
 
     if (result < 0)
     {
@@ -123,7 +109,7 @@ int read(int fd, void *buf, size_t len)
     struct dfs_fd *d;
 
     /* get the fd */
-    d = fd_get(fd);
+    d = fd_get_ref(fd);
     if (d == NULL)
     {
         rt_set_errno(-EBADF);
@@ -132,6 +118,7 @@ int read(int fd, void *buf, size_t len)
     }
 
     result = dfs_file_read(d, buf, len);
+    fd_put(d);
     if (result < 0)
     {
         rt_set_errno(result);
@@ -163,7 +150,7 @@ int write(int fd, const void *buf, size_t len)
     struct dfs_fd *d;
 
     /* get the fd */
-    d = fd_get(fd);
+    d = fd_get_ref(fd);
     if (d == NULL)
     {
         rt_set_errno(-EBADF);
@@ -172,6 +159,7 @@ int write(int fd, const void *buf, size_t len)
     }
 
     result = dfs_file_write(d, buf, len);
+    fd_put(d);
     if (result < 0)
     {
         rt_set_errno(result);
@@ -198,7 +186,7 @@ off_t lseek(int fd, off_t offset, int whence)
     int result;
     struct dfs_fd *d;
 
-    d = fd_get(fd);
+    d = fd_get_ref(fd);
     if (d == NULL)
     {
         rt_set_errno(-EBADF);
@@ -220,6 +208,7 @@ off_t lseek(int fd, off_t offset, int whence)
         break;
 
     default:
+        fd_put(d);
         rt_set_errno(-EINVAL);
 
         return -1;
@@ -227,11 +216,13 @@ off_t lseek(int fd, off_t offset, int whence)
 
     if (offset < 0)
     {
+        fd_put(d);
         rt_set_errno(-EINVAL);
 
         return -1;
     }
     result = dfs_file_lseek(d, offset);
+    fd_put(d);
     if (result < 0)
     {
         rt_set_errno(result);
@@ -332,7 +323,7 @@ int fstat(int fildes, struct stat *buf)
     struct dfs_fd *d;
 
     /* get the fd */
-    d = fd_get(fildes);
+    d = fd_get_ref(fildes);
     if (d == NULL)
     {
         rt_set_errno(-EBADF);
@@ -353,6 +344,7 @@ int fstat(int fildes, struct stat *buf)
 
     buf->st_size    = d->fnode->size;
     buf->st_mtime   = 0;
+    fd_put(d);
 
     return RT_EOK;
 }
@@ -375,7 +367,7 @@ int fsync(int fildes)
     struct dfs_fd *d;
 
     /* get the fd */
-    d = fd_get(fildes);
+    d = fd_get_ref(fildes);
     if (d == NULL)
     {
         rt_set_errno(-EBADF);
@@ -383,6 +375,7 @@ int fsync(int fildes)
     }
 
     ret = dfs_file_flush(d);
+    fd_put(d);
 
     return ret;
 }
@@ -406,7 +399,7 @@ int fcntl(int fildes, int cmd, ...)
     struct dfs_fd *d;
 
     /* get the fd */
-    d = fd_get(fildes);
+    d = fd_get_ref(fildes);
     if (d)
     {
         void *arg;
@@ -417,6 +410,7 @@ int fcntl(int fildes, int cmd, ...)
         va_end(ap);
 
         ret = dfs_file_ioctl(d, cmd, arg);
+        fd_put(d);
     }
     else ret = -EBADF;
 
@@ -471,7 +465,7 @@ int ftruncate(int fd, off_t length)
     int result;
     struct dfs_fd *d;
 
-    d = fd_get(fd);
+    d = fd_get_ref(fd);
     if (d == NULL)
     {
         rt_set_errno(-EBADF);
@@ -481,11 +475,13 @@ int ftruncate(int fd, off_t length)
 
     if (length < 0)
     {
+        fd_put(d);
         rt_set_errno(-EINVAL);
 
         return -1;
     }
     result = dfs_file_ftruncate(d, length);
+    fd_put(d);
     if (result < 0)
     {
         rt_set_errno(result);

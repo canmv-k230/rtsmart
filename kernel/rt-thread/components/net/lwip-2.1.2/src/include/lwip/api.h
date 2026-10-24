@@ -344,6 +344,9 @@ err_t   netconn_write_partly(struct netconn *conn, const void *dataptr, size_t s
                              u8_t apiflags, size_t *bytes_written);
 err_t   netconn_write_vectors_partly(struct netconn *conn, struct netvector *vectors, u16_t vectorcnt,
                                      u8_t apiflags, size_t *bytes_written);
+/* time_started uses the sys_now() millisecond clock, including caller wait. */
+err_t   netconn_write_vectors_partly_started(struct netconn *conn, struct netvector *vectors, u16_t vectorcnt,
+                                            u8_t apiflags, size_t *bytes_written, u32_t time_started);
 /** @ingroup netconn_tcp */
 #define netconn_write(conn, dataptr, size, apiflags) \
           netconn_write_partly(conn, dataptr, size, apiflags, NULL)

@@ -11,6 +11,7 @@
 
 #include <rtthread.h>
 #include <rthw.h>
+#include <fcntl.h>
 #include <sys/time.h>
 
 #include <sal_socket.h>
@@ -377,7 +378,7 @@ struct sal_socket *sal_get_socket(int socket)
 
     if (idx < 0 || idx >= (int)st->max_socket || st->sockets == RT_NULL ||
         st->sockets[idx] == RT_NULL ||
-        st->sockets[idx]->magic != SAL_SOCKET_MAGIC)
+        st->sockets[idx]->magic != SAL_SOCKET_MAGIC || st->sockets[idx]->closing)
     {
         return RT_NULL;
     }
@@ -409,6 +410,130 @@ static void sal_lock(void)
 static void sal_unlock(void)
 {
     rt_mutex_release(&sal_core_lock);
+}
+
+static void sal_socket_tx_put(struct sal_socket *sock)
+{
+    sal_lock();
+    RT_ASSERT(sock->tx_users > 0);
+    if (--sock->tx_users == 0 && sock->closing)
+        rt_sem_release(&sock->tx_drained);
+    sal_unlock();
+}
+
+static struct sal_socket *sal_socket_tx_lock(int socket, int flags, rt_tick_t started)
+{
+    struct sal_socket *sock;
+    rt_int32_t wait = RT_WAITING_FOREVER;
+    rt_err_t result;
+
+    sal_lock();
+    sock = sal_get_socket(socket);
+    if (sock == RT_NULL)
+    {
+        sal_unlock();
+        rt_set_errno(-EBADF);
+        return RT_NULL;
+    }
+
+    /* Pin before releasing the table lock. A blocked sender must not prevent
+     * unrelated sockets or netdev cleanup from acquiring sal_core_lock. */
+    sock->tx_users++;
+    sal_unlock();
+
+    /* Preserve both per-call and per-socket nonblocking behavior before
+     * waiting for another sender. The pin keeps the backend alive here. */
+    if (!(flags & MSG_DONTWAIT) && sock->pf && sock->pf->skt_ops &&
+        sock->pf->skt_ops->ioctlsocket)
+    {
+        int saved_errno = rt_get_errno();
+        int file_flags = sock->pf->skt_ops->ioctlsocket(
+                (int)(size_t)sock->user_data, F_GETFL, RT_NULL);
+
+        if (file_flags >= 0 && (file_flags & O_NONBLOCK))
+            flags |= MSG_DONTWAIT;
+        /* Protocol backends need not implement F_GETFL. */
+        rt_set_errno(saved_errno);
+    }
+    if (flags & MSG_DONTWAIT)
+    {
+        wait = 0;
+    }
+    else if (sock->pf && sock->pf->skt_ops && sock->pf->skt_ops->getsockopt)
+    {
+        /* Read the backend's current setting, including accepted sockets and
+         * concurrent setsockopt changes, without a second cached value. */
+        struct timeval timeout = {0};
+        socklen_t len = sizeof(timeout);
+        int saved_errno = rt_get_errno();
+
+        if (sock->pf->skt_ops->getsockopt((int)(size_t)sock->user_data,
+                SOL_SOCKET, SO_SNDTIMEO, &timeout, &len) == 0 &&
+            len == sizeof(timeout) && timeout.tv_sec >= 0 && timeout.tv_usec >= 0 &&
+            (timeout.tv_sec || timeout.tv_usec))
+        {
+            rt_uint64_t ticks = (rt_uint64_t)timeout.tv_sec * RT_TICK_PER_SECOND +
+                ((rt_uint64_t)timeout.tv_usec * RT_TICK_PER_SECOND + 999999) / 1000000;
+            rt_tick_t elapsed = rt_tick_get() - started;
+
+            if (ticks > (RT_TICK_MAX >> 1))
+                ticks = RT_TICK_MAX >> 1;
+            wait = elapsed < ticks ? (rt_int32_t)(ticks - elapsed) : 0;
+        }
+        /* Unsupported timeout options leave the original infinite wait. */
+        rt_set_errno(saved_errno);
+    }
+    result = rt_mutex_take_interruptible(&sock->tx_lock, wait);
+    if (result != RT_EOK)
+    {
+        sal_socket_tx_put(sock);
+        rt_set_errno(result == -RT_ETIMEOUT ? -EAGAIN : -EINTR);
+        return RT_NULL;
+    }
+    return sock;
+}
+
+static void sal_socket_tx_unlock(struct sal_socket *sock)
+{
+    int saved_errno = rt_get_errno();
+
+    rt_mutex_release(&sock->tx_lock);
+    sal_socket_tx_put(sock);
+    rt_set_errno(saved_errno);
+}
+
+/* Claim teardown once and drain senders without holding sal_core_lock. */
+static struct sal_socket *socket_close_begin(int socket)
+{
+    struct sal_socket *sock;
+    rt_err_t result;
+
+    RT_DEBUG_IN_THREAD_CONTEXT;
+    sal_lock();
+    sock = sal_get_socket(socket);
+    if (sock == RT_NULL)
+    {
+        sal_unlock();
+        rt_set_errno(-EBADF);
+        return RT_NULL;
+    }
+
+    sock->closing = RT_TRUE;
+    while (sock->tx_users != 0)
+    {
+        sal_unlock();
+        result = rt_sem_take_interruptible(&sock->tx_drained, RT_WAITING_FOREVER);
+        sal_lock();
+        if (result != RT_EOK)
+        {
+            sock->closing = RT_FALSE;
+            sal_unlock();
+            rt_set_errno(result == -RT_EINTR ? -EINTR : -EIO);
+            return RT_NULL;
+        }
+    }
+    sal_unlock();
+    return sock;
 }
 
 /**
@@ -567,7 +692,13 @@ static void socket_free(struct sal_socket_table *st, int idx)
     struct sal_socket *sock;
 
     sock = st->sockets[idx];
+    RT_ASSERT(sock->closing && sock->tx_users == 0);
     st->sockets[idx] = RT_NULL;
+    sock->magic = 0;
+    sock->netdev = RT_NULL;
+    sock->pf = RT_NULL;
+    rt_mutex_detach(&sock->tx_lock);
+    rt_sem_detach(&sock->tx_drained);
     rt_free(sock);
 }
 
@@ -596,6 +727,8 @@ static int socket_new(void)
     sock->pf = RT_NULL;
     sock->netdev_bound = RT_FALSE;
     sock->user_data = RT_NULL;
+    rt_mutex_init(&sock->tx_lock, "sal_tx", RT_IPC_FLAG_FIFO);
+    rt_sem_init(&sock->tx_drained, "sal_drain", 0, RT_IPC_FLAG_FIFO);
 #ifdef SAL_USING_TLS
     sock->user_data_tls = RT_NULL;
 #endif
@@ -609,25 +742,21 @@ static void socket_delete(int socket)
 {
     struct sal_socket *sock;
     struct sal_socket_table *st = &socket_table;
-    int idx;
+    int idx = socket - SAL_SOCKET_OFFSET;
+    int saved_errno = rt_get_errno();
 
-    idx = socket - SAL_SOCKET_OFFSET;
-    if (idx < 0 || idx >= (int) st->max_socket)
+    /* Roll back socket creation through the same teardown ownership and
+     * sender drain used by normal close. Netdev cleanup does not delete. */
+    sock = socket_close_begin(socket);
+    if (sock == RT_NULL)
     {
+        rt_set_errno(saved_errno);
         return;
     }
     sal_lock();
-    sock = sal_get_socket(socket);
-    if (sock == RT_NULL)
-    {
-        sal_unlock();
-        return;
-    }
-    sock->magic = 0;
-    sock->netdev = RT_NULL;
-    sock->pf = RT_NULL;
     socket_free(st, idx);
     sal_unlock();
+    rt_set_errno(saved_errno);
 }
 
 int sal_accept(int socket, struct sockaddr *addr, socklen_t *addrlen)
@@ -958,50 +1087,82 @@ int sal_sendto(int socket, const void *dataptr, size_t size, int flags,
 {
     struct sal_socket *sock;
     struct sal_proto_family *pf;
+    rt_tick_t started = rt_tick_get();
+    int ret;
 
-    /* get the socket object by socket descriptor */
-    SAL_SOCKET_OBJ_GET(sock, socket);
+    sock = sal_socket_tx_lock(socket, flags, started);
+    if (sock == RT_NULL)
+    {
+        return -1;
+    }
 
-    /* check the network interface socket opreation */
-    SAL_SOCKETOPS_VALID(sock, pf, sendto);
+    pf = sock->pf;
+    if (pf == RT_NULL || pf->skt_ops == RT_NULL || pf->skt_ops->sendto == RT_NULL)
+    {
+        rt_set_errno(-EOPNOTSUPP);
+        ret = -1;
+        goto __exit;
+    }
 
 #ifdef SAL_USING_TLS
     if (SAL_SOCKOPS_PROTO_TLS_VALID(sock, send))
     {
-        int ret;
-
         if ((ret = proto_tls->ops->send(sock->user_data_tls, dataptr, size)) < 0)
         {
-            return -1;
+            ret = -1;
         }
-        return ret;
     }
     else
-    {
-        return pf->skt_ops->sendto((int) sock->user_data, dataptr, size, flags, to, tolen);
-    }
-#else
-    return pf->skt_ops->sendto((int)(size_t)sock->user_data, dataptr, size, flags, to, tolen);
 #endif
+    if (pf->skt_ops->sendto_started)
+        ret = pf->skt_ops->sendto_started((int)(size_t)sock->user_data,
+                dataptr, size, flags, to, tolen, started);
+    else
+        ret = pf->skt_ops->sendto((int)(size_t)sock->user_data, dataptr, size, flags, to, tolen);
+
+__exit:
+    sal_socket_tx_unlock(sock);
+    return ret;
 }
 
 int sal_sendmsg(int socket, const struct sal_msghdr *message, int flags)
 {
     struct sal_socket *sock;
     struct sal_proto_family *pf;
+    rt_tick_t started = rt_tick_get();
+    int ret;
 
-    SAL_SOCKET_OBJ_GET(sock, socket);
-    SAL_SOCKETOPS_VALID(sock, pf, sendmsg);
+    sock = sal_socket_tx_lock(socket, flags, started);
+    if (sock == RT_NULL)
+    {
+        return -1;
+    }
+
+    pf = sock->pf;
+    if (pf == RT_NULL || pf->skt_ops == RT_NULL || pf->skt_ops->sendmsg == RT_NULL)
+    {
+        rt_set_errno(-EOPNOTSUPP);
+        ret = -1;
+        goto __exit;
+    }
 
 #ifdef SAL_USING_TLS
     if (SAL_SOCKOPS_PROTO_TLS_VALID(sock, send))
     {
         rt_set_errno(-EOPNOTSUPP);
-        return -1;
+        ret = -1;
+        goto __exit;
     }
 #endif
 
-    return pf->skt_ops->sendmsg((int)(size_t)sock->user_data, message, flags);
+    if (pf->skt_ops->sendmsg_started)
+        ret = pf->skt_ops->sendmsg_started((int)(size_t)sock->user_data, message, flags, started);
+    else
+        ret = pf->skt_ops->sendmsg((int)(size_t)sock->user_data, message, flags);
+
+__exit:
+    sal_socket_tx_unlock(sock);
+    return ret;
 }
 
 int sal_socket(int domain, int type, int protocol)
@@ -1059,18 +1220,30 @@ int sal_socket(int domain, int type, int protocol)
     return -1;
 }
 
-int sal_closesocket(int socket)
+int sal_closesocket_ex(int socket, rt_bool_t *closed)
 {
     struct sal_socket *sock;
     struct sal_proto_family *pf;
+    struct sal_socket_table *st = &socket_table;
+    int idx = socket - SAL_SOCKET_OFFSET;
     int error = 0;
+    int saved_errno;
 
-    /* get the socket object by socket descriptor */
-    SAL_SOCKET_OBJ_GET(sock, socket);
+    if (closed)
+        *closed = RT_FALSE;
+    sock = socket_close_begin(socket);
+    if (sock == RT_NULL)
+    {
+        return -1;
+    }
 
-    /* clsoesocket operation not need to vaild network interface status */
-    /* valid the network interface socket opreation */
-    SAL_SOCKETOPS_VALID(sock, pf, socket);
+    pf = sock->pf;
+    if (pf == RT_NULL || pf->skt_ops == RT_NULL || pf->skt_ops->closesocket == RT_NULL)
+    {
+        rt_set_errno(-EOPNOTSUPP);
+        error = -1;
+        goto __exit;
+    }
 
     if (pf->skt_ops->closesocket((int)(size_t)sock->user_data) == 0)
     {
@@ -1091,10 +1264,21 @@ int sal_closesocket(int socket)
         error = -1;
     }
 
-    /* delete socket */
-    socket_delete(socket);
+__exit:
+    saved_errno = rt_get_errno();
+    sal_lock();
+    socket_free(st, idx);
+    sal_unlock();
+    if (closed)
+        *closed = RT_TRUE;
+    rt_set_errno(saved_errno);
 
     return error;
+}
+
+int sal_closesocket(int socket)
+{
+    return sal_closesocket_ex(socket, RT_NULL);
 }
 
 int sal_ioctlsocket(int socket, long cmd, void *arg)

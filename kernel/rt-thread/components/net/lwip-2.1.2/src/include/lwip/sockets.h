@@ -598,6 +598,10 @@ ssize_t lwip_send(int s, const void *dataptr, size_t size, int flags);
 ssize_t lwip_sendmsg(int s, const struct msghdr *message, int flags);
 ssize_t lwip_sendto(int s, const void *dataptr, size_t size, int flags,
     const struct sockaddr *to, socklen_t tolen);
+/* RT-Smart sends include serialization wait in SO_SNDTIMEO; sys_now() clock. */
+ssize_t lwip_sendmsg_started(int s, const struct msghdr *message, int flags, u32_t time_started);
+ssize_t lwip_sendto_started(int s, const void *dataptr, size_t size, int flags,
+                          const struct sockaddr *to, socklen_t tolen, u32_t time_started);
 int lwip_socket(int domain, int type, int protocol);
 ssize_t lwip_write(int s, const void *dataptr, size_t size);
 ssize_t lwip_writev(int s, const struct iovec *iov, int iovcnt);

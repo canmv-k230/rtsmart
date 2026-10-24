@@ -230,10 +230,28 @@ static int inet_getsockname(int socket, struct sockaddr *name, socklen_t *namele
 }
 
 #if LWIP_VERSION >= 0x02010000
-static int inet_sendmsg(int socket, const struct sal_msghdr *message, int flags)
+/* Use the same tick origin and integer scale as this port's sys_now().
+ * The scale is exact when RT_TICK_PER_SECOND divides 1000 (K230 uses 1000).
+ * Convert the captured tick directly, avoiding skew between clock reads and
+ * preserving sys_now()'s unsigned wrap behavior. */
+static u32_t inet_send_started(rt_tick_t started)
+{
+    return (u32_t)started * (1000 / RT_TICK_PER_SECOND);
+}
+
+static int inet_sendto_started(int socket, const void *data, size_t size, int flags,
+                               const struct sockaddr *to, socklen_t tolen, rt_tick_t started)
+{
+    return (int)lwip_sendto_started(socket, data, size, flags, to, tolen,
+                                   inet_send_started(started));
+}
+
+static int inet_sendmsg_started(int socket, const struct sal_msghdr *message, int flags,
+                                rt_tick_t started)
 {
     struct msghdr lwip_message;
     struct iovec *lwip_iov;
+    u32_t time_started = inet_send_started(started);
     int i;
     int ret;
 
@@ -258,9 +276,14 @@ static int inet_sendmsg(int socket, const struct sal_msghdr *message, int flags)
     lwip_message.msg_controllen = message->msg_controllen;
     lwip_message.msg_flags = message->msg_flags;
 
-    ret = (int)lwip_sendmsg(socket, &lwip_message, flags);
+    ret = (int)lwip_sendmsg_started(socket, &lwip_message, flags, time_started);
     rt_free(lwip_iov);
     return ret;
+}
+
+static int inet_sendmsg(int socket, const struct sal_msghdr *message, int flags)
+{
+    return inet_sendmsg_started(socket, message, flags, rt_tick_get());
 }
 
 static int inet_recvmsg(int socket, struct sal_msghdr *message, int flags)
@@ -391,6 +414,13 @@ static const struct sal_socket_ops lwip_socket_ops =
     inet_ioctlsocket,
 #ifdef SAL_USING_POSIX
     inet_poll,
+#endif
+#if LWIP_VERSION >= 0x02010000
+    inet_sendto_started,
+    inet_sendmsg_started,
+#else
+    RT_NULL,
+    RT_NULL,
 #endif
 };
 

@@ -16,12 +16,28 @@
 
 #include <sys/socket.h>
 
+/* Keep the DFS object and its backend socket alive across every socket call. */
+#define SOCKET_GET(s) \
+    struct dfs_fd *socket_file; \
+    int socket = dfs_net_getsocket_ref((s), &socket_file); \
+    if (socket < 0) \
+    { \
+        return -1; \
+    }
+
+static int socket_result(struct dfs_fd *file, int result)
+{
+    fd_put(file);
+    return result;
+}
+
 int accept(int s, struct sockaddr *addr, socklen_t *addrlen)
 {
     int new_socket = -1;
-    int socket = dfs_net_getsocket(s);
+    SOCKET_GET(s);
 
     new_socket = sal_accept(socket, addr, addrlen);
+    fd_put(socket_file);
     if (new_socket != -1)
     {
         /* this is a new socket, create it in file system fd */
@@ -32,8 +48,8 @@ int accept(int s, struct sockaddr *addr, socklen_t *addrlen)
         fd = fd_new();
         if (fd < 0)
         {
-            rt_set_errno(-ENOMEM);
             sal_closesocket(new_socket);
+            rt_set_errno(-ENOMEM);
             return -1;
         }
 
@@ -41,15 +57,15 @@ int accept(int s, struct sockaddr *addr, socklen_t *addrlen)
         if(d)
         {
             /* this is a socket fd */
-            d->fnode = (struct dfs_fnode *)rt_malloc(sizeof(struct dfs_fnode));
+            d->fnode = (struct dfs_fnode *)rt_calloc(1, sizeof(struct dfs_fnode));
             if (!d->fnode)
             {
                 /* release fd */
                 fd_release(fd);
+                sal_closesocket(new_socket);
                 rt_set_errno(-ENOMEM);
                 return -1;
             }
-            rt_memset(d->fnode, 0, sizeof(struct dfs_fnode));
             rt_list_init(&d->fnode->list);
 
             d->fnode->type = FT_SOCKET;
@@ -67,8 +83,9 @@ int accept(int s, struct sockaddr *addr, socklen_t *addrlen)
             return fd;
         }
 
-        rt_set_errno(-ENOMEM);
+        fd_release(fd);
         sal_closesocket(new_socket);
+        rt_set_errno(-ENOMEM);
         return -1;
     }
 
@@ -78,7 +95,7 @@ RTM_EXPORT(accept);
 
 int bind(int s, const struct sockaddr *name, socklen_t namelen)
 {
-    int socket = dfs_net_getsocket(s);
+    SOCKET_GET(s);
 
 #ifdef SAL_USING_AF_UNIX
     struct sockaddr_in server_addr = {0};
@@ -87,83 +104,57 @@ int bind(int s, const struct sockaddr *name, socklen_t namelen)
         server_addr.sin_family = AF_INET;
         server_addr.sin_port = htons(514);
         server_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
-        return sal_bind(socket, (struct sockaddr *)&server_addr, namelen);
+        return socket_result(socket_file,
+            sal_bind(socket, (struct sockaddr *)&server_addr, namelen));
     }
 #endif /* SAL_USING_AF_UNIX */
 
-    return sal_bind(socket, name, namelen);
+    return socket_result(socket_file, sal_bind(socket, name, namelen));
 }
 RTM_EXPORT(bind);
 
 int shutdown(int s, int how)
 {
-    int error = 0;
-    int socket = -1;
-    struct dfs_fd *d;
-
-    socket = dfs_net_getsocket(s);
-    if (socket < 0)
-    {
-        rt_set_errno(-ENOTSOCK);
-        return -1;
-    }
-
-    d = fd_get(s);
-    if (d == NULL)
-    {
-        rt_set_errno(-EBADF);
-        return -1;
-    }
-
-    if (sal_shutdown(socket, how) == 0)
-    {
-        error = 0;
-    }
-    else
-    {
-        rt_set_errno(-ENOTSOCK);
-        error = -1;
-    }
-
-    return error;
+    SOCKET_GET(s);
+    return socket_result(socket_file, sal_shutdown(socket, how));
 }
 RTM_EXPORT(shutdown);
 
 int getpeername(int s, struct sockaddr *name, socklen_t *namelen)
 {
-    int socket = dfs_net_getsocket(s);
+    SOCKET_GET(s);
 
-    return sal_getpeername(socket, name, namelen);
+    return socket_result(socket_file, sal_getpeername(socket, name, namelen));
 }
 RTM_EXPORT(getpeername);
 
 int getsockname(int s, struct sockaddr *name, socklen_t *namelen)
 {
-    int socket = dfs_net_getsocket(s);
+    SOCKET_GET(s);
 
-    return sal_getsockname(socket, name, namelen);
+    return socket_result(socket_file, sal_getsockname(socket, name, namelen));
 }
 RTM_EXPORT(getsockname);
 
 int getsockopt(int s, int level, int optname, void *optval, socklen_t *optlen)
 {
-    int socket = dfs_net_getsocket(s);
+    SOCKET_GET(s);
 
-    return sal_getsockopt(socket, level, optname, optval, optlen);
+    return socket_result(socket_file, sal_getsockopt(socket, level, optname, optval, optlen));
 }
 RTM_EXPORT(getsockopt);
 
 int setsockopt(int s, int level, int optname, const void *optval, socklen_t optlen)
 {
-    int socket = dfs_net_getsocket(s);
+    SOCKET_GET(s);
 
-    return sal_setsockopt(socket, level, optname, optval, optlen);
+    return socket_result(socket_file, sal_setsockopt(socket, level, optname, optval, optlen));
 }
 RTM_EXPORT(setsockopt);
 
 int connect(int s, const struct sockaddr *name, socklen_t namelen)
 {
-    int socket = dfs_net_getsocket(s);
+    SOCKET_GET(s);
 
 #ifdef SAL_USING_AF_UNIX
     struct sockaddr_in server_addr = {0};
@@ -172,53 +163,54 @@ int connect(int s, const struct sockaddr *name, socklen_t namelen)
         server_addr.sin_family = AF_INET;
         server_addr.sin_port = htons(514);
         server_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
-        return sal_connect(socket, (struct sockaddr *)&server_addr, namelen);
+        return socket_result(socket_file,
+            sal_connect(socket, (struct sockaddr *)&server_addr, namelen));
     }
 #endif /* SAL_USING_AF_UNIX */
 
-    return sal_connect(socket, name, namelen);
+    return socket_result(socket_file, sal_connect(socket, name, namelen));
 }
 RTM_EXPORT(connect);
 
 int listen(int s, int backlog)
 {
-    int socket = dfs_net_getsocket(s);
+    SOCKET_GET(s);
 
-    return sal_listen(socket, backlog);
+    return socket_result(socket_file, sal_listen(socket, backlog));
 }
 RTM_EXPORT(listen);
 
 int recv(int s, void *mem, size_t len, int flags)
 {
-    int socket = dfs_net_getsocket(s);
+    SOCKET_GET(s);
 
-    return sal_recvfrom(socket, mem, len, flags, NULL, NULL);
+    return socket_result(socket_file, sal_recvfrom(socket, mem, len, flags, NULL, NULL));
 }
 RTM_EXPORT(recv);
 
 int recvfrom(int s, void *mem, size_t len, int flags,
              struct sockaddr *from, socklen_t *fromlen)
 {
-    int socket = dfs_net_getsocket(s);
+    SOCKET_GET(s);
 
-    return sal_recvfrom(socket, mem, len, flags, from, fromlen);
+    return socket_result(socket_file, sal_recvfrom(socket, mem, len, flags, from, fromlen));
 }
 RTM_EXPORT(recvfrom);
 
 int send(int s, const void *dataptr, size_t size, int flags)
 {
-    int socket = dfs_net_getsocket(s);
+    SOCKET_GET(s);
 
-    return sal_sendto(socket, dataptr, size, flags, NULL, 0);
+    return socket_result(socket_file, sal_sendto(socket, dataptr, size, flags, NULL, 0));
 }
 RTM_EXPORT(send);
 
 int sendto(int s, const void *dataptr, size_t size, int flags,
            const struct sockaddr *to, socklen_t tolen)
 {
-    int socket = dfs_net_getsocket(s);
+    SOCKET_GET(s);
 
-    return sal_sendto(socket, dataptr, size, flags, to, tolen);
+    return socket_result(socket_file, sal_sendto(socket, dataptr, size, flags, to, tolen));
 }
 RTM_EXPORT(sendto);
 
@@ -238,7 +230,13 @@ int socket(int domain, int type, int protocol)
         return -1;
     }
     d = fd_get(fd);
-    d->fnode = (struct dfs_fnode *)rt_malloc(sizeof(struct dfs_fnode));
+    if (!d)
+    {
+        fd_release(fd);
+        rt_set_errno(-ENOMEM);
+        return -1;
+    }
+    d->fnode = (struct dfs_fnode *)rt_calloc(1, sizeof(struct dfs_fnode));
     if (!d->fnode)
     {
         /* release fd */
@@ -246,6 +244,8 @@ int socket(int domain, int type, int protocol)
         rt_set_errno(-ENOMEM);
         return -1;
     }
+    /* fd_release() also owns this fnode if sal_socket() fails. */
+    d->fnode->ref_count = 1;
 
 #ifdef SAL_USING_AF_UNIX
     if (domain == AF_UNIX)
@@ -258,13 +258,11 @@ int socket(int domain, int type, int protocol)
     socket = sal_socket(domain, type, protocol);
     if (socket >= 0)
     {
-        rt_memset(d->fnode, 0, sizeof(struct dfs_fnode));
         rt_list_init(&d->fnode->list);
         /* this is a socket fd */
         d->fnode->type = FT_SOCKET;
         d->fnode->path = NULL;
         d->fnode->fullpath = NULL;
-        d->fnode->ref_count = 1;
         d->fnode->fops = dfs_net_get_fops();
 
         d->flags = O_RDWR; /* set flags as read and write */
@@ -276,7 +274,6 @@ int socket(int domain, int type, int protocol)
     }
     else
     {
-        // rt_free(d->fnode);
         /* release fd */
         fd_release(fd);
         rt_set_errno(-ENOMEM);
@@ -290,32 +287,8 @@ RTM_EXPORT(socket);
 int closesocket(int s)
 {
     int error;
-    struct dfs_fd *d;
 
-    if (dfs_net_getsocket(s) < 0)
-    {
-        rt_set_errno(-ENOTSOCK);
-        return -1;
-    }
-
-    d = fd_get(s);
-    if (d == RT_NULL)
-    {
-        rt_set_errno(-EBADF);
-        return -1;
-    }
-
-    if (!d->fnode)
-    {
-        rt_set_errno(-EBADF);
-        return -1;
-    }
-
-    error = dfs_file_close(d);
-    if (error >= 0 || (d->flags & DFS_F_CLOSE_TERMINAL))
-    {
-        fd_release(s);
-    }
+    error = fdt_fd_close(dfs_fdtable_get(), s, FT_SOCKET);
 
     if (error < 0)
     {
@@ -329,8 +302,8 @@ RTM_EXPORT(closesocket);
 
 int ioctlsocket(int s, long cmd, void *arg)
 {
-    int socket = dfs_net_getsocket(s);
+    SOCKET_GET(s);
 
-    return sal_ioctlsocket(socket, cmd, arg);
+    return socket_result(socket_file, sal_ioctlsocket(socket, cmd, arg));
 }
 RTM_EXPORT(ioctlsocket);

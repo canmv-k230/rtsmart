@@ -20,15 +20,33 @@
 
 int dfs_net_getsocket(int fd)
 {
+    struct dfs_fd *file;
+    int socket = dfs_net_getsocket_ref(fd, &file);
+
+    fd_put(file);
+    return socket;
+}
+
+int dfs_net_getsocket_ref(int fd, struct dfs_fd **file)
+{
     int socket;
     struct dfs_fd *_dfs_fd;
 
-    _dfs_fd = fd_get(fd);
-    if (_dfs_fd == NULL || _dfs_fd->fnode == NULL) return -1;
-
-    if (_dfs_fd->fnode->type != FT_SOCKET) socket = -1;
-    else socket = (int)(size_t)_dfs_fd->fnode->data;
-
+    *file = RT_NULL;
+    _dfs_fd = fd_get_ref(fd);
+    if (!_dfs_fd)
+    {
+        rt_set_errno(-EBADF);
+        return -1;
+    }
+    if (_dfs_fd->fnode->type != FT_SOCKET)
+    {
+        fd_put(_dfs_fd);
+        rt_set_errno(-ENOTSOCK);
+        return -1;
+    }
+    socket = (int)(size_t)_dfs_fd->fnode->data;
+    *file = _dfs_fd;
     return socket;
 }
 
@@ -80,11 +98,19 @@ static int dfs_net_close(struct dfs_fd* file)
 
     if (file->fnode->ref_count == 1)
     {
+        rt_bool_t closed;
+
         socket = (int)(size_t)file->fnode->data;
-        ret = sal_closesocket(socket);
-        /* SAL consumes its socket object even if the protocol close reports
-         * an error. Do not leave a DFS descriptor pointing at freed state. */
-        file->flags |= DFS_F_CLOSE_TERMINAL;
+        ret = sal_closesocket_ex(socket, &closed);
+        if (ret < 0)
+        {
+            ret = rt_get_errno();
+            ret = ret > 0 ? -ret : (ret ? ret : -EIO);
+        }
+        /* An interrupted drain retains the socket for retry. A backend
+         * close error may instead have consumed it and must be terminal. */
+        if (closed)
+            file->flags |= DFS_F_CLOSE_TERMINAL;
     }
     return ret;
 }

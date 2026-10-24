@@ -85,6 +85,8 @@ static const struct sal_socket_ops at_socket_ops =
 #ifdef SAL_USING_POSIX
     at_poll,
 #endif /* SAL_USING_POSIX */
+    RT_NULL, /* sendto_started: backend retains its own timeout */
+    RT_NULL, /* sendmsg_started */
 };
 
 static const struct sal_netdb_ops at_netdb_ops = 

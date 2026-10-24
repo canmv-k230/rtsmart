@@ -603,6 +603,7 @@ static void* lwp_syscall_kmem_get(size_t nbyte, size_t* block_size)
 ssize_t sys_read(int fd, void* buf, size_t nbyte)
 {
 #ifdef RT_USING_USERSPACE
+    struct dfs_fd *file;
     void*   kmem       = RT_NULL;
     ssize_t ret        = -1;
     ssize_t read_size  = 0;
@@ -620,16 +621,22 @@ ssize_t sys_read(int fd, void* buf, size_t nbyte)
     if (!kmem) {
         return -ENOMEM;
     }
+    file = fd_get_ref(fd);
+    if (!file) {
+        kmem_put(kmem);
+        return -EBADF;
+    }
 
     while (nbyte > 0) {
         size_t chunk = nbyte > block_size ? block_size : nbyte;
 
-        ret = read(fd, kmem, chunk);
+        ret = dfs_file_read(file, kmem, chunk);
         if (ret <= 0) {
             break;
         }
 
         if (lwp_put_to_user(buf, kmem, ret) != (size_t)ret) {
+            fd_put(file);
             kmem_put(kmem);
             return -EFAULT;
         }
@@ -643,9 +650,10 @@ ssize_t sys_read(int fd, void* buf, size_t nbyte)
         }
     }
 
+    fd_put(file);
     kmem_put(kmem);
     if (ret < 0 && read_size == 0) {
-        return GET_ERRNO();
+        return ret;
     }
 
     return read_size;
@@ -662,6 +670,7 @@ ssize_t sys_read(int fd, void* buf, size_t nbyte)
 ssize_t sys_write(int fd, const void* buf, size_t nbyte)
 {
 #ifdef RT_USING_USERSPACE
+    struct dfs_fd *file;
     void*   kmem       = RT_NULL;
     ssize_t ret        = -1;
     ssize_t write_size = 0;
@@ -679,16 +688,22 @@ ssize_t sys_write(int fd, const void* buf, size_t nbyte)
     if (!kmem) {
         return -ENOMEM;
     }
+    file = fd_get_ref(fd);
+    if (!file) {
+        kmem_put(kmem);
+        return -EBADF;
+    }
 
     while (nbyte > 0) {
         size_t chunk = nbyte > block_size ? block_size : nbyte;
 
         if (lwp_get_from_user(kmem, (void*)buf, chunk) != chunk) {
+            fd_put(file);
             kmem_put(kmem);
             return write_size ? write_size : -EFAULT;
         }
 
-        ret = write(fd, kmem, chunk);
+        ret = dfs_file_write(file, kmem, chunk);
         if (ret <= 0) {
             break;
         }
@@ -702,9 +717,10 @@ ssize_t sys_write(int fd, const void* buf, size_t nbyte)
         }
     }
 
+    fd_put(file);
     kmem_put(kmem);
     if (ret < 0 && write_size == 0) {
-        return GET_ERRNO();
+        return ret;
     }
 
     return write_size;
@@ -3512,6 +3528,7 @@ static void free_kernel_msghdr(struct musl_iovec *user_iov,
 
 int sys_sendmsg(int socket, struct musl_msghdr *message, int flags)
 {
+    struct dfs_fd *socket_file = RT_NULL;
     struct musl_msghdr kmessage;
     struct musl_iovec *user_iov = RT_NULL;
     struct sal_iovec *kernel_iov = RT_NULL;
@@ -3568,7 +3585,7 @@ int sys_sendmsg(int socket, struct musl_msghdr *message, int flags)
     sal_message.msg_iov = kernel_iov;
     sal_message.msg_iovlen = kernel_iovlen;
 
-    sal_socket = dfs_net_getsocket(socket);
+    sal_socket = dfs_net_getsocket_ref(socket, &socket_file);
     if (sal_socket < 0)
     {
         ret = -EBADF;
@@ -3581,12 +3598,14 @@ int sys_sendmsg(int socket, struct musl_msghdr *message, int flags)
     }
 
 out:
+    fd_put(socket_file);
     free_kernel_msghdr(user_iov, kernel_iov, kernel_data);
     return ret;
 }
 
 int sys_recvmsg(int socket, struct musl_msghdr *message, int flags)
 {
+    struct dfs_fd *socket_file = RT_NULL;
     struct musl_msghdr kmessage;
     struct musl_iovec *user_iov = RT_NULL;
     struct sal_iovec *kernel_iov = RT_NULL;
@@ -3653,7 +3672,7 @@ int sys_recvmsg(int socket, struct musl_msghdr *message, int flags)
         sal_message.msg_controllen = user_control_len;
     }
 
-    sal_socket = dfs_net_getsocket(socket);
+    sal_socket = dfs_net_getsocket_ref(socket, &socket_file);
     if (sal_socket < 0)
     {
         ret = -EBADF;
@@ -3814,6 +3833,7 @@ int sys_recvmsg(int socket, struct musl_msghdr *message, int flags)
     }
 
 out:
+    fd_put(socket_file);
     rt_free(kernel_control);
     free_kernel_msghdr(user_iov, kernel_iov, kernel_data);
     return ret;

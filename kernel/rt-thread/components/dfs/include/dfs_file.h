@@ -62,6 +62,7 @@ struct dfs_fd
     off_t    pos;                /* Current file position */
     struct dfs_fnode *fnode;     /* file node struct */
     void *data;                  /* Specific fd data */
+    struct dfs_fd *close_next;   /* Last-reference closes awaiting retry */
 };
 
 struct dfs_mmap2_args

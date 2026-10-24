@@ -20,10 +20,11 @@ extern "C" {
 
 const struct dfs_file_ops* dfs_net_get_fops(void);
 int dfs_net_getsocket(int fd);
+/* On success, *file owns a pin that the caller must release with fd_put(). */
+int dfs_net_getsocket_ref(int fd, struct dfs_fd **file);
 
 #ifdef __cplusplus
 }
 #endif
 
 #endif
-

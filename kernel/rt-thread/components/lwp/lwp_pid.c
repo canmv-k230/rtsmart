@@ -132,12 +132,14 @@ static void __exit_files(struct rt_lwp *lwp)
     {
         struct dfs_fd *d;
 
+        /* Transfer the table's ownership before dropping it. An operation in
+         * another process may release the last shared pin during teardown.
+         * fd_put also retains retryable failures after this table is gone. */
+        dfs_fd_lock();
         d = lwp->fdt.fds[fd];
-        if (d)
-        {
-            dfs_file_close(d);
-            fdt_fd_release(&lwp->fdt, fd);
-        }
+        lwp->fdt.fds[fd] = RT_NULL;
+        dfs_fd_unlock();
+        fd_put(d);
         fd--;
     }
 }
@@ -359,10 +361,6 @@ void lwp_free(struct rt_lwp* lwp)
 
     LOG_D("lwp free: %p\n", lwp);
 
-    level = rt_hw_interrupt_disable();
-    lwp->finish = 1;
-    rt_hw_interrupt_enable(level);
-
     if (lwp->args != RT_NULL)
     {
 #ifndef ARCH_MM_MMU
@@ -462,7 +460,11 @@ void lwp_free(struct rt_lwp* lwp)
         }
     }
 
-    rt_hw_interrupt_enable(level);
+    /* Publish completion only after descriptor and address-space cleanup.
+     * waitpid (or an exiting parent) may free this object as soon as finish
+     * becomes visible. Keep publication and waiter wakeup in one critical
+     * section, with no further access after restoring interrupts. */
+    lwp->finish = 1;
     /* for parent */
     {
         if (lwp->parent)
@@ -474,19 +476,11 @@ void lwp_free(struct rt_lwp* lwp)
                 thread->error = RT_EOK;
                 thread->msg_ret = (void*)(rt_size_t)lwp->lwp_ret;
                 rt_thread_resume(thread);
-                rt_hw_interrupt_enable(level);
-                return;
             }
-            else
-            {
-                struct rt_lwp **it = &lwp->parent->first_child;
-
-                while (*it != lwp)
-                {
-                    it = &(*it)->sibling;
-                }
-                *it = lwp->sibling;
-            }
+            /* Retain the completed child until waitpid reaps it, including
+             * when the parent starts waiting after cleanup has finished. */
+            rt_hw_interrupt_enable(level);
+            return;
         }
         lwp_pid_put(lwp_to_pid(lwp));
         rt_hw_interrupt_enable(level);

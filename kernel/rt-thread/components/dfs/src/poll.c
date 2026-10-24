@@ -27,6 +27,7 @@ struct rt_poll_table
 {
     rt_pollreq_t req;
     rt_uint32_t triggered; /* the waited thread whether triggered */
+    rt_bool_t sleeping;    /* wakeups may resume only the poll sleep */
     rt_thread_t polling_thread;
     struct rt_poll_node *nodes;
 };
@@ -47,6 +48,11 @@ static int __wqueue_pollwake(struct rt_wqueue_node *wait, void *key)
 
     pn = rt_container_of(wait, struct rt_poll_node, wqn);
     pn->pt->triggered = 1;
+
+    /* Waitqueue callbacks run with interrupts disabled. Keep readiness even
+     * during a scan, but do not resume a thread blocked on a backend mutex. */
+    if (!pn->pt->sleeping)
+        return -1;
 
     return __wqueue_default_wake(wait, key);
 }
@@ -76,6 +82,7 @@ static void poll_table_init(struct rt_poll_table *pt)
 {
     pt->req._proc = _poll_add;
     pt->triggered = 0;
+    pt->sleeping = RT_FALSE;
     pt->nodes = RT_NULL;
     pt->polling_thread = rt_thread_self();
 }
@@ -95,8 +102,11 @@ static int poll_wait_timeout(struct rt_poll_table *pt, int msec)
 
     if (timeout != 0 && !pt->triggered)
     {
+        /* Interrupts remain disabled across suspend and sleeping publication.
+         * Publishing earlier would allow a backend-mutex wait to be resumed. */
         if (rt_thread_suspend_with_flag(thread, RT_INTERRUPTIBLE) == RT_EOK)
         {
+            pt->sleeping = RT_TRUE;
             if (timeout > 0)
             {
                 rt_timer_control(&(thread->thread_timer),
@@ -110,6 +120,7 @@ static int poll_wait_timeout(struct rt_poll_table *pt, int msec)
             rt_schedule();
 
             level = rt_hw_interrupt_disable();
+            pt->sleeping = RT_FALSE;
         }
     }
 
@@ -119,7 +130,7 @@ static int poll_wait_timeout(struct rt_poll_table *pt, int msec)
     return ret;
 }
 
-static int do_pollfd(struct pollfd *pollfd, rt_pollreq_t *req)
+static int do_pollfd(struct pollfd *pollfd, struct dfs_fd *f, rt_pollreq_t *req)
 {
     int mask = 0;
     int fd;
@@ -128,7 +139,6 @@ static int do_pollfd(struct pollfd *pollfd, rt_pollreq_t *req)
 
     if (fd >= 0)
     {
-        struct dfs_fd *f = fd_get(fd);
         mask = POLLNVAL;
 
         if (f)
@@ -156,7 +166,8 @@ static int do_pollfd(struct pollfd *pollfd, rt_pollreq_t *req)
     return mask;
 }
 
-static int poll_do(struct pollfd *fds, nfds_t nfds, struct rt_poll_table *pt, int msec)
+static int poll_do(struct pollfd *fds, struct dfs_fd **files, nfds_t nfds,
+                  struct rt_poll_table *pt, int msec)
 {
     int num;
     int istimeout = 0;
@@ -177,7 +188,7 @@ static int poll_do(struct pollfd *fds, nfds_t nfds, struct rt_poll_table *pt, in
 
         for (n = 0; n < nfds; n ++)
         {
-            ret = do_pollfd(pf, &pt->req);
+            ret = do_pollfd(pf, files[n], &pt->req);
             if(ret < 0)
             {
                 /*dealwith the device return error -1  */
@@ -222,12 +233,33 @@ int poll(struct pollfd *fds, nfds_t nfds, int timeout)
 {
     int num;
     struct rt_poll_table table;
+    struct dfs_fd **files = RT_NULL;
+    nfds_t n;
+
+    if (nfds)
+    {
+        files = rt_calloc(nfds, sizeof(*files));
+        if (!files)
+        {
+            return -ENOMEM;
+        }
+        for (n = 0; n < nfds; n++)
+        {
+            files[n] = fd_get_ref(fds[n].fd);
+        }
+    }
 
     poll_table_init(&table);
 
-    num = poll_do(fds, nfds, &table, timeout);
+    num = poll_do(fds, files, nfds, &table, timeout);
 
     poll_teardown(&table);
+    /* Waitqueue nodes point into the backend; unlink them before final close. */
+    for (n = 0; n < nfds; n++)
+    {
+        fd_put(files[n]);
+    }
+    rt_free(files);
 
     return num;
 }

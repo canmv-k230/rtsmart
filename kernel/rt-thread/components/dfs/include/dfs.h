@@ -63,6 +63,7 @@
 #define DFS_F_EOF               0x04000000
 #define DFS_F_ERR               0x08000000
 #define DFS_F_CLOSE_TERMINAL    0x20000000 /* close consumed private state */
+#define DFS_F_CLOSING           0x40000000 /* final backend close in progress */
 
 #ifdef __cplusplus
 extern "C" {
@@ -118,8 +119,19 @@ int fdt_fd_new(struct dfs_fdtable *fdt);
 struct dfs_fd *fdt_fd_get(struct dfs_fdtable* fdt, int fd);
 void fdt_fd_release(struct dfs_fdtable* fdt, int fd);
 int fd_new(void);
+/* Attach a live source descriptor to an empty destination slot. */
 int fd_associate(struct dfs_fdtable *fdt, int fd, struct dfs_fd *file);
+/* Borrowed lookup; the caller must prevent concurrent close. */
 struct dfs_fd *fd_get(int fd);
+/* Pin through a blocking operation; pair with fd_put(), not fd_release(). */
+struct dfs_fd *fd_get_ref(int fd);
+void fd_put(struct dfs_fd *fd);
+/* Close this table entry; success does not guarantee backend closure while
+ * aliases or operation pins remain. Retryable failures in a later fd_put()
+ * (including interrupted socket draining) are logged and queued for retry
+ * on allocation or explicit close, without changing the earlier success.
+ * type < 0 accepts any descriptor; otherwise require the given FT_* type. */
+int fdt_fd_close(struct dfs_fdtable *fdt, int fd, int type);
 int fd_get_fd_index(struct dfs_fd *file);
 void fd_release(int fd);
 

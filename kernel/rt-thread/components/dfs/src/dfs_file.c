@@ -326,7 +326,7 @@ int dfs_file_close(struct dfs_fd *fd)
     char *notify_path = RT_NULL;
 #endif // CHERRY_USB_DEVICE_ENABLE_CLASS_MTP
 
-    if (fd == NULL)
+    if (fd == NULL || fd->fnode == NULL)
     {
         return -ENXIO;
     }

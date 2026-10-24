@@ -267,7 +267,14 @@ int sal_sendto(int socket, const void *dataptr, size_t size, int flags,
     const struct sockaddr *to, socklen_t tolen);
 int sal_sendmsg(int socket, const struct sal_msghdr *message, int flags);
 int sal_socket(int domain, int type, int protocol);
+/* Thread context only, without locks needed by active senders. Close waits
+ * for senders to drain; a signal interrupts that wait with EINTR and leaves
+ * the socket open for retry. Without a signal, a blocked sender can delay
+ * close indefinitely. The backend's own close may also block. */
 int sal_closesocket(int socket);
+/* DFS needs to distinguish interrupted draining from terminal close errors.
+ * closed is true only when SAL has consumed the socket, even on failure. */
+int sal_closesocket_ex(int socket, rt_bool_t *closed);
 int sal_ioctlsocket(int socket, long cmd, void *arg);
 
 #ifdef __cplusplus

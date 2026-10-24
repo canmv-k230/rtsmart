@@ -51,6 +51,13 @@
 #define LWIP_DEBUG
 #endif
 
+/* Match lwIP 2.2's recoverable-error behavior without disabling LWIP_ASSERT.
+ * debug.h expands LWIP_DEBUGF to a no-op when LWIP_DEBUG is disabled. */
+#ifndef LWIP_ERROR
+#define LWIP_ERROR(message, expression, handler) do { if (!(expression)) { \
+    LWIP_DEBUGF(LWIP_DBG_ON, ("lwIP error: %s\n", message)); handler;}} while (0)
+#endif
+
 /* ---------- Debug options ---------- */
 #ifdef LWIP_DEBUG
 #ifdef RT_LWIP_SYS_DEBUG

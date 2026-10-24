@@ -81,6 +81,10 @@ struct sal_socket
     struct netdev *netdev;             /* explicitly selected or initial network interface */
     struct sal_proto_family *pf;       /* socket protocol backend */
     rt_bool_t netdev_bound;            /* socket was bound to a netdev address */
+    struct rt_mutex tx_lock;           /* serialize send and final close */
+    struct rt_semaphore tx_drained;
+    rt_uint32_t tx_users;              /* includes senders waiting on tx_lock */
+    rt_bool_t closing;
 
     void *user_data;                   /* user-specific data */
 #ifdef SAL_USING_TLS
@@ -110,6 +114,16 @@ struct sal_socket_ops
 #ifdef SAL_USING_POSIX
     int (*poll)       (struct dfs_fd *file, struct rt_pollreq *req);
 #endif
+    /* SAL serializes sends per socket for every backend. These optional
+     * callbacks include that lock wait in the backend's send timeout.
+     * started is the RT-Thread tick at entry to the send operation.
+     * Without them (e.g. AT or lwIP < 2.1), the ordinary send callback keeps
+     * its own timeout: SAL's lock wait and backend wait are separate budgets,
+     * so SO_SNDTIMEO does not bound their combined duration. */
+    int (*sendto_started)(int s, const void *data, size_t size, int flags,
+                         const struct sockaddr *to, socklen_t tolen, rt_tick_t started);
+    int (*sendmsg_started)(int s, const struct sal_msghdr *message, int flags,
+                          rt_tick_t started);
 };
 
 /* sal network database name resolving */

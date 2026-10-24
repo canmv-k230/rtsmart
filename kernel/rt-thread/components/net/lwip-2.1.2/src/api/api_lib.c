@@ -997,6 +997,14 @@ err_t
 netconn_write_vectors_partly(struct netconn *conn, struct netvector *vectors, u16_t vectorcnt,
                              u8_t apiflags, size_t *bytes_written)
 {
+  return netconn_write_vectors_partly_started(conn, vectors, vectorcnt, apiflags, bytes_written, sys_now());
+}
+
+/* Include time spent waiting for the caller's send serialization lock. */
+err_t
+netconn_write_vectors_partly_started(struct netconn *conn, struct netvector *vectors, u16_t vectorcnt,
+                                     u8_t apiflags, size_t *bytes_written, u32_t time_started)
+{
   API_MSG_VAR_DECLARE(msg);
   err_t err;
   u8_t dontblock;
@@ -1052,10 +1060,12 @@ netconn_write_vectors_partly(struct netconn *conn, struct netvector *vectors, u1
   if (conn->send_timeout != 0) {
     /* get the time we started, which is later compared to
         sys_now() + conn->send_timeout */
-    API_MSG_VAR_REF(msg).msg.w.time_started = sys_now();
+    API_MSG_VAR_REF(msg).msg.w.time_started = time_started;
   } else {
     API_MSG_VAR_REF(msg).msg.w.time_started = 0;
   }
+#else
+  LWIP_UNUSED_ARG(time_started);
 #endif /* LWIP_SO_SNDTIMEO */
 
   /* For locking the core: this _can_ be delayed on low memory/low send buffer,

@@ -1401,8 +1401,17 @@ lwip_recvmsg(int s, struct msghdr *message, int flags)
 #endif /* LWIP_UDP || LWIP_RAW */
 }
 
+static ssize_t
+lwip_send_started(int s, const void *data, size_t size, int flags, u32_t time_started);
+
 ssize_t
 lwip_send(int s, const void *data, size_t size, int flags)
+{
+  return lwip_send_started(s, data, size, flags, sys_now());
+}
+
+static ssize_t
+lwip_send_started(int s, const void *data, size_t size, int flags, u32_t time_started)
 {
   struct lwip_sock *sock;
   err_t err;
@@ -1420,7 +1429,7 @@ lwip_send(int s, const void *data, size_t size, int flags)
   if (NETCONNTYPE_GROUP(netconn_type(sock->conn)) != NETCONN_TCP) {
 #if (LWIP_UDP || LWIP_RAW)
     done_socket(sock);
-    return lwip_sendto(s, data, size, flags, NULL, 0);
+    return lwip_sendto_started(s, data, size, flags, NULL, 0, time_started);
 #else /* (LWIP_UDP || LWIP_RAW) */
     sock_set_errno(sock, err_to_errno(ERR_ARG));
     done_socket(sock);
@@ -1432,7 +1441,12 @@ lwip_send(int s, const void *data, size_t size, int flags)
                        ((flags & MSG_MORE)     ? NETCONN_MORE      : 0) |
                        ((flags & MSG_DONTWAIT) ? NETCONN_DONTBLOCK : 0));
   written = 0;
-  err = netconn_write_partly(sock->conn, data, size, write_flags, &written);
+  {
+    struct netvector vector;
+    vector.ptr = data;
+    vector.len = size;
+    err = netconn_write_vectors_partly_started(sock->conn, &vector, 1, write_flags, &written, time_started);
+  }
 
   LWIP_DEBUGF(SOCKETS_DEBUG, ("lwip_send(%d) err=%d written=%"SZT_F"\n", s, err, written));
   sock_set_errno(sock, err_to_errno(err));
@@ -1443,6 +1457,12 @@ lwip_send(int s, const void *data, size_t size, int flags)
 
 ssize_t
 lwip_sendmsg(int s, const struct msghdr *msg, int flags)
+{
+  return lwip_sendmsg_started(s, msg, flags, sys_now());
+}
+
+ssize_t
+lwip_sendmsg_started(int s, const struct msghdr *msg, int flags, u32_t time_started)
 {
   struct lwip_sock *sock;
 #if LWIP_TCP
@@ -1476,7 +1496,7 @@ lwip_sendmsg(int s, const struct msghdr *msg, int flags)
                          ((flags & MSG_DONTWAIT) ? NETCONN_DONTBLOCK : 0));
 
     written = 0;
-    err = netconn_write_vectors_partly(sock->conn, (struct netvector *)msg->msg_iov, (u16_t)msg->msg_iovlen, write_flags, &written);
+    err = netconn_write_vectors_partly_started(sock->conn, (struct netvector *)msg->msg_iov, (u16_t)msg->msg_iovlen, write_flags, &written, time_started);
     sock_set_errno(sock, err_to_errno(err));
     done_socket(sock);
     /* casting 'written' to ssize_t is OK here since the netconn API limits it to SSIZE_MAX */
@@ -1608,6 +1628,13 @@ ssize_t
 lwip_sendto(int s, const void *data, size_t size, int flags,
             const struct sockaddr *to, socklen_t tolen)
 {
+  return lwip_sendto_started(s, data, size, flags, to, tolen, sys_now());
+}
+
+ssize_t
+lwip_sendto_started(int s, const void *data, size_t size, int flags,
+                    const struct sockaddr *to, socklen_t tolen, u32_t time_started)
+{
   struct lwip_sock *sock;
   err_t err;
   u16_t short_size;
@@ -1622,7 +1649,7 @@ lwip_sendto(int s, const void *data, size_t size, int flags,
   if (NETCONNTYPE_GROUP(netconn_type(sock->conn)) == NETCONN_TCP) {
 #if LWIP_TCP
     done_socket(sock);
-    return lwip_send(s, data, size, flags);
+    return lwip_send_started(s, data, size, flags, time_started);
 #else /* LWIP_TCP */
     LWIP_UNUSED_ARG(flags);
     sock_set_errno(sock, err_to_errno(ERR_ARG));

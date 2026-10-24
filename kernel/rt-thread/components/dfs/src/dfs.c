@@ -33,6 +33,9 @@ char working_directory[DFS_PATH_MAX] = {"/"};
 
 static struct dfs_fdtable _fdtab;
 static int  fd_alloc(struct dfs_fdtable *fdt, int startfd);
+static struct dfs_fd *failed_closes;
+static rt_bool_t retrying_closes;
+static void fd_retry_failed_closes(void);
 
 /**
  * @addtogroup DFS
@@ -247,6 +250,10 @@ int fdt_fd_new(struct dfs_fdtable *fdt)
 {
     int idx;
 
+    /* Retry retired handles before allocating more, without holding fdlock
+     * across backend operations. Persistent failures remain owned by DFS. */
+    fd_retry_failed_closes();
+
     /* lock filesystem */
     dfs_fd_lock();
 
@@ -281,7 +288,8 @@ int fd_new(void)
  * pointer.
  */
 
-struct dfs_fd *fdt_fd_get(struct dfs_fdtable* fdt, int fd)
+/* Caller holds fdlock. */
+static struct dfs_fd *fdt_fd_get_locked(struct dfs_fdtable *fdt, int fd)
 {
     struct dfs_fd *d;
 
@@ -290,16 +298,24 @@ struct dfs_fd *fdt_fd_get(struct dfs_fdtable* fdt, int fd)
         return NULL;
     }
 
-    dfs_fd_lock();
     d = fdt->fds[fd];
 
     /* check dfs_fd valid or not */
-    if ((d == NULL) || (d->magic != DFS_FD_MAGIC))
+    if ((d == NULL) || (d->magic != DFS_FD_MAGIC) ||
+        (d->flags & DFS_F_CLOSING))
     {
-        dfs_fd_unlock();
         return NULL;
     }
 
+    return d;
+}
+
+struct dfs_fd *fdt_fd_get(struct dfs_fdtable *fdt, int fd)
+{
+    struct dfs_fd *d;
+
+    dfs_fd_lock();
+    d = fdt_fd_get_locked(fdt, fd);
     dfs_fd_unlock();
 
     return d;
@@ -311,6 +327,172 @@ struct dfs_fd *fd_get(int fd)
 
     fdt = dfs_fdtable_get();
     return fdt_fd_get(fdt, fd);
+}
+
+struct dfs_fd *fd_get_ref(int fd)
+{
+    struct dfs_fd *d;
+
+    dfs_fd_lock();
+    d = fdt_fd_get_locked(dfs_fdtable_get(), fd);
+    if (d && d->fnode)
+    {
+        d->ref_count++;
+    }
+    else
+    {
+        d = RT_NULL;
+    }
+    dfs_fd_unlock();
+    return d;
+}
+
+/* Caller holds fdlock and has removed the last reference. */
+static void fd_free(struct dfs_fd *d)
+{
+    struct dfs_fnode *fnode = d->fnode;
+
+    if (fnode && --fnode->ref_count == 0)
+    {
+        rt_free(fnode);
+    }
+    d->magic = 0;
+    rt_free(d);
+}
+
+/* Release an operation pin or detached table reference. The last reference
+ * may close the backend after close() has already returned success. Retryable
+ * failures, including interrupted socket draining, are logged and retained
+ * for a later allocation/close to retry; they cannot change that earlier
+ * close result. Preserve the current operation's errno in either case. */
+void fd_put(struct dfs_fd *d)
+{
+    /* Taking fdlock resets thread->error; releasing a reference must preserve
+     * the preceding file or socket operation's errno on every path. */
+    int saved_errno = rt_get_errno();
+    int result;
+
+    if (!d)
+    {
+        return;
+    }
+    dfs_fd_lock();
+    RT_ASSERT(d->ref_count > 0);
+    if (d->ref_count > 1)
+    {
+        d->ref_count--;
+        dfs_fd_unlock();
+        rt_set_errno(saved_errno);
+        return;
+    }
+    /* No table entry or other operation owns this descriptor now. Keep its
+     * final reference until the backend has consumed the private state. */
+    dfs_fd_unlock();
+    result = dfs_file_close(d);
+    if (result < 0 && !(d->flags & DFS_F_CLOSE_TERMINAL))
+    {
+        LOG_E("deferred file close failed: %d", result);
+        /* The backend still owns private state, and fnode is still hashed.
+         * Retain the final reference until a later allocation or close retries it;
+         * freeing either object here would leave a dangling cache entry. */
+        dfs_fd_lock();
+        d->flags |= DFS_F_CLOSING;
+        d->close_next = failed_closes;
+        failed_closes = d;
+        dfs_fd_unlock();
+        rt_set_errno(saved_errno);
+        return;
+    }
+    dfs_fd_lock();
+    d->ref_count--;
+    fd_free(d);
+    dfs_fd_unlock();
+    rt_set_errno(saved_errno);
+}
+
+static void fd_retry_failed_closes(void)
+{
+    struct dfs_fd *pending;
+    int saved_errno = rt_get_errno();
+
+    dfs_fd_lock();
+    if (retrying_closes || !failed_closes)
+    {
+        dfs_fd_unlock();
+        rt_set_errno(saved_errno);
+        return;
+    }
+    retrying_closes = RT_TRUE;
+    pending = failed_closes;
+    failed_closes = RT_NULL;
+    dfs_fd_unlock();
+
+    /* One attempt per retained descriptor. A failed retry is requeued by
+     * fd_put(), never retried in this pass. Backends may themselves open a
+     * file; retrying_closes prevents recursion and concurrent drainers. */
+    while (pending)
+    {
+        struct dfs_fd *next = pending->close_next;
+
+        pending->close_next = RT_NULL;
+        fd_put(pending);
+        pending = next;
+    }
+    dfs_fd_lock();
+    retrying_closes = RT_FALSE;
+    dfs_fd_unlock();
+    rt_set_errno(saved_errno);
+}
+
+int fdt_fd_close(struct dfs_fdtable *fdt, int fd, int type)
+{
+    struct dfs_fd *d;
+    int result;
+
+    /* Explicit file and socket closes also retry retired handles once.
+     * The retry guard allows a backend close to reenter DFS safely. */
+    fd_retry_failed_closes();
+
+    dfs_fd_lock();
+    d = fdt_fd_get_locked(fdt, fd);
+    if (!d || !d->fnode)
+    {
+        dfs_fd_unlock();
+        return -EBADF;
+    }
+    if (type >= 0 && d->fnode->type != type)
+    {
+        dfs_fd_unlock();
+        return -ENOTSOCK;
+    }
+    if (d->ref_count > 1)
+    {
+        /* Success here only removes this table entry. Other aliases or I/O
+         * pins keep the backend alive. A later fd_put() may fail to close
+         * it (e.g. EINTR while draining sends) and queue a logged retry. */
+        fdt->fds[fd] = RT_NULL;
+        d->ref_count--;
+        dfs_fd_unlock();
+        return 0;
+    }
+    /* Reserve the slot while a retryable close is in progress. New lookups
+     * reject it, and no global descriptor lock spans a backend operation. */
+    d->flags |= DFS_F_CLOSING;
+    dfs_fd_unlock();
+    result = dfs_file_close(d);
+    dfs_fd_lock();
+    if (result >= 0 || (d->flags & DFS_F_CLOSE_TERMINAL))
+    {
+        fdt->fds[fd] = RT_NULL;
+        d->ref_count--;
+        fd_free(d);
+    }
+    else
+    {
+        d->flags &= ~DFS_F_CLOSING;
+    }
+    dfs_fd_unlock();
+    return result;
 }
 
 /**
@@ -348,17 +530,7 @@ void fdt_fd_release(struct dfs_fdtable* fdt, int fd)
     /* clear this fd entry */
     if (fd_slot->ref_count == 0)
     {
-        struct dfs_fnode *fnode = fd_slot->fnode;
-        if (fnode)
-        {
-            fnode->ref_count--;
-            if(fnode->ref_count == 0)
-            {
-                rt_free(fnode);
-                fd_slot->fnode = RT_NULL;
-            }
-        }
-        rt_free(fd_slot);
+        fd_free(fd_slot);
     }
     dfs_fd_unlock();
 }
@@ -383,7 +555,7 @@ int sys_dup(int oldfd)
     {
         goto exit;
     }
-    if (!fdt->fds[oldfd])
+    if (!fdt->fds[oldfd] || (fdt->fds[oldfd]->flags & DFS_F_CLOSING))
     {
         goto exit;
     }
@@ -403,7 +575,7 @@ exit:
 int sys_dup2(int oldfd, int newfd)
 {
     struct dfs_fdtable *fdt = NULL;
-    int ret = 0;
+    struct dfs_fd *replaced = RT_NULL;
     int retfd = -1;
 
     dfs_fd_lock();
@@ -413,7 +585,7 @@ int sys_dup2(int oldfd, int newfd)
     {
         goto exit;
     }
-    if (!fdt->fds[oldfd])
+    if (!fdt->fds[oldfd] || (fdt->fds[oldfd]->flags & DFS_F_CLOSING))
     {
         goto exit;
     }
@@ -438,13 +610,9 @@ int sys_dup2(int oldfd, int newfd)
 
     if (fdt->fds[newfd])
     {
-        ret = dfs_file_close(fdt->fds[newfd]);
-        if (ret < 0 && !(fdt->fds[newfd]->flags & DFS_F_CLOSE_TERMINAL))
-        {
+        if (fdt->fds[newfd]->flags & DFS_F_CLOSING)
             goto exit;
-        }
-        /* dup2 consumes newfd and does not report a terminal close error. */
-        fd_release(newfd);
+        replaced = fdt->fds[newfd];
     }
 
     fdt->fds[newfd] = fdt->fds[oldfd];
@@ -453,6 +621,9 @@ int sys_dup2(int oldfd, int newfd)
     retfd = newfd;
 exit:
     dfs_fd_unlock();
+    /* dup2 atomically replaces the slot, then releases the old ownership.
+     * A writer holding a reference continues on the original descriptor. */
+    fd_put(replaced);
     return retfd;
 }
 
@@ -509,7 +680,11 @@ int fd_associate(struct dfs_fdtable *fdt, int fd, struct dfs_fd *file)
         goto exit;
     }
 
-    if (fdt->fds[fd])
+    /* The destination must be empty. Independently, file is the source
+     * descriptor, possibly shared with another table: do not add a reference
+     * while its backend close is in progress or queued for retry. An occupied
+     * destination is rejected regardless of that destination's flags. */
+    if (fdt->fds[fd] || (file->flags & DFS_F_CLOSING))
     {
         goto exit;
     }
