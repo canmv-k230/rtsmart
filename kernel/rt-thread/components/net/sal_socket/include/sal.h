@@ -82,8 +82,9 @@ struct sal_socket
     struct sal_proto_family *pf;       /* socket protocol backend */
     rt_bool_t netdev_bound;            /* socket was bound to a netdev address */
     struct rt_mutex tx_lock;           /* serialize send and final close */
-    struct rt_semaphore tx_drained;
-    rt_uint32_t tx_users;              /* includes senders waiting on tx_lock */
+    struct rt_mutex rx_lock;           /* serialize nonblocking receive/accept attempts */
+    struct rt_semaphore io_drained;
+    rt_uint32_t io_users;              /* pins senders, receivers and mode ioctls */
     rt_bool_t closing;
 
     void *user_data;                   /* user-specific data */
@@ -124,6 +125,11 @@ struct sal_socket_ops
                          const struct sockaddr *to, socklen_t tolen, rt_tick_t started);
     int (*sendmsg_started)(int s, const struct sal_msghdr *message, int flags,
                           rt_tick_t started);
+    /* Optional readiness-based receive support. wait_readable returns a
+     * positive readiness mask, 0 on timeout, or a negative POSIX errno.
+     * accept_nonblock runs under rx_lock, also shared by socket mode ioctls. */
+    int (*wait_readable)(int s, int timeout);
+    int (*accept_nonblock)(int s, struct sockaddr *addr, socklen_t *addrlen);
 };
 
 /* sal network database name resolving */

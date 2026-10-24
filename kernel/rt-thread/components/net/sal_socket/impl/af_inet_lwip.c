@@ -171,7 +171,8 @@ static void event_callback(struct netconn *conn, enum netconn_evt evt, u16_t len
 
     if (event)
     {
-        rt_wqueue_wakeup(&sock->wait_head, (void*)(size_t)event);
+        /* A poller must not consume the only wakeup intended for a receiver. */
+        rt_wqueue_wakeup_all(&sock->wait_head, (void*)(size_t)event);
     }
 }
 #endif /* SAL_USING_POSIX */
@@ -218,6 +219,82 @@ static int inet_accept(int socket, struct sockaddr *addr, socklen_t *addrlen)
     return lwip_accept(socket, addr, addrlen);
 #endif /* SAL_USING_POSIX */
 }
+
+#ifdef SAL_USING_POSIX
+/* SAL serializes this attempt with other receives/accepts and mode ioctls.
+ * Only the short backend call changes mode; the readiness wait never does. */
+static int inet_accept_nonblock(int socket, struct sockaddr *addr, socklen_t *addrlen)
+{
+    int listening = 0, type, mode;
+    socklen_t length = sizeof(listening);
+    int result, error;
+
+    /* Never expose a temporary mode to send/connect on a non-listener. */
+    if (lwip_getsockopt(socket, SOL_SOCKET, SO_TYPE, &type, &length) < 0)
+        return -1;
+    if (type != SOCK_STREAM)
+    {
+        rt_set_errno(-EOPNOTSUPP);
+        return -1;
+    }
+    length = sizeof(listening);
+    if (lwip_getsockopt(socket, SOL_SOCKET, SO_ACCEPTCONN, &listening, &length) < 0)
+        return -1;
+    if (!listening)
+    {
+        rt_set_errno(-EINVAL);
+        return -1;
+    }
+    mode = lwip_fcntl(socket, F_GETFL, 0);
+    if (mode < 0)
+        return -1;
+    if (!(mode & O_NONBLOCK) && lwip_fcntl(socket, F_SETFL, mode | O_NONBLOCK) < 0)
+        return -1;
+    result = inet_accept(socket, addr, addrlen);
+    error = rt_get_errno();
+    if (!(mode & O_NONBLOCK) && lwip_fcntl(socket, F_SETFL, mode) < 0)
+    {
+        rt_kprintf("[W/sal.lwip] socket %d: restore accept flags failed (errno %d)\n",
+                   socket, (int)rt_get_errno());
+    }
+    rt_set_errno(error);
+    return result;
+}
+
+static int inet_read_poll(void *data, struct rt_pollreq *req)
+{
+    struct lwip_sock *sock = data;
+    int mask = 0;
+    SYS_ARCH_DECL_PROTECT(level);
+
+    rt_poll_add(&sock->wait_head, req);
+    SYS_ARCH_PROTECT(level);
+#if LWIP_VERSION >= 0x20100ff
+    if (sock->lastdata.pbuf || sock->rcvevent > 0)
+#else
+    if (sock->lastdata || sock->rcvevent > 0)
+#endif
+        mask |= POLLIN;
+    if (sock->errevent)
+        mask |= POLLERR;
+    /* Another poller may have observed/cleared errevent before registration. */
+    if (sock->conn->pending_err != ERR_OK ||
+            (sock->conn->flags & NETCONN_FLAG_MBOXCLOSED))
+        mask |= POLLIN;
+    SYS_ARCH_UNPROTECT(level);
+    return mask;
+}
+
+static int inet_wait_readable(int socket, int timeout)
+{
+    /* The SAL I/O reference prevents final close while this queue is linked.
+     * Do not acquire another lwIP reference on each readiness retry. */
+    struct lwip_sock *sock = lwip_socket_dbg_get_socket(socket);
+    if (!sock || !sock->conn)
+        return -EBADF;
+    return rt_poll_wait(inet_read_poll, sock, POLLIN, timeout);
+}
+#endif
 
 static int inet_getsockname(int socket, struct sockaddr *name, socklen_t *namelen)
 {
@@ -418,6 +495,13 @@ static const struct sal_socket_ops lwip_socket_ops =
 #if LWIP_VERSION >= 0x02010000
     inet_sendto_started,
     inet_sendmsg_started,
+#else
+    RT_NULL,
+    RT_NULL,
+#endif
+#ifdef SAL_USING_POSIX
+    inet_wait_readable,
+    inet_accept_nonblock,
 #else
     RT_NULL,
     RT_NULL,

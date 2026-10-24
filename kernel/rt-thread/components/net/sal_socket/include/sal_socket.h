@@ -267,9 +267,9 @@ int sal_sendto(int socket, const void *dataptr, size_t size, int flags,
     const struct sockaddr *to, socklen_t tolen);
 int sal_sendmsg(int socket, const struct sal_msghdr *message, int flags);
 int sal_socket(int domain, int type, int protocol);
-/* Thread context only, without locks needed by active senders. Close waits
- * for senders to drain; a signal interrupts that wait with EINTR and leaves
- * the socket open for retry. Without a signal, a blocked sender can delay
+/* Thread context only, without locks needed by active I/O. Close waits
+ * for senders/receivers to drain; a signal interrupts that wait with EINTR and
+ * leaves the socket open for retry. A blocked I/O operation can delay
  * close indefinitely. The backend's own close may also block. */
 int sal_closesocket(int socket);
 /* DFS needs to distinguish interrupted draining from terminal close errors.

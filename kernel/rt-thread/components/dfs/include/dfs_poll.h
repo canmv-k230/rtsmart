@@ -41,6 +41,11 @@ struct pollfd
 
 #define POLLMASK_DEFAULT (POLLIN | POLLOUT | POLLRDNORM | POLLWRNORM)
 int poll(struct pollfd *fds, nfds_t nfds, int timeout);
+struct rt_pollreq;
+/* Wait on an already pinned backend. Returns an event mask, 0 on timeout,
+ * or a negative POSIX errno. The caller retains the backend until return. */
+int rt_poll_wait(int (*poll_fn)(void *, struct rt_pollreq *), void *data,
+                 int events, int timeout);
 #endif /* RT_USING_POSIX */
 
 #endif /* DFS_POLL_H__ */

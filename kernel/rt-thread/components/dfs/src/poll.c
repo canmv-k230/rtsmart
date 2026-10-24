@@ -30,6 +30,7 @@ struct rt_poll_table
     rt_bool_t sleeping;    /* wakeups may resume only the poll sleep */
     rt_thread_t polling_thread;
     struct rt_poll_node *nodes;
+    int error;
 };
 
 struct rt_poll_node
@@ -54,6 +55,8 @@ static int __wqueue_pollwake(struct rt_wqueue_node *wait, void *key)
     if (!pn->pt->sleeping)
         return -1;
 
+    pn->pt->sleeping = RT_FALSE;
+    pn->pt->polling_thread->error = RT_EOK;
     return __wqueue_default_wake(wait, key);
 }
 
@@ -62,11 +65,14 @@ static void _poll_add(rt_wqueue_t *wq, rt_pollreq_t *req)
     struct rt_poll_table *pt;
     struct rt_poll_node *node;
 
+    pt = rt_container_of(req, struct rt_poll_table, req);
     node = (struct rt_poll_node *)rt_malloc(sizeof(struct rt_poll_node));
     if (node == RT_NULL)
+    {
+        pt->error = -ENOMEM;
         return;
+    }
 
-    pt = rt_container_of(req, struct rt_poll_table, req);
 
     node->wqn.key = req->_key;
     rt_list_init(&(node->wqn.list));
@@ -84,9 +90,11 @@ static void poll_table_init(struct rt_poll_table *pt)
     pt->triggered = 0;
     pt->sleeping = RT_FALSE;
     pt->nodes = RT_NULL;
+    pt->error = 0;
     pt->polling_thread = rt_thread_self();
 }
 
+/* Return 0 for a wakeup, 1 for no event/timeout, or a negative POSIX errno. */
 static int poll_wait_timeout(struct rt_poll_table *pt, int msec)
 {
     rt_int32_t timeout;
@@ -102,6 +110,9 @@ static int poll_wait_timeout(struct rt_poll_table *pt, int msec)
 
     if (timeout != 0 && !pt->triggered)
     {
+        /* LWP signal resume does not assign an errno. As in RT-Thread IPC,
+         * a normal wakeup clears this; timer expiry supplies ETIMEOUT. */
+        thread->error = -RT_EINTR;
         /* Interrupts remain disabled across suspend and sleeping publication.
          * Publishing earlier would allow a backend-mutex wait to be resumed. */
         if (rt_thread_suspend_with_flag(thread, RT_INTERRUPTIBLE) == RT_EOK)
@@ -122,9 +133,13 @@ static int poll_wait_timeout(struct rt_poll_table *pt, int msec)
             level = rt_hw_interrupt_disable();
             pt->sleeping = RT_FALSE;
         }
+
+        if (thread->error == -RT_EINTR || thread->error == RT_EINTR)
+            ret = -EINTR;
     }
 
-    ret = !pt->triggered;
+    if (ret == 0)
+        ret = !pt->triggered;
     rt_hw_interrupt_enable(level);
 
     return ret;
@@ -208,7 +223,10 @@ static int poll_do(struct pollfd *fds, struct dfs_fd **files, nfds_t nfds,
         if (num || istimeout)
             break;
 
-        if (poll_wait_timeout(pt, msec))
+        ret = poll_wait_timeout(pt, msec);
+        if (ret < 0)
+            return ret;
+        if (ret)
             istimeout = 1;
     }
 
@@ -227,6 +245,56 @@ static void poll_teardown(struct rt_poll_table *pt)
         next = node->next;
         rt_free(node);
     }
+}
+
+int rt_poll_wait(int (*poll_fn)(void *, struct rt_pollreq *), void *data,
+                 int events, int timeout)
+{
+    struct rt_poll_table table;
+    rt_tick_t started = rt_tick_get();
+    int result;
+
+    poll_table_init(&table);
+    table.req._key = events | POLLERR | POLLHUP;
+    if (!timeout)
+        table.req._proc = RT_NULL;
+
+    for (;;)
+    {
+        rt_base_t level;
+        int remaining = timeout;
+
+        /* Clear before scanning: an event during the scan must prevent sleep. */
+        level = rt_hw_interrupt_disable();
+        table.triggered = 0;
+        rt_hw_interrupt_enable(level);
+        result = poll_fn(data, &table.req);
+        table.req._proc = RT_NULL;
+        if (result < 0)
+            break;
+        result &= table.req._key;
+        if (result)
+            break;
+        if (table.error)
+        {
+            result = table.error;
+            break;
+        }
+        if (timeout >= 0)
+        {
+            rt_uint64_t elapsed = (rt_uint64_t)(rt_tick_get() - started) *
+                                  1000 / RT_TICK_PER_SECOND;
+            if (elapsed >= (rt_uint32_t)timeout)
+                break;
+            remaining -= (int)elapsed;
+        }
+        result = poll_wait_timeout(&table, remaining);
+        if (result < 0)
+            break;
+        /* Recheck readiness after timeout or a competing reader's wakeup. */
+    }
+    poll_teardown(&table);
+    return result;
 }
 
 int poll(struct pollfd *fds, nfds_t nfds, int timeout)

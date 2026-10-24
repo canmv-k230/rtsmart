@@ -412,13 +412,140 @@ static void sal_unlock(void)
     rt_mutex_release(&sal_core_lock);
 }
 
-static void sal_socket_tx_put(struct sal_socket *sock)
+static void sal_socket_put(struct sal_socket *sock)
 {
     sal_lock();
-    RT_ASSERT(sock->tx_users > 0);
-    if (--sock->tx_users == 0 && sock->closing)
-        rt_sem_release(&sock->tx_drained);
+    RT_ASSERT(sock->io_users > 0);
+    if (--sock->io_users == 0 && sock->closing)
+        rt_sem_release(&sock->io_drained);
     sal_unlock();
+}
+
+static struct sal_socket *sal_socket_get(int socket)
+{
+    struct sal_socket *sock;
+
+    sal_lock();
+    sock = sal_get_socket(socket);
+    if (sock)
+        sock->io_users++;
+    sal_unlock();
+    if (!sock)
+        rt_set_errno(-EBADF);
+    return sock;
+}
+
+static int sal_socket_result(struct sal_socket *sock, int result)
+{
+    int error = rt_get_errno();
+    sal_socket_put(sock);
+    rt_set_errno(error);
+    return result;
+}
+
+struct sal_rx_request
+{
+    void *mem;
+    size_t len;
+    int flags;
+    struct sockaddr *addr;
+    socklen_t *addrlen;
+    struct sal_msghdr *message;
+    rt_bool_t accept;
+};
+
+static rt_int32_t socket_rx_remaining(rt_tick_t started, rt_int32_t timeout)
+{
+    rt_tick_t elapsed = rt_tick_get() - started;
+    return timeout < 0 ? RT_WAITING_FOREVER :
+           elapsed < (rt_tick_t)timeout ? timeout - elapsed : 0;
+}
+
+/* Own the blocking wait here; backend attempts must never wait for packets.
+ * rx_lock protects lwIP's lastdata and the listener's temporary nonblocking
+ * mode, but is released while sleeping so another receiver can make progress. */
+static int socket_receive(struct sal_socket *sock, struct sal_rx_request *request)
+{
+    const struct sal_socket_ops *ops = sock->pf->skt_ops;
+    int socket = (int)(size_t)sock->user_data;
+    rt_tick_t started = rt_tick_get();
+    rt_int32_t timeout = RT_WAITING_FOREVER;
+    int flags = request->flags;
+    rt_bool_t first = RT_TRUE;
+
+    if (ops->wait_readable && (!request->accept || ops->accept_nonblock))
+    {
+        struct timeval tv = {0};
+        socklen_t length = sizeof(tv);
+        if (ops->getsockopt && ops->getsockopt(socket, SOL_SOCKET, SO_RCVTIMEO,
+                &tv, &length) == 0 && length == sizeof(tv) &&
+                tv.tv_sec >= 0 && tv.tv_usec >= 0 && (tv.tv_sec || tv.tv_usec))
+        {
+            rt_uint64_t ticks = (rt_uint64_t)tv.tv_sec * RT_TICK_PER_SECOND +
+                ((rt_uint64_t)tv.tv_usec * RT_TICK_PER_SECOND + 999999) / 1000000;
+            timeout = ticks > (RT_TICK_MAX >> 1) ? RT_TICK_MAX >> 1 : ticks;
+        }
+        for (;;)
+        {
+            int result, error;
+            rt_int32_t remaining = socket_rx_remaining(started, timeout);
+            rt_err_t locked = rt_mutex_take_interruptible(&sock->rx_lock,
+                    flags & MSG_DONTWAIT ? 0 : remaining);
+            if (locked != RT_EOK)
+            {
+                rt_set_errno(locked == -RT_ETIMEOUT ? -EAGAIN : -EINTR);
+                return -1;
+            }
+            if (first && ops->ioctlsocket)
+            {
+                int mode = ops->ioctlsocket(socket, F_GETFL, RT_NULL);
+                if (mode >= 0 && (mode & O_NONBLOCK))
+                    flags |= MSG_DONTWAIT;
+            }
+            first = RT_FALSE;
+            if (request->accept)
+                result = ops->accept_nonblock(socket, request->addr, request->addrlen);
+            else if (request->message)
+                result = ops->recvmsg(socket, request->message, flags | MSG_DONTWAIT);
+            else
+                result = ops->recvfrom(socket, request->mem, request->len,
+                        flags | MSG_DONTWAIT, request->addr, request->addrlen);
+            error = rt_get_errno();
+            rt_mutex_release(&sock->rx_lock);
+            rt_set_errno(error);
+            if (result >= 0 || (error != EAGAIN && error != -EAGAIN &&
+                    error != EWOULDBLOCK && error != -EWOULDBLOCK) ||
+                    (flags & MSG_DONTWAIT))
+                return result;
+
+            remaining = socket_rx_remaining(started, timeout);
+            if (!remaining)
+            {
+                rt_set_errno(-EAGAIN);
+                return -1;
+            }
+            /* Round up when converting ticks; keep one deadline across retries. */
+            if (remaining > 0)
+            {
+                rt_uint64_t ms = ((rt_uint64_t)remaining * 1000 +
+                        RT_TICK_PER_SECOND - 1) / RT_TICK_PER_SECOND;
+                remaining = ms > 0x7fffffff ? 0x7fffffff : (rt_int32_t)ms;
+            }
+            result = ops->wait_readable(socket, remaining);
+            if (result <= 0)
+            {
+                rt_set_errno(result ? result : -EAGAIN);
+                return -1;
+            }
+        }
+    }
+    /* Backends without nonblocking/readiness support retain their own waits. */
+    if (request->accept)
+        return ops->accept(socket, request->addr, request->addrlen);
+    if (request->message)
+        return ops->recvmsg(socket, request->message, flags);
+    return ops->recvfrom(socket, request->mem, request->len, flags,
+                         request->addr, request->addrlen);
 }
 
 static struct sal_socket *sal_socket_tx_lock(int socket, int flags, rt_tick_t started)
@@ -438,7 +565,7 @@ static struct sal_socket *sal_socket_tx_lock(int socket, int flags, rt_tick_t st
 
     /* Pin before releasing the table lock. A blocked sender must not prevent
      * unrelated sockets or netdev cleanup from acquiring sal_core_lock. */
-    sock->tx_users++;
+    sock->io_users++;
     sal_unlock();
 
     /* Preserve both per-call and per-socket nonblocking behavior before
@@ -486,7 +613,7 @@ static struct sal_socket *sal_socket_tx_lock(int socket, int flags, rt_tick_t st
     result = rt_mutex_take_interruptible(&sock->tx_lock, wait);
     if (result != RT_EOK)
     {
-        sal_socket_tx_put(sock);
+        sal_socket_put(sock);
         rt_set_errno(result == -RT_ETIMEOUT ? -EAGAIN : -EINTR);
         return RT_NULL;
     }
@@ -498,11 +625,11 @@ static void sal_socket_tx_unlock(struct sal_socket *sock)
     int saved_errno = rt_get_errno();
 
     rt_mutex_release(&sock->tx_lock);
-    sal_socket_tx_put(sock);
+    sal_socket_put(sock);
     rt_set_errno(saved_errno);
 }
 
-/* Claim teardown once and drain senders without holding sal_core_lock. */
+/* Claim teardown once and drain active I/O without holding sal_core_lock. */
 static struct sal_socket *socket_close_begin(int socket)
 {
     struct sal_socket *sock;
@@ -519,10 +646,10 @@ static struct sal_socket *socket_close_begin(int socket)
     }
 
     sock->closing = RT_TRUE;
-    while (sock->tx_users != 0)
+    while (sock->io_users != 0)
     {
         sal_unlock();
-        result = rt_sem_take_interruptible(&sock->tx_drained, RT_WAITING_FOREVER);
+        result = rt_sem_take_interruptible(&sock->io_drained, RT_WAITING_FOREVER);
         sal_lock();
         if (result != RT_EOK)
         {
@@ -692,13 +819,14 @@ static void socket_free(struct sal_socket_table *st, int idx)
     struct sal_socket *sock;
 
     sock = st->sockets[idx];
-    RT_ASSERT(sock->closing && sock->tx_users == 0);
+    RT_ASSERT(sock->closing && sock->io_users == 0);
     st->sockets[idx] = RT_NULL;
     sock->magic = 0;
     sock->netdev = RT_NULL;
     sock->pf = RT_NULL;
     rt_mutex_detach(&sock->tx_lock);
-    rt_sem_detach(&sock->tx_drained);
+    rt_mutex_detach(&sock->rx_lock);
+    rt_sem_detach(&sock->io_drained);
     rt_free(sock);
 }
 
@@ -728,7 +856,8 @@ static int socket_new(void)
     sock->netdev_bound = RT_FALSE;
     sock->user_data = RT_NULL;
     rt_mutex_init(&sock->tx_lock, "sal_tx", RT_IPC_FLAG_FIFO);
-    rt_sem_init(&sock->tx_drained, "sal_drain", 0, RT_IPC_FLAG_FIFO);
+    rt_mutex_init(&sock->rx_lock, "sal_rx", RT_IPC_FLAG_FIFO);
+    rt_sem_init(&sock->io_drained, "sal_drain", 0, RT_IPC_FLAG_FIFO);
 #ifdef SAL_USING_TLS
     sock->user_data_tls = RT_NULL;
 #endif
@@ -746,7 +875,7 @@ static void socket_delete(int socket)
     int saved_errno = rt_get_errno();
 
     /* Roll back socket creation through the same teardown ownership and
-     * sender drain used by normal close. Netdev cleanup does not delete. */
+     * I/O drain used by normal close. Netdev cleanup does not delete. */
     sock = socket_close_begin(socket);
     if (sock == RT_NULL)
     {
@@ -766,12 +895,20 @@ int sal_accept(int socket, struct sockaddr *addr, socklen_t *addrlen)
     struct sal_proto_family *pf;
 
     /* get the socket object by socket descriptor */
-    SAL_SOCKET_OBJ_GET(sock, socket);
+    sock = sal_socket_get(socket);
+    if (!sock)
+        return -1;
 
     /* check the network interface socket operations */
-    SAL_SOCKETOPS_VALID(sock, pf, accept);
+    pf = sock->pf;
+    if (!pf || !pf->skt_ops || !pf->skt_ops->accept)
+    {
+        rt_set_errno(-EOPNOTSUPP);
+        return sal_socket_result(sock, -1);
+    }
 
-    new_socket = pf->skt_ops->accept((int)(size_t)sock->user_data, addr, addrlen);
+    struct sal_rx_request request = { .addr = addr, .addrlen = addrlen, .accept = RT_TRUE };
+    new_socket = socket_receive(sock, &request);
     if (new_socket != -1)
     {
         int new_sal_socket;
@@ -783,7 +920,7 @@ int sal_accept(int socket, struct sockaddr *addr, socklen_t *addrlen)
         if (new_sock == RT_NULL)
         {
             pf->skt_ops->closesocket(new_socket);
-            return -1;
+            return sal_socket_result(sock, -1);
         }
 
         /* An accepted socket belongs to the listener's interface. Re-selecting
@@ -797,10 +934,10 @@ int sal_accept(int socket, struct sockaddr *addr, socklen_t *addrlen)
         new_sock->netdev_bound = sock->netdev_bound;
         new_sock->user_data = (void *)(size_t)new_socket;
 
-        return new_sal_socket;
+        return sal_socket_result(sock, new_sal_socket);
     }
 
-    return -1;
+    return sal_socket_result(sock, -1);
 }
 
 static void sal_sockaddr_to_ipaddr(const struct sockaddr *name, ip_addr_t *local_ipaddr)
@@ -1034,52 +1171,54 @@ int sal_listen(int socket, int backlog)
 int sal_recvfrom(int socket, void *mem, size_t len, int flags,
                  struct sockaddr *from, socklen_t *fromlen)
 {
-    struct sal_socket *sock;
-    struct sal_proto_family *pf;
+    struct sal_socket *sock = sal_socket_get(socket);
+    struct sal_rx_request request = { .mem = mem, .len = len, .flags = flags,
+                                     .addr = from, .addrlen = fromlen };
+    int result;
 
-    /* get the socket object by socket descriptor */
-    SAL_SOCKET_OBJ_GET(sock, socket);
-
-    /* check the network interface socket opreation */
-    SAL_SOCKETOPS_VALID(sock, pf, recvfrom);
-
+    if (!sock)
+        return -1;
+    if (!sock->pf || !sock->pf->skt_ops || !sock->pf->skt_ops->recvfrom)
+    {
+        rt_set_errno(-EOPNOTSUPP);
+        return sal_socket_result(sock, -1);
+    }
 #ifdef SAL_USING_TLS
     if (SAL_SOCKOPS_PROTO_TLS_VALID(sock, recv))
-    {
-        int ret;
-
-        if ((ret = proto_tls->ops->recv(sock->user_data_tls, mem, len)) < 0)
-        {
-            return -1;
-        }
-        return ret;
-    }
+        result = proto_tls->ops->recv(sock->user_data_tls, mem, len);
     else
-    {
-        return pf->skt_ops->recvfrom((int)(size_t)sock->user_data, mem, len, flags, from, fromlen);
-    }
-#else
-    return pf->skt_ops->recvfrom((int)(size_t)sock->user_data, mem, len, flags, from, fromlen);
 #endif
+        result = socket_receive(sock, &request);
+    return sal_socket_result(sock, result);
 }
 
 int sal_recvmsg(int socket, struct sal_msghdr *message, int flags)
 {
-    struct sal_socket *sock;
-    struct sal_proto_family *pf;
+    struct sal_socket *sock = sal_socket_get(socket);
+    struct sal_rx_request request = { .message = message, .flags = flags };
+    int result;
 
-    SAL_SOCKET_OBJ_GET(sock, socket);
-    SAL_SOCKETOPS_VALID(sock, pf, recvmsg);
-
+    if (!sock)
+        return -1;
+    if (!message)
+    {
+        rt_set_errno(-EFAULT);
+        return sal_socket_result(sock, -1);
+    }
+    if (!sock->pf || !sock->pf->skt_ops || !sock->pf->skt_ops->recvmsg)
+    {
+        rt_set_errno(-EOPNOTSUPP);
+        return sal_socket_result(sock, -1);
+    }
 #ifdef SAL_USING_TLS
     if (SAL_SOCKOPS_PROTO_TLS_VALID(sock, recv))
     {
         rt_set_errno(-EOPNOTSUPP);
-        return -1;
+        return sal_socket_result(sock, -1);
     }
 #endif
-
-    return pf->skt_ops->recvmsg((int)(size_t)sock->user_data, message, flags);
+    result = socket_receive(sock, &request);
+    return sal_socket_result(sock, result);
 }
 
 int sal_sendto(int socket, const void *dataptr, size_t size, int flags,
@@ -1288,9 +1427,33 @@ int sal_ioctlsocket(int socket, long cmd, void *arg)
     struct sockaddr_in *addr_in = RT_NULL;
     struct sockaddr *addr = RT_NULL;
     ip_addr_t input_ipaddr;
-    /* get the socket object by socket descriptor */
+    if (cmd == F_GETFL || cmd == F_SETFL || cmd == FIONBIO)
+    {
+        int result, error;
+        rt_err_t locked;
+        sock = sal_socket_get(socket);
+        if (!sock)
+            return -1;
+        pf = sock->pf;
+        if (!pf || !pf->skt_ops || !pf->skt_ops->ioctlsocket)
+        {
+            rt_set_errno(-EOPNOTSUPP);
+            return sal_socket_result(sock, -1);
+        }
+        locked = rt_mutex_take_interruptible(&sock->rx_lock, RT_WAITING_FOREVER);
+        if (locked != RT_EOK)
+        {
+            rt_set_errno(-EINTR);
+            return sal_socket_result(sock, -1);
+        }
+        result = pf->skt_ops->ioctlsocket((int)(size_t)sock->user_data, cmd, arg);
+        error = rt_get_errno();
+        rt_mutex_release(&sock->rx_lock);
+        rt_set_errno(error);
+        return sal_socket_result(sock, result);
+    }
+
     SAL_SOCKET_OBJ_GET(sock, socket);
-    /* check the network interface socket opreation */
     SAL_SOCKETOPS_VALID(sock, pf, ioctlsocket);
 
     struct sal_ifreq *ifr = (struct sal_ifreq *)arg;
