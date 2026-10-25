@@ -31,6 +31,7 @@
     #include "mmu.h"
     #include "page.h"
     #include "lwp_arch.h"
+    #include "lwp_user_mm.h"
 #endif
 
 extern rt_ubase_t __text_start[];
@@ -42,8 +43,66 @@ extern rt_ubase_t __stack_cpu0[];
 static const char *get_exception_msg(int id);
 void dump_regs(struct rt_hw_stack_frame *regs);
 
-/* Re-entrancy guard: prevent infinite recursive crash reports. */
+/* Re-entrancy guard: this port runs on one hart, with interrupts disabled
+ * on trap entry. A future SMP port needs a separate guard for each hart. */
 static volatile int crash_handler_depth = 0;
+
+/* Startup and trap_entry use CPU0's stack; the linker also reserves an unused
+ * CPU1 stack. Keep classification and frame walking on the same CPU0 range. */
+static rt_bool_t on_boot_stack(rt_ubase_t sp)
+{
+    return sp >= (rt_ubase_t)__stack_start__ && sp < (rt_ubase_t)__stack_cpu0;
+}
+
+#ifdef RT_USING_USERSPACE
+static rt_ubase_t user_stack_top(rt_thread_t thread, rt_ubase_t sp)
+{
+    rt_ubase_t bottom, size;
+    struct lwp_avl_struct *node;
+    const struct rt_mm_area_struct *area;
+    const struct rt_lwp *lwp;
+
+    if (!thread || !thread->lwp || sp < USER_VADDR_START || sp >= USER_VADDR_TOP)
+        return 0;
+
+    /* sys_thread_create() records explicit stack bounds. The main-thread
+     * entry clears user_stack, so it reaches the reserved-range fallback. */
+    bottom = (rt_ubase_t)thread->user_stack;
+    size = thread->user_stack_size;
+    if (bottom && size)
+    {
+        if (bottom < USER_VADDR_START || bottom >= USER_VADDR_TOP ||
+            size > USER_VADDR_TOP - bottom || sp < bottom || sp - bottom >= size)
+            return 0;
+        return bottom + size;
+    }
+
+    /* The main stack is demand-mapped a page at a time. Its reserved range
+     * is a better bound than any one currently mapped page. */
+    if (sp >= USER_STACK_VSTART && sp < USER_STACK_VEND)
+        return USER_STACK_VEND;
+
+    /* clone() leaves user_stack/size unset. For pthreads, use the data mapping
+     * containing SP as a conservative bound; it can include TLS or other data.
+     * Do not take the MM mutex in a fault handler. This single-hart port enters
+     * traps with interrupts disabled, so the mapping tree cannot change here.
+     * A future SMP port needs a crash-safe snapshot or synchronization scheme;
+     * blocking on the MM mutex could deadlock if the faulting code holds it.
+     * Every frame is still copied through lwp_get_from_user(). */
+    lwp = thread->lwp;
+    node = lwp_map_find(lwp->map_area, sp);
+    if (!node || !node->data)
+        return 0;
+    area = node->data;
+    bottom = area->addr;
+    size = area->size;
+    if (area->type != MM_AREA_TYPE_DATA || bottom < USER_VADDR_START ||
+        bottom >= USER_VADDR_TOP || size > USER_VADDR_TOP - bottom ||
+        sp < bottom || sp - bottom >= size)
+        return 0;
+    return bottom + size;
+}
+#endif
 
 /*
  * Try to safely read one word from a kernel address.
@@ -56,7 +115,7 @@ static int safe_read_kern(rt_ubase_t addr, rt_ubase_t *out)
         return -1;
 
     /* Accept kernel text/data/bss range and ISR stack range. */
-    if (addr >= (rt_ubase_t)&__text_start && addr < (rt_ubase_t)&__stack_cpu0 + 0x10000)
+    if (addr >= (rt_ubase_t)__text_start && addr < (rt_ubase_t)&__bss_end)
     {
         *out = *(volatile rt_ubase_t *)addr;
         return 0;
@@ -107,37 +166,89 @@ static void dump_stack_memory(rt_ubase_t sp, int words_before, int words_after)
 }
 
 /*
- * Walk the RISC-V frame pointer chain and print a full backtrace.
+ * Walk the RISC-V frame pointer chain and print the available backtrace.
  * For -fno-omit-frame-pointer compiled code, the convention is:
  *   fp[-1]  = saved ra  (return address)
  *   fp[-2]  = saved fp  (previous frame pointer)
+ *
+ * How to use the crash trace:
+ *
+ * 1. Add these flags to both C and C++ compilation, then clean-rebuild the
+ *    kernel or application being diagnosed and the relevant libraries:
+ *      -g -fno-omit-frame-pointer -fno-optimize-sibling-calls
+ *    Apply them when compiling each source file, not only when linking.
+ *    The SDK's usual optimized builds do not preserve frame pointers by
+ *    default; enabling this reporter alone does not create a frame chain.
+ *
+ * 2. Keep the exact matching, unstripped ELF on the build host. To reduce the
+ *    deployed application's file size, strip a separate copy, for example:
+ *      riscv64-unknown-linux-musl-strip --strip-debug -o app.deploy.elf app.elf
+ *    Stripping debug information preserves frame pointers. Debug sections
+ *    increase ELF file size but normally are not loaded into target RAM.
+ *
+ * 3. After a hardware fault, run the printed addr2line command on the host.
+ *    For a kernel fault, use the matching rtthread.elf. For a user fault,
+ *    replace the printed board application path with its local ELF path.
+ *    Add -C to demangle C++ class and template names, for example:
+ *      riscv64-unknown-linux-musl-addr2line -e app.elf -a -f -C ADDRESS...
+ *    Replace ADDRESS... with the hexadecimal addresses from the report.
+ *
+ * Frame walking stops at a missing, invalid or inaccessible frame. Debug
+ * symbols cannot restore frames removed by inlining, tail calls or omitted
+ * frame pointers. The saved ra may duplicate the first frame's return address;
+ * return addresses can resolve to the source line after a call.
+ *
+ * C++ hardware faults, including faults inside catch handlers, use this path.
+ * Uncaught exceptions using the default terminate/abort path do not produce
+ * this hardware-trap report; they need separate application/runtime diagnostics.
  */
-static void dump_backtrace_fp_chain(rt_ubase_t fp, rt_ubase_t sepc)
+static void dump_backtrace_fp_chain(rt_ubase_t fp, rt_ubase_t sepc,
+                                    rt_ubase_t stack_pointer, rt_ubase_t saved_ra,
+                                    rt_ubase_t status)
 {
     rt_ubase_t ra, prev_fp;
     rt_ubase_t addrs[33];
     int naddr = 0;
     int depth;
-    int is_kernel;
+    int is_kernel = (status & SSTATUS_SPP) != 0;
     rt_ubase_t text_lo, text_hi;
+    rt_ubase_t stack_lo = 0, stack_hi = 0;
+    rt_thread_t thread = rt_thread_self();
 
     rt_kprintf("------------- Frame Pointer Backtrace -------\n");
 
     if (sepc)
         rt_kprintf("  #0  pc = 0x%016lx\n", (unsigned long)sepc);
 
-    if (fp >= USER_VADDR_START && fp < USER_VADDR_TOP)
+    /* Determine privilege from saved SSTATUS_SPP, independently of SP and FP. */
+    if (!is_kernel)
     {
-        is_kernel = 0;
         text_lo = USER_VADDR_START;
         text_hi = USER_VADDR_TOP;
+#ifdef RT_USING_USERSPACE
+        stack_lo = stack_pointer;
+        stack_hi = user_stack_top(thread, stack_pointer);
+#endif
     }
     else
     {
-        is_kernel = 1;
         text_lo = (rt_ubase_t)&__text_start;
         text_hi = (rt_ubase_t)&__text_end;
+        if (thread && stack_pointer >= (rt_ubase_t)thread->stack_addr &&
+            stack_pointer < (rt_ubase_t)thread->stack_addr + thread->stack_size)
+        {
+            stack_lo = stack_pointer;
+            stack_hi = (rt_ubase_t)thread->stack_addr + thread->stack_size;
+        }
+        else if (on_boot_stack(stack_pointer))
+        {
+            stack_lo = stack_pointer;
+            stack_hi = (rt_ubase_t)__stack_cpu0;
+        }
     }
+
+    if (saved_ra >= text_lo && saved_ra < text_hi)
+        addrs[naddr++] = saved_ra;
 
     for (depth = 1; depth < 32; depth++)
     {
@@ -145,6 +256,14 @@ static void dump_backtrace_fp_chain(rt_ubase_t fp, rt_ubase_t sepc)
         {
             rt_kprintf("  -- fp=0x%lx invalid (NULL or unaligned), stop\n",
                        (unsigned long)fp);
+            break;
+        }
+
+        /* Optimized code can use s0 as a general saved register. */
+        if (!stack_hi || fp < stack_lo || fp - stack_lo < 2 * sizeof(rt_ubase_t) ||
+            fp > stack_hi)
+        {
+            rt_kprintf("  -- s0/fp is outside the active stack; no frame chain available\n");
             break;
         }
 
@@ -159,15 +278,28 @@ static void dump_backtrace_fp_chain(rt_ubase_t fp, rt_ubase_t sepc)
         }
         else
         {
-            /* User-space: need lwp copy — skip for now. */
-            rt_kprintf("  -- user-space backtrace not supported\n");
+#ifdef RT_USING_USERSPACE
+            /* Copy through the page tables, never dereference a user fp. */
+            rt_ubase_t frame[2];
+
+            if (!thread || !thread->lwp ||
+                lwp_get_from_user(frame, (void *)(fp - sizeof(frame)),
+                                  sizeof(frame)) != sizeof(frame))
+            {
+                rt_kprintf("  -- fp=0x%lx inaccessible, stop\n", (unsigned long)fp);
+                break;
+            }
+            prev_fp = frame[0];
+            ra = frame[1];
+#else
             break;
+#endif
         }
 
         rt_kprintf("  #%d  ra = 0x%016lx  (fp was 0x%016lx)",
                    depth, (unsigned long)ra, (unsigned long)fp);
 
-        if (ra >= text_lo && ra < text_hi)
+        if (is_kernel && ra >= text_lo && ra < text_hi)
             rt_kprintf("  [kernel]");
         else if (ra >= USER_VADDR_START && ra < USER_VADDR_TOP)
             rt_kprintf("  [user]");
@@ -176,14 +308,14 @@ static void dump_backtrace_fp_chain(rt_ubase_t fp, rt_ubase_t sepc)
 
         rt_kprintf("\n");
 
-        if (naddr < 33)
-            addrs[naddr++] = ra;
-
-        if (ra < text_lo || ra > text_hi)
+        if (ra < text_lo || ra >= text_hi)
         {
-            rt_kprintf("  -- ra out of text range, likely corrupted. stop\n");
+            rt_kprintf("  -- no valid return address in frame; stop\n");
             break;
         }
+
+        if (naddr < 33)
+            addrs[naddr++] = ra;
 
         if (prev_fp == 0)
         {
@@ -191,9 +323,9 @@ static void dump_backtrace_fp_chain(rt_ubase_t fp, rt_ubase_t sepc)
             break;
         }
 
-        if (is_kernel && prev_fp <= fp)
+        if (prev_fp <= fp)
         {
-            rt_kprintf("  -- prev_fp(0x%lx) <= fp(0x%lx), stack corrupted. stop\n",
+            rt_kprintf("  -- prev_fp(0x%lx) <= fp(0x%lx), invalid frame chain; stop\n",
                        (unsigned long)prev_fp, (unsigned long)fp);
             break;
         }
@@ -203,7 +335,18 @@ static void dump_backtrace_fp_chain(rt_ubase_t fp, rt_ubase_t sepc)
 
     /* Print a single addr2line command with all addresses. */
     rt_kprintf("------------- addr2line command --------------\n");
-    rt_kprintf("riscv64-unknown-linux-musl-addr2line -e rtthread.elf -a -f");
+    rt_kprintf("riscv64-unknown-linux-musl-addr2line -e ");
+#ifdef RT_USING_USERSPACE
+    if (!is_kernel && thread && thread->lwp)
+    {
+        const struct rt_lwp *lwp = thread->lwp;
+
+        rt_kprintf("'%.*s'", (int)sizeof(lwp->cmd), lwp->cmd);
+    }
+    else
+#endif
+        rt_kprintf("rtthread.elf");
+    rt_kprintf(" -a -f");
     if (sepc)
         rt_kprintf(" 0x%lx", (unsigned long)sepc);
     {
@@ -402,7 +545,8 @@ static void dump_crash_info(rt_size_t scause, rt_size_t stval, rt_size_t sepc,
                             struct rt_hw_stack_frame *sp)
 {
     rt_size_t id = __MASKVALUE(scause, __MASK(63UL));
-    int is_supervisor = (sp->sstatus & 0x100) ? 1 : 0;
+    int is_supervisor = (sp->sstatus & SSTATUS_SPP) != 0;
+    rt_uint8_t irq_nest;
 
     crash_handler_depth++;
     if (crash_handler_depth > 1)
@@ -413,6 +557,7 @@ static void dump_crash_info(rt_size_t scause, rt_size_t stval, rt_size_t sepc,
         while (1) ;
     }
 
+    irq_nest = rt_interrupt_get_nest();
     rt_kprintf("\n============ CRASH REPORT ===================\n");
     rt_kprintf("Exception %ld: %s\n", id, get_exception_msg(id));
     rt_kprintf("  scause = 0x%016lx\n", (unsigned long)scause);
@@ -421,14 +566,16 @@ static void dump_crash_info(rt_size_t scause, rt_size_t stval, rt_size_t sepc,
     rt_kprintf("  ra     = 0x%016lx  (return address)\n", (unsigned long)sp->ra);
     rt_kprintf("  sp     = 0x%016lx\n", (unsigned long)sp->user_sp_exc_stack);
     rt_kprintf("  frame  = 0x%016lx  (trap frame on stack)\n", (unsigned long)(rt_ubase_t)sp);
-    if (sp->user_sp_exc_stack >= (rt_ubase_t)__stack_start__ &&
-        sp->user_sp_exc_stack < (rt_ubase_t)__stack_cpu0 + 0x10000)
-        rt_kprintf("  sp     : ON ISR/BOOT STACK [0x%lx - 0x%lx] => INTERRUPT CONTEXT!\n",
+    if (is_supervisor && on_boot_stack(sp->user_sp_exc_stack))
+        rt_kprintf("  sp     : ON ISR/BOOT STACK [0x%lx - 0x%lx)\n",
                    (unsigned long)(rt_ubase_t)__stack_start__,
                    (unsigned long)(rt_ubase_t)__stack_cpu0);
     rt_kprintf("  fp/s0  = 0x%016lx\n", (unsigned long)sp->s0_fp);
     rt_kprintf("  mode   = %s (SPP=%d)\n",
                is_supervisor ? "SUPERVISOR" : "USER", is_supervisor);
+    /* The boot stack alone does not imply an active interrupt handler. */
+    if (is_supervisor && irq_nest)
+        rt_kprintf("  context: INTERRUPT CONTEXT! (nest=%u)\n", (unsigned)irq_nest);
 
     /* Check if sepc is within known code ranges. */
     if (sepc >= (rt_ubase_t)&__text_start && sepc < (rt_ubase_t)&__text_end)
@@ -443,7 +590,7 @@ static void dump_crash_info(rt_size_t scause, rt_size_t stval, rt_size_t sepc,
     /* Check if stval is a valid address. */
     if (stval == 0)
         rt_kprintf("  stval  : NULL pointer dereference\n");
-    else if (stval >= (rt_ubase_t)&__text_start && stval < (rt_ubase_t)&__stack_cpu0 + 0x10000)
+    else if (stval >= (rt_ubase_t)__text_start && stval < (rt_ubase_t)&__bss_end)
         rt_kprintf("  stval  : in kernel memory\n");
     else if (stval >= USER_VADDR_START && stval < USER_VADDR_TOP)
         rt_kprintf("  stval  : in user space\n");
@@ -455,11 +602,13 @@ static void dump_crash_info(rt_size_t scause, rt_size_t stval, rt_size_t sepc,
     dump_regs(sp);
     dump_thread_info();
     dump_instructions(sepc);
-    dump_backtrace_fp_chain(sp->s0_fp, sepc);
+    dump_backtrace_fp_chain(sp->s0_fp, sepc, sp->user_sp_exc_stack, sp->ra,
+                            sp->sstatus);
     dump_stack_memory(sp->user_sp_exc_stack, 8, 24);
 
     /* Dump ALL thread stacks FIRST — this is the most important info. */
     dump_all_thread_stacks();
+    crash_handler_depth--;
 }
 
 void dump_regs(struct rt_hw_stack_frame *regs)
@@ -684,9 +833,6 @@ void handle_user(rt_size_t scause, rt_size_t stval, rt_size_t sepc, struct rt_hw
     /* Enhanced crash dump with full diagnostics. */
     dump_crash_info(scause, stval, sepc, sp);
 
-    /* Also print the legacy addr2line command for convenience. */
-    rt_hw_backtrace((uint32_t *)sp->s0_fp, sepc);
-
     LOG_E("User Fault, killing thread: %s, tid: %d", rt_thread_self()->name, rt_thread_self()->tid);
 
 #if defined (RT_RECOVERY_MPY_AUTO_EXEC_PY)
@@ -738,8 +884,20 @@ static int illegal_inst_recoverable(rt_ubase_t stval, struct rt_hw_stack_frame *
     return flag;
 }
 
-#define IN_USER_SPACE (stval >= USER_VADDR_START && stval < USER_VADDR_TOP)
-#define PAGE_FAULT (id == EP_LOAD_PAGE_FAULT || id == EP_STORE_PAGE_FAULT)
+static rt_bool_t trap_is_user_fault(rt_size_t cause, rt_size_t address,
+                                    rt_ubase_t status)
+{
+    rt_thread_t thread = rt_thread_self();
+
+    /* Supervisor accesses may demand-page a process's user stack, but a
+     * kernel thread (or an ISR) must never enter process-exit handling. */
+    if (!thread || !thread->lwp || rt_interrupt_get_nest())
+        return RT_FALSE;
+
+    return !(status & SSTATUS_SPP) ||
+           ((cause == EP_LOAD_PAGE_FAULT || cause == EP_STORE_PAGE_FAULT) &&
+            address >= USER_VADDR_START && address < USER_VADDR_TOP);
+}
 
 /* Trap entry */
 void handle_trap(rt_size_t scause,rt_size_t stval,rt_size_t sepc,struct rt_hw_stack_frame *sp)
@@ -796,7 +954,7 @@ void handle_trap(rt_size_t scause,rt_size_t stval,rt_size_t sepc,struct rt_hw_st
             if (!(sp->sstatus & SSTATUS_VS) && illegal_inst_recoverable(stval, sp))
                 return;
         }
-        if (!(sp->sstatus & 0x100) || (PAGE_FAULT && IN_USER_SPACE))
+        if (trap_is_user_fault(id, stval, sp->sstatus))
         {
             handle_user(scause, stval, sepc, sp);
             // after handle_user(), return to user space.
@@ -814,10 +972,6 @@ void handle_trap(rt_size_t scause,rt_size_t stval,rt_size_t sepc,struct rt_hw_st
     rt_kprintf("--------------Thread list--------------\n");
     rt_kprintf("current thread: %s\n", rt_thread_self()->name);
     list_process();
-
-    extern struct rt_thread *rt_current_thread;
-    rt_kprintf("--------------Backtrace--------------\n");
-    rt_hw_backtrace((uint32_t *)sp->s0_fp, sepc);
 
     while (1)
         ;
