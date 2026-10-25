@@ -12,6 +12,7 @@
 #include <ipc/workqueue.h>
 #ifdef AIC8800_WIFI_TRANSPORT_USB
 #include <usbh_core.h>
+#include "aic8800_tx_queue.h"
 #endif
 #ifdef AIC8800_WIFI_TRANSPORT_SDIO
 #include <drivers/sdio.h>
@@ -291,14 +292,15 @@ struct aic8800_tx_slot
     volatile rt_bool_t in_use;
     /* Armed immediately before usbh_submit_urb() and retired on giveback.
      * A host channel that stops completing leaves `submitted` set with
-     * `submit_tick` frozen, which is the only evidence the watchdog has that
-     * the request is stuck rather than merely slow. */
+     * `submit_tick` frozen. Age is diagnostic: firmware backpressure can also
+     * leave a valid request pending indefinitely. */
     volatile rt_bool_t submitted;
     /* Set while usbh_kill_urb() owns urb->reject.  Giveback may make the slot
      * otherwise look free before kill returns, so acquisition must also gate
      * on this state. */
     volatile rt_bool_t cancelling;
     volatile rt_tick_t submit_tick;
+    rt_bool_t watchdog_reported;
     struct aic8800_tx_metadata
         metadata[AIC8800_WIFI_USB_TX_AGGREGATE_FRAMES];
     rt_uint8_t metadata_count;
@@ -320,15 +322,21 @@ struct aic8800_tx_worker
     rt_uint32_t completion_count;
     rt_uint64_t byte_count;
     rt_uint32_t wait_count;
-    /* Watchdog cancellations and slots reclaimed without a giveback. */
+    /* Slow-request observations and error-recovery reclaims. */
     rt_uint32_t watchdog_count;
     rt_uint32_t reclaim_count;
+    /* Progress-timeout state. Completion/error totals reset the timer;
+     * prolonged backpressure can reach the same timeout as a lost giveback. */
+    rt_uint32_t stall_retired;
+    rt_tick_t stall_since;
     /* Consecutive submissions that acquired a slot without blocking. */
     rt_uint32_t burst_count;
     rt_uint32_t max_burst_count;
     rt_size_t next_slot;
     int last_error;
     volatile rt_bool_t active;
+    /* Latched before releasing an errored slot; cleared only after recovery. */
+    volatile rt_bool_t recovering;
     rt_bool_t semaphore_initialized;
     rt_bool_t completion_initialized;
 };
@@ -341,19 +349,6 @@ struct aic8800_usb_tx_record
     rt_uint8_t data[AIC8800_WIFI_TX_BUFFER_SIZE];
 };
 
-/* Do not put a native pointer in the message queue.  A damaged queue payload
- * used to be consumed as a record address and was dereferenced immediately by
- * the TX worker.  Keep a checked, redundant token at opposite ends of one
- * RT_ALIGN_SIZE queue cell instead. */
-struct aic8800_usb_tx_queue_entry
-{
-    rt_uint64_t token;
-    rt_uint8_t reserved[48];
-    rt_uint64_t token_check;
-};
-
-_Static_assert(sizeof(struct aic8800_usb_tx_queue_entry) == 64,
-               "AIC USB TX queue entry must occupy one RT queue cell");
 _Static_assert(AIC8800_WIFI_USB_TX_QUEUE_DEPTH <=
                    AIC8800_USB_TX_TOKEN_INDEX_MAX,
                "AIC USB TX token index is eight bits");
@@ -429,7 +424,6 @@ struct aic8800_rx_worker
     rt_uint32_t dispatch_last_us;
 #endif
     int last_error;
-    rt_uint8_t completion_log_count;
     volatile rt_bool_t active;
     volatile rt_bool_t queue_overflow;
     const char *name;
@@ -656,7 +650,7 @@ struct aic8800_context
     struct aic8800_rx_worker message_worker;
     struct rt_completion usb_tx_thread_stopped;
     rt_thread_t usb_tx_thread;
-    rt_mq_t usb_tx_queue;
+    struct aic8800_tx_queue *usb_tx_queue;
     rt_mp_t usb_tx_pool;
     rt_uint8_t *usb_tx_aggregate_buffer;
     rt_uint32_t usb_tx_queue_drop_count;
@@ -671,6 +665,7 @@ struct aic8800_context
     rt_uint32_t usb_tx_submit_busy_count;
     rt_uint32_t usb_tx_queue_token_recovery_count;
     rt_uint32_t usb_tx_queue_token_error_count;
+    rt_uint32_t usb_tx_queue_state_error_count;
     rt_uint32_t usb_tx_queue_record_error_count;
     rt_uint32_t usb_tx_pool_rebuild_count;
     rt_uint32_t usb_tx_queue_orphan_reclaim_count;
@@ -680,6 +675,7 @@ struct aic8800_context
     volatile rt_bool_t usb_tx_queue_enabled;
     rt_bool_t usb_tx_aggregation_enabled;
     volatile rt_bool_t usb_tx_terminate;
+    volatile rt_bool_t usb_port_reenumerate;
 #endif
 
 #ifdef AIC8800_WIFI_TRANSPORT_SDIO
@@ -785,6 +781,8 @@ struct aic8800_context
     rt_int32_t power_save_level;
     rt_bool_t station_enabled;
     rt_bool_t station_connected;
+    /* Survives an unsolicited link loss until an explicit leave/disable. */
+    rt_bool_t station_restore_needed;
     rt_bool_t station_qos;
     rt_uint8_t station_acm;
     rt_bool_t station_interface_recycle_pending;
@@ -989,6 +987,10 @@ rt_err_t aic8800_core_attach(struct aic8800_context *context);
 rt_err_t aic8800_core_detach(struct aic8800_context *context);
 rt_err_t aic8800_core_receive(struct rt_wlan_offload_bus *bus, const void *data,
                               rt_size_t length, void *parameter);
+#ifdef AIC8800_WIFI_TRANSPORT_USB
+void aic8800_usb_request_port_reenumeration(
+    struct aic8800_context *context);
+#endif
 #ifdef AIC8800_WIFI_DEBUG_STATS
 #ifdef AIC8800_WIFI_TRANSPORT_USB
 struct aic8800_context *aic8800_usb_stat_context(void);

@@ -114,6 +114,85 @@ static struct rt_mutex mgnt_mutex;
 
 static struct rt_wlan_mgnt_des _sta_mgnt;
 static struct rt_wlan_mgnt_des _ap_mgnt;
+static rt_uint32_t station_generation = 1;
+static rt_bool_t station_reconnect_valid;
+static rt_bool_t station_selection_automatic;
+/* Outstanding firmware/hotplug snapshots take precedence over cache retries.
+ * A generation can have both owners while recovery escalates to USB reset. */
+static rt_uint32_t station_reconnect_users;
+
+void rt_wlan_mgnt_cancel_reconnect(struct rt_wlan_device *device)
+{
+    rt_base_t level = rt_hw_interrupt_disable();
+
+    if (!device || device == _sta_mgnt.device)
+    {
+        if (!++station_generation)
+            ++station_generation;
+        station_reconnect_valid = RT_FALSE;
+        station_reconnect_users = 0;
+    }
+    rt_hw_interrupt_enable(level);
+}
+
+rt_err_t rt_wlan_mgnt_get_reconnect(struct rt_wlan_device *device,
+                                   struct rt_wlan_reconnect *connection)
+{
+    rt_base_t level;
+
+    if (!device || !connection)
+        return -RT_EINVAL;
+    rt_memset(connection, 0, sizeof(*connection));
+    level = rt_hw_interrupt_disable();
+    if (_sta_mgnt.device != device || !station_reconnect_valid ||
+        !_sta_mgnt.info.ssid.len ||
+        _sta_mgnt.info.ssid.len > RT_WLAN_SSID_MAX_LENGTH ||
+        _sta_mgnt.key.len > RT_WLAN_PASSWORD_MAX_LENGTH)
+    {
+        rt_hw_interrupt_enable(level);
+        return -RT_EBUSY;
+    }
+    connection->generation = station_generation;
+    connection->ssid = _sta_mgnt.info.ssid;
+    connection->key = _sta_mgnt.key;
+    connection->band = _sta_mgnt.band_locked ? _sta_mgnt.info.band :
+                                             RT_802_11_BAND_UNKNOWN;
+    station_reconnect_users++;
+    rt_hw_interrupt_enable(level);
+    connection->ssid.val[connection->ssid.len] = '\0';
+    connection->key.val[connection->key.len] = '\0';
+    return RT_EOK;
+}
+
+rt_err_t rt_wlan_mgnt_retain_reconnect(const struct rt_wlan_reconnect *connection)
+{
+    rt_base_t level;
+
+    if (!connection || !connection->generation)
+        return -RT_EINVAL;
+    level = rt_hw_interrupt_disable();
+    if (connection->generation != station_generation)
+    {
+        rt_hw_interrupt_enable(level);
+        return -RT_EBUSY;
+    }
+    station_reconnect_users++;
+    rt_hw_interrupt_enable(level);
+    return RT_EOK;
+}
+
+void rt_wlan_mgnt_release_reconnect(struct rt_wlan_reconnect *connection)
+{
+    rt_base_t level;
+
+    if (!connection)
+        return;
+    level = rt_hw_interrupt_disable();
+    if (connection->generation == station_generation && station_reconnect_users)
+        station_reconnect_users--;
+    rt_memset(connection, 0, sizeof(*connection));
+    rt_hw_interrupt_enable(level);
+}
 
 static struct rt_wlan_scan_result scan_result;
 static struct rt_mutex scan_result_mutex;
@@ -168,7 +247,7 @@ rt_inline int _ap_is_null(void)
 
 rt_inline rt_bool_t _is_do_connect(void)
 {
-    if (_sta_is_null() ||
+    if (_sta_is_null() || station_reconnect_users ||
             (rt_wlan_get_autoreconnect_mode() == RT_FALSE) ||
             (rt_wlan_is_connected() == RT_TRUE) ||
             (_sta_mgnt.state & RT_WLAN_STATE_CONNECTING))
@@ -621,6 +700,7 @@ static void rt_wlan_event_dispatch(struct rt_wlan_device *device, rt_wlan_dev_ev
         RT_WLAN_LOG_D("event: CONNECT");
         _sta_mgnt.state |= RT_WLAN_STATE_CONNECT;
         _sta_mgnt.state &= ~RT_WLAN_STATE_CONNECTING;
+        station_reconnect_valid = RT_TRUE;
         user_event = RT_WLAN_EVT_STA_CONNECTED;
         TIME_STOP();
         user_buff.data = &_sta_mgnt.info;
@@ -877,6 +957,15 @@ rt_err_t rt_wlan_set_mode(const char *dev_name, rt_wlan_mode_t mode)
     }
 
     MGNT_LOCK();
+    if ((mode == RT_WLAN_STATION &&
+         (station_selection_automatic || (_sta_mgnt.device &&
+          _sta_mgnt.device != RT_WLAN_DEVICE(device)))) ||
+        (mode == RT_WLAN_NONE && _sta_mgnt.device == RT_WLAN_DEVICE(device)))
+    {
+        rt_wlan_mgnt_cancel_reconnect(RT_NULL);
+    }
+    if (mode == RT_WLAN_STATION)
+        station_selection_automatic = RT_FALSE;
     if (RT_WLAN_DEVICE(device)->mode == mode &&
         (mode == RT_WLAN_NONE ||
          (mode == RT_WLAN_STATION &&
@@ -1033,6 +1122,67 @@ rt_err_t rt_wlan_set_mode(const char *dev_name, rt_wlan_mode_t mode)
     return err;
 }
 
+rt_err_t rt_wlan_mgnt_autostart(const char *dev_name, rt_wlan_mode_t mode)
+{
+    struct rt_wlan_device *device;
+    struct rt_wlan_device *selected;
+    rt_err_t result;
+
+    if (!dev_name || (mode != RT_WLAN_STATION && mode != RT_WLAN_AP))
+        return -RT_EINVAL;
+    MGNT_LOCK();
+    device = rt_wlan_dev_find(dev_name);
+    selected = mode == RT_WLAN_STATION ? STA_DEVICE() : AP_DEVICE();
+    if (!device)
+        result = -RT_EIO;
+    else if (!selected || selected == device)
+        result = rt_wlan_set_mode(dev_name, mode);
+    else
+    {
+        /* Initialize the new interface without replacing a user selection. */
+        result = device->mode == mode ? RT_EOK : rt_wlan_dev_init(device, mode);
+#if defined(RT_WLAN_PROT_ENABLE) && defined(RT_WLAN_DEFAULT_PROT)
+        if (result == RT_EOK)
+            rt_wlan_prot_attach(dev_name, RT_WLAN_DEFAULT_PROT);
+#endif
+    }
+    MGNT_UNLOCK();
+    return result;
+}
+
+rt_err_t rt_wlan_mgnt_reconnect(struct rt_wlan_device *device,
+                               const struct rt_wlan_reconnect *connection)
+{
+    rt_err_t result;
+
+    if (!device || !connection || !connection->generation ||
+        !connection->ssid.len ||
+        connection->ssid.len > RT_WLAN_SSID_MAX_LENGTH ||
+        connection->key.len > RT_WLAN_PASSWORD_MAX_LENGTH ||
+        connection->ssid.val[connection->ssid.len] ||
+        connection->key.val[connection->key.len])
+        return -RT_EINVAL;
+
+    /* Hold the same recursive mutex as selection, join and leave, through
+     * the check and connect. A user command either invalidates this snapshot
+     * first, or executes after this restore; it cannot be undone afterward. */
+    MGNT_LOCK();
+    if (connection->generation != station_generation ||
+        (STA_DEVICE() && STA_DEVICE() != device && !station_selection_automatic) ||
+        (_sta_mgnt.state & (RT_WLAN_STATE_CONNECT | RT_WLAN_STATE_CONNECTING)))
+    {
+        MGNT_UNLOCK();
+        return -RT_EBUSY;
+    }
+    result = rt_wlan_set_mode(device->device.parent.name, RT_WLAN_STATION);
+    if (result == RT_EOK)
+        result = rt_wlan_connect_by_band((const char *)connection->ssid.val,
+            connection->key.len ? (const char *)connection->key.val : RT_NULL,
+            connection->band);
+    MGNT_UNLOCK();
+    return result;
+}
+
 struct rt_wlan_device *rt_wlan_get_device(rt_wlan_mode_t mode)
 {
     struct rt_wlan_device *device = RT_NULL;
@@ -1079,7 +1229,7 @@ rt_err_t rt_wlan_select_device(rt_wlan_mode_t mode,
             rt_device_find(current->device.parent.name) ==
                 (rt_device_t)current)
         {
-            return RT_EOK;
+            return rt_wlan_set_mode(current->device.parent.name, mode);
         }
 
         for (index = 0; index < sizeof(auto_order) / sizeof(auto_order[0]);
@@ -1112,6 +1262,24 @@ rt_err_t rt_wlan_select_device(rt_wlan_mode_t mode,
     return result;
 }
 
+rt_err_t rt_wlan_mgnt_autoselect(rt_wlan_mode_t mode)
+{
+    rt_err_t result = RT_EOK;
+
+    MGNT_LOCK();
+    if (mode == RT_WLAN_STATION && !STA_DEVICE())
+    {
+        result = rt_wlan_select_device(mode, RT_WLAN_TRANSPORT_UNKNOWN);
+        /* Unplug fallback keeps the removed station's generation. A later
+         * explicit selection, even of this same fallback, invalidates it. */
+        station_selection_automatic = result == RT_EOK;
+    }
+    else if (mode == RT_WLAN_AP && !AP_DEVICE())
+        result = rt_wlan_select_device(mode, RT_WLAN_TRANSPORT_UNKNOWN);
+    MGNT_UNLOCK();
+    return result;
+}
+
 rt_err_t rt_wlan_mgnt_unregister_device(struct rt_wlan_device *device)
 {
     rt_wlan_dev_event_t event;
@@ -1124,6 +1292,7 @@ rt_err_t rt_wlan_mgnt_unregister_device(struct rt_wlan_device *device)
     MGNT_LOCK();
     if (_sta_mgnt.device == device)
     {
+        station_selection_automatic = RT_FALSE;
         _sta_mgnt.device = RT_NULL;
         _sta_mgnt.state = 0;
 #ifdef RT_WLAN_AUTO_CONNECT_ENABLE
@@ -1290,8 +1459,8 @@ static rt_err_t rt_wlan_connect_adv_internal(struct rt_wlan_info *info,
 static struct rt_wlan_scan_result *rt_wlan_scan_with_info_internal(
     struct rt_wlan_info *info, rt_bool_t band_locked);
 
-rt_err_t rt_wlan_connect_by_band(const char *ssid, const char *password,
-                                 rt_802_11_band_t band)
+static rt_err_t wlan_connect_by_band(const char *ssid, const char *password,
+                                     rt_802_11_band_t band)
 {
     rt_err_t err = RT_EOK;
     int ssid_len = 0;
@@ -1334,6 +1503,7 @@ rt_err_t rt_wlan_connect_by_band(const char *ssid, const char *password,
         rt_bool_t policy_changed;
 
         rt_enter_critical();
+        station_reconnect_valid = RT_TRUE;
         policy_changed = _sta_mgnt.band_locked != band_locked;
         _sta_mgnt.band_locked = band_locked;
         rt_exit_critical();
@@ -1411,6 +1581,18 @@ rt_err_t rt_wlan_connect_by_band(const char *ssid, const char *password,
     return err;
 }
 
+rt_err_t rt_wlan_connect_by_band(const char *ssid, const char *password,
+                                 rt_802_11_band_t band)
+{
+    rt_err_t result;
+
+    MGNT_LOCK();
+    rt_wlan_mgnt_cancel_reconnect(RT_NULL);
+    result = wlan_connect_by_band(ssid, password, band);
+    MGNT_UNLOCK();
+    return result;
+}
+
 rt_err_t rt_wlan_connect(const char *ssid, const char *password)
 {
     return rt_wlan_connect_by_band(
@@ -1460,6 +1642,7 @@ static rt_err_t rt_wlan_connect_adv_internal(struct rt_wlan_info *info,
     }
     /* is connect ? */
     MGNT_LOCK();
+    rt_wlan_mgnt_cancel_reconnect(RT_NULL);
     if (rt_wlan_is_connected())
     {
         if ((_sta_mgnt.info.ssid.len == info->ssid.len) &&
@@ -1471,6 +1654,7 @@ static rt_err_t rt_wlan_connect_adv_internal(struct rt_wlan_info *info,
             rt_bool_t policy_changed;
 
             rt_enter_critical();
+            station_reconnect_valid = RT_TRUE;
             policy_changed = _sta_mgnt.band_locked != band_locked;
             _sta_mgnt.band_locked = band_locked;
             rt_exit_critical();
@@ -1541,7 +1725,13 @@ static rt_err_t rt_wlan_connect_adv_internal(struct rt_wlan_info *info,
 
 rt_err_t rt_wlan_connect_adv(struct rt_wlan_info *info, const char *password)
 {
-    return rt_wlan_connect_adv_internal(info, password, RT_FALSE);
+    rt_err_t result;
+
+    MGNT_LOCK();
+    rt_wlan_mgnt_cancel_reconnect(RT_NULL);
+    result = rt_wlan_connect_adv_internal(info, password, RT_FALSE);
+    MGNT_UNLOCK();
+    return result;
 }
 
 rt_err_t rt_wlan_disconnect(void)
@@ -1550,15 +1740,18 @@ rt_err_t rt_wlan_disconnect(void)
     struct rt_wlan_complete_des *complete;
     rt_uint32_t recved = 0, set = 0;
 
+    /* Invalidate even while a hot-plug station is absent. */
+    MGNT_LOCK();
+    rt_wlan_mgnt_cancel_reconnect(RT_NULL);
     /* ap dev Can't be empty */
     if (_sta_is_null())
     {
+        MGNT_UNLOCK();
         return -RT_EIO;
     }
     RT_WLAN_LOG_D("%s is run", __FUNCTION__);
 
     /* run disconnect */
-    MGNT_LOCK();
     /* create event wait complete */
     complete = rt_wlan_complete_create("disc");
     if (complete == RT_NULL)

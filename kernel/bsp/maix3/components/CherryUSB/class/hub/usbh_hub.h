@@ -9,6 +9,7 @@
 #include "usb_hub.h"
 
 struct usbh_hub;
+struct usbh_hubport;
 
 #define USBH_HUB_MAX_PORTS 4
 /* Maximum size of an interrupt IN transfer */
@@ -20,6 +21,7 @@ extern "C" {
 
 int usbh_hub_set_feature(struct usbh_hub *hub, uint8_t port, uint8_t feature);
 int usbh_hub_clear_feature(struct usbh_hub *hub, uint8_t port, uint8_t feature);
+int usbh_hubport_reenumerate(struct usbh_hubport *hport);
 
 void usbh_hub_thread_wakeup(struct usbh_hub *hub);
 

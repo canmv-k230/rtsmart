@@ -2847,6 +2847,7 @@ static void aic_report_connect(struct aic8800_context *context,
     }
     if (!status)
     {
+        context->station_restore_needed = RT_TRUE;
         rt_memcpy(context->bssid, parameter + 2, 6);
         context->ap_station_index =
             parameter[AIC_SM_CONNECT_IND_STATION_OFFSET];
@@ -2932,10 +2933,16 @@ static void aic_report_disconnect(struct aic8800_context *context,
     struct rt_wlan_offload_event event;
     rt_bool_t was_connected;
 
-    if (!context || !parameter || length < 2)
+    if (!context || !parameter || length < 3 ||
+        parameter[2] != context->vif_index)
     {
         return;
     }
+    LOG_D("station disconnected: reason=%u vif=%u local=%u ft=%u reassoc=%u",
+          (unsigned int)aic_get_le16(parameter), (unsigned int)parameter[2],
+          (unsigned int)(context->disconnect_request_id != 0),
+          length > 3 ? (unsigned int)parameter[3] : 0,
+          length > 4 ? (unsigned int)parameter[4] : 0);
     aic_rx_reorder_reset(context);
     aic_tcp_ack_reset(context);
     was_connected = context->station_connected;
@@ -4210,12 +4217,13 @@ static rt_err_t aic_deliver_amsdu(struct aic8800_context *context,
                                   enum rt_wlan_offload_iftype iftype,
                                   const rt_uint8_t *frame,
                                   rt_size_t frame_length,
-                                  rt_size_t header_length)
+                                  rt_size_t header_length,
+                                  rt_uint8_t *ethernet,
+                                  rt_size_t ethernet_capacity)
 {
     rt_size_t offset;
     const rt_uint8_t *cursor;
     rt_size_t remaining;
-    rt_uint8_t ethernet[AIC8800_ETHERNET_FRAME_MAX];
     rt_bool_t delivered = RT_FALSE;
 
     offset = aic_amsdu_payload_offset(frame, frame_length, header_length);
@@ -4243,7 +4251,7 @@ static rt_err_t aic_deliver_amsdu(struct aic8800_context *context,
             cursor[18] == 0x00 && cursor[19] == 0x00)
         {
             ethernet_length = 14U + payload_length - 8U;
-            if (ethernet_length > sizeof(ethernet))
+            if (ethernet_length > ethernet_capacity)
             {
                 return -RT_EFULL;
             }
@@ -4256,7 +4264,7 @@ static rt_err_t aic_deliver_amsdu(struct aic8800_context *context,
         {
             /* Preserve non-SNAP 802.3 MSDUs, including their length field. */
             ethernet_length = subframe_length;
-            if (ethernet_length > sizeof(ethernet))
+            if (ethernet_length > ethernet_capacity)
             {
                 return -RT_EFULL;
             }
@@ -4375,8 +4383,9 @@ static rt_err_t aic_deliver_ethernet(struct aic8800_context *context,
     if (amsdu)
     {
         AIC8800_STAT(context->rx_amsdu_record_count++);
+        /* Reuse the caller's frame buffer across the synchronous RX path. */
         return aic_deliver_amsdu(context, iftype, frame, frame_length,
-                                 header_length);
+                                 header_length, ethernet, sizeof(ethernet));
     }
     if (frame_length < header_length + 8U)
     {
@@ -6219,6 +6228,7 @@ static rt_err_t aic_change_interface(struct rt_wlan_offload_vif *vif,
             aic_clear_vif_hardware_keys(context, iftype);
             if (iftype == RT_WLAN_OFFLOAD_IFTYPE_STATION)
             {
+                context->station_restore_needed = RT_FALSE;
                 context->station_connected = RT_FALSE;
                 context->station_interface_recycle_pending = RT_FALSE;
                 context->promiscuous_enabled = RT_FALSE;
@@ -7122,6 +7132,9 @@ static rt_err_t aic_disconnect(struct rt_wlan_offload_vif *vif,
     {
         return -RT_EINVAL;
     }
+    /* A user leave must not be undone by a subsequent USB restart, even if
+     * the firmware has already stopped answering commands. */
+    context->station_restore_needed = RT_FALSE;
     rt_memset(request, 0, sizeof(request));
     aic_put_le16(request, reason ? reason : 3);
     request[2] = context->vif_index;
@@ -9181,9 +9194,9 @@ static void aic_stat_print_usb(struct aic8800_context *context)
     rt_kprintf("USB TX queue: queued=%u depth=%u high=%u frames=%u "
                "aggregates=%u max=%u drops=%u defer=%u worker-drop=%u "
                "submit-busy=%u errors=%u token-recover=%u token-errors=%u "
-               "record-errors=%u pool-rebuilds=%u orphan-reclaims=%u\n",
-               context->usb_tx_queue ?
-                   (unsigned int)context->usb_tx_queue->entry : 0U,
+               "state-errors=%u record-errors=%u pool-rebuilds=%u "
+               "orphan-reclaims=%u\n",
+               (unsigned int)aic8800_tx_queue_count(context->usb_tx_queue),
                (unsigned int)AIC8800_WIFI_USB_TX_QUEUE_DEPTH,
                (unsigned int)context->usb_tx_queue_high_water,
                (unsigned int)context->usb_tx_frame_count,
@@ -9196,6 +9209,7 @@ static void aic_stat_print_usb(struct aic8800_context *context)
                (unsigned int)context->usb_tx_error_count,
                (unsigned int)context->usb_tx_queue_token_recovery_count,
                (unsigned int)context->usb_tx_queue_token_error_count,
+               (unsigned int)context->usb_tx_queue_state_error_count,
                (unsigned int)context->usb_tx_queue_record_error_count,
                (unsigned int)context->usb_tx_pool_rebuild_count,
                (unsigned int)context->usb_tx_queue_orphan_reclaim_count);
@@ -10135,14 +10149,14 @@ rt_err_t aic8800_core_attach(struct aic8800_context *context)
               aic8800_transport_name(context), control);
     }
 #ifdef AIC8800_WIFI_AUTO_START
-    result = rt_wlan_set_mode(
+    result = rt_wlan_mgnt_autostart(
         context->radio.vifs[RT_WLAN_OFFLOAD_VIF_STA_INDEX].wlan.device.parent.name,
         RT_WLAN_STATION);
     if (result != RT_EOK)
     {
         LOG_W("automatic station initialization failed: %d", result);
     }
-    result = rt_wlan_set_mode(
+    result = rt_wlan_mgnt_autostart(
         context->radio.vifs[RT_WLAN_OFFLOAD_VIF_AP_INDEX].wlan.device.parent.name,
         RT_WLAN_AP);
     if (result != RT_EOK)

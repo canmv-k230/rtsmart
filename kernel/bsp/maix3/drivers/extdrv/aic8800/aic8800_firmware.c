@@ -1443,7 +1443,10 @@ static rt_err_t aic_firmware_apply_patch_table(
         }
         if (type == AIC_PATCH_POWER_ON_TYPE)
         {
-            cpu_ticks_delay_us(500);
+            /* The vendor loader (aicbluetooth.c, aicbt_patch_table_load)
+             * sleeps 100 ms after the PWRON block; its older 500 us delay is
+             * commented out there.  This runs on the attach work thread. */
+            rt_thread_mdelay(100);
         }
         offset += 24U + (rt_size_t)count * 8U;
     }

@@ -2493,9 +2493,8 @@ int usbh_roothub_control(struct usbh_bus *bus, struct usb_setup_packet *setup,
 
         if (dwc2_is_device_mode(hsotg)) {
             /*
-             * Return 0's for the remainder of the port status
-             * since the port register can't be read if the core
-             * is in device mode.
+             * Return only the software change flags because HPRT0
+             * cannot be read while the core is in device mode.
              */
             *(u32 *)buf = port_status;
             break;
@@ -2565,8 +2564,7 @@ int usbh_roothub_control(struct usbh_bus *bus, struct usb_setup_packet *setup,
 
         if (dwc2_is_device_mode(hsotg)) {
             /*
-             * Return without doing anything since the port
-             * register can't be written if the core is in device
+             * HPRT0 cannot be written while the core is in device
              * mode.
              */
             break;
@@ -4090,6 +4088,60 @@ static int dwc2_hcd_urb_dequeue(struct dwc2_hsotg *hsotg, struct dwc2_hcd_urb *u
     }
 
     return 0;
+}
+
+int usbh_dwc2_reset_endpoint(struct usbh_hubport *hport, uint8_t endpoint)
+{
+    struct dwc2_hsotg *hsotg;
+    struct usb_host_endpoint *ep;
+    rt_tick_t start = rt_tick_get();
+    rt_tick_t timeout = rt_tick_from_millisecond(100);
+
+    if (!hport || !hport->bus || !(endpoint & 0x0f) || (endpoint & 0x70))
+        return -USB_ERR_INVAL;
+
+    hsotg = dwc2_hcd_to_hsotg(&hport->bus->hcd);
+    ep = USB_EP_GET_DIR(endpoint) ? &hport->hep_in[USB_EP_GET_IDX(endpoint)] :
+                                  &hport->hep_out[USB_EP_GET_IDX(endpoint)];
+    for (;;) {
+        struct dwc2_qh *qh;
+        bool busy = false;
+        rt_base_t level = rt_spin_lock_irqsave(&hsotg->lock);
+
+        if (!hport->connected) {
+            rt_spin_unlock_irqrestore(&hsotg->lock, level);
+            return -USB_ERR_NODEV;
+        }
+        /* The disconnect IRQ updates HCD state before the hub callback. */
+        if (!hsotg->flags.b.port_connect_status) {
+            rt_spin_unlock_irqrestore(&hsotg->lock, level);
+            return -USB_ERR_NOTCONN;
+        }
+        qh = ep->hcpriv;
+        if (qh) {
+            busy = !list_empty(&qh->qtd_list) || qh->channel;
+            /* Buffer-DMA dequeue clears qh->channel before the halt IRQ. */
+            for (int i = 0; !busy && i < hsotg->params.host_channels; i++) {
+                struct dwc2_host_chan *chan = hsotg->hc_ptr_array[i];
+
+                busy = chan && chan->qh == qh && chan->xfer_started;
+            }
+        }
+        if (!busy) {
+            if (qh) {
+                qh->data_toggle = DWC2_HC_PID_DATA0;
+                qh->ping_state = 0;
+            }
+            rt_spin_unlock_irqrestore(&hsotg->lock, level);
+            return 0;
+        }
+        rt_spin_unlock_irqrestore(&hsotg->lock, level);
+        /* Giveback can finish before the channel-halted interrupt. Never
+         * reset an active QH or let that interrupt restore the old toggle. */
+        if ((rt_tick_t)(rt_tick_get() - start) >= timeout)
+            return -USB_ERR_BUSY;
+        msleep(1);
+    }
 }
 
 /* Must NOT be called with interrupt disabled or spinlock held */

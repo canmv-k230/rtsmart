@@ -183,6 +183,20 @@ static int lwip_netdev_set_dhcp(struct netdev *netif, rt_bool_t is_enabled)
 }
 #endif /* RT_LWIP_DHCP */
 
+/* Shared board network management also uses this entry with lwIP 2.2.1. */
+int netdev_dhcp_renew(struct netdev *netdev)
+{
+#ifdef RT_LWIP_DHCP
+    if (netdev == RT_NULL || netdev->user_data == RT_NULL)
+        return -RT_ERROR;
+    return netifapi_netif_common((struct netif *)netdev->user_data,
+                                 dhcp_network_changed_link_up, NULL) == ERR_OK ? RT_EOK : -RT_ERROR;
+#else
+    (void)netdev;
+    return -RT_ERROR;
+#endif
+}
+
 #ifdef RT_USING_FINSH
 #ifdef RT_LWIP_USING_PING
 extern int lwip_ping_recv(int s, int *ttl);
@@ -634,6 +648,14 @@ const char *rt_lwip_netif_name(const struct netif *netif, char *buffer,
     rt_snprintf(buffer, size, "%c%c%u", netif->name[0], netif->name[1],
                 (unsigned int)netif->num);
     return buffer;
+}
+
+/* WLAN uses the same ingress entry as the Ethernet port. */
+err_t eth_device_input(struct pbuf *p, struct netif *netif)
+{
+    if (netif == RT_NULL)
+        return ERR_ARG;
+    return tcpip_input(p, netif);
 }
 
 static err_t ethernetif_linkoutput(struct netif *netif, struct pbuf *p)

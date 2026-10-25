@@ -439,16 +439,88 @@ and priority are configurable with
 `AIC8800_WIFI_ATTACH_THREAD_STACK_SIZE` and
 `AIC8800_WIFI_ATTACH_THREAD_PRIORITY`.
 
-Wi-Fi data transmission uses an asynchronous USB request and an aligned DMA
-buffer. Firmware control messages remain synchronous so command ordering and
-error reporting are preserved. A reusable frame staging buffer also removes
-per-packet heap allocation from the normal Wi-Fi transmit path. The default
-pool contains 64 requests. This is the largest pipeline supported by the
-driver configuration and leaves half of the RT-Smart DWC2 controller's fixed
-128-request pool for receive, Bluetooth, and other USB devices. The vendor
-driver uses 200 ordinary TX URBs when USB TX aggregation is disabled; the
-deeper RT-Smart pipeline similarly lets a cold firmware receive enough records
-to establish air aggregation without requiring a preliminary traffic run.
+USB receive workers default to 12 KiB stacks. The A-MSDU decoder reuses the
+calling decoder's Ethernet buffer, avoiding a second frame-sized stack buffer
+while synchronous authentication and network delivery are running. Existing
+configurations retain their selected `AIC8800_WIFI_RX_THREAD_STACK_SIZE`;
+select 12288 or more when repeating sustained-traffic tests.
+
+The USB TX software queue stores redundant record tokens in a bounded ring.
+It validates the head, count, and checksum before indexing. An event wakes
+the consumer for data or shutdown, including when the ring is full or
+damaged. Corruption stops producers and triggers a pool rebuild that reclaims
+orphaned records without following damaged queue state. The recovery log and
+`aic8800_stat` counters report these faults; rebuilding does not repair an
+external source of memory corruption.
+
+The USB transport requires a single-core RT-Thread build. Its queue and
+transport state use local interrupt critical sections; enabling
+`RT_USING_SMP` is rejected at compile time.
+
+The DWC2 descriptor-DMA path keeps requests marked for immediate giveback in
+separate transactions. Other IN requests can be batched, while the sparse
+message endpoint queues one request. OUT requests retain their short-packet
+and zero-length-packet boundaries. Completion scanning checks descriptor
+ownership and stops using a QTD once a short packet completes and frees it.
+
+Wi-Fi data uses asynchronous USB transfers with aligned DMA buffers and a
+reusable frame staging buffer. The defaults are two in-flight USB requests
+and 64 software queue entries. Firmware control messages remain synchronous
+to preserve command ordering.
+
+TX errors pause submissions, cancel endpoint requests, wait for DWC2 channel
+retirement, reset DATA0/PING state, and clear the device halt. Giveback waits
+do not hold the TX mutex. A failed endpoint recovery escalates to WLAN
+recovery and USB port re-enumeration.
+
+`AIC8800_WIFI_TX_WATCHDOG_MS` sets the pending-request warning threshold.
+Warnings are rate-limited, with each request counted once. Recovery begins
+when an overdue endpoint makes no completion or error progress for
+`AIC8800_WIFI_TX_STALL_MS` (five watchdog periods by default). Prolonged
+firmware backpressure can reach this timeout too; cancellation may lose
+in-flight frames.
+
+The TX worker retains its batch during brief slot or host-resource shortages.
+After `AIC8800_WIFI_TX_QUEUE_WAIT_MS`, it requeues the batch. Each retry
+rechecks peer/channel state and restores metadata accounting. The worker
+yields to the lower-priority recovery queue, and stop, disconnect, or queue
+corruption ends retries.
+
+Queue admission waits on an event signalled when a record is freed, using
+one bounded deadline and preserving the urgent-record reserve. Each blocked
+producer owns its waiter registration. Stop and corruption wake producers
+before waiting for them to leave. Deferred peers yield only after a queue
+pass without ready traffic. A disabled queue rejects data and management
+records; firmware control traffic alone bypasses it.
+
+Shutdown waits for every initialized URB's giveback before reusing its
+storage, including callbacks that have already cleared the pending count.
+NODEV/NOTCONN latches the transport offline until a new attachment. Endpoint
+reset also checks the controller's connection state. SHUTDOWN from request
+cancellation does not by itself indicate removal.
+
+The DWC2 backend reports ordinary backpressure, timeouts, and protocol errors
+separately from NOTCONN. Reset or disconnect events can temporarily invalidate
+the connection; the hub then releases and re-enumerates the device, allowing a
+new attachment without a physical unplug. An error code alone cannot establish
+whether the hardware experienced a spurious connection-status transition.
+
+Firmware recovery and USB reattachment restore the interrupted station's
+SSID, credentials, and band policy independently of the saved-network cache.
+Pending snapshots defer automatic saved-network retries until consumed or
+released. Firmware recovery and USB re-enumeration can hold separate
+references to the same connection generation.
+
+An explicit disconnect, new join, or station selection cancels restoration,
+including commands issued while USB is absent. Automatic initialization
+preserves the selected radio. An automatically selected fallback can yield
+to the restored USB station; explicitly selecting that fallback cancels the
+old snapshot.
+
+Managed offload selects the WLAN worker in Kconfig. Restoration runs there
+so the system queue remains available for scan and firmware events. If the
+worker is unavailable, restoration returns an error and releases its
+reservation.
 
 Enable `AIC8800_WIFI_DEBUG_STATS` to collect the optional USB, network, and
 receive-reorder diagnostics and export the read-only `aic8800_stat` command.
@@ -457,17 +529,18 @@ USB and SDIO transport counters when those transports are configured. The
 option also enables transmit ICMP checksum validation. It defaults off so
 production builds avoid the stat-only fields and per-frame accounting.
 
-`AIC8800_WIFI_TX_WAIT_MS` bounds direct USB request backpressure on firmware
-families that do not use the host queue. Queued USB and SDIO admission is
-non-blocking so a saturated normal-data producer cannot hold the shared bus
-lock ahead of management or EAPOL traffic. Reserved pool entries and urgent
-queue insertion keep those records available. Ordinary data is posted through
+`AIC8800_WIFI_TX_WAIT_MS` bounds USB request backpressure in the TX worker.
+Normal USB queue admission waits up to `AIC8800_WIFI_TX_QUEUE_WAIT_MS` for
+space (three times the request wait by default); urgent admission never waits
+for pool space. This bounded wait can still hold the shared transmit locks,
+but record frees wake it immediately. Reserved pool entries and urgent queue
+insertion keep high-priority records available. Ordinary data is posted through
 a bounded queue to a dedicated transmit worker, matching the reference
 driver's asynchronous submission policy. Firmware control traffic bypasses
 the queue. On DC/DW/DL,
 EAPOL and management traffic enters at the queue head so the worker applies
-the mandatory USB aggregate envelope without adding ordinary-data latency;
-unaggregated devices continue to submit it directly.
+the mandatory USB aggregate envelope; unaggregated devices use the same queue
+with ordinary record framing.
 D80/D80X2 records remain unaggregated because their bundled runtime does not
 accept the vendor DC/DW aggregate envelope. Transmit completion, byte,
 queue-wait, burst, and error counters are printed when the bus stops if

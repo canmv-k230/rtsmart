@@ -1438,8 +1438,7 @@ rt_err_t rt_wlan_dev_unregister(struct rt_wlan_device *wlan)
 #ifdef RT_WLAN_MANAGE_ENABLE
     if ((registered_mode == RT_WLAN_STATION ||
          registered_mode == RT_WLAN_AP) &&
-        rt_wlan_select_device(registered_mode,
-                              RT_WLAN_TRANSPORT_UNKNOWN) != RT_EOK)
+        rt_wlan_mgnt_autoselect(registered_mode) != RT_EOK)
     {
         LOG_D("no replacement for removed %s device",
               registered_mode == RT_WLAN_STATION ? "station" : "AP");

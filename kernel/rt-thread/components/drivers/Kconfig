@@ -580,11 +580,14 @@ menuconfig RT_USING_WIFI
             default n
             select RT_USING_DEVICE_IPC
             select RT_USING_SYSTEM_WORKQUEUE
+            select RT_WLAN_WORK_THREAD_ENABLE if RT_WLAN_MANAGE_ENABLE
             help
                 Provides a common device and transport layer for firmware-based
                 Wi-Fi devices. Vendor drivers implement WLAN offload operations while
                 SPI, SDIO, and USB transports remain independent of the RT-Thread
                 WLAN management and lwIP layers.
+                Managed station recovery uses the WLAN worker so scans and
+                firmware events can continue on the system workqueue.
 
         config RT_WLAN_OFFLOAD_CONTROL
             bool "Enable WLAN offload userspace control device"

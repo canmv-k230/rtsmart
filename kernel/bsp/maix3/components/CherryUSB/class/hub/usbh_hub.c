@@ -589,16 +589,25 @@ static void usbh_hub_events(struct usbh_hub *hub)
     uint16_t mask;
     uint16_t feat;
     uint8_t speed;
+    uint8_t force_reenumerate;
+    size_t flags;
     int ret;
 
     if (!hub->connected) {
         return;
     }
 
-    portchange_index = hub->int_buffer[0];
+    flags = usb_osal_enter_critical_section();
+    force_reenumerate = hub->force_reenumerate;
+    hub->force_reenumerate = 0;
+    usb_osal_leave_critical_section(flags);
+
+    portchange_index = hub->int_buffer[0] | force_reenumerate;
     hub->int_buffer[0] &= ~portchange_index;
 
     for (uint8_t port = 0; port < hub->hub_desc.bNbrPorts; port++) {
+        bool forced = force_reenumerate & (1 << (port + 1));
+
         USB_LOG_DBG("Port change:0x%02x\r\n", portchange_index);
 
         if (!(portchange_index & (1 << (port + 1)))) {
@@ -638,10 +647,12 @@ static void usbh_hub_events(struct usbh_hub *hub)
         portchange = port_status.wPortChange;
 
         /* Second, if port changes, debounces first */
-        if (portchange & HUB_PORT_STATUS_C_CONNECTION) {
+        if ((portchange & HUB_PORT_STATUS_C_CONNECTION) || forced) {
             uint16_t connection = 0;
             uint16_t debouncestable = 0;
-            for (uint32_t debouncetime = 0; debouncetime < HUB_DEBOUNCE_TIMEOUT; debouncetime += HUB_DEBOUNCE_STEP) {
+            for (uint32_t debouncetime = 0;
+                 !forced && debouncetime < HUB_DEBOUNCE_TIMEOUT;
+                 debouncetime += HUB_DEBOUNCE_STEP) {
                 /* Read hub port status */
                 ret = usbh_hub_get_portstatus(hub, port + 1, &port_status);
                 if (ret < 0) {
@@ -673,13 +684,19 @@ static void usbh_hub_events(struct usbh_hub *hub)
             }
 
             /** check if debounce ok */
-            if (debouncestable < HUB_DEBOUNCE_STABLE) {
+            if (!forced && debouncestable < HUB_DEBOUNCE_STABLE) {
                 USB_LOG_ERR("Failed to debounce port %u\r\n", port + 1);
                 break;
             }
 
             /* Last, check connect status */
             if (portstatus & HUB_PORT_STATUS_CONNECTION) {
+                if (forced) {
+                    USB_LOG_INFO("Re-enumerating Bus %u, Hub %u, Port %u\r\n",
+                                 hub->bus->busid, hub->index, port + 1);
+                    child = &hub->child[port];
+                    usbh_hubport_release(child);
+                }
                 for (uint8_t reset_retry = 0; reset_retry < HUB_PORT_RESET_RETRIES; reset_retry++) {
                     ret = usbh_hub_set_feature(hub, port + 1, HUB_PORT_FEATURE_RESET);
                     if (ret < 0) {
@@ -882,9 +899,10 @@ static void usbh_hub_events(struct usbh_hub *hub)
                         USB_LOG_WRN("Port %u failed to enable after %u reset attempts, status:0x%04x, change:0x%04x\r\n",
                                     port + 1, HUB_PORT_RESET_RETRIES, portstatus, portchange);
                     } else {
-                        USB_LOG_DBG("Port %u disconnected during reset\r\n", port + 1);
+                        USB_LOG_DBG("Port %u disconnected during reset%s, status:0x%04x, change:0x%04x\r\n",
+                                    port + 1, forced ? " (forced re-enumeration)" : "",
+                                    portstatus, portchange);
                     }
-
                     continue;
                 }
             } else {
@@ -923,6 +941,45 @@ static void usbh_hub_thread(void *argument)
 void usbh_hub_thread_wakeup(struct usbh_hub *hub)
 {
     usb_osal_mq_send(hub->bus->hub_mq, (uintptr_t)hub);
+}
+
+int usbh_hubport_reenumerate(struct usbh_hubport *hport)
+{
+    struct usbh_hub *hub;
+    uint8_t mask;
+    bool pending;
+    size_t flags;
+    int ret;
+
+    if (!hport || !hport->connected || !hport->parent || !hport->bus) {
+        return -USB_ERR_NOTCONN;
+    }
+    hub = hport->parent;
+    if (!hub->connected || hub->bus != hport->bus || !hport->port ||
+        hport->port > hub->hub_desc.bNbrPorts || hport->port >= 8) {
+        return -USB_ERR_INVAL;
+    }
+
+    mask = 1 << hport->port;
+    flags = usb_osal_enter_critical_section();
+    if (!hport->connected || hport->parent != hub) {
+        usb_osal_leave_critical_section(flags);
+        return -USB_ERR_NOTCONN;
+    }
+    pending = (hub->force_reenumerate & mask) != 0;
+    hub->force_reenumerate |= mask;
+    usb_osal_leave_critical_section(flags);
+
+    if (pending) {
+        return 0;
+    }
+    ret = usb_osal_mq_send(hub->bus->hub_mq, (uintptr_t)hub);
+    if (ret < 0) {
+        flags = usb_osal_enter_critical_section();
+        hub->force_reenumerate &= ~mask;
+        usb_osal_leave_critical_section(flags);
+    }
+    return ret;
 }
 
 int usbh_hub_initialize(struct usbh_bus *bus)

@@ -80,6 +80,16 @@ struct rt_wlan_scan_result
     struct rt_wlan_info *info;
 };
 
+/* A connection owned by one management generation, independent of the saved
+ * network cache and of a device object's lifetime across hotplug. */
+struct rt_wlan_reconnect
+{
+    rt_uint32_t generation;
+    struct rt_wlan_ssid ssid;
+    struct rt_wlan_key key;
+    rt_802_11_band_t band;
+};
+
 /*
  * wifi init interface
  */
@@ -90,6 +100,20 @@ struct rt_wlan_device *rt_wlan_get_device(rt_wlan_mode_t mode);
 rt_err_t rt_wlan_select_device(rt_wlan_mode_t mode,
                                rt_wlan_transport_t transport);
 rt_err_t rt_wlan_mgnt_unregister_device(struct rt_wlan_device *device);
+rt_err_t rt_wlan_mgnt_autostart(const char *dev_name, rt_wlan_mode_t mode);
+rt_err_t rt_wlan_mgnt_autoselect(rt_wlan_mode_t mode);
+/* Snapshot/cancel do not take the management mutex: driver event paths must
+ * not wait on a connect/disconnect command that is awaiting their reply.
+ * Each successful get/retain defers automatic cache retries until its owner
+ * releases the snapshot. Copies transfer ownership unless explicitly retained.
+ * User commands invalidate all snapshots immediately. */
+rt_err_t rt_wlan_mgnt_get_reconnect(struct rt_wlan_device *device,
+                                   struct rt_wlan_reconnect *connection);
+rt_err_t rt_wlan_mgnt_retain_reconnect(const struct rt_wlan_reconnect *connection);
+void rt_wlan_mgnt_release_reconnect(struct rt_wlan_reconnect *connection);
+void rt_wlan_mgnt_cancel_reconnect(struct rt_wlan_device *device);
+rt_err_t rt_wlan_mgnt_reconnect(struct rt_wlan_device *device,
+                               const struct rt_wlan_reconnect *connection);
 
 /*
  * wifi station mode interface

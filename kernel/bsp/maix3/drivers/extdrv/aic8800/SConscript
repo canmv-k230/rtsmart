@@ -10,7 +10,7 @@ src = [
 ]
 
 if GetDepend(['AIC8800_WIFI_TRANSPORT_USB']):
-    src += ['aic8800_usb.c']
+    src += ['aic8800_usb.c', 'aic8800_tx_queue.c']
 
 if GetDepend(['AIC8800_WIFI_TRANSPORT_SDIO']):
     src += ['aic8800_sdio.c']

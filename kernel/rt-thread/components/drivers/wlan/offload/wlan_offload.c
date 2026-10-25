@@ -28,6 +28,9 @@
 #ifdef RT_WLAN_MANAGE_ENABLE
 #include <wlan_mgnt.h>
 #endif
+#ifdef RT_WLAN_WORK_THREAD_ENABLE
+#include <wlan_workqueue.h>
+#endif
 
 #define WLAN_OFFLOAD_DEFAULT_FRAME_SIZE 1600
 #define WLAN_OFFLOAD_VIF_STA_INDEX      0
@@ -1029,6 +1032,10 @@ static rt_err_t wlan_offload_change_interface_submit(struct rt_wlan_offload_vif 
     struct rt_wlan_offload_vif *other;
     rt_err_t result;
 
+#ifdef RT_WLAN_MANAGE_ENABLE
+    if (!enabled && vif->iftype == RT_WLAN_OFFLOAD_IFTYPE_STATION)
+        rt_wlan_mgnt_cancel_reconnect(&vif->wlan);
+#endif
     rt_mutex_take(&radio->operation_lock, RT_WAITING_FOREVER);
     if (vif->enabled == enabled)
     {
@@ -1192,6 +1199,9 @@ static rt_err_t wlan_offload_connect_submit(
         return -RT_ENOSYS;
     }
 
+#ifdef RT_WLAN_MANAGE_ENABLE
+    rt_wlan_mgnt_cancel_reconnect(&vif->wlan);
+#endif
     vif->pending_connect_id = request->request_id;
     rt_mutex_release(&radio->operation_lock);
     result = radio->ops->connect(vif, request);
@@ -1218,6 +1228,9 @@ static rt_err_t wlan_offload_disconnect_submit(struct rt_wlan_offload_vif *vif,
         return -RT_EINVAL;
     }
     rt_mutex_take(&vif->radio->operation_lock, RT_WAITING_FOREVER);
+#ifdef RT_WLAN_MANAGE_ENABLE
+    rt_wlan_mgnt_cancel_reconnect(&vif->wlan);
+#endif
     enabled = vif->enabled;
     rt_mutex_release(&vif->radio->operation_lock);
     if (!enabled)
@@ -1444,11 +1457,119 @@ static rt_err_t wlan_offload_wlan_mode(struct rt_wlan_device *wlan,
     return result;
 }
 
+#ifdef RT_WLAN_MANAGE_ENABLE
+static void wlan_offload_drop_reconnect(struct rt_wlan_offload_radio *radio)
+{
+    rt_mutex_take(&radio->operation_lock, RT_WAITING_FOREVER);
+    rt_wlan_mgnt_release_reconnect(&radio->reconnect);
+    rt_mutex_release(&radio->operation_lock);
+}
+
+/* The snapshot identifies the connection that recovery interrupted. The
+ * management layer serializes restoration with user commands and rejects a
+ * snapshot invalidated by leave, another join, or a different station. */
+static void wlan_offload_reconnect_work(struct rt_work *work, void *work_data)
+{
+    struct rt_wlan_offload_radio *radio = work_data;
+    struct rt_wlan_reconnect connection;
+    rt_err_t result;
+
+    (void)work;
+    if (!radio)
+        return;
+    rt_mutex_take(&radio->operation_lock, RT_WAITING_FOREVER);
+    if ((radio->state != RT_WLAN_OFFLOAD_STARTED &&
+         radio->state != RT_WLAN_OFFLOAD_REGISTERED) ||
+        !radio->vifs[WLAN_OFFLOAD_VIF_STA_INDEX].registered)
+    {
+        rt_wlan_mgnt_release_reconnect(&radio->reconnect);
+        rt_mutex_release(&radio->operation_lock);
+        return;
+    }
+    connection = radio->reconnect;
+    rt_memset(&radio->reconnect, 0, sizeof(radio->reconnect));
+    rt_mutex_release(&radio->operation_lock);
+    if (!connection.generation)
+        return;
+    result = rt_wlan_mgnt_reconnect(
+        &radio->vifs[WLAN_OFFLOAD_VIF_STA_INDEX].wlan, &connection);
+    rt_wlan_mgnt_release_reconnect(&connection);
+    if (result != RT_EOK && result != -RT_EBUSY)
+        LOG_W("station connection restore failed: %d", result);
+}
+
+static rt_err_t wlan_offload_queue_reconnect(
+    struct rt_wlan_offload_radio *radio)
+{
+#ifdef RT_WLAN_WORK_THREAD_ENABLE
+    struct rt_workqueue *workqueue = rt_wlan_get_workqueue();
+    rt_err_t result = -RT_EBUSY;
+
+    if (workqueue)
+    {
+        rt_mutex_take(&radio->operation_lock, RT_WAITING_FOREVER);
+        if ((radio->state == RT_WLAN_OFFLOAD_STARTED ||
+             radio->state == RT_WLAN_OFFLOAD_REGISTERED) &&
+            radio->vifs[WLAN_OFFLOAD_VIF_STA_INDEX].registered)
+        {
+            /* Serialize enqueue with unregister's state transition. */
+            if (rt_workqueue_dowork(workqueue, &radio->reconnect_work) == RT_EOK ||
+                (radio->reconnect_work.flags & RT_WORK_STATE_PENDING))
+            {
+                result = RT_EOK;
+            }
+        }
+        rt_mutex_release(&radio->operation_lock);
+        return result;
+    }
+#endif
+    /* Recovery itself runs on the system queue. Never wait there for scan
+     * completion or firmware work that needs that same queue to execute. */
+    (void)radio;
+    return -RT_ENOSYS;
+}
+#endif
+
+rt_err_t rt_wlan_offload_restore_station(struct rt_wlan_offload_radio *radio,
+                                        const struct rt_wlan_reconnect *connection)
+{
+#ifdef RT_WLAN_MANAGE_ENABLE
+    rt_err_t result;
+
+    if (!radio || !connection || !connection->generation)
+        return -RT_EINVAL;
+    rt_mutex_take(&radio->operation_lock, RT_WAITING_FOREVER);
+    if ((radio->state != RT_WLAN_OFFLOAD_STARTED &&
+         radio->state != RT_WLAN_OFFLOAD_REGISTERED) ||
+        !radio->vifs[WLAN_OFFLOAD_VIF_STA_INDEX].registered)
+    {
+        rt_mutex_release(&radio->operation_lock);
+        return -RT_EBUSY;
+    }
+    result = rt_wlan_mgnt_retain_reconnect(connection);
+    if (result == RT_EOK)
+    {
+        rt_wlan_mgnt_release_reconnect(&radio->reconnect);
+        radio->reconnect = *connection;
+        result = wlan_offload_queue_reconnect(radio);
+        if (result != RT_EOK)
+            rt_wlan_mgnt_release_reconnect(&radio->reconnect);
+    }
+    rt_mutex_release(&radio->operation_lock);
+    return result;
+#else
+    (void)radio;
+    (void)connection;
+    return -RT_ENOSYS;
+#endif
+}
+
 static void wlan_offload_recovery_work(struct rt_work *work, void *work_data)
 {
     struct rt_wlan_offload_radio *radio = work_data;
     rt_bool_t restore_station = RT_FALSE;
     rt_bool_t restore_ap = RT_FALSE;
+    rt_bool_t reconnect_station;
     struct rt_wlan_offload_vif *init_vif = RT_NULL;
     rt_err_t result = -RT_EINVAL;
     int index;
@@ -1460,9 +1581,14 @@ static void wlan_offload_recovery_work(struct rt_work *work, void *work_data)
     }
 
     rt_mutex_take(&radio->operation_lock, RT_WAITING_FOREVER);
+    reconnect_station = radio->recovery_reconnect_station;
+    radio->recovery_reconnect_station = RT_FALSE;
     if (radio->state != RT_WLAN_OFFLOAD_FAILED)
     {
         radio->recovery_queued = RT_FALSE;
+#ifdef RT_WLAN_MANAGE_ENABLE
+        rt_wlan_mgnt_release_reconnect(&radio->reconnect);
+#endif
         rt_mutex_release(&radio->operation_lock);
         return;
     }
@@ -1517,6 +1643,22 @@ static void wlan_offload_recovery_work(struct rt_work *work, void *work_data)
     {
         LOG_E("WLAN offload firmware recovery failed: %d", result);
     }
+#ifdef RT_WLAN_MANAGE_ENABLE
+    if (result == RT_EOK && reconnect_station && restore_station)
+    {
+        /* The mode restore above brought back the interface, not the
+         * connection the failure took down. */
+        if (wlan_offload_queue_reconnect(radio) != RT_EOK)
+        {
+            wlan_offload_drop_reconnect(radio);
+            LOG_W("cannot queue station connection restore");
+        }
+    }
+    else
+        wlan_offload_drop_reconnect(radio);
+#else
+    (void)reconnect_station;
+#endif
 }
 
 static rt_err_t wlan_offload_wlan_scan(struct rt_wlan_device *wlan,
@@ -2508,6 +2650,9 @@ rt_err_t rt_wlan_offload_register_radio(struct rt_wlan_offload_radio *radio,
     }
 #endif
     rt_work_init(&radio->recovery_work, wlan_offload_recovery_work, radio);
+#ifdef RT_WLAN_MANAGE_ENABLE
+    rt_work_init(&radio->reconnect_work, wlan_offload_reconnect_work, radio);
+#endif
     radio->recovery_work_initialized = RT_TRUE;
     return RT_EOK;
 }
@@ -2567,9 +2712,22 @@ rt_err_t rt_wlan_offload_unregister_radio(struct rt_wlan_offload_radio *radio)
     if (radio->recovery_work_initialized)
     {
         rt_work_cancel_sync(&radio->recovery_work);
+#if defined(RT_WLAN_MANAGE_ENABLE) && defined(RT_WLAN_WORK_THREAD_ENABLE)
+        if (rt_wlan_get_workqueue())
+        {
+            /* reconnect_work is embedded in the radio that USB will zero.
+             * Drain it on its owning queue before detaching any VIF/lock. */
+            rt_workqueue_cancel_work_sync(rt_wlan_get_workqueue(),
+                                          &radio->reconnect_work);
+        }
+#endif
         radio->recovery_work_initialized = RT_FALSE;
         radio->recovery_queued = RT_FALSE;
     }
+
+#ifdef RT_WLAN_MANAGE_ENABLE
+    wlan_offload_drop_reconnect(radio);
+#endif
 
     if (stop_driver && radio->ops->stop)
     {
@@ -3192,6 +3350,13 @@ rt_err_t rt_wlan_offload_report_event(struct rt_wlan_offload_radio *radio,
         {
             radio->vifs[WLAN_OFFLOAD_VIF_STA_INDEX].link_up = RT_FALSE;
             firmware_sta_disconnect = RT_TRUE;
+#ifdef RT_WLAN_MANAGE_ENABLE
+            rt_wlan_mgnt_release_reconnect(&radio->reconnect);
+            radio->recovery_reconnect_station =
+                rt_wlan_mgnt_get_reconnect(
+                    &radio->vifs[WLAN_OFFLOAD_VIF_STA_INDEX].wlan,
+                    &radio->reconnect) == RT_EOK;
+#endif
         }
         if (radio->vifs[WLAN_OFFLOAD_VIF_AP_INDEX].link_up)
         {

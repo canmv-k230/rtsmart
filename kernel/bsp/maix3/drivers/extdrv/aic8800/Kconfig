@@ -26,6 +26,7 @@ if RT_USING_AIC8800_WIFI
         config AIC8800_WIFI_TRANSPORT_USB
             bool "USB"
             depends on ENABLE_CHERRY_USB_HOST
+            select RT_USING_EVENT
             select RT_USING_MESSAGEQUEUE
             select RT_USING_MEMPOOL
             default y if !AIC8800_WIFI_TRANSPORT_SDIO
@@ -226,18 +227,9 @@ if RT_USING_AIC8800_WIFI
                 default 4 if DWC2_DRV_DMA_DESC_ENABLE
                 default 20
                 help
-                    Under descriptor DMA the queue depth becomes the length of
-                    a single descriptor chain, and this device fails a deep
-                    chain on an otherwise idle endpoint: a 19-descriptor chain
-                    armed during association returns HOST_DMA_STS_PKTERR with
-                    an excessive transaction error and zero bytes moved. The
-                    chain then stops being walked, so the requests behind the
-                    failing descriptor are stranded rather than retried and the
-                    endpoint stops delivering entirely - which loses EAPOL
-                    message 1/4 and fails the join. The same depth is why
-                    MESSAGE_RX_URBS drops to one here. Keep a shallow chain
-                    under descriptor DMA; buffer DMA has no such limit and
-                    takes the vendor's depth.
+                    DWC2 descriptor DMA chains queued data IN requests into
+                    one transaction. Keep the conservative four-request depth
+                    to batch receive traffic without a long descriptor chain.
 
                     The vendor driver keeps 20 data receive URBs queued. Each
                     request owns one URB plus
@@ -250,10 +242,9 @@ if RT_USING_AIC8800_WIFI
                     per-URB kmalloc with no ceiling. The sum of this option,
                     MESSAGE_RX_URBS, DATA_TX_URBS, the Bluetooth transport and
                     every other enabled USB class must stay below that budget:
-                    exhausting the pool makes the next submit fail with -ENOMEM
-                    (-12) on whichever endpoint happens to submit, which is why
-                    an over-deep queue shows up as bulk IN errors rather than
-                    transmit errors.
+                    exhausting the pool makes the next submit fail with
+                    -USB_ERR_NOMEM (-1) on whichever endpoint submits. In this
+                    API, -12 is USB_ERR_IO, not Linux ENOMEM.
 
             config AIC8800_WIFI_MESSAGE_RX_URBS
                 int "Queued message receive requests"
@@ -265,10 +256,9 @@ if RT_USING_AIC8800_WIFI
                     caps the configurable depth at 32 because its DWC2 host has
                     a fixed controller-wide request pool.
 
-                    Descriptor DMA completes a non-periodic chain at its final
-                    descriptor. Keep one request continuously armed for the
-                    sparse dedicated message endpoint so command replies are
-                    not delayed behind an otherwise idle descriptor chain.
+                    Descriptor DMA interrupts at the end of an IN chain.
+                    Keep one request on the sparse message endpoint so a
+                    command reply does not wait behind idle receive requests.
 
             config AIC8800_WIFI_DATA_TX_URBS
                 int "Queued data transmit requests"
@@ -390,29 +380,22 @@ if RT_USING_AIC8800_WIFI
                     on AIC8800_WIFI_SDIO_TX_PRIORITY_RESERVE instead.
 
             config AIC8800_WIFI_TX_WATCHDOG_MS
-                int "Transmit watchdog (ms)"
+                int "Transmit pending warning threshold (ms)"
                 range 100 30000
                 default 1000
                 help
-                    How long a bulk OUT request may stay in flight before it is
-                    treated as lost and cancelled.
+                    Report a bulk OUT request that remains pending this long.
+                    Reports are rate-limited and each request is counted once.
+                    Age alone cannot distinguish firmware backpressure from a
+                    lost completion, so it never cancels a single request: that
+                    would truncate a partially sent firmware record.
 
-                    The transmit pool only holds AIC8800_WIFI_DATA_TX_URBS
-                    requests and its slot semaphore is released only from the
-                    completion callback, so one request the host controller
-                    never gives back drains the pool and stops transmit for
-                    good. That has been observed after a descriptor-DMA AHB
-                    fault: the endpoint went quiet, every later frame timed out
-                    against AIC8800_WIFI_TX_WAIT_MS, and the link stayed dead
-                    until the device was re-enumerated.
-
-                    Keep this well above the transmit wait. Cancelling costs
-                    one retransmit; a wedged endpoint costs the link.
-
-                    The caller is normally the lwIP protocol thread, which also
-                    feeds received frames into the stack, so do not raise this
-                    far beyond the point where transmit congestion would begin
-                    to delay receive.
+                    If an overdue endpoint retires no requests for five times
+                    this period, recover the whole endpoint: cancel requests,
+                    wait for the DWC2 channel to stop, reset DATA0, then clear
+                    the device halt. This bounds a stall but can also interrupt
+                    prolonged firmware backpressure and lose in-flight frames.
+                    Reported USB errors trigger recovery immediately.
 
             config AIC8800_WIFI_RX_RECOVERY_ERRORS
                 int "Receive errors before firmware recovery"
@@ -597,8 +580,11 @@ if RT_USING_AIC8800_WIFI
 
         config AIC8800_WIFI_RX_THREAD_STACK_SIZE
             int "Receive thread stack size"
-            range 4096 32768
-            default 8192
+            range 8192 32768
+            default 12288
+            help
+                Includes synchronous WLAN authentication and packet delivery.
+                Leave headroom for their nested calls during sustained traffic.
 
         config AIC8800_WIFI_RX_THREAD_PRIORITY
             int "Receive thread priority"

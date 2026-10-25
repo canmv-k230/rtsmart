@@ -260,6 +260,13 @@ static void dwc2_init_non_isoc_dma_desc(struct dwc2_hsotg *hsotg,
             qtd->urb->length && chan->max_packet &&
             !(qtd->urb->length % chan->max_packet) &&
             !chan->xfer_len && n_desc != MAX_DMA_DESC_NUM_GENERIC) {
+            /* Appending the ZLP bypasses the data loop's predecessor
+             * activation. The last data descriptor must also be runnable. */
+            if (n_desc > 1) {
+                qh->desc_list[n_desc - 1].status |= HOST_DMA_A;
+                dma_sync_single_for_device(&qh->desc_list[n_desc - 1],
+                                           sizeof(struct dwc2_dma_desc));
+            }
             dwc2_fill_host_dma_desc(hsotg, chan, qtd, qh, n_desc);
             qtd->n_desc++;
             n_desc++;
@@ -1300,10 +1307,14 @@ static void dwc2_complete_non_isoc_xfer_ddma(struct dwc2_hsotg *hsotg,
         int qtd_desc_count;
 
         qtd = list_entry(qtd_item, struct dwc2_qtd, qtd_list_entry);
+        /* Waiting QTDs may retain descriptor counts from a cancelled chain;
+         * only the descriptors armed on this channel belong to this IRQ. */
+        if (!qtd->in_process || desc_num >= chan->ntd)
+            break;
         xfer_done = 0;
         qtd_desc_count = qtd->n_desc;
 
-        for (i = 0; i < qtd_desc_count; i++) {
+        for (i = 0; i < qtd_desc_count && desc_num < chan->ntd; i++) {
             if (dwc2_process_non_isoc_desc(hsotg, chan, chnum, qtd,
                                            desc_num, halt_status,
                                            &xfer_done)) {
@@ -1312,6 +1323,13 @@ static void dwc2_complete_non_isoc_xfer_ddma(struct dwc2_hsotg *hsotg,
             }
 
             desc_num++;
+            if (xfer_done) {
+                /* A short IN packet can complete and free the QTD before
+                 * its last descriptor. Skip its remaining descriptors without
+                 * dereferencing it again, preserving the next QTD's index. */
+                desc_num += qtd_desc_count - i - 1;
+                break;
+            }
         }
     }
 

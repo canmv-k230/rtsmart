@@ -188,6 +188,7 @@ struct usbh_hub {
     struct usb_endpoint_descriptor *intin;
     struct usbh_urb intin_urb;
     uint8_t *int_buffer;
+    uint8_t force_reenumerate;
     struct usb_osal_timer *int_timer;
 };
 

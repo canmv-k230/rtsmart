@@ -9,6 +9,11 @@
 #include <wlan_offload_bus.h>
 #include <ipc/workqueue.h>
 #include <wlan_dev.h>
+#ifdef RT_WLAN_MANAGE_ENABLE
+#include <wlan_mgnt.h>
+#endif
+
+struct rt_wlan_reconnect;
 
 #ifdef __cplusplus
 extern "C" {
@@ -607,6 +612,13 @@ struct rt_wlan_offload_radio
     struct rt_work recovery_work;
     rt_bool_t recovery_work_initialized;
     rt_bool_t recovery_queued;
+    /* The failure took an established station link down; the recovery that
+     * follows must restore the connection, not just the interface. */
+    rt_bool_t recovery_reconnect_station;
+    struct rt_work reconnect_work;
+#ifdef RT_WLAN_MANAGE_ENABLE
+    struct rt_wlan_reconnect reconnect;
+#endif
 #ifdef RT_WLAN_OFFLOAD_EMBEDDED_WPA2
     struct rt_wlan_offload_bss_cache_entry
         bss_cache[RT_WLAN_OFFLOAD_BSS_CACHE_COUNT];
@@ -620,6 +632,8 @@ struct rt_wlan_offload_radio
 rt_err_t rt_wlan_offload_register_radio(struct rt_wlan_offload_radio *radio,
                                    const struct rt_wlan_offload_radio_config *config);
 rt_err_t rt_wlan_offload_unregister_radio(struct rt_wlan_offload_radio *radio);
+rt_err_t rt_wlan_offload_restore_station(struct rt_wlan_offload_radio *radio,
+                                        const struct rt_wlan_reconnect *connection);
 rt_err_t rt_wlan_offload_set_radio_online(struct rt_wlan_offload_radio *radio,
                                      rt_bool_t online);
 rt_uint32_t rt_wlan_offload_alloc_request_id(struct rt_wlan_offload_radio *radio);

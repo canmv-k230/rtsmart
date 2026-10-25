@@ -325,9 +325,10 @@ static void dwc2_port_intr(struct dwc2_hsotg *hsotg)
         dev_vdbg(hsotg->dev,
                  "--Port Interrupt HPRT0=0x%08x Port Connect Detected--\n",
                  hprt0);
+        /* Publish the new connection state before waking the hub thread. */
+        dwc2_hcd_connect(hsotg);
         bus->hcd.roothub.int_buffer[0] = (1 << 1);
         usbh_hub_thread_wakeup(&bus->hcd.roothub);
-        dwc2_hcd_connect(hsotg);
 
         /*
          * The Hub driver asserts a reset when it sees port connect
@@ -345,6 +346,11 @@ static void dwc2_port_intr(struct dwc2_hsotg *hsotg)
                  "  --Port Interrupt HPRT0=0x%08x Port Enable Changed (now %d)--\n",
                  hprt0, !!(hprt0 & HPRT0_ENA));
         if (hprt0 & HPRT0_ENA) {
+            /* A reset can raise DISCONNINT before the enable-change IRQ.
+             * The enabled hardware port is authoritative in that case. */
+            if ((hprt0 & HPRT0_CONNSTS) &&
+                !hsotg->flags.b.port_connect_status)
+                dwc2_hcd_connect(hsotg);
             hsotg->new_connection = true;
             hsotg->ddma_desc_error_count = 0;
             dwc2_hprt0_enable(hsotg, hprt0, &hprt0_modify);
