@@ -1501,17 +1501,32 @@ static rt_err_t aic_wire_send_tx_power_offset(
                          aic_wire_tx_power_offset_request_length(context));
 }
 
-static rt_err_t aic_wire_send_tx_power_v2(
-    struct aic8800_context *context)
+/* v2/v3/v4 contain an enable byte followed only by signed per-rate levels.
+ * Work on the outgoing copy so repeated polls never accumulate reductions. */
+static void aic_radio_reduce_power_levels(void *table, rt_size_t size,
+                                           rt_uint8_t loss_db)
 {
-    const struct aic_wire_tx_power_v2 *power =
-        &context->radio_config.tx_power_v2;
+    rt_int8_t *levels = table;
+
+    for (rt_size_t index = 1; index < size; index++)
+    {
+        levels[index] = aic_radio_apply_power_loss(levels[index],
+                                                   (rt_int8_t)loss_db);
+    }
+}
+
+static rt_err_t aic_wire_send_tx_power_v2(
+    struct aic8800_context *context, rt_uint8_t loss_db)
+{
+    struct aic_wire_tx_power_v2 reduced = context->radio_config.tx_power_v2;
+    const struct aic_wire_tx_power_v2 *power = &reduced;
     struct aic_wire_mm_set_tx_power_req request;
 
     if (!power->enable)
     {
         return RT_EOK;
     }
+    aic_radio_reduce_power_levels(&reduced, sizeof(reduced), loss_db);
     rt_memset(&request, 0, sizeof(request));
     if (context->chip_sub_id == 0)
     {
@@ -1537,7 +1552,7 @@ static rt_err_t aic_wire_send_tx_power_v2(
 }
 
 static rt_err_t aic_wire_send_tx_power_v3(
-    struct aic8800_context *context)
+    struct aic8800_context *context, rt_uint8_t loss_db)
 {
     struct aic_wire_mm_set_tx_power_req request;
 
@@ -1547,6 +1562,8 @@ static rt_err_t aic_wire_send_tx_power_v3(
     {
         return RT_EOK;
     }
+    aic_radio_reduce_power_levels(&request.configuration.v3,
+                                   sizeof(request.configuration.v3), loss_db);
     return aic_wire_send(context, AIC_MM_SET_TXPWR_REQ,
                          AIC_MM_SET_TXPWR_CFM,
                          &request.configuration,
@@ -1554,7 +1571,7 @@ static rt_err_t aic_wire_send_tx_power_v3(
 }
 
 static rt_err_t aic_wire_send_tx_power_v4(
-    struct aic8800_context *context)
+    struct aic8800_context *context, rt_uint8_t loss_db)
 {
     struct aic_wire_mm_set_tx_power_req request;
 
@@ -1564,6 +1581,9 @@ static rt_err_t aic_wire_send_tx_power_v4(
     {
         return RT_EOK;
     }
+    /* The vendor thermal loss applies to 2.4/5 GHz only. */
+    aic_radio_reduce_power_levels(&request.configuration.v4,
+        offsetof(struct aic_wire_tx_power_v4, legacy_6ghz), loss_db);
     return aic_wire_send(context, AIC_MM_SET_TXPWR_REQ,
                          AIC_MM_SET_TXPWR_CFM,
                          &request.configuration.v4,
@@ -1682,6 +1702,10 @@ rt_err_t aic8800_radio_initialize(struct aic8800_context *context)
     {
         return -RT_EINVAL;
     }
+#ifdef AIC8800_WIFI_THERMAL_CONTROL
+    /* The levels sent below are the unreduced configuration. */
+    context->thermal_loss_db = 0;
+#endif
     if (!context->radio_config.loaded)
     {
         result = aic8800_radio_load_config(context);
@@ -1705,8 +1729,13 @@ rt_err_t aic8800_radio_initialize(struct aic8800_context *context)
         break;
 
     case AIC8800_USB_PID_AIC8800D81:
+    case AIC8800_USB_PID_AIC8800D83:
+    case AIC8800_USB_PID_AIC8800D84:
+    case AIC8800_USB_PID_AIC8800D85:
+    case AIC8800_USB_PID_AIC8800D86:
+    case AIC8800_USB_PID_AIC8800D88:
     case AIC8800_USB_PID_AIC8800D41:
-        result = aic_wire_send_tx_power_v3(context);
+        result = aic_wire_send_tx_power_v3(context, 0);
         if (result == RT_EOK)
         {
             result = aic_wire_send_tx_power_adjust(context);
@@ -1724,7 +1753,7 @@ rt_err_t aic8800_radio_initialize(struct aic8800_context *context)
 
     case AIC8800_USB_PID_AIC8800D81X2:
     case AIC8800_USB_PID_AIC8800D89X2:
-        result = aic_wire_send_tx_power_v4(context);
+        result = aic_wire_send_tx_power_v4(context, 0);
         if (result == RT_EOK)
         {
             result = aic_wire_send_tx_power_adjust(context);
@@ -1756,7 +1785,7 @@ rt_err_t aic8800_radio_initialize(struct aic8800_context *context)
             tx_gain = g_aic8800dc_tx_gain_24ghz;
             tx_gain_dsss = g_aic8800dc_tx_gain_24ghz_dsss;
         }
-        result = aic_wire_send_tx_power_v2(context);
+        result = aic_wire_send_tx_power_v2(context, 0);
         if (result == RT_EOK)
         {
             result = aic_wire_send_tx_power_offset(context);
@@ -1972,3 +2001,41 @@ void aic8800_radio_prepare(struct aic8800_context *context,
           (unsigned int)request->power_save_enabled,
           (unsigned int)request->dynamic_power_save);
 }
+
+
+#ifdef AIC8800_WIFI_THERMAL_CONTROL
+/* Match each runtime's initialization layout, including the DC/DW U01
+ * compatibility conversion and the transport-specific request lengths. */
+rt_err_t aic8800_radio_set_tx_power_loss(struct aic8800_context *context,
+                                         rt_uint8_t loss_db)
+{
+    if (!context || loss_db > 127U)
+    {
+        return -RT_EINVAL;
+    }
+    switch (context->product_id)
+    {
+    case AIC8800_USB_PID_AIC8800DC:
+    case AIC8800_USB_PID_AIC8800DW:
+        return context->radio_config.tx_power_v2.enable ?
+               aic_wire_send_tx_power_v2(context, loss_db) : -RT_ENOSYS;
+    case AIC8800_USB_PID_AIC8800D81:
+    case AIC8800_USB_PID_AIC8800D83:
+    case AIC8800_USB_PID_AIC8800D84:
+    case AIC8800_USB_PID_AIC8800D85:
+    case AIC8800_USB_PID_AIC8800D86:
+    case AIC8800_USB_PID_AIC8800D88:
+    case AIC8800_USB_PID_AIC8800D41:
+        return context->radio_config.tx_power_v3.enable ?
+               aic_wire_send_tx_power_v3(context, loss_db) : -RT_ENOSYS;
+    case AIC8800_USB_PID_AIC8800D81X2:
+    case AIC8800_USB_PID_AIC8800D89X2:
+        return context->radio_config.tx_power_v4.enable ?
+               aic_wire_send_tx_power_v4(context, loss_db) : -RT_ENOSYS;
+    default:
+        /* AIC8800/8801 uses power indices, not calibrated dBm levels. The
+         * vendor supplies no dB conversion; USB only monitors temperature. */
+        return -RT_ENOSYS;
+    }
+}
+#endif /* AIC8800_WIFI_THERMAL_CONTROL */

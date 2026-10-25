@@ -776,6 +776,125 @@ static rt_bool_t aic8800_sdio_requeue_tx_record(
                RT_EOK;
 }
 
+#ifdef AIC8800_WIFI_THERMAL_CONTROL
+/* Vendor SDIO CONFIG_TEMP_CONTROL: aicwf_temp_ctrl()/update_state(). */
+#define AIC_SDIO_THERMAL_LOW_C          80
+#define AIC_SDIO_THERMAL_HIGH_C         95
+#define AIC_SDIO_THERMAL_LOW_RESUME_C   72
+#define AIC_SDIO_THERMAL_HIGH_RESUME_C  82
+#define AIC_SDIO_THERMAL_LOW_PAUSE_MS   60
+#define AIC_SDIO_THERMAL_HIGH_PAUSE_MS  180
+#define AIC_SDIO_THERMAL_LOW_PAUSE_TICKS \
+    ((rt_tick_t)((AIC_SDIO_THERMAL_LOW_PAUSE_MS * RT_TICK_PER_SECOND + 999U) / 1000U))
+#define AIC_SDIO_THERMAL_HIGH_PAUSE_TICKS \
+    ((rt_tick_t)((AIC_SDIO_THERMAL_HIGH_PAUSE_MS * RT_TICK_PER_SECOND + 999U) / 1000U))
+
+/* Pure vendor hysteresis decision; window accounting stays in the TX path. */
+static rt_uint8_t aic8800_sdio_thermal_state(rt_int8_t degree, rt_uint8_t state)
+{
+    if (degree <= AIC_SDIO_THERMAL_LOW_RESUME_C)
+    {
+        return 0;
+    }
+    else if (degree > AIC_SDIO_THERMAL_HIGH_C ||
+             (state == 2 && degree > AIC_SDIO_THERMAL_HIGH_RESUME_C))
+    {
+        return 2;
+    }
+    else if (degree > AIC_SDIO_THERMAL_LOW_C || state != 0)
+    {
+        return 1;
+    }
+    return 0;
+}
+
+static void aic8800_sdio_thermal_throttle(struct aic8800_context *context)
+{
+    rt_tick_t now;
+    rt_uint8_t state;
+    rt_base_t level = rt_hw_interrupt_disable();
+
+    if (!context->thermal_initialized || !context->thermal_valid)
+    {
+        rt_hw_interrupt_enable(level);
+        return;
+    }
+    state = aic8800_sdio_thermal_state(context->thermal_degree,
+                                      context->thermal_sdio_level);
+    context->thermal_sdio_level = state;
+    now = rt_tick_get();
+    /* Hold new arrivals in the queue, but continue draining older records.
+     * A running pause is not extended by each packet in the drain loop. */
+    if (state && (context->thermal_sdio_pause_ticks == 0 ||
+        (rt_tick_t)(now - context->thermal_sdio_pause_tick) >=
+            context->thermal_sdio_pause_ticks))
+    {
+        context->thermal_sdio_pause_tick = now;
+        context->thermal_sdio_pause_ticks =
+            state == 2 ? AIC_SDIO_THERMAL_HIGH_PAUSE_TICKS :
+                         AIC_SDIO_THERMAL_LOW_PAUSE_TICKS;
+    }
+    rt_hw_interrupt_enable(level);
+}
+
+/* Snapshot the window at admission. Frames already queued keep their original
+ * eligibility, so they can drain while new arrivals wait without blocking lwIP. */
+static void aic8800_sdio_thermal_stamp(struct aic8800_context *context,
+                                      struct aic8800_sdio_tx_record *record)
+{
+    rt_base_t level = rt_hw_interrupt_disable();
+    rt_tick_t now = rt_tick_get();
+
+    record->thermal_enqueue_tick = now;
+    record->thermal_delay_ticks = 0;
+    if (context->thermal_initialized && !record->metadata.management &&
+        context->thermal_sdio_pause_ticks)
+    {
+        rt_tick_t elapsed = now - context->thermal_sdio_pause_tick;
+
+        if (elapsed < context->thermal_sdio_pause_ticks)
+        {
+            record->thermal_delay_ticks =
+                context->thermal_sdio_pause_ticks - elapsed;
+        }
+    }
+    rt_hw_interrupt_enable(level);
+}
+
+static rt_tick_t aic8800_sdio_thermal_remaining(struct aic8800_context *context,
+                                               struct aic8800_sdio_tx_record *record)
+{
+    rt_tick_t remaining = 0;
+    rt_base_t level = rt_hw_interrupt_disable();
+
+    if (context->thermal_initialized && record->thermal_delay_ticks)
+    {
+        rt_tick_t elapsed = rt_tick_get() - record->thermal_enqueue_tick;
+
+        if (elapsed < record->thermal_delay_ticks)
+        {
+            remaining = record->thermal_delay_ticks - elapsed;
+        }
+    }
+    if (!remaining)
+    {
+        record->thermal_delay_ticks = 0;
+    }
+    rt_hw_interrupt_enable(level);
+    return remaining;
+}
+
+static rt_bool_t aic8800_sdio_thermal_limited(struct aic8800_context *context)
+{
+    rt_base_t level = rt_hw_interrupt_disable();
+    rt_bool_t limited = context->thermal_initialized &&
+                        context->thermal_sdio_level != 0;
+
+    rt_hw_interrupt_enable(level);
+    return limited;
+}
+#endif
+
 static rt_err_t aic8800_sdio_transmit_aggregate(
     struct aic8800_context *context,
     struct aic8800_sdio_tx_record *first,
@@ -821,8 +940,21 @@ static rt_err_t aic8800_sdio_transmit_aggregate(
     }
     while (frame_count < frame_limit)
     {
-        enum aic8800_tx_record_state state =
-            aic8800_core_tx_metadata_state(context, &record->metadata);
+        enum aic8800_tx_record_state state;
+
+#ifdef AIC8800_WIFI_THERMAL_CONTROL
+        if (aic8800_sdio_thermal_remaining(context, record))
+        {
+            /* The first record was admitted by the worker; only a later
+             * record can be held here, after consuming the prefetched one.
+             * Flush the older frames and retain this record for the worker. */
+            RT_ASSERT(!prefetched);
+            prefetched = record;
+            record = RT_NULL;
+            break;
+        }
+#endif
+        state = aic8800_core_tx_metadata_state(context, &record->metadata);
 
         if (state != AIC8800_TX_RECORD_READY)
         {
@@ -1021,6 +1153,16 @@ static void aic8800_sdio_tx_worker(void *parameter)
             }
             continue;
         }
+#ifdef AIC8800_WIFI_THERMAL_CONTROL
+        if (aic8800_sdio_thermal_remaining(context, record))
+        {
+            /* Only this data worker waits, with no bus/frame/queue locks.
+             * Recheck stop/removal every tick and preserve FIFO ownership. */
+            carry = record;
+            rt_thread_delay(1);
+            continue;
+        }
+#endif
         {
             enum aic8800_tx_record_state state =
                 aic8800_core_tx_metadata_state(context, &record->metadata);
@@ -1038,6 +1180,9 @@ static void aic8800_sdio_tx_worker(void *parameter)
                 continue;
             }
         }
+#ifdef AIC8800_WIFI_THERMAL_CONTROL
+        aic8800_sdio_thermal_throttle(context);
+#endif
         result = aic8800_sdio_transmit_aggregate(context, record, &carry);
         if (result != RT_EOK && result != -RT_EBUSY)
         {
@@ -1660,6 +1805,9 @@ static rt_err_t aic8800_sdio_bus_transmit_priority(
             record->priority = (rt_uint8_t)priority;
             aic8800_core_tx_metadata_init(
                 context, data, length, &record->metadata);
+#ifdef AIC8800_WIFI_THERMAL_CONTROL
+            aic8800_sdio_thermal_stamp(context, record);
+#endif
             rt_memcpy(record->data, data, length);
             /* The pool and the queue have the same depth and every queued
              * record owns a pool block, so holding a block leaves at least one
@@ -1688,6 +1836,14 @@ static rt_err_t aic8800_sdio_bus_transmit_priority(
             result = -RT_EFULL;
         }
         rt_mutex_release(&context->sdio_tx_queue_mutex);
+#ifdef AIC8800_WIFI_THERMAL_CONTROL
+        /* A cooling queue can stay full for 180 ms. Fail admission promptly
+         * instead of holding the lwIP core lock until the window expires. */
+        if (aic8800_sdio_thermal_limited(context))
+        {
+            break;
+        }
+#endif
         if (aic8800_sdio_tx_queue_wait_expired(start, timeout))
         {
             break;

@@ -63,12 +63,16 @@
 #define AIC_MM_SET_STACK_START_REQ AIC_WIRE_MSG(AIC_WIRE_TASK_MM, 123)
 #define AIC_MM_SET_STACK_START_CFM AIC_WIRE_MSG(AIC_WIRE_TASK_MM, 124)
 #define AIC_MM_APM_STALOSS_IND  AIC_WIRE_MSG(AIC_WIRE_TASK_MM, 125)
+#define AIC_MM_SET_VENDOR_HWCONFIG_REQ AIC_WIRE_MSG(AIC_WIRE_TASK_MM, 126)
+#define AIC_MM_SET_VENDOR_HWCONFIG_CFM AIC_WIRE_MSG(AIC_WIRE_TASK_MM, 127)
 #define AIC_MM_GET_STA_INFO_REQ   AIC_WIRE_MSG(AIC_WIRE_TASK_MM, 117)
 #define AIC_MM_GET_STA_INFO_CFM   AIC_WIRE_MSG(AIC_WIRE_TASK_MM, 118)
 #define AIC_MM_GET_FW_VERSION_REQ  AIC_WIRE_MSG(AIC_WIRE_TASK_MM, 128)
 #define AIC_MM_GET_FW_VERSION_CFM  AIC_WIRE_MSG(AIC_WIRE_TASK_MM, 129)
 #define AIC_MM_SET_TXPWR_ADJ_REQ  AIC_WIRE_MSG(AIC_WIRE_TASK_MM, 137)
 #define AIC_MM_SET_TXPWR_ADJ_CFM  AIC_WIRE_MSG(AIC_WIRE_TASK_MM, 138)
+#define AIC_MM_SET_VENDOR_SWCONFIG_REQ AIC_WIRE_MSG(AIC_WIRE_TASK_MM, 135)
+#define AIC_MM_SET_VENDOR_SWCONFIG_CFM AIC_WIRE_MSG(AIC_WIRE_TASK_MM, 136)
 #define AIC_MM_FW_PANIC_IND      AIC_WIRE_MSG(AIC_WIRE_TASK_MM, 149)
 #define AIC_MM_FW_ASSERT_IND     AIC_WIRE_MSG(AIC_WIRE_TASK_MM, 150)
 
@@ -423,6 +427,39 @@ struct aic_wire_mm_get_fw_version_cfm
 {
     rt_uint8_t length;
     rt_uint8_t version[63];
+};
+
+/* USB DC/DW uses the hardware query; its reply has no status byte. */
+#define AIC_VENDOR_HWCONFIG_CHIP_TEMP_GET 5U
+
+struct aic_wire_mm_vendor_hwconfig_temp_req
+{
+    rt_uint32_t hwconfig_id;
+};
+
+struct aic_wire_mm_vendor_hwconfig_temp_cfm
+{
+    rt_uint32_t hwconfig_id;
+    rt_int8_t degree;
+    rt_uint8_t reserved[3];
+};
+
+/* MM_SET_VENDOR_SWCONFIG with vendor_swconfig_tag TEMP_COMP_GET_REQ: the
+ * firmware reports its die temperature in degrees Celsius.  The confirmation
+ * is the 4-byte id followed by the union member {status, degree}. */
+#define AIC_VENDOR_SWCONFIG_TEMP_COMP_GET 2U
+
+struct aic_wire_mm_vendor_swconfig_temp_req
+{
+    rt_uint32_t swconfig_id;
+};
+
+struct aic_wire_mm_vendor_swconfig_temp_cfm
+{
+    rt_uint32_t swconfig_id;
+    rt_uint8_t status;
+    rt_int8_t degree;
+    rt_uint8_t reserved[2];
 };
 
 struct aic_wire_mm_add_if_req
@@ -847,6 +884,14 @@ _Static_assert(sizeof(struct aic_wire_me_set_ps_mode_req) == 1,
                "AIC power-save request ABI changed");
 _Static_assert(sizeof(struct aic_wire_mm_get_fw_version_cfm) == 64,
                "AIC firmware-version confirmation ABI changed");
+_Static_assert(sizeof(struct aic_wire_mm_vendor_hwconfig_temp_req) == 4,
+               "AIC vendor hwconfig request ABI changed");
+_Static_assert(sizeof(struct aic_wire_mm_vendor_hwconfig_temp_cfm) == 8,
+               "AIC vendor hwconfig confirmation ABI changed");
+_Static_assert(sizeof(struct aic_wire_mm_vendor_swconfig_temp_req) == 4,
+               "AIC vendor swconfig request ABI changed");
+_Static_assert(sizeof(struct aic_wire_mm_vendor_swconfig_temp_cfm) == 8,
+               "AIC vendor swconfig confirmation ABI changed");
 _Static_assert(sizeof(struct aic_wire_mm_add_if_req) == 10,
                "AIC add-interface ABI changed");
 _Static_assert(sizeof(struct aic_wire_mm_key_add_req) == 44,

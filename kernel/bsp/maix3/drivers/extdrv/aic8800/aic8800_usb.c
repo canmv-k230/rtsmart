@@ -266,6 +266,9 @@ static rt_uint32_t aic8800_usb_context_resource_mask(
         context->rx_reorder_work_queued ||
         context->radio.recovery_work_initialized ||
         context->radio.recovery_queued || context->radio.control
+#ifdef AIC8800_WIFI_THERMAL_POLL
+        || context->thermal_initialized || context->thermal_work_queued
+#endif
 #ifdef RT_WLAN_OFFLOAD_EMBEDDED_WPA2
         || context->radio.supplicant
 #endif
@@ -1622,6 +1625,17 @@ static void aic8800_usb_tx_complete(void *parameter, int length)
     {
         worker->completion_count++;
         worker->byte_count += (rt_uint64_t)length;
+#ifdef AIC8800_WIFI_DEBUG_STATS
+        worker->completion_last_ticks = rt_tick_get() - slot->submit_tick;
+        if (worker->completion_last_ticks > worker->completion_max_ticks)
+        {
+            worker->completion_max_ticks = worker->completion_last_ticks;
+        }
+        if (worker->completion_last_ticks >= rt_tick_from_millisecond(10))
+        {
+            worker->completion_slow_count++;
+        }
+#endif
     }
     if (worker->pending)
     {
@@ -1705,6 +1719,11 @@ static rt_err_t aic8800_usb_start_tx(struct aic8800_tx_worker *worker,
     worker->recovering = RT_FALSE;
     worker->stall_retired = 0;
     worker->stall_since = 0;
+#ifdef AIC8800_WIFI_DEBUG_STATS
+    worker->completion_last_ticks = 0;
+    worker->completion_max_ticks = 0;
+    worker->completion_slow_count = 0;
+#endif
     rt_completion_init(&worker->stopped);
     worker->completion_initialized = RT_TRUE;
     for (rt_size_t index = 0; index < worker->slot_count; index++)

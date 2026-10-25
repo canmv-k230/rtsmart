@@ -110,6 +110,10 @@ static void aic_scan_work(struct rt_work *work, void *work_data);
 static void aic_ap_rechannel_work(struct rt_work *work, void *work_data);
 static void aic_traffic_work(struct rt_work *work, void *work_data);
 static void aic_station_loss_work(struct rt_work *work, void *work_data);
+#ifdef AIC8800_WIFI_THERMAL_POLL
+static rt_err_t aic_thermal_start(struct aic8800_context *context);
+static void aic_thermal_stop(struct aic8800_context *context);
+#endif
 static void aic_set_traffic_status(struct aic8800_context *context,
                                    rt_uint8_t station_index,
                                    rt_uint8_t ps_id,
@@ -120,6 +124,13 @@ static void aic_report_scan_done_status(struct aic8800_context *context,
                                         rt_uint16_t result_count);
 static rt_err_t aic_confirmation_status(const rt_uint8_t *confirmation,
                                         rt_size_t length);
+static rt_err_t aic_query_station_info(
+    struct aic8800_context *context,
+    struct aic_wire_mm_get_sta_info_cfm *response,
+    rt_size_t *response_length, rt_bool_t diagnostic);
+static void aic_station_rate_decode(rt_uint32_t rate, unsigned int *format,
+                                    unsigned int *nss, unsigned int *mcs,
+                                    unsigned int *bandwidth, unsigned int *gi);
 static rt_bool_t aic_device_supports_vht(
     const struct aic8800_context *context);
 static rt_bool_t aic_device_supports_5ghz(
@@ -1859,6 +1870,32 @@ static rt_err_t aic_execute(struct aic8800_context *context,
                                     response_capacity, response_length);
 }
 
+/* Optional shell diagnostics must not queue behind radio-control commands.
+ * The firmware response wait is capped; transport submission retains its
+ * existing timeout and error handling. */
+static rt_err_t aic_execute_diagnostic(
+    struct aic8800_context *context, rt_uint16_t request_id,
+    rt_uint16_t confirmation_id, const void *request, rt_size_t request_length,
+    void *response, rt_size_t response_capacity, rt_size_t *response_length)
+{
+    rt_err_t result;
+
+    if (!context || !context->command_gate_initialized)
+    {
+        return -RT_EIO;
+    }
+    if (rt_sem_take(&context->command_gate, RT_WAITING_NO) != RT_EOK)
+    {
+        return -RT_EBUSY;
+    }
+    result = rt_wlan_offload_command_execute(
+        &context->commands, request_id, confirmation_id,
+        request, request_length, response, response_capacity, response_length,
+        rt_tick_from_millisecond(1000), RT_NULL);
+    rt_sem_release(&context->command_gate);
+    return result;
+}
+
 static rt_err_t aic_runtime_mem_mask_write(
     struct aic8800_context *context, rt_uint32_t address, rt_uint32_t mask,
     rt_uint32_t value)
@@ -3265,6 +3302,8 @@ static rt_bool_t aic_command_is_confirmation(rt_uint16_t id)
     case AIC_APM_START_CFM:
     case AIC_APM_STOP_CFM:
     case AIC_APM_SET_BEACON_IE_CFM:
+    case AIC_MM_SET_VENDOR_HWCONFIG_CFM:
+    case AIC_MM_SET_VENDOR_SWCONFIG_CFM:
         return RT_TRUE;
     default:
         return RT_FALSE;
@@ -6090,6 +6129,12 @@ static rt_err_t aic_wlan_offload_start(struct rt_wlan_offload_radio *radio)
         return result;
     }
     result = aic_configure_firmware(context);
+#ifdef AIC8800_WIFI_THERMAL_POLL
+    if (result == RT_EOK)
+    {
+        result = aic_thermal_start(context);
+    }
+#endif
     if (result != RT_EOK)
     {
         context->firmware_capabilities_valid = RT_FALSE;
@@ -6111,6 +6156,10 @@ static rt_err_t aic_wlan_offload_stop(struct rt_wlan_offload_radio *radio)
     {
         return -RT_EINVAL;
     }
+#ifdef AIC8800_WIFI_THERMAL_POLL
+    /* Drain firmware queries before the bus stop takes its TX lock. */
+    aic_thermal_stop(context);
+#endif
     rt_wlan_offload_command_manager_fail(&context->commands, -RT_EIO);
     aic_cancel_mgmt_confirmations(context, -RT_EIO);
     aic_rx_reorder_reset(context);
@@ -8991,36 +9040,41 @@ static const char *aic_rate_format_name(rt_uint32_t format)
                                                         "unknown";
 }
 
-static void aic_log_station_rate(
-    const struct aic_wire_mm_get_sta_info_cfm *response)
+static void aic_station_rate_decode(rt_uint32_t rate, unsigned int *format,
+                                    unsigned int *nss, unsigned int *mcs,
+                                    unsigned int *bandwidth, unsigned int *gi)
 {
-    rt_uint32_t rate = response->rate_info;
-    rt_uint32_t format = (rate >> 11) & 0x07U;
-    rt_uint32_t bandwidth = 20U << ((rate >> 7) & 0x03U);
-    rt_uint32_t gi = (rate >> 9) & 0x03U;
-    rt_uint32_t mcs;
-    rt_uint32_t nss;
-
-    if (format == 2U || format == 3U)
+    *format = (rate >> 11) & 0x07U;
+    *bandwidth = 20U << ((rate >> 7) & 0x03U);
+    *gi = (rate >> 9) & 0x03U;
+    if (*format == 2U || *format == 3U)
     {
-        mcs = rate & 0x07U;
-        nss = ((rate >> 3) & 0x03U) + 1U;
+        *mcs = rate & 0x07U;
+        *nss = ((rate >> 3) & 0x03U) + 1U;
     }
-    else if (format >= 4U)
+    else if (*format >= 4U)
     {
-        mcs = rate & 0x0fU;
-        nss = ((rate >> 4) & 0x07U) + 1U;
+        *mcs = rate & 0x0fU;
+        *nss = ((rate >> 4) & 0x07U) + 1U;
     }
     else
     {
-        mcs = rate & 0x7fU;
-        nss = 1U;
+        *mcs = rate & 0x7fU;
+        *nss = 1U;
     }
+}
+
+static void aic_log_station_rate(
+    const struct aic_wire_mm_get_sta_info_cfm *response)
+{
+    unsigned int format, nss, mcs, bandwidth, gi;
+
+    aic_station_rate_decode(response->rate_info, &format, &nss, &mcs,
+                            &bandwidth, &gi);
     LOG_I("link: RSSI=%d TX=%s NSS%u MCS/index=%u bandwidth=%u MHz GI=%u failed=%u raw=0x%08x",
-          response->rssi, aic_rate_format_name(format),
-          (unsigned int)nss, (unsigned int)mcs,
-          (unsigned int)bandwidth, (unsigned int)gi,
-          (unsigned int)response->tx_failed, (unsigned int)rate);
+          response->rssi, aic_rate_format_name(format), nss, mcs, bandwidth,
+          gi, (unsigned int)response->tx_failed,
+          (unsigned int)response->rate_info);
 }
 
 #ifdef AIC8800_WIFI_DEBUG_STATS
@@ -9068,7 +9122,7 @@ static void aic_stat_print_rc(struct aic8800_context *context)
     }
     request.station_index = context->ap_station_index;
     rt_memset(&response, 0, sizeof(response));
-    result = aic_execute(context, AIC_ME_RC_STATS_REQ,
+    result = aic_execute_diagnostic(context, AIC_ME_RC_STATS_REQ,
                          AIC_ME_RC_STATS_CFM, &request, sizeof(request),
                          &response, sizeof(response), &response_length);
     if (result != RT_EOK || response_length < sizeof(response))
@@ -9124,6 +9178,81 @@ static void aic_stat_print_rc(struct aic8800_context *context)
                    (unsigned int)aic_get_le16(&rate->attempts),
                    (unsigned int)rate->detail.sample.sample_skipped);
     }
+}
+
+/* Firmware's own account of the link to the AP.  Read alongside the RC table:
+ * low-MCS samples failing while RSSI is unchanged means our frames are not
+ * being acknowledged (TX chain or AP receive); RSSI fallen with them means
+ * both directions degraded (RF front end, crystal, antenna); channel busy far
+ * above our own TX share means contention or interference.  The ACK and
+ * survey counters are as the firmware reports them, so the difference between
+ * two snapshots is what carries meaning. */
+static void aic_stat_print_station(struct aic8800_context *context)
+{
+    struct aic_wire_mm_get_sta_info_cfm response;
+    rt_size_t response_length;
+    unsigned int format, nss, mcs, bandwidth, gi;
+    rt_uint64_t acks;
+    rt_err_t result;
+
+    if (!context->attached || !context->station_connected ||
+        context->ap_station_index == AIC8800_INVALID_INDEX)
+    {
+        return;
+    }
+    result = aic_query_station_info(context, &response, &response_length, RT_TRUE);
+    if (result != RT_EOK)
+    {
+        rt_kprintf("STA: unavailable result=%d\n", result);
+        return;
+    }
+    aic_station_rate_decode(response.rate_info, &format, &nss, &mcs,
+                            &bandwidth, &gi);
+    rt_kprintf("STA: RSSI=%d dBm TX=%s NSS%u MCS/index=%u BW=%u GI=%u "
+               "tx-failed=%u\n",
+               response.rssi, aic_rate_format_name(format), nss, mcs,
+               bandwidth, gi, (unsigned int)response.tx_failed);
+#ifdef AIC8800_WIFI_THERMAL_POLL
+    if (context->thermal_valid)
+    {
+        rt_kprintf("STA: chip temperature=%d C TX-power-loss=%d dB\n",
+                   context->thermal_degree, context->thermal_loss_db);
+    }
+#ifdef AIC8800_WIFI_THERMAL_CONTROL
+    if (context->transport == AIC8800_TRANSPORT_SDIO)
+    {
+        rt_kprintf("STA: thermal SDIO throttle level=%u\n",
+                   (unsigned int)context->thermal_sdio_level);
+    }
+#endif
+#endif
+    if (response_length < sizeof(response))
+    {
+        return;
+    }
+    acks = (rt_uint64_t)response.ack_succeeded + response.ack_failed;
+    rt_kprintf("STA: ACK ok=%u failed=%u (%u%% failed)\n",
+               (unsigned int)response.ack_succeeded,
+               (unsigned int)response.ack_failed,
+               acks ? (unsigned int)((rt_uint64_t)response.ack_failed *
+                                     100U / acks) : 0U);
+    if (!response.channel_time)
+    {
+        /* The D80 06090101 runtime returns the extension with the survey
+         * fields zero; only the ACK counters are populated. */
+        rt_kprintf("STA: channel survey not reported by this firmware\n");
+        return;
+    }
+    rt_kprintf("STA: channel time=%u busy=%u (%u%%) tx-busy=%u (%u%%)\n",
+               (unsigned int)response.channel_time,
+               (unsigned int)response.channel_busy_time,
+               response.channel_time ?
+                   (unsigned int)((rt_uint64_t)response.channel_busy_time *
+                                  100U / response.channel_time) : 0U,
+               (unsigned int)response.channel_tx_busy_time,
+               response.channel_time ?
+                   (unsigned int)((rt_uint64_t)response.channel_tx_busy_time *
+                                  100U / response.channel_time) : 0U);
 }
 
 static void aic_stat_print_common(const char *transport,
@@ -9189,6 +9318,27 @@ static void aic_stat_print_usb(struct aic8800_context *context)
     const struct aic8800_tx_worker *tx = &context->tx_worker;
     const struct aic8800_rx_worker *data = &context->data_worker;
     const struct aic8800_rx_worker *message = &context->message_worker;
+    rt_tick_t oldest = 0;
+    rt_tick_t last_ticks, max_ticks, now;
+    rt_uint32_t slow_count;
+    rt_base_t level;
+
+    level = rt_hw_interrupt_disable();
+    now = rt_tick_get();
+    last_ticks = tx->completion_last_ticks;
+    max_ticks = tx->completion_max_ticks;
+    slow_count = tx->completion_slow_count;
+    for (rt_size_t index = 0; tx->slots && index < tx->slot_count; index++)
+    {
+        const struct aic8800_tx_slot *slot = &tx->slots[index];
+        rt_tick_t age = now - slot->submit_tick;
+
+        if (slot->in_use && slot->submitted && age > oldest)
+        {
+            oldest = age;
+        }
+    }
+    rt_hw_interrupt_enable(level);
 
     aic_stat_print_common("USB", context);
     rt_kprintf("USB TX queue: queued=%u depth=%u high=%u frames=%u "
@@ -9227,6 +9377,13 @@ static void aic_stat_print_usb(struct aic8800_context *context)
                (unsigned int)tx->recovery_count,
                (unsigned int)tx->max_burst_count,
                (unsigned int)tx->error_count, tx->last_error);
+    rt_kprintf("USB TX latency: last=%u ms max=%u ms >=10ms=%u "
+               "oldest=%u ms recovering=%d\n",
+               (unsigned int)((rt_uint64_t)last_ticks * 1000U / RT_TICK_PER_SECOND),
+               (unsigned int)((rt_uint64_t)max_ticks * 1000U / RT_TICK_PER_SECOND),
+               (unsigned int)slow_count,
+               (unsigned int)((rt_uint64_t)oldest * 1000U / RT_TICK_PER_SECOND),
+               tx->recovering);
     rt_kprintf("USB RX data/msg: complete=%u/%u errors=%u/%u retries=%u/%u "
                "recoveries=%u/%u backlog-high=%u/%u overflow=%d/%d\n",
                (unsigned int)data->completion_count,
@@ -9246,6 +9403,7 @@ static void aic_stat_print_usb(struct aic8800_context *context)
                (unsigned int)data->dispatch_last_us,
                (unsigned int)message->dispatch_max_us,
                (unsigned int)message->dispatch_last_us);
+    aic_stat_print_station(context);
     aic_stat_print_rc(context);
 }
 #endif
@@ -9303,6 +9461,7 @@ static void aic_stat_print_sdio(struct aic8800_context *context)
                (unsigned int)context->sdio_data_processed_count,
                (unsigned int)context->sdio_data_drop_count,
                (unsigned int)context->sdio_data_queue_high_water);
+    aic_stat_print_station(context);
     aic_stat_print_rc(context);
 }
 #endif
@@ -9324,18 +9483,375 @@ static int aic8800_stat(int argc, char **argv)
     return 0;
 }
 MSH_CMD_EXPORT(aic8800_stat, show AIC8800 USB and SDIO statistics);
+
+#ifdef AIC8800_WIFI_TRANSPORT_USB
+static int aic8800_recover(int argc, char **argv)
+{
+    struct aic8800_context *context = aic8800_usb_stat_context();
+    rt_bool_t port_reenumerate = RT_FALSE;
+    rt_base_t level;
+
+    if (argc == 2 && rt_strcmp(argv[1], "port") == 0)
+    {
+        port_reenumerate = RT_TRUE;
+    }
+    else if (argc == 2 && rt_strcmp(argv[1], "hotplug") == 0)
+    {
+        /* Exercise the hub teardown/attach path without pre-arming the
+         * driver's requested-recovery flag, as on a firmware USB restart. */
+        if (!context || !context->attached || !context->transport_connected)
+        {
+            return -RT_EBUSY;
+        }
+        return usbh_hubport_reenumerate(context->hport);
+    }
+    else if (argc != 1)
+    {
+        rt_kprintf("usage: aic8800_recover [port|hotplug]\n");
+        return -RT_EINVAL;
+    }
+    if (!context || !context->attached || !context->bus_initialized ||
+        !context->transport_connected ||
+        context->radio.state != RT_WLAN_OFFLOAD_STARTED)
+    {
+        rt_kprintf("AIC8800 USB radio is not ready\n");
+        return -RT_EBUSY;
+    }
+
+    level = rt_hw_interrupt_disable();
+    if (context->tx_worker.recovering)
+    {
+        rt_hw_interrupt_enable(level);
+        rt_kprintf("AIC8800 USB radio recovery is already running\n");
+        return -RT_EBUSY;
+    }
+    context->tx_worker.recovering = RT_TRUE;
+    if (port_reenumerate)
+    {
+        aic8800_usb_request_port_reenumeration(context);
+    }
+    rt_hw_interrupt_enable(level);
+
+    rt_kprintf("requesting AIC8800 USB %s recovery\n",
+               port_reenumerate ? "port" : "radio");
+    rt_wlan_offload_bus_notify(&context->bus,
+                               RT_WLAN_OFFLOAD_BUS_EVENT_ERROR,
+                               -RT_ETIMEOUT);
+    return RT_EOK;
+}
+MSH_CMD_EXPORT(aic8800_recover, restart AIC8800 USB radio or port for testing);
+#endif
 #endif /* AIC8800_WIFI_DEBUG_STATS */
 
-static rt_err_t aic_get_rssi(struct rt_wlan_offload_vif *vif, int *rssi)
+#ifdef AIC8800_WIFI_THERMAL_POLL
+/* The vendor USB driver's CONFIG_TEMP_CONTROL policy (rwnx_main.h):
+ * TX power loss of 10, 5 and 2 dB above 110, 95 and 85 degrees C. */
+#define AIC_THERMAL_THRESHOLD_HIGH_C   110
+#define AIC_THERMAL_THRESHOLD_MID_C    95
+#define AIC_THERMAL_THRESHOLD_LOW_C    85
+#define AIC_THERMAL_LOSS_HIGH_DB       10U
+#define AIC_THERMAL_LOSS_MID_DB        5U
+#define AIC_THERMAL_LOSS_LOW_DB        2U
+#define AIC_THERMAL_QUERY_FAILURES     3U
+#define AIC_THERMAL_FAILURE_LOG_MS     300000
+#define AIC_THERMAL_USB_POLL_MS        10000
+#define AIC_THERMAL_SDIO_POLL_MS       60000
+
+static rt_err_t aic_query_chip_temperature(struct aic8800_context *context,
+                                           rt_int8_t *degree)
 {
-    struct aic8800_context *context = aic_context_from_vif(vif);
-    struct aic_wire_mm_get_sta_info_compat_req request;
-    struct aic_wire_mm_get_sta_info_cfm response;
-    rt_size_t request_length;
+    struct aic_wire_mm_vendor_swconfig_temp_req request;
+    struct aic_wire_mm_vendor_swconfig_temp_cfm response;
     rt_size_t response_length = 0;
     rt_err_t result;
 
-    if (!context || !rssi || !context->station_connected)
+    if (context->transport == AIC8800_TRANSPORT_USB &&
+        (context->product_id == AIC8800_USB_PID_AIC8800DC ||
+         context->product_id == AIC8800_USB_PID_AIC8800DW))
+    {
+        struct aic_wire_mm_vendor_hwconfig_temp_req hw_request;
+        struct aic_wire_mm_vendor_hwconfig_temp_cfm hw_response;
+
+        rt_memset(&hw_request, 0, sizeof(hw_request));
+        hw_request.hwconfig_id = AIC_VENDOR_HWCONFIG_CHIP_TEMP_GET;
+        rt_memset(&hw_response, 0, sizeof(hw_response));
+        result = aic_execute(context, AIC_MM_SET_VENDOR_HWCONFIG_REQ,
+                             AIC_MM_SET_VENDOR_HWCONFIG_CFM, &hw_request,
+                             sizeof(hw_request), &hw_response,
+                             sizeof(hw_response), &response_length);
+        if (result != RT_EOK)
+        {
+            return result;
+        }
+        if (response_length < 5U ||
+            hw_response.hwconfig_id != AIC_VENDOR_HWCONFIG_CHIP_TEMP_GET)
+        {
+            return -RT_EIO;
+        }
+        *degree = hw_response.degree;
+        return RT_EOK;
+    }
+
+    rt_memset(&request, 0, sizeof(request));
+    request.swconfig_id = AIC_VENDOR_SWCONFIG_TEMP_COMP_GET;
+    rt_memset(&response, 0, sizeof(response));
+    result = aic_execute(context, AIC_MM_SET_VENDOR_SWCONFIG_REQ,
+                         AIC_MM_SET_VENDOR_SWCONFIG_CFM, &request,
+                         sizeof(request), &response, sizeof(response),
+                         &response_length);
+    if (result != RT_EOK)
+    {
+        return result;
+    }
+    if (response_length < 6U ||
+        response.swconfig_id != AIC_VENDOR_SWCONFIG_TEMP_COMP_GET ||
+        response.status != 0)
+    {
+        return -RT_EIO;
+    }
+    *degree = response.degree;
+    return RT_EOK;
+}
+
+rt_bool_t aic8800_core_thermal_due(struct aic8800_context *context,
+                                   rt_tick_t now)
+{
+    rt_tick_t period;
+
+    if (!context || context->thermal_unsupported ||
+        !context->attached || !context->transport_connected ||
+        !context->lmac_started)
+    {
+        return RT_FALSE;
+    }
+    /* A failed submission or cancelled watchdog job leaves this request
+     * pending. Retry it even while idle, until a worker consumes it. */
+    if (context->thermal_pending)
+    {
+        return RT_TRUE;
+    }
+    period = rt_tick_from_millisecond(
+        context->transport == AIC8800_TRANSPORT_SDIO ?
+            AIC_THERMAL_SDIO_POLL_MS : AIC_THERMAL_USB_POLL_MS);
+    if ((rt_tick_t)(now - context->thermal_last_tick) < period)
+    {
+        return RT_FALSE;
+    }
+    context->thermal_last_tick = now;
+    context->thermal_pending = RT_TRUE;
+    return RT_TRUE;
+}
+
+void aic8800_core_thermal_poll(struct aic8800_context *context)
+{
+    rt_int8_t degree = 0;
+    rt_err_t result;
+
+    if (!context || !context->thermal_pending)
+    {
+        return;
+    }
+    context->thermal_pending = RT_FALSE;
+    if (context->thermal_unsupported || !context->attached ||
+        !context->transport_connected || !context->lmac_started)
+    {
+        return;
+    }
+    result = aic_query_chip_temperature(context, &degree);
+    if (result != RT_EOK)
+    {
+        rt_bool_t report = RT_FALSE;
+
+        /* Removal or a radio stop can interrupt an otherwise supported
+         * command. A new attachment probes again with a fresh context. */
+        if (!context->attached || !context->transport_connected ||
+            !context->lmac_started)
+        {
+            return;
+        }
+        if (context->thermal_failures < AIC_THERMAL_QUERY_FAILURES)
+        {
+            report = ++context->thermal_failures == AIC_THERMAL_QUERY_FAILURES;
+        }
+        else if (context->thermal_valid &&
+                 (rt_tick_t)(rt_tick_get() - context->thermal_failure_log_tick) >=
+                     rt_tick_from_millisecond(AIC_THERMAL_FAILURE_LOG_MS))
+        {
+            report = RT_TRUE;
+        }
+        if (report)
+        {
+            if (!context->thermal_valid)
+            {
+                context->thermal_unsupported = RT_TRUE;
+                LOG_W("chip temperature query failed %u times (%d); "
+                      "polling stopped for this attachment",
+                      (unsigned int)context->thermal_failures, result);
+            }
+            else
+            {
+                /* Keep the last thermal limits until a valid reading shows
+                 * cooling, and retry after temporary command failures. */
+                context->thermal_failure_log_tick = rt_tick_get();
+                LOG_W("chip temperature query still failing (%d); "
+                      "retaining thermal limits and retrying",
+                      result);
+            }
+        }
+        return;
+    }
+    context->thermal_failures = 0;
+    context->thermal_failure_log_tick = 0;
+    {
+        rt_base_t level = rt_hw_interrupt_disable();
+
+        context->thermal_degree = degree;
+        context->thermal_valid = RT_TRUE;
+        rt_hw_interrupt_enable(level);
+    }
+    LOG_I("chip temperature: %d C", degree);
+#ifdef AIC8800_WIFI_THERMAL_CONTROL
+    if (context->transport == AIC8800_TRANSPORT_USB)
+    {
+        rt_uint8_t loss;
+
+        if (degree > AIC_THERMAL_THRESHOLD_HIGH_C)
+        {
+            loss = AIC_THERMAL_LOSS_HIGH_DB;
+        }
+        else if (degree > AIC_THERMAL_THRESHOLD_MID_C)
+        {
+            loss = AIC_THERMAL_LOSS_MID_DB;
+        }
+        else if (degree > AIC_THERMAL_THRESHOLD_LOW_C)
+        {
+            loss = AIC_THERMAL_LOSS_LOW_DB;
+        }
+        else
+        {
+            loss = 0;
+        }
+        if (!context->thermal_power_unsupported &&
+            (rt_int8_t)loss != context->thermal_loss_db)
+        {
+            result = aic8800_radio_set_tx_power_loss(context, loss);
+            if (result == RT_EOK)
+            {
+                context->thermal_loss_db = (rt_int8_t)loss;
+                LOG_W("thermal control: %d C, TX power lowered by %u dB",
+                      degree, (unsigned int)loss);
+            }
+            else if (result == -RT_ENOSYS)
+            {
+                context->thermal_power_unsupported = RT_TRUE;
+                LOG_W("thermal TX power back-off unavailable for product "
+                      "0x%04x; temperature monitoring continues",
+                      context->product_id);
+            }
+            else
+            {
+                LOG_W("thermal control: TX power change failed: %d",
+                      result);
+            }
+        }
+    }
+#endif
+}
+
+static void aic_thermal_work(struct rt_work *work, void *work_data)
+{
+    struct aic8800_context *context = work_data;
+
+    (void)work;
+    aic8800_core_thermal_poll(context);
+    /* Keep the gate closed throughout the blocking query. cancel_work_sync
+     * joins a running job but does not remove a second, requeued instance. */
+    context->thermal_work_queued = RT_FALSE;
+}
+
+static void aic_thermal_timer(void *parameter)
+{
+    struct aic8800_context *context = parameter;
+
+    if (!context->thermal_initialized || context->thermal_work_queued ||
+        !aic8800_core_thermal_due(context, rt_tick_get()))
+    {
+        return;
+    }
+    context->thermal_work_queued = RT_TRUE;
+    if (rt_work_submit(&context->thermal_work, 0) != RT_EOK)
+    {
+        context->thermal_work_queued = RT_FALSE;
+    }
+}
+
+static void aic_thermal_stop(struct aic8800_context *context)
+{
+    if (!context->thermal_initialized)
+    {
+        return;
+    }
+    {
+        rt_base_t level = rt_hw_interrupt_disable();
+
+        context->thermal_initialized = RT_FALSE;
+#ifdef AIC8800_WIFI_THERMAL_CONTROL
+        context->thermal_sdio_level = 0;
+        context->thermal_sdio_pause_ticks = 0;
+#endif
+        rt_hw_interrupt_enable(level);
+    }
+    rt_timer_stop(&context->thermal_timer);
+    rt_timer_detach(&context->thermal_timer);
+    rt_work_cancel_sync(&context->thermal_work);
+    /* Also remove a submission made just after the callback opened its gate
+     * but before the workqueue cleared work_current. The timer is stopped. */
+    rt_work_cancel(&context->thermal_work);
+    context->thermal_work_queued = RT_FALSE;
+}
+
+static rt_err_t aic_thermal_start(struct aic8800_context *context)
+{
+    rt_err_t result;
+
+    if (context->thermal_initialized)
+    {
+        return RT_EOK;
+    }
+    rt_work_init(&context->thermal_work, aic_thermal_work, context);
+    context->thermal_work_queued = RT_FALSE;
+    if (!context->thermal_pending)
+    {
+        context->thermal_last_tick = rt_tick_get();
+    }
+    rt_timer_init(&context->thermal_timer, "aic-temp", aic_thermal_timer,
+                  context, rt_tick_from_millisecond(1000),
+                  RT_TIMER_FLAG_PERIODIC | RT_TIMER_FLAG_SOFT_TIMER);
+    context->thermal_initialized = RT_TRUE;
+    result = rt_timer_start(&context->thermal_timer);
+    if (result != RT_EOK)
+    {
+        aic_thermal_stop(context);
+    }
+    return result;
+}
+#endif /* AIC8800_WIFI_THERMAL_POLL */
+
+/* One MM_GET_STA_INFO round-trip for the associated AP.  Beyond RSSI and the
+ * current TX rate, V5 firmware appends ACK success/failure and a channel
+ * survey - the only firmware-side view the host has of why frames are or are
+ * not being acknowledged. */
+static rt_err_t aic_query_station_info(
+    struct aic8800_context *context,
+    struct aic_wire_mm_get_sta_info_cfm *response,
+    rt_size_t *response_length, rt_bool_t diagnostic)
+{
+    struct aic_wire_mm_get_sta_info_compat_req request;
+    rt_size_t request_length;
+    rt_err_t result;
+
+    *response_length = 0;
+    if (!context->station_connected)
     {
         return -RT_EINVAL;
     }
@@ -9352,21 +9868,50 @@ static rt_err_t aic_get_rssi(struct rt_wlan_offload_vif *vif, int *rssi)
         context->product_id == AIC8800_USB_PID_AIC8800D81X2 ||
         context->product_id == AIC8800_USB_PID_AIC8800D89X2 ?
             sizeof(struct aic_wire_mm_get_sta_info_req) : sizeof(request);
-    rt_memset(&response, 0, sizeof(response));
-    result = aic_execute(context, AIC_MM_GET_STA_INFO_REQ,
-                         AIC_MM_GET_STA_INFO_CFM, &request, request_length,
-                         &response, sizeof(response), &response_length);
+    rt_memset(response, 0, sizeof(*response));
+    if (diagnostic)
+    {
+        result = aic_execute_diagnostic(context, AIC_MM_GET_STA_INFO_REQ,
+                                        AIC_MM_GET_STA_INFO_CFM,
+                                        &request, request_length,
+                                        response, sizeof(*response), response_length);
+    }
+    else
+    {
+        result = aic_execute(context, AIC_MM_GET_STA_INFO_REQ,
+                             AIC_MM_GET_STA_INFO_CFM, &request, request_length,
+                             response, sizeof(*response), response_length);
+    }
     if (result != RT_EOK)
     {
         return result;
     }
     /* V5 returns the 32-byte statistics extension. Older compatible firmware
      * may stop after the original RSSI fields at byte 12. */
-    if (response_length < 12U)
+    if (*response_length < 12U)
     {
         return -RT_EIO;
     }
-    context->rssi = response.rssi;
+    context->rssi = response->rssi;
+    return RT_EOK;
+}
+
+static rt_err_t aic_get_rssi(struct rt_wlan_offload_vif *vif, int *rssi)
+{
+    struct aic8800_context *context = aic_context_from_vif(vif);
+    struct aic_wire_mm_get_sta_info_cfm response;
+    rt_size_t response_length;
+    rt_err_t result;
+
+    if (!context || !rssi)
+    {
+        return -RT_EINVAL;
+    }
+    result = aic_query_station_info(context, &response, &response_length, RT_FALSE);
+    if (result != RT_EOK)
+    {
+        return result;
+    }
     *rssi = context->rssi;
     aic_log_station_rate(&response);
     return RT_EOK;
@@ -9858,6 +10403,9 @@ static void aic_refresh_channel_metadata(struct aic8800_context *context)
 
 static void aic8800_core_cancel_work(struct aic8800_context *context)
 {
+#ifdef AIC8800_WIFI_THERMAL_POLL
+    aic_thermal_stop(context);
+#endif
     if (context->traffic_work_initialized)
     {
         rt_work_cancel_sync(&context->traffic_work);

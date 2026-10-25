@@ -193,6 +193,41 @@ if RT_USING_AIC8800_WIFI
                 Enable only when reduced idle power is more important than
                 deterministic latency and throughput.
 
+        config AIC8800_WIFI_THERMAL_POLL
+            bool "Monitor chip temperature"
+            default y
+            help
+                Query die temperature through the vendor firmware commands
+                while the radio is active. Use the vendor polling
+                intervals: 10 seconds for USB and 60 seconds for SDIO.
+                The last reading appears in aic8800_stat. Firmware without
+                temperature-query support stops polling after three failed
+                initial probes. Temporary failures after a successful query
+                retain the last thermal limits and continue polling.
+                Enabled by default for thermal protection. Each active device
+                uses a one-second software timer to schedule firmware queries
+                on a worker. Queries share the serialized command channel and
+                may delay other firmware commands until completion or timeout.
+
+        config AIC8800_WIFI_THERMAL_CONTROL
+            bool "Enable vendor thermal protection"
+            depends on AIC8800_WIFI_THERMAL_POLL
+            default y
+            help
+                Follow the vendor policy for each transport on all supported
+                chip families whose firmware reports temperature.
+                USB reduces TX power by 2, 5 and 10 dB above 85, 95 and
+                110 C on DC/DW, D80/D40 and D80X2. Legacy AIC8800/8801
+                has no vendor power back-off and only monitors temperature.
+                SDIO holds newly queued data for 60 ms above 80 C or
+                180 ms above 95 C, with the vendor cooling hysteresis
+                (82 C to leave the higher tier, 72 C to stop throttling).
+                Cooling waits run in the data TX worker. A full cooling
+                queue rejects new frames immediately so network processing
+                can continue.
+                Protection intentionally trades transmit throughput and
+                latency for lower temperature while a thermal limit is active.
+
     endmenu
 
     if AIC8800_WIFI_TRANSPORT_USB
@@ -643,8 +678,12 @@ if RT_USING_AIC8800_WIFI
                 Collect common WLAN, USB, SDIO, receive-reorder, and firmware
                 rate-control statistics and export the read-only aic8800_stat
                 shell command. This also enables transmit ICMP checksum
-                validation. With this option disabled, stat-only fields and
+                validation and USB TX completion-latency counters. With this
+                option disabled, stat-only fields and
                 per-frame accounting are not compiled.
+                Live station and rate-control queries skip a busy command
+                channel and wait at most one second each for a firmware reply.
+                Transport submission uses its existing timeouts.
 
     endmenu
 

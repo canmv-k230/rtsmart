@@ -337,6 +337,11 @@ struct aic8800_tx_worker
     volatile rt_bool_t active;
     /* Latched before releasing an errored slot; cleared only after recovery. */
     volatile rt_bool_t recovering;
+#ifdef AIC8800_WIFI_DEBUG_STATS
+    rt_tick_t completion_last_ticks;
+    rt_tick_t completion_max_ticks;
+    rt_uint32_t completion_slow_count;
+#endif
     rt_bool_t semaphore_initialized;
     rt_bool_t completion_initialized;
 };
@@ -566,6 +571,11 @@ struct aic8800_sdio_tx_record
 {
     rt_uint16_t length;
     rt_uint8_t priority;
+#ifdef AIC8800_WIFI_THERMAL_CONTROL
+    /* New arrivals wait in the TX queue until their cooling window ends. */
+    rt_tick_t thermal_enqueue_tick;
+    rt_tick_t thermal_delay_ticks;
+#endif
     struct aic8800_tx_metadata metadata;
     rt_uint8_t data[AIC8800_WIFI_TX_BUFFER_SIZE];
 };
@@ -767,6 +777,28 @@ struct aic8800_context
     rt_bool_t tx_watchdog_timer_initialized;
     rt_bool_t tx_watchdog_work_initialized;
     volatile rt_bool_t tx_watchdog_work_queued;
+#endif
+#ifdef AIC8800_WIFI_THERMAL_POLL
+    /* Common thermal monitor for USB and SDIO, independent of data TX. */
+    struct rt_timer thermal_timer;
+    struct rt_work thermal_work;
+    rt_bool_t thermal_initialized;
+    volatile rt_bool_t thermal_work_queued;
+    rt_tick_t thermal_last_tick;
+    volatile rt_bool_t thermal_pending;
+    rt_bool_t thermal_valid;
+    rt_bool_t thermal_unsupported;
+    rt_uint8_t thermal_failures;
+    rt_tick_t thermal_failure_log_tick;
+    rt_int8_t thermal_degree;
+    rt_int8_t thermal_loss_db;
+#ifdef AIC8800_WIFI_THERMAL_CONTROL
+    rt_bool_t thermal_power_unsupported;
+    /* SDIO holds new arrivals in its queue while older records drain. */
+    rt_uint8_t thermal_sdio_level;
+    rt_tick_t thermal_sdio_pause_tick;
+    rt_tick_t thermal_sdio_pause_ticks;
+#endif
 #endif
     rt_bool_t transport_connected;
     rt_bool_t firmware_transition;
@@ -991,6 +1023,13 @@ rt_err_t aic8800_core_receive(struct rt_wlan_offload_bus *bus, const void *data,
 void aic8800_usb_request_port_reenumeration(
     struct aic8800_context *context);
 #endif
+#ifdef AIC8800_WIFI_THERMAL_POLL
+/* Soft-timer side: decides whether a temperature poll is due; never blocks. */
+rt_bool_t aic8800_core_thermal_due(struct aic8800_context *context,
+                                   rt_tick_t now);
+/* Work side: queries the firmware and applies thermal control; may block. */
+void aic8800_core_thermal_poll(struct aic8800_context *context);
+#endif
 #ifdef AIC8800_WIFI_DEBUG_STATS
 #ifdef AIC8800_WIFI_TRANSPORT_USB
 struct aic8800_context *aic8800_usb_stat_context(void);
@@ -1009,6 +1048,12 @@ rt_err_t aic8800_protocol_command(struct aic8800_context *context,
                                 rt_size_t response_capacity,
                                 rt_size_t *response_length);
 rt_err_t aic8800_radio_initialize(struct aic8800_context *context);
+#ifdef AIC8800_WIFI_THERMAL_CONTROL
+/* Re-send the chip's calibrated TX levels lowered by loss_db; 0 restores them.
+ * Legacy power-index firmware returns -RT_ENOSYS, as it has no vendor back-off. */
+rt_err_t aic8800_radio_set_tx_power_loss(struct aic8800_context *context,
+                                         rt_uint8_t loss_db);
+#endif
 rt_err_t aic8800_radio_load_config(struct aic8800_context *context);
 rt_bool_t aic8800_radio_supports_80mhz(
     const struct aic8800_context *context);
