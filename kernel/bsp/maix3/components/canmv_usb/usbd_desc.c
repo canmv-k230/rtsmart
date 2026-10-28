@@ -102,7 +102,6 @@ static void prepare_usb_descriptor(void)
     }
     rt_memcpy(g_canmv_usb_descriptor + prefix_size + CANMV_USB_SERIAL_DESCRIPTOR_SIZE,
               canmv_usb_descriptor + suffix_offset, sizeof(canmv_usb_descriptor) - suffix_offset);
-    rt_kprintf("USB serial initialized from PUFS UID\n");
 }
 
 void board_usb_device_event_handler(uint8_t busid, uint8_t event)

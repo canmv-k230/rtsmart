@@ -780,6 +780,11 @@ rt_int32_t init_sd(struct rt_mmcsd_host *host, rt_uint32_t ocr)
         goto remove_card;
     mmcsd_host_lock(host);
 
+    LOG_I("%s: selected timing: %s, %u-bit, clock=%u Hz",
+          host->name,
+          (host->card->flags & CARD_FLAG_HIGHSPEED) ? "SD HS" : "legacy",
+          1U << host->io_cfg.bus_width, host->io_cfg.clock);
+
     return 0;
 
 remove_card:

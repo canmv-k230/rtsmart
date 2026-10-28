@@ -418,6 +418,7 @@ menu "InterDriver"
                     default n
                     help
                         Advertise HS200 support for validated 1.8V eMMC boards.
+                        Enable explicitly in board configurations after validation.
 
                 choice
                     bool "SDIO0 Bus Max Width"
@@ -438,6 +439,19 @@ menu "InterDriver"
             config RT_USING_SDIO1
                 bool "Enable SDIO1"
                 default n
+
+            config RT_SDIO_SKIP_INITIAL_PROBE
+                bool "Skip SDIO probing on the first boot-storage scan"
+                depends on RT_USING_SDIO0 || RT_USING_SDIO1
+                default y
+                help
+                    The boot SD/MMC controller on supported boards is used for storage.
+                    Skip SDIO CMD52 reset, its settle delay and CMD5 probing on its
+                    first scan. Later scans use normal probing, even if the first fails.
+                    SD/MMC power-up, identification and retry timings are unchanged.
+                    Other hosts, including SDIO Wi-Fi, retain normal enumeration.
+                    This setting is independent of fast boot. Disable it when using
+                    an SDIO combo card on the boot host.
 
             config BSP_SDIO_CARD_MAX_SEG_SIZE_KB
                 int "SD/SDIO maximum segment size (KiB)"

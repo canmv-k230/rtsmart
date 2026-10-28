@@ -305,6 +305,9 @@ static void auto_exec_trusted_preload(const char *cmd_line)
 }
 
 int main(void) {
+#ifdef CONFIG_FAST_BOOT_QUIET
+  rt_kprintf("SDK: %s, nncase: %s\n", SDK_VERSION_, NNCASE_VERSION_);
+#else
   rt_kprintf("\n#############SDK VERSION######################################\n");
   rt_kprintf("SDK   : %s\n", SDK_VERSION_);
 #ifdef CONFIG_SDK_ENABLE_CANMV
@@ -312,6 +315,7 @@ int main(void) {
 #endif //CONFIG_SDK_ENABLE_CANMV
   rt_kprintf("nncase: %s\n", NNCASE_VERSION_);
   rt_kprintf("##############################################################\n");
+#endif
 
 #ifdef RT_USING_SDIO
   if (g_sysctl_boot_mode == SYSCTL_BOOT_EMMC ||

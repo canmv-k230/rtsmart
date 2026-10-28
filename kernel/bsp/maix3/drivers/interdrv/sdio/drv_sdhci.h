@@ -517,13 +517,14 @@ struct sdhci_host
     void *sdma_bounce;
     uint32_t clock_upper_bound;
     rt_err_t clock_error;
+    rt_err_t iocfg_error; /* requires a complete, valid bus configuration */
     uint8_t clk_mul;
     uint8_t index;
     uint8_t is_emmc_card;
     uint8_t io_fixed_1v8;
     uint8_t have_phy;
     uint8_t mshc_ctrl_r;
-    uint32_t rx_delay_line;
+    uint32_t rx_delay_line; /* SMPLDL_CNFG register value, including RX_EXTDLY_EN */
     uint32_t tx_delay_line;
     /* The read-modify-writes of SDHCI_INT_ENABLE and SDHCI_SIGNAL_ENABLE are
      * serialized against sdhci_irq() by a local interrupt disable, not a lock:

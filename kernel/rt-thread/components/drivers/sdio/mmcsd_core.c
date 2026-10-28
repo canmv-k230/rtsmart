@@ -698,11 +698,16 @@ void mmcsd_detect(void *param)
     rt_uint32_t  ocr;
     rt_int32_t  err;
     rt_bool_t skip_sd_probe;
+    rt_bool_t skip_sdio_probe;
 
     while (1)
     {
         if (rt_mb_recv(&mmcsd_detect_mb, (rt_ubase_t *)&host, RT_WAITING_FOREVER) == RT_EOK)
         {
+            /* Consume before probing so every later scan probes SDIO,
+             * including after an unsuccessful first storage scan. */
+            skip_sdio_probe = host->skip_sdio_once;
+            host->skip_sdio_once = RT_FALSE;
             if (host->card == RT_NULL)
             {
                 mmcsd_host_lock(host);
@@ -711,7 +716,8 @@ void mmcsd_detect(void *param)
                  * mmc_rescan_try_freq().  CMD0 alone leaves an already
                  * initialized SDIO card - one carried over a warm reset of the
                  * host - in a state where it never answers CMD5. */
-                sdio_reset(host);
+                if (!skip_sdio_probe)
+                    sdio_reset(host);
                 mmcsd_go_idle(host);
 
                 skip_sd_probe = !controller_is_spi(host) &&
@@ -722,20 +728,23 @@ void mmcsd_detect(void *param)
 
                 mmcsd_send_if_cond(host, host->valid_ocr);
 
-                err = sdio_io_send_op_cond(host, 0, &ocr);
-                if (!err)
+                if (!skip_sdio_probe)
                 {
-                    err = init_sdio(host, ocr);
-                    if (err && err != -RT_EBUSY)
-                        mmcsd_power_off(host);
-                    mmcsd_host_unlock(host);
-                    mmcsd_detect_complete(
-                        host,
-                        err == -RT_EBUSY ? err :
-                            (host->card ? MMCSD_HOST_PLUGED :
-                                          MMCSD_HOST_UNPLUGED),
-                        RT_FALSE);
-                    continue;
+                    err = sdio_io_send_op_cond(host, 0, &ocr);
+                    if (!err)
+                    {
+                        err = init_sdio(host, ocr);
+                        if (err && err != -RT_EBUSY)
+                            mmcsd_power_off(host);
+                        mmcsd_host_unlock(host);
+                        mmcsd_detect_complete(
+                            host,
+                            err == -RT_EBUSY ? err :
+                                (host->card ? MMCSD_HOST_PLUGED :
+                                              MMCSD_HOST_UNPLUGED),
+                            RT_FALSE);
+                        continue;
+                    }
                 }
 
                 /*

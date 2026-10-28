@@ -142,6 +142,7 @@ struct rt_mmcsd_host
     struct rt_completion card_detect_completion;
     rt_int32_t card_detect_status;
     rt_bool_t card_detect_pending;
+    rt_bool_t skip_sdio_once; /* consumed when the first queued scan starts */
 
     rt_uint32_t       sdio_irq_num;
     struct rt_semaphore    *sdio_irq_sem;

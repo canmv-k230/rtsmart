@@ -174,10 +174,11 @@ static int mmc_get_ext_csd(struct rt_mmcsd_card *card, rt_uint8_t **new_ext_csd)
 
     mmcsd_send_request(card->host, &req);
 
-    if (cmd.err)
-        return cmd.err;
-    if (data.err)
-        return data.err;
+    if (cmd.err || data.err)
+    {
+        rt_free(ext_csd);
+        return cmd.err ? cmd.err : data.err;
+    }
 
     *new_ext_csd = ext_csd;
     return 0;
@@ -851,6 +852,7 @@ rt_int32_t init_mmc(struct rt_mmcsd_host *host, rt_uint32_t ocr)
     rt_int32_t err;
     rt_err_t remove_err;
     rt_uint32_t  current_ocr;
+    const char *timing;
     /*
      * We need to get OCR a different way for SPI.
      */
@@ -890,6 +892,25 @@ retry:
     if (err)
         goto remove_card;
     mmcsd_host_lock(host);
+
+    switch (host->io_cfg.timing)
+    {
+    case MMCSD_TIMING_MMC_HS200:
+        timing = "HS200";
+        break;
+    case MMCSD_TIMING_MMC_DDR52:
+        timing = "DDR52";
+        break;
+    case MMCSD_TIMING_MMC_HS:
+        timing = "HS";
+        break;
+    default:
+        timing = "legacy";
+        break;
+    }
+    LOG_I("%s: selected timing: %s, %u-bit, clock=%u Hz",
+          host->name, timing, 1U << host->io_cfg.bus_width,
+          host->io_cfg.clock);
 
     return 0;
 
