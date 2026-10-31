@@ -79,25 +79,87 @@ void jffs2_free_node_frag(struct jffs2_node_frag *x)
 	rt_free(x);
 }
 
+/* Raw references have the same uninitialized-field contract as rt_malloc().
+ * Callers initialize every field before use and release each reference once,
+ * after removing it from the filesystem lists. */
 #if CYGNUM_FS_JFFS2_RAW_NODE_REF_CACHE_POOL_SIZE == 0
+
+/* Linux allocates raw-node references in blocks. Keep this port's reference
+ * layout and individual free API, but amortize RT-Thread heap allocation and
+ * its lock across many records. Chunks live until the last unmount; freed
+ * records are reused by scans, writes and garbage collection. */
+#define RAW_REFS_PER_CHUNK 128
+struct raw_ref_chunk {
+	struct raw_ref_chunk *next;
+	struct jffs2_raw_node_ref refs[RAW_REFS_PER_CHUNK];
+};
+
+static struct raw_ref_chunk *ref_chunks;
+static struct jffs2_raw_node_ref *free_refs;
+static struct rt_mutex ref_mutex;
+
+static int grow_ref_cache(void)
+{
+	struct raw_ref_chunk *chunk = rt_malloc(sizeof(*chunk));
+	unsigned i;
+	if (!chunk)
+		return -ENOMEM;
+	chunk->next = ref_chunks;
+	ref_chunks = chunk;
+	for (i = 0; i < RAW_REFS_PER_CHUNK; i++) {
+		chunk->refs[i].next_phys = free_refs;
+		free_refs = &chunk->refs[i];
+	}
+	return 0;
+}
 
 int jffs2_create_slab_caches(void)
 {
+	ref_chunks = NULL;
+	free_refs = NULL;
+	if (rt_mutex_init(&ref_mutex, "jffs2ref", RT_IPC_FLAG_PRIO) != RT_EOK)
+		return -ENOMEM;
+	if (grow_ref_cache()) {
+		rt_mutex_detach(&ref_mutex);
+		return -ENOMEM;
+	}
 	return 0;
 }
 
 void jffs2_destroy_slab_caches(void)
 {
+	/* The caller has released all filesystem instances and their references. */
+	while (ref_chunks) {
+		struct raw_ref_chunk *next = ref_chunks->next;
+		rt_free(ref_chunks);
+		ref_chunks = next;
+	}
+	free_refs = NULL;
+	rt_mutex_detach(&ref_mutex);
 }
 
 struct jffs2_raw_node_ref *jffs2_alloc_raw_node_ref(void)
 {
-	return rt_malloc(sizeof(struct jffs2_raw_node_ref));
+	struct jffs2_raw_node_ref *ref;
+	rt_mutex_take(&ref_mutex, RT_WAITING_FOREVER);
+	if (!free_refs && grow_ref_cache()) {
+		rt_mutex_release(&ref_mutex);
+		return NULL;
+	}
+	ref = free_refs;
+	free_refs = ref->next_phys;
+	rt_mutex_release(&ref_mutex);
+	return ref;
 }
 
 void jffs2_free_raw_node_ref(struct jffs2_raw_node_ref *x)
 {
-	rt_free(x);
+	if (!x)
+		return;
+	rt_mutex_take(&ref_mutex, RT_WAITING_FOREVER);
+	x->next_phys = free_refs;
+	free_refs = x;
+	rt_mutex_release(&ref_mutex);
 }
 
 #else // CYGNUM_FS_JFFS2_RAW_NODE_REF_CACHE_POOL_SIZE == 0

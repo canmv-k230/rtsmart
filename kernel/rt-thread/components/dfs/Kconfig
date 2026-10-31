@@ -162,6 +162,11 @@ if RT_USING_DFS
         select RT_USING_MTD_NOR
         default n
 
+    config RT_JFFS2_USING_ZLIB
+        bool "Enable JFFS2 transparent zlib compression"
+        depends on RT_USING_DFS_JFFS2
+        default y
+
     config RT_USING_DFS_NFS
         bool "Using NFS v3 client file system"
         depends on RT_USING_LWIP

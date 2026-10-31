@@ -19,7 +19,9 @@
 #include <linux/compiler.h>
 #include "nodelist.h"
 
-#define DEFAULT_EMPTY_SCAN_SIZE 1024
+#define DEFAULT_EMPTY_SCAN_SIZE 256
+#define NOR_SCAN_BUFFER_SIZE 1024
+#define NOR_METADATA_SCAN_SIZE 128
 
 #if defined (__GNUC__) 
 #elif defined (MSVC)
@@ -129,7 +131,9 @@ int jffs2_scan_medium(struct jffs2_sb_info *c)
 		if (jffs2_cleanmarker_oob(c))
 			buf_size = c->sector_size;
 		else
-			buf_size = PAGE_SIZE;
+			/* The empty probe is smaller than the refill buffer. Directory
+			 * nodes can exceed 256 bytes with a full-length filename. */
+			buf_size = NOR_SCAN_BUFFER_SIZE;
 
 		/* Respect kmalloc limitations */
 		if (buf_size > 128*1024)
@@ -265,7 +269,8 @@ int jffs2_scan_medium(struct jffs2_sb_info *c)
 	}
 #endif
 	if (c->nr_erasing_blocks) {
-		if ( !c->used_size && ((c->nr_free_blocks+empty_blocks+bad_blocks)!= c->nr_blocks || bad_blocks == c->nr_blocks) ) { 
+		if (!c->used_size && !c->unchecked_size &&
+		    ((c->nr_free_blocks+empty_blocks+bad_blocks)!= c->nr_blocks || bad_blocks == c->nr_blocks)) {
 			printk(KERN_NOTICE "Cowardly refusing to erase blocks on filesystem with no valid JFFS2 nodes\n");
 			printk(KERN_NOTICE "empty_blocks %d, bad_blocks %d, c->nr_blocks %d\n",empty_blocks,bad_blocks,c->nr_blocks);
 			ret = -EIO;
@@ -309,8 +314,9 @@ static int jffs2_scan_eraseblock (struct jffs2_sb_info *c, struct jffs2_eraseblo
 				  unsigned char *buf, uint32_t buf_size) {
 	struct jffs2_unknown_node *node;
 	struct jffs2_unknown_node crcnode;
-	uint32_t ofs, prevofs;
+	uint32_t ofs, prevofs, max_ofs;
 	uint32_t hdr_crc, buf_ofs, buf_len;
+	uint32_t metadata_size = buf_size;
 	int err;
 	int noise = 0;
 #ifdef CONFIG_JFFS2_FS_WRITEBUFFER
@@ -338,6 +344,11 @@ static int jffs2_scan_eraseblock (struct jffs2_sb_info *c, struct jffs2_eraseblo
 		}
 	}
 #endif
+	/* Inode scans only need the 68-byte header before skipping the payload.
+	 * Keep full-sized reads for the initial empty-block check, empty ranges
+	 * and directory entries (which may include a 255-byte name). */
+	if (!jffs2_cleanmarker_oob(c))
+		metadata_size = min_t(uint32_t, buf_size, NOR_METADATA_SCAN_SIZE);
 	buf_ofs = jeb->offset;
 
 	if (!buf_size) {
@@ -352,11 +363,12 @@ static int jffs2_scan_eraseblock (struct jffs2_sb_info *c, struct jffs2_eraseblo
 	/* We temporarily use 'ofs' as a pointer into the buffer/jeb */
 	ofs = 0;
 
-	/* Scan only 4KiB of 0xFF before declaring it's empty */
-	while(ofs < EMPTY_SCAN_SIZE(c->sector_size) && *(uint32_t *)(&buf[ofs]) == 0xFFFFFFFF)
+	max_ofs = EMPTY_SCAN_SIZE(c->sector_size);
+	/* Match Linux's bounded initial empty-block probe. */
+	while(ofs < max_ofs && *(uint32_t *)(&buf[ofs]) == 0xFFFFFFFF)
 		ofs += 4;
 
-	if (ofs == EMPTY_SCAN_SIZE(c->sector_size)) {
+	if (ofs == max_ofs) {
 #ifdef CONFIG_JFFS2_FS_WRITEBUFFER
 		if (jffs2_cleanmarker_oob(c)) {
 			/* scan oob, take care of cleanmarker */
@@ -414,7 +426,7 @@ scan_more:
 		}
 
 		if (buf_ofs + buf_len < ofs + sizeof(*node)) {
-			buf_len = min_t(uint32_t, buf_size, jeb->offset + c->sector_size - ofs);
+			buf_len = min_t(uint32_t, metadata_size, jeb->offset + c->sector_size - ofs);
 			D1(printk(KERN_DEBUG "Fewer than %zd bytes (node header) left to end of buf. Reading 0x%x at 0x%08x\n",
 				  sizeof(struct jffs2_unknown_node), buf_len, ofs));
 			err = jffs2_fill_scan_buf(c, buf, ofs, buf_len);
@@ -542,7 +554,7 @@ scan_more:
 		switch(je16_to_cpu(node->nodetype)) {
 		case JFFS2_NODETYPE_INODE:
 			if (buf_ofs + buf_len < ofs + sizeof(struct jffs2_raw_inode)) {
-				buf_len = min_t(uint32_t, buf_size, jeb->offset + c->sector_size - ofs);
+				buf_len = min_t(uint32_t, metadata_size, jeb->offset + c->sector_size - ofs);
 				D1(printk(KERN_DEBUG "Fewer than %zd bytes (inode node) left to end of buf. Reading 0x%x at 0x%08x\n",
 					  sizeof(struct jffs2_raw_inode), buf_len, ofs));
 				err = jffs2_fill_scan_buf(c, buf, ofs, buf_len);
@@ -708,33 +720,25 @@ static int jffs2_scan_inode_node(struct jffs2_sb_info *c, struct jffs2_erasebloc
 	   Which means that the _full_ amount of time to get to proper write mode with GC
 	   operational may actually be _longer_ than before. Sucks to be me. */
 
-	raw = jffs2_alloc_raw_node_ref();
-	if (!raw) {
-		printk(KERN_NOTICE "jffs2_scan_inode_node(): allocation of node reference failed\n");
-		return -ENOMEM;
+	/* Validate every inode header before using it, including later versions
+	 * of an inode already in the cache (Linux 53043002ef6c). */
+	uint32_t crc = crc32(0, ri, sizeof(*ri)-8);
+	if (crc != je32_to_cpu(ri->node_crc)) {
+		printk(KERN_NOTICE "jffs2_scan_inode_node(): CRC failed on node at 0x%08x: Read 0x%08x, calculated 0x%08x\n",
+		       ofs, je32_to_cpu(ri->node_crc), crc);
+		DIRTY_SPACE(PAD(je32_to_cpu(ri->totlen)));
+		return 0;
 	}
 
 	ic = jffs2_get_ino_cache(c, ino);
 	if (!ic) {
-		/* Inocache get failed. Either we read a bogus ino# or it's just genuinely the
-		   first node we found for this inode. Do a CRC check to protect against the former
-		   case */
-		uint32_t crc = crc32(0, ri, sizeof(*ri)-8);
-
-		if (crc != je32_to_cpu(ri->node_crc)) {
-			printk(KERN_NOTICE "jffs2_scan_inode_node(): CRC failed on node at 0x%08x: Read 0x%08x, calculated 0x%08x\n",
-			       ofs, je32_to_cpu(ri->node_crc), crc);
-			/* We believe totlen because the CRC on the node _header_ was OK, just the node itself failed. */
-			DIRTY_SPACE(PAD(je32_to_cpu(ri->totlen)));
-			jffs2_free_raw_node_ref(raw);
-			return 0;
-		}
 		ic = jffs2_scan_make_ino_cache(c, ino);
-		if (!ic) {
-			jffs2_free_raw_node_ref(raw);
+		if (!ic)
 			return -ENOMEM;
-		}
 	}
+	raw = jffs2_alloc_raw_node_ref();
+	if (!raw)
+		return -ENOMEM;
 
 	/* Wheee. It worked */
 

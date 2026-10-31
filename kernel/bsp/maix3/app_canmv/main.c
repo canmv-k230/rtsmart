@@ -114,6 +114,10 @@ static int usbh_initialize_async(uint8_t busid, uint32_t reg_base)
 static const struct dfs_mount_tbl* const auto_mount_table[SYSCTL_BOOT_MAX] = {
     (const struct dfs_mount_tbl[]) {
         /* Nor Flash */
+#ifdef BSP_USING_SPI_NOR
+        { "nor0", "/bin", "jffs2", 0, 0 },
+        { "nor1", "/sdcard", "jffs2", 0, 0 },
+#endif
         { 0 },
     },
     (const struct dfs_mount_tbl[]) {
@@ -154,8 +158,8 @@ static void mnt_mount_table(void)
     int err                     = 0;
     int fd                      = -1;
     int mkfs_for_data_partition = 0;
-#if defined(CONFIG_RT_AUTO_RESIZE_PARTITION)
     bool format_data_partition  = false;
+#if defined(CONFIG_RT_AUTO_RESIZE_PARTITION)
     bool auto_mkfs_marker       = false;
 #endif
 
@@ -174,16 +178,17 @@ static void mnt_mount_table(void)
             break;
         }
 
-        if (0x00
-            == (ret = dfs_mount(mnt_tbl->device_name, mnt_tbl->path, mnt_tbl->filesystemtype, mnt_tbl->rwflag,
-                                mnt_tbl->data))) {
+        ret = dfs_mount(mnt_tbl->device_name, mnt_tbl->path, mnt_tbl->filesystemtype,
+                        mnt_tbl->rwflag, mnt_tbl->data);
+        if (ret != 0)
+            err = errno;
+        if (ret == 0) {
             if (0x00 == rt_strcmp("/data", mnt_tbl->path)) {
                 g_fs_mount_data_succ = true;
             } else if (0x00 == rt_strcmp("/sdcard", mnt_tbl->path)) {
                 g_fs_mount_sdcard_succ = true;
             }
         } else {
-            err = errno;
             rt_kprintf("mount fs[%s] on %s failed(%d), error %d.\n", mnt_tbl->filesystemtype, mnt_tbl->path, ret, err);
 
             if ((0x00 == rt_strncmp("/data", mnt_tbl->path, sizeof("/data") - 1))
@@ -330,6 +335,25 @@ int main(void) {
   }
 #endif //RT_USING_SDIO
 
+#if defined(ENABLE_CHERRY_USB) && !defined(ENABLE_CHERRY_USB_OTG) && defined(ENABLE_CHERRY_USB_HOST) && defined(ENABLE_CANMV_USB_HOST)
+  /* Start the host and its VBUS off interval before mounting. Flash I/O gives
+   * the background host thread time to run; device initialization stays later. */
+  void *usb_host_base = rt_ioremap((void *)(0x91500000UL +
+                                           CHERRY_USB_HOST_USING_DEV * 0x40000UL), 0x10000);
+#ifdef CANMV_USB_PWR_PIN
+  int usb_host_pin = CANMV_USB_PWR_PIN;
+  rt_tick_t usb_host_power_off_tick = 0;
+  if (usb_host_pin >= 0) {
+    /* Reset does not clear the output latch. Keep the cold-plug power cycle
+     * so a previously enumerated peripheral drops its old USB address. */
+    kd_pin_mode(usb_host_pin, GPIO_DM_OUTPUT);
+    kd_pin_write(usb_host_pin, !CANMV_USB_PWR_PIN_VALID_VAL);
+    usb_host_power_off_tick = rt_tick_get();
+  }
+#endif
+  usbh_initialize_async(0, (uint32_t)(uintptr_t)usb_host_base);
+#endif
+
   mnt_mount_table();
   excute_sdcard_config();
 
@@ -351,30 +375,15 @@ int main(void) {
   board_usb_device_register();
   usbotg_initialize(0, (uint32_t)(long)usb_base, board_usb_device_event_handler, USBOTG_MODE_OTG);
 #else
-  /* Strange BUG, ​​USB Host must be initialized first */
+  /* The host was started before mounting, ahead of USB device setup. */
 #if defined (ENABLE_CHERRY_USB_HOST) && defined (ENABLE_CANMV_USB_HOST)
-  usb_base = (void *)rt_ioremap((void *)usb_dev_addr[CHERRY_USB_HOST_USING_DEV], 0x10000);
-
-#ifdef CANMV_USB_PWR_PIN
-  /* Power-cycle the port so every boot looks like a cold one to the device.  A
-   * reset button press does not clear the GPIO output latch, so VBUS would
-   * otherwise stay up and an already enumerated device would keep its old USB
-   * address - it then ignores the GET_DESCRIPTOR sent to address 0 and
-   * enumeration fails with -USB_ERR_TIMEOUT.  The host thread runs at the
-   * lowest priority and cannot start before main() blocks, so dropping VBUS
-   * here still happens before the host stack looks at the port. */
-  int usb_host_pin = CANMV_USB_PWR_PIN;
-  if(0 <= usb_host_pin) {
-    kd_pin_mode(usb_host_pin, GPIO_DM_OUTPUT);
-    kd_pin_write(usb_host_pin, !CANMV_USB_PWR_PIN_VALID_VAL);
-  }
-#endif
-
-  usbh_initialize_async(0, (uint32_t)(long)usb_base);
-
 #ifdef CANMV_USB_PWR_PIN
   if(0 <= usb_host_pin) {
-    rt_thread_mdelay(CANMV_USB_PWR_CYCLE_MS);
+    rt_tick_t elapsed = (rt_tick_t)(rt_tick_get() - usb_host_power_off_tick);
+    /* One extra tick covers the fractional tick at the GPIO transition. */
+    rt_tick_t off_ticks = rt_tick_from_millisecond(CANMV_USB_PWR_CYCLE_MS) + 1;
+    if (elapsed < off_ticks)
+      rt_thread_delay(off_ticks - elapsed);
     kd_pin_write(usb_host_pin, CANMV_USB_PWR_PIN_VALID_VAL);
   }
 #endif

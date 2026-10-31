@@ -631,7 +631,10 @@ _exit:
 }
 #else
 static int execute_auto_resize(char *value) {
-  rt_kprintf("not support reisze partition.\n");
+  if (value[0] != 'y') {
+    return 0;
+  }
+  rt_kprintf("automatic partition resizing is disabled\n");
   return -1;
 }
 #endif

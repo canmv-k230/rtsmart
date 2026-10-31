@@ -139,7 +139,7 @@ static inline int
 read_direntry(struct jffs2_sb_info *c,
 	      struct jffs2_raw_node_ref *ref,
 	      struct jffs2_raw_dirent *rd,
-	      uint32_t read,
+	      size_t read,
 	      struct jffs2_full_dirent **fdp,
 	      int32_t *latest_mctime,
 	      uint32_t *mctime_ver)
@@ -188,7 +188,7 @@ read_direntry(struct jffs2_sb_info *c,
 		int already = read - sizeof(*rd);
 			
 		err = jffs2_flash_read(c, (ref_offset(ref)) + read, 
-				rd->nsize - already, (size_t*)&read, &fd->name[already]);
+				rd->nsize - already, &read, &fd->name[already]);
 		if (unlikely(read != rd->nsize - already) && likely(!err))
 			return -EIO;
 			
@@ -224,7 +224,7 @@ static inline int
 read_dnode(struct jffs2_sb_info *c,
 	   struct jffs2_raw_node_ref *ref,
 	   struct jffs2_raw_inode *rd,
-	   uint32_t read,
+	   size_t read,
 	   struct rb_root *tnp,
 	   int32_t *latest_mctime,
 	   uint32_t *mctime_ver)
@@ -278,7 +278,7 @@ read_dnode(struct jffs2_sb_info *c,
 					return -ENOMEM;
 				
 				err = jffs2_flash_read(c, ref_offset(ref) + sizeof(*rd), je32_to_cpu(rd->csize),
-							(size_t*)&read, buf);
+							&read, buf);
 				if (unlikely(read != je32_to_cpu(rd->csize)) && likely(!err))
 					err = -EIO;
 				if (err) {

@@ -127,11 +127,13 @@
 # define cyg_halcount64 long long
 #endif
 
+#include <stdint.h>
+
 #ifndef cyg_haladdress
-# define cyg_haladdress cyg_uint32
+# define cyg_haladdress uintptr_t
 #endif
 #ifndef cyg_haladdrword
-# define cyg_haladdrword cyg_uint32
+# define cyg_haladdrword uintptr_t
 #endif
 
 #ifndef cyg_halbool

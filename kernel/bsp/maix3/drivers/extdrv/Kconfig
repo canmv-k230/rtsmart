@@ -78,6 +78,7 @@ menu "Wi-Fi Drivers"
 endmenu
 
     source "drivers/extdrv/spinand/Kconfig"
+    source "drivers/extdrv/spinor/Kconfig"
     source "drivers/extdrv/lsm6dsm/Kconfig"
     source "drivers/extdrv/touch/Kconfig"
     source "drivers/extdrv/regulator/Kconfig"

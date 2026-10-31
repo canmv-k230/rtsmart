@@ -1,0 +1,8 @@
+config RT_USING_SPINOR
+    bool "Native SPI NOR driver"
+    depends on RT_USING_SPI
+    select RT_USING_QSPI
+    default n
+    help
+        Native SPI NOR access through the RT-Thread QSPI bus, with optional
+        MTD NOR partitions. Supported chips are listed in spinor_chips.c.

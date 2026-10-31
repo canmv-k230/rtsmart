@@ -610,6 +610,8 @@ static int jffs2_garbage_collect_pristine(struct jffs2_sb_info *c,
 			printk(KERN_NOTICE "Not marking the space at 0x%08x as dirty because the flash driver returned retlen zero\n", nraw->flash_offset);
                         jffs2_free_raw_node_ref(nraw);
 		}
+		/* The failed-write reference is now linked or freed. Only a fresh
+		 * retry reference belongs to this function below. */
 		if (!retried && (nraw = jffs2_alloc_raw_node_ref())) {
 			/* Try to reallocate space and retry */
 			uint32_t dummy;
@@ -635,8 +637,6 @@ static int jffs2_garbage_collect_pristine(struct jffs2_sb_info *c,
 			D1(printk(KERN_DEBUG "Failed to allocate space to retry failed write: %d!\n", ret));
 			jffs2_free_raw_node_ref(nraw);
 		}
-
-		jffs2_free_raw_node_ref(nraw);
 		if (!ret)
 			ret = -EIO;
 		goto out_node;

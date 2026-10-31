@@ -1,0 +1,10 @@
+from building import *
+
+cwd = GetCurrentDir()
+src = ['spinor_core.c', 'spinor_qspi.c', 'spinor_chips.c']
+if GetDepend('RT_USING_MTD_NOR'):
+    src += ['spinor_mtd.c']
+
+group = DefineGroup('spinor', src, depend=['RT_USING_SPINOR'],
+                    CPPPATH=[cwd + '/inc'])
+Return('group')

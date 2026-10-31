@@ -58,6 +58,7 @@ if GetDepend('SPI_NAND_FUDANMICRO'):
 if GetDepend('LPKG_USING_SPINAND'):
     src += ['spinand.c']
     src += ['spinand_port.c']
+    src += ['spinand_mtd.c']
     src += ['spinand_ooblayout.c']
     src += ['bbt.c']
 

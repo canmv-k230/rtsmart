@@ -1,14 +1,16 @@
 #ifndef JFFS2_CONFIG_H
 #define JFFS2_CONFIG_H
 
+#include <rtconfig.h>
+
 #define __ECOS  /* must be defined */
 
 #define FILE_PATH_MAX                128  /* the longest file path */
-#define CONFIG_JFFS2_ENTRY_NAME_MAX  23
+#define CONFIG_JFFS2_ENTRY_NAME_MAX  255
 #define	JFFS2_NAME_MAX   CONFIG_JFFS2_ENTRY_NAME_MAX  
 #define	JFFS2_PATH_MAX   FILE_PATH_MAX
 
-#define DEVICE_PART_MAX   1  /* the max partions on a nand deivce*/
+#define DEVICE_PART_MAX   DFS_FILESYSTEMS_MAX /* independently registered MTD partitions */
 
 /* memory page size in kernel/asm/page.h, it is correspond with flash read/write
  * option, so this size has a great impact on reading/writing speed */
@@ -44,7 +46,9 @@
 //#define CONFIG_JFFS2_FS_WRITEBUFFER /* should not be enabled */
 
 /* zlib section*/
-//#define CONFIG_JFFS2_ZLIB
+#ifdef RT_JFFS2_USING_ZLIB
+#define CONFIG_JFFS2_ZLIB
+#endif
 //#define CONFIG_JFFS2_RTIME
 //#define CONFIG_JFFS2_RUBIN
 //#define CONFIG_JFFS2_CMODE_NONE

@@ -269,6 +269,8 @@ static void* dw_spi_get_dma_buf(dw_spi_bus_t* spi_bus, rt_size_t size)
     if (size > DW_SSI_DMA_BOUNCE_MAX_SIZE) {
         return NULL;
     }
+    /* Cache invalidation must never include another heap allocation. */
+    size = RT_ALIGN(size, RT_CPU_CACHE_LINE_SZ);
     if (spi_bus->dma_buf && spi_bus->dma_buf_size >= size) {
         return spi_bus->dma_buf;
     }
@@ -863,7 +865,14 @@ static rt_err_t drv_spi_configure(struct rt_spi_device* device, struct rt_spi_co
     if (spi_clock == 0) {
         return -RT_ERROR;
     }
-    div       = spi_clock / max_hz;
+    /* DesignWare BAUDR accepts even divisors from 2 through 65534.
+     * Round up so the resulting SCK never exceeds the requested limit. */
+    div = spi_clock / max_hz + (spi_clock % max_hz != 0);
+    if (div < 2)
+        div = 2;
+    if (div > 0xfffe)
+        return -RT_EINVAL;
+    div = (div + 1) & ~1U;
 
     mode = configuration->mode & RT_SPI_MODE_3;
 
@@ -1085,7 +1094,10 @@ static rt_uint32_t drv_spi_xfer_enhanced(dw_spi_bus_t* spi_bus, struct rt_qspi_c
                 goto multi_cleanup;
             }
 
-            if (dw_spi_buf_aligned(dst_buf, cell_size)) {
+            /* Filesystem metadata reads can target partial cache lines.
+             * Invalidate only private, complete lines, then copy back. */
+            if ((uintptr_t)dst_buf % RT_CPU_CACHE_LINE_SZ == 0 &&
+                total_bytes % RT_CPU_CACHE_LINE_SZ == 0) {
                 dma_buf = (void*)dst_buf;
             } else {
                 dma_buf = dw_spi_get_dma_buf(spi_bus, total_bytes);

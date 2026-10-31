@@ -6,7 +6,7 @@
 
 #define jiffies 100
 
-#define ERR_PTR(err) ((void*)(err))
+#define ERR_PTR(err) ((void*)(intptr_t)(err))
 #define PTR_ERR(err) ((unsigned long)(err))
 #define IS_ERR(err) ((unsigned long)err > (unsigned long)-1000L)
 

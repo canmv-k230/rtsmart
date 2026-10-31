@@ -70,6 +70,7 @@ int jffs2_flash_direct_writev(struct jffs2_sb_info *c,
 
 	for (i = 0; i < count; i++)
 	{
+		thislen = 0;
 		// writes need to be aligned but the data we're passed may not be
 		// Observation suggests most unaligned writes are small, so we
 		// optimize for that case.
@@ -105,6 +106,7 @@ int jffs2_flash_direct_writev(struct jffs2_sb_info *c,
 					memcpy(cbufptr, vecs[j].iov_base, vecs[j].iov_len);
 					cbufptr += vecs[j].iov_len;
 				}
+				memset(cbufptr, 0xff, sizetomalloc - totvecsize);
 				//rt_kprintf("direct_write: offset %d, size %d\n", to, sizetomalloc);
 				ret = jffs2_flash_write(c, to, sizetomalloc, &thislen,
 						(unsigned char *) cbuf);
@@ -124,7 +126,9 @@ int jffs2_flash_direct_writev(struct jffs2_sb_info *c,
 				// pad up in case its unaligned
 				lentowrite += sizeof(int) - 1;
 				lentowrite &= ~(sizeof(int) - 1);
-				memcpy(buf, vecs[i].iov_base, lentowrite);
+				/* Padding must not read past the caller's data buffer. */
+				memset(buf, 0xff, lentowrite);
+				memcpy(buf, vecs[i].iov_base, vecs[i].iov_len);
 
 				//rt_kprintf("direct_write: offset %d, size %d\n", to, lentowrite);
 				ret = jffs2_flash_write(c, to, lentowrite, &thislen,

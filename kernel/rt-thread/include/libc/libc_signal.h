@@ -16,6 +16,8 @@ extern "C" {
 #endif
 
 #include <stdint.h>
+/* musl supplies the signal types through <signal.h> below. */
+#ifndef RT_USING_MUSL
 #ifdef HAVE_CCONFIG_H
 #include <cconfig.h>
 #endif
@@ -54,6 +56,7 @@ struct siginfo
 };
 typedef struct siginfo siginfo_t;
 #endif
+#endif /* !RT_USING_MUSL */
 
 #if !defined(RT_USING_MUSL)
 #define SI_USER     0x01    /* Signal sent by kill(). */

@@ -256,7 +256,7 @@ static int find_entry(jffs2_dirsearch * ds)
 	struct _inode *dir = ds->dir;
 	const unsigned char *name = ds->path;
 	const unsigned char *n = name;
-	char namelen = 0;
+	int namelen = 0;
 	struct _inode *d;
 
 	D2(printf("find_entry\n"));
@@ -266,8 +266,11 @@ static int find_entry(jffs2_dirsearch * ds)
 		return ENOTDIR;
 
 	// Isolate the next element of the path name.
-	while (*n != '\0' && *n != '/')
+	while (*n != '\0' && *n != '/') {
+		if (namelen == JFFS2_NAME_MAX)
+			return ENAMETOOLONG;
 		n++, namelen++;
+	}
 
 	// Check if this is the last path element.
 	while( *n == '/') n++;
@@ -533,7 +536,13 @@ int jffs2_mount(cyg_fstab_entry * fste, cyg_mtab_entry * mte)
 		}
 		memset(c->inocache_list, 0, sizeof(struct jffs2_inode_cache *) * INOCACHE_HASHSIZE);
                 if (n_fs_mounted++ == 0) {
-                        jffs2_create_slab_caches(); // No error check, cannot fail
+			err = jffs2_create_slab_caches();
+			if (err) {
+				n_fs_mounted--;
+				rt_free(c->inocache_list);
+				rt_free(jffs2_sb);
+				return -err;
+			}
 			jffs2_compressors_init();
 		}
 
@@ -545,8 +554,8 @@ int jffs2_mount(cyg_fstab_entry * fste, cyg_mtab_entry * mte)
 				jffs2_compressors_exit();
 			}
 
-			rt_free(jffs2_sb);
 			rt_free(c->inocache_list);
+			rt_free(jffs2_sb);
 			return err;
 		}
 
@@ -1145,6 +1154,7 @@ static int jffs2_stat(cyg_mtab_entry * mte, cyg_dir dir, const char *name,
 		return err;
 
 	// Fill in the status
+	memset(buf, 0, sizeof(*buf));
 	buf->st_mode = ds.node->i_mode;
 	buf->st_ino = ds.node->i_ino;
 	buf->st_dev = 0;

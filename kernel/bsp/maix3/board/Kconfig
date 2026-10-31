@@ -21,6 +21,91 @@ menu "Board Configuration"
         bool "Fastboot, disable some log output"
         default n
 
+    config BSP_USING_SPI_NAND
+        bool "Register board SPI NAND filesystem partitions"
+        depends on LPKG_USING_SPINAND
+        default y
+        help
+            Attach and configure the board's SPI NAND and register its
+            spinand_parts.h partitions. Disable to use the driver with
+            your own board setup. Existing SPI NAND configurations keep
+            their automatic board registration by default.
+
+    if BSP_USING_SPI_NAND
+
+    choice
+        bool "SPI Nand On"
+
+        config SPI_NAND_ON_OSPI
+            bool "ospi"
+        config SPI_NAND_ON_QSPI0
+            bool "qspi0"
+        config SPI_NAND_ON_QSPI1
+            bool "qspi1"
+    endchoice
+
+    config SPI_NAND_SPI_DEV
+        string
+        default "spi0" if SPI_NAND_ON_OSPI
+        default "spi1" if SPI_NAND_ON_QSPI0
+        default "spi2" if SPI_NAND_ON_QSPI1
+
+    choice
+        bool "SPI Nand Bus Width"
+        default SPI_NAND_SPI_BUS_WIDTH_4
+
+        config SPI_NAND_SPI_BUS_WIDTH_1
+            bool "1"
+        config SPI_NAND_SPI_BUS_WIDTH_2
+            bool "2"
+        config SPI_NAND_SPI_BUS_WIDTH_4
+            bool "4"
+    endchoice
+
+    config SPI_NAND_SPI_BUS_WIDTH
+        int
+        default 1 if SPI_NAND_SPI_BUS_WIDTH_1
+        default 2 if SPI_NAND_SPI_BUS_WIDTH_2
+        default 4 if SPI_NAND_SPI_BUS_WIDTH_4
+
+    config SPI_NAND_SPI_FREQ
+        int "SPI Nand Bus Freq"
+        default 50000000
+
+    endif
+
+    config BSP_USING_SPI_NOR
+        bool "Boot SPI NOR filesystem partitions on SPI0 CS0"
+        depends on RT_USING_DFS && RT_USING_SPI && RT_USING_SPI0
+        select RT_USING_DFS_JFFS2
+        select RT_JFFS2_USING_ZLIB
+        select RT_USING_MTD_NOR
+        select RT_USING_SPINOR
+        default n
+        help
+            Register the board's spinor_parts.h partitions as MTD NOR devices
+            for compressed JFFS2 using the native SPI NOR driver, with
+            64 KiB erase blocks.
+
+    config BSP_SPI_NOR_MAX_HZ
+        int "Boot SPI NOR maximum clock (Hz)"
+        depends on BSP_USING_SPI_NOR
+        range 1000000 100000000
+        default 50000000
+        help
+            Board/flash wiring limit, equivalent to spi-max-frequency in
+            U-Boot's device tree. Choose a rate supported by the fitted chip.
+            Probe/fallback use at most 50 MHz; the controller rounds SCK down.
+
+    config BSP_SPI_NOR_MAX_LINES
+        int "Boot SPI NOR data lines wired"
+        depends on BSP_USING_SPI_NOR
+        range 1 8
+        default 4
+        help
+            Data lines between SPI0 and the flash: 1, 2, 4 or 8. Reads use the
+            widest mode both the chip profile and this wiring allow.
+
     config RT_BOARD_ENABLE_PINMUX
         bool "Enable Pinmux Configure"
         select RT_BOARD_ENABLE_PIN_INIT_SEQUENCE
