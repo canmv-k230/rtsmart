@@ -1,43 +1,38 @@
 menuconfig RT_USING_REGULATOR
     bool "Enable regulator Driver"
-    depends on RT_USING_PM
     default n
+    help
+        Board rails come from board/configs/<board>/regulator_config.c.
 
     if RT_USING_REGULATOR
         config RT_REGULATOR_ENABLE_BUILTIN_CMD
-            bool "Enable regulator debug command"
+            bool "Enable the regulator shell command"
             depends on RT_USING_MSH
             default n
             help
-                Enable the regulator_debug MSH command. The command can enable
-                regulators and change or sweep their output voltage.
+                Enable the regulator MSH command. It lists the board
+                rails and can enable them and set or sweep their voltage
+                within the rail limits.
 
         config RT_USING_REGULATOR_TPS6286X
             bool "Use TPS6286X"
             default n
 
-        config RT_USING_REGULATOR_DUMMY
-            bool "Use dummy regulator devices"
+        config RT_USING_REGULATOR_GPIO
+            bool "Use GPIO-controlled regulators"
+            depends on RT_USING_GPIO
             default n
-            depends on !RT_USING_REGULATOR_TPS6286X
             help
-                Register no-op regulator_cpu and regulator_kpu devices for tests.
-                Production DVFS should run frequency-only when no real regulator
-                provider is enabled.
+                Switches and LDOs with an enable GPIO and/or a GPIO selecting
+                between two voltages, such as SD card power.
 
-        menuconfig RT_USING_REGULATOR_CPU
-            bool "Enable regulator for CPU"
-
-            if RT_USING_REGULATOR_CPU
-                config RT_REGULATOR_CPU_I2C_DEV
-                    string "Regulator for CPU I2C Device name"
-            endif
-
-        menuconfig RT_USING_REGULATOR_KPU
-            bool "Enable regulator for KPU"
-
-            if RT_USING_REGULATOR_KPU
-                config RT_REGULATOR_KPU_I2C_DEV
-                    string "Regulator for KPU I2C Device name"
-            endif
+        config RT_USING_REGULATOR_K230_IOBANK
+            bool "Use K230 IO bank voltage switching"
+            depends on RT_USING_FPIOA
+            default n
+            help
+                Switches the voltage mode of a whole K230 IO bank between
+                3.3 V and 1.8 V, together with the regulator for the bank's
+                external rail (e.g. a GPIO regulator switching pull-ups), in
+                the order that keeps 1.8 V pads off 3.3 V. For SD UHS-I.
     endif

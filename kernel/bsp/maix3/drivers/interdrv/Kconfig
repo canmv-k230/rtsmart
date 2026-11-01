@@ -434,11 +434,54 @@ menu "InterDriver"
                     int
                     default 1 if SDIO0_BUS_WIDTH_4BIT
                     default 2 if SDIO0_BUS_WIDTH_8BIT
+
+                config RT_SDIO0_UHS
+                    bool "Enable SDIO0 SD UHS-I (1.8V signaling)"
+                    depends on !RT_SDIO0_EMMC && !RT_SDIO0_1V8 && RT_USING_REGULATOR
+                    default n
+                    help
+                        Needs hardware that switches the I/O bank supply between
+                        3.3 V and 1.8 V, described as a board regulator. Modes
+                        follow the controller: SDR104 needs the 200 MHz clock and
+                        the tuning PHY. A card power switch is strongly advised:
+                        a card left at 1.8 V survives a warm reset.
+
+                config RT_SDIO0_VQMMC
+                    string "SDIO0 I/O supply regulator"
+                    depends on RT_SDIO0_UHS
+                    default "sd0_vqmmc"
+
+                config RT_SDIO0_VMMC
+                    string "SDIO0 card power regulator (empty: none)"
+                    depends on RT_SDIO0_UHS
+                    default ""
             endif
 
             config RT_USING_SDIO1
                 bool "Enable SDIO1"
                 default n
+
+            config RT_SDIO1_UHS
+                bool "Enable SDIO1 SD UHS-I (1.8V signaling)"
+                depends on RT_USING_SDIO1 && RT_USING_REGULATOR
+                default n
+                help
+                    Needs hardware that switches the I/O bank supply between
+                    3.3 V and 1.8 V, described as a board regulator. SDIO1 has
+                    a 100 MHz clock and no tuning PHY: at most DDR50, or SDR50
+                    where the controller does not require tuning for it. A card
+                    power switch is strongly advised: a card left at 1.8 V
+                    survives a warm reset.
+
+            config RT_SDIO1_VQMMC
+                string "SDIO1 I/O supply regulator"
+                depends on RT_SDIO1_UHS
+                default "sd1_vqmmc"
+
+            config RT_SDIO1_VMMC
+                string "SDIO1 card power regulator (empty: none)"
+                depends on RT_SDIO1_UHS
+                default ""
 
             config RT_SDIO_SKIP_INITIAL_PROBE
                 bool "Skip SDIO probing on the first boot-storage scan"

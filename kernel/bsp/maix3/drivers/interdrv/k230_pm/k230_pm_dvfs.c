@@ -12,9 +12,7 @@
 #include "k230_pm_dvfs.h"
 #include "k230_pm_pid.h"
 #include "usage.h"
-
-struct regulator_dev;
-int regulator_set_voltage(struct regulator_dev *pdev, int vol_uv);
+#include "regulator.h"
 
 #define PROFILE_IS_UP(from, to) ((from) > (to))
 #define K230_DVFS_MAX_PROFILES K230_PM_MAX_PROFILE_COUNT
@@ -54,6 +52,8 @@ struct k230_dvfs_domain {
     int32_t thermal_protect_idx;
     bool thermal_over;
     struct regulator_dev *regulator;
+    /* The board has this rail but its provider failed: transitions blocked. */
+    bool regulator_failed;
 };
 
 static struct k230_dvfs_domain k230_dvfs_domains[K230_PM_DOMAIN_NR];
@@ -269,6 +269,12 @@ static int k230_dvfs_get_expect_profile(struct k230_dvfs_domain *domain)
     return 0;
 }
 
+static int k230_dvfs_set_voltage(struct k230_dvfs_domain *domain, int32_t idx)
+{
+    return regulator_set_voltage(domain->regulator, domain->desc->steps[idx].volt,
+        domain->desc->steps[0].volt);
+}
+
 static int k230_dvfs_set_actual_profile_locked(struct k230_dvfs_domain *domain)
 {
     int ret;
@@ -306,31 +312,27 @@ static int k230_dvfs_set_actual_profile_locked(struct k230_dvfs_domain *domain)
     if (domain->profile_valid && from_idx_cvt == to_idx_cvt) {
         return 0;
     }
+    if (domain->regulator_failed)
+        return K230_ERR_PM_NOTREADY;
 
     if (domain->regulator == RT_NULL) {
         ret = k230_dvfs_set_clock_step(domain, to_idx_cvt);
     } else if (!domain->profile_valid) {
         /* With an unknown boot frequency, raise to the maximum required
          * voltage before changing the clock, then settle at the target. */
-        ret = regulator_set_voltage(domain->regulator,
-            domain->desc->steps[0].volt);
-        if (ret == 0) {
-            rt_thread_mdelay(1);
+        ret = k230_dvfs_set_voltage(domain, 0);
+        if (ret == 0)
             ret = k230_dvfs_set_clock_step(domain, to_idx_cvt);
-        }
         if (ret == 0 && domain->desc->steps[0].volt !=
             domain->desc->steps[to_idx_cvt].volt) {
-            ret = regulator_set_voltage(domain->regulator,
-                domain->desc->steps[to_idx_cvt].volt);
+            ret = k230_dvfs_set_voltage(domain, to_idx_cvt);
         }
     } else if (PROFILE_IS_UP(from_idx_cvt, to_idx_cvt)) {
         if (domain->desc->steps[from_idx_cvt].volt ==
             domain->desc->steps[to_idx_cvt].volt) {
             ret = 0;
         } else {
-            ret = regulator_set_voltage(domain->regulator,
-                domain->desc->steps[to_idx_cvt].volt);
-            rt_thread_mdelay(1);
+            ret = k230_dvfs_set_voltage(domain, to_idx_cvt);
         }
         if (ret == 0)
             ret = k230_dvfs_set_clock_step(domain, to_idx_cvt);
@@ -338,8 +340,7 @@ static int k230_dvfs_set_actual_profile_locked(struct k230_dvfs_domain *domain)
         ret = k230_dvfs_set_clock_step(domain, to_idx_cvt);
         if (ret == 0 && domain->desc->steps[from_idx_cvt].volt !=
             domain->desc->steps[to_idx_cvt].volt) {
-            ret = regulator_set_voltage(domain->regulator,
-                domain->desc->steps[to_idx_cvt].volt);
+            ret = k230_dvfs_set_voltage(domain, to_idx_cvt);
             if (ret != 0) {
                 rollback_ret = k230_dvfs_set_clock_step(domain, from_idx_cvt);
                 if (rollback_ret != 0)
@@ -359,8 +360,7 @@ static int k230_dvfs_set_actual_profile_locked(struct k230_dvfs_domain *domain)
             int32_t actual_idx_cvt = k230_dvfs_profile_index_transform(domain,
                 domain->actual_profile_idx);
 
-            rollback_ret = regulator_set_voltage(domain->regulator,
-                domain->desc->steps[actual_idx_cvt].volt);
+            rollback_ret = k230_dvfs_set_voltage(domain, actual_idx_cvt);
             if (rollback_ret != 0)
                 rt_kprintf("k230_pm_dvfs: %s voltage reconcile failed: %d\n",
                     domain->desc->name, rollback_ret);
@@ -955,13 +955,45 @@ void k230_pm_dvfs_dump(void)
             k230_dvfs_profile_index_transform(dvfs, dvfs->actual_profile_idx),
             dvfs->clock_vote_count, dvfs->power_vote_count,
             dvfs->thermal_protect_temp, dvfs->thermal_protect_idx,
-            dvfs->regulator ? "yes" : "no");
+            dvfs->regulator ? "yes" : dvfs->regulator_failed ? "failed" : "no");
         for (j = 0; j < dvfs->desc->step_count; j++) {
             if (dvfs->profile_lock[j])
                 rt_kprintf("%u:%u ", j, dvfs->profile_lock[j]);
         }
         rt_kprintf("%s\n", dvfs->thermal_over ? "hot" : "");
     }
+}
+
+int k230_pm_dvfs_prepare_reset(void)
+{
+    int ret = 0;
+    unsigned int i;
+
+    if (!k230_dvfs_domains_initialized || rt_interrupt_get_nest() || !rt_thread_self())
+        return K230_ERR_PM_NOTREADY;
+    for (i = 0; i < k230_dvfs_domain_desc_count; ++i) {
+        struct k230_dvfs_domain *domain = &k230_dvfs_domains[i];
+        int volt, actual = 0, r;
+
+        if (!domain->desc || !domain->regulator || !domain->desc->step_count)
+            continue;
+        volt = domain->desc->steps[0].volt;
+        /* Held until the reset, so no governor or thermal update lowers it. */
+        if (rt_mutex_take(&domain->mutex, rt_tick_from_millisecond(100)) != RT_EOK) {
+            ret = K230_ERR_PM_BUSY;
+            continue;
+        }
+        /* Waits for the rise to settle before returning. */
+        r = regulator_set_voltage(domain->regulator, volt, volt);
+        if (r == 0)
+            r = regulator_get_voltage(domain->regulator, &actual);
+        if (r != 0 || actual < volt) {
+            rt_kprintf("k230_pm_dvfs: %s boot voltage %d uV not restored: %d\n",
+                domain->desc->name, volt, r);
+            ret = K230_ERR_PM_NOTREADY;
+        }
+    }
+    return ret;
 }
 
 int k230_pm_dvfs_init(void)
@@ -999,12 +1031,13 @@ int k230_pm_dvfs_init(void)
             dvfs->thermal_protect_temp = K230_DVFS_THERMAL_DEFAULT_TEMP;
             dvfs->thermal_protect_idx = dvfs->desc->step_count - 1;
 
-            if (dvfs->desc->regulator_name) {
-                dvfs->regulator = (struct regulator_dev *)
-                    rt_device_find(dvfs->desc->regulator_name);
-                if (dvfs->regulator == RT_NULL)
-                    rt_kprintf("k230_pm_dvfs: can't find %s device, skip voltage scaling\n",
-                        dvfs->desc->regulator_name);
+            /* No board rail: frequency-only. A failed one blocks transitions. */
+            dvfs->regulator = regulator_get(dvfs->desc->regulator_name);
+            if (dvfs->regulator && regulator_status(dvfs->regulator) != 0) {
+                rt_kprintf("k230_pm_dvfs: regulator %s failed (%d); transitions blocked\n",
+                    dvfs->desc->regulator_name, regulator_status(dvfs->regulator));
+                dvfs->regulator = RT_NULL;
+                dvfs->regulator_failed = true;
             }
         }
 
@@ -1033,11 +1066,4 @@ int k230_pm_dvfs_init(void)
 
     k230_dvfs_ready = true;
     return 0;
-}
-
-__attribute__((weak)) int regulator_set_voltage(struct regulator_dev *pdev, int vol_uv)
-{
-    (void)pdev;
-    (void)vol_uv;
-    return -1;
 }

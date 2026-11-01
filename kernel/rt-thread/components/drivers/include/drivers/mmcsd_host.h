@@ -86,6 +86,11 @@ struct rt_mmcsd_host_ops
     rt_int32_t (*get_card_status)(struct rt_mmcsd_host *host);
     void (*enable_sdio_irq)(struct rt_mmcsd_host *host, rt_int32_t en);
     rt_int32_t (*execute_tuning)(struct rt_mmcsd_host *host, rt_int32_t opcode);
+    /* Optional, for UHS-I: switch the I/O signaling, including its supply, to
+     * io_cfg->signal_voltage. */
+    rt_int32_t (*switch_signal_voltage)(struct rt_mmcsd_host *host, struct rt_mmcsd_io_cfg *io_cfg);
+    /* Optional: non-zero while the card holds DAT[0] low. */
+    rt_int32_t (*card_busy)(struct rt_mmcsd_host *host);
 };
 
 struct rt_mmcsd_host
@@ -130,6 +135,12 @@ struct rt_mmcsd_host
 #define MMCSD_SUP_HS200_1V2  (1 << 10)
 #define MMCSD_SUP_HS200     (MMCSD_SUP_HS200_1V2 | MMCSD_SUP_HS200_1V8) /* hs200 sdr */
 #define MMCSD_SUP_NONREMOVABLE  (1 << 11)
+/* SD UHS-I bus speed modes, at 1.8 V signaling after CMD11. */
+#define MMCSD_SUP_SDR50     (1 << 12)
+#define MMCSD_SUP_SDR104    (1 << 13)
+#define MMCSD_SUP_DDR50     (1 << 14)
+#define MMCSD_SUP_UHS       (MMCSD_SUP_SDR50 | MMCSD_SUP_SDR104 | MMCSD_SUP_DDR50)
+#define MMCSD_SDR50_TUNING  (1 << 15)   /* this host needs tuning for SDR50 */
 
     rt_uint32_t max_seg_size;   /* maximum size of one dma segment */
     rt_uint32_t max_dma_segs;   /* maximum number of dma segments in one request */

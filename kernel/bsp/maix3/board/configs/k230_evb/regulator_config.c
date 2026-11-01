@@ -1,4 +1,4 @@
-/* Copyright (c) 2023, Canaan Bright Sight Co., Ltd
+/* Copyright (c) 2026, Canaan Bright Sight Co., Ltd
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are met:
@@ -24,64 +24,36 @@
  */
 
 #include "regulator.h"
-#include <rtdevice.h>
-#include <rtthread.h>
 
-#define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 
-struct dummpy_dev {
-  struct regulator_dev dev;
-  const char *dev_name;
-};
-
-static int dummpy_init(struct regulator_dev *pdev) { return RT_EOK; }
-
-static int dummpy_deinit(struct regulator_dev *pdev) { return 0; }
-
-static int dummpy_enable(struct regulator_dev *pdev, bool enable) {
-  return RT_EOK;
-}
-
-static int dummpy_set_voltage(struct regulator_dev *pdev, int vol_uv) {
-  return RT_EOK;
-}
-
-static int dummpy_get_voltage(struct regulator_dev *pdev, int *pvol_uv) {
-  return RT_EOK;
-}
-
-static struct regulator_ops dummy_ops = {
-    .init = dummpy_init,
-    .deinit = dummpy_deinit,
-    .enable = dummpy_enable,
-    .set_voltage = dummpy_set_voltage,
-    .get_voltage = dummpy_get_voltage,
-};
-
-static struct dummpy_dev dev[2] = {
+/* Limits span the DVFS voltage tables; widen them only with silicon data.
+ * The 1 ms settle matches the allowance DVFS used before raising a clock. */
+static const struct regulator_config board_regulators[] = {
     {
-        .dev_name = "regulator_cpu",
+        .name = "regulator_cpu",
+        .driver = &regulator_tps6286x_driver,
+        .bus = "i2c4",
+        .addr = 0x49,
+        .min_uv = 620000,
+        .max_uv = 800000,
+        .settle_us = 1000,
+        .always_on = true,
     },
     {
-        .dev_name = "regulator_kpu",
+        .name = "regulator_kpu",
+        .driver = &regulator_tps6286x_driver,
+        .bus = "i2c1",
+        .addr = 0x49,
+        .min_uv = 800000,
+        .max_uv = 800000,
+        .settle_us = 1000,
+        .always_on = true,
     },
 };
 
-int regulator_dummpy_init(void) {
-  int ret;
-
-  for (int i = 0; i < ARRAY_SIZE(dev); i++) {
-    if(RT_NULL != rt_device_find(dev[i].dev_name)) {
-      continue;
-    }
-
-    ret = regulator_dev_register(&dev[i].dev, &dummy_ops, dev[i].dev_name);
-    if (ret) {
-      rt_kprintf("dummpy %d register fial: %d\n", i, ret);
-      break;
-    }
-  }
-
-  return ret;
+const struct regulator_config *board_regulator_configs(unsigned int *count)
+{
+    *count = ARRAY_SIZE(board_regulators);
+    return board_regulators;
 }
-INIT_DEVICE_EXPORT(regulator_dummpy_init);

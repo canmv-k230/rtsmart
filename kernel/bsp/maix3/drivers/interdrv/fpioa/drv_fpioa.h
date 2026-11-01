@@ -25,6 +25,7 @@
 
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #include "rtconfig.h"
@@ -311,6 +312,9 @@ typedef struct _fpioa_iomux_cfg {
 
 int drv_fpioa_get_pin_cfg(int pin, uint32_t* value);
 int drv_fpioa_set_pin_cfg(int pin, uint32_t value);
+/* Pad voltage mode (MSC). drv_fpioa_set_pin_cfg() never changes it; only the
+ * owner of the bank supply may, in step with that supply. */
+int drv_fpioa_set_pin_msc(int pin, bool v1p8);
 
 int drv_fpioa_get_pin_func(int pin, fpioa_func_t* func);
 int drv_fpioa_set_pin_func(int pin, fpioa_func_t func);

@@ -1,0 +1,166 @@
+/* Copyright (c) 2026, Canaan Bright Sight Co., Ltd
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ * 1. Redistributions of source code must retain the above copyright
+ * notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ * notice, this list of conditions and the following disclaimer in the
+ * documentation and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND
+ * CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES,
+ * INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR
+ * CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+ * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
+ * WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+ * NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
+/*
+ * TEMPLATE: SD UHS-I (1.8 V signaling) rails for a 01Studio-style board.
+ * Not built: board/SConscript only compiles regulator_config.c.
+ *
+ * On this board the SD card is on SDIO0 (the dedicated MMC0 pads with the
+ * PHY, not an IOMUX bank) and is the boot medium; SDIO1 carries the SDIO
+ * Wi-Fi. The SDHCI driver switches the PHY pad mode itself, after lowering
+ * and before raising the rail below.
+ *
+ * Hardware this assumes, which the current 01Studio board does not have:
+ *  - a GPIO that switches the SD card's I/O rail (pad supply and pull-ups)
+ *    between 3.3 V and 1.8 V; the card's own VDD stays at 3.3 V. The pin's
+ *    reset default (a pull resistor) must select 3.3 V: the boot ROM and SPL
+ *    do not drive it;
+ *  - a GPIO load switch on the card's 3.3 V VDD (sd0_vmmc below) that is on
+ *    by reset default (pull resistor), since the boot ROM needs the card
+ *    powered. A card stays at 1.8 V signaling until it loses power, and the
+ *    boot ROM reads it at 3.3 V after any reset:
+ *      - software reboot: rt_hw_cpu_reset() (kd_sdhci_prepare_reset()) cuts
+ *        the card power and restores 3.3 V I/O; the reset default powers the
+ *        card again at 3.3 V;
+ *      - watchdog and reset key: nothing runs first, so the hardware must
+ *        cut card VDD while the SoC is held in reset.
+ *    The switch also lets the driver power cycle a card after a failed
+ *    voltage switch.
+ *
+ * U-Boot stays at 3.3 V; its side (the same GPIOs as supplies of mmc0, so SPL
+ * and U-Boot power cycle the card and keep 3.3 V I/O) is the template
+ * u-boot arch/riscv/dts/k230_canmv_01studio_sd_uhs.dtsi.template.
+ *
+ * Bus speed modes follow the controller. SDIO0 has the 200 MHz clock and the
+ * tuning PHY, but its PHY delays are only set up for eMMC HS200: SD SDR104 is
+ * unvalidated, and a tuning failure falls back to SDR50 or DDR50.
+ *
+ * To use it:
+ *  1. Copy this file to regulator_config.c and set the GPIOs below. Each must
+ *     be configured as a GPIO in pinmux_config.c, on a bank whose voltage
+ *     matches the switch's control input.
+ *  2. Enable in configs/k230_canmv_01studio_defconfig:
+ *       CONFIG_RT_USING_REGULATOR_GPIO=y
+ *       CONFIG_RT_SDIO0_UHS=y
+ *       CONFIG_RT_SDIO0_VQMMC="sd0_vqmmc"
+ *       CONFIG_RT_SDIO0_VMMC="sd0_vmmc"   (or "" without a card power switch)
+ *     and, for checking, CONFIG_RT_REGULATOR_ENABLE_BUILTIN_CMD=y.
+ *  3. Boot log: "sd0: UHS-I SDR104 SDR50 DDR50" (the modes the controller
+ *     reports), then with a UHS card "selected timing: UHS SDR104 ...".
+ *     The regulator command shows sd0_vqmmc at 1800000 uV while the card runs.
+ *  4. Enable the U-Boot template with the same GPIOs.
+ *  5. Test reboot, the watchdog and the reset key with a UHS card inserted:
+ *     each must boot again from the card.
+ */
+
+#include "regulator.h"
+
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+
+/* GPIO switching the SD0 I/O rail; the level that selects 1.8 V. */
+#define SD0_IO_SELECT_PIN       (-1)
+#define SD0_IO_1V8_LEVEL_HIGH   1
+/* GPIO enabling the card's 3.3 V VDD; -1 without a card power switch. */
+#define SD0_POWER_ENABLE_PIN    (-1)
+#define SD0_POWER_ACTIVE_LOW    0
+
+#if SD0_IO_SELECT_PIN < 0
+#error "Set SD0_IO_SELECT_PIN to the GPIO that switches the SD0 I/O rail"
+#endif
+
+/* The I/O rail: volts[0] with the select pin low, volts[1] with it high. */
+static const struct regulator_gpio_data sd0_vqmmc_data = {
+    .enable_pin = -1,
+    .select_pin = SD0_IO_SELECT_PIN,
+#if SD0_IO_1V8_LEVEL_HIGH
+    .volts = { 3300000, 1800000 },
+#else
+    .volts = { 1800000, 3300000 },
+#endif
+};
+
+#if SD0_POWER_ENABLE_PIN >= 0
+/* Card VDD: always 3.3 V, only switched off and on. */
+static const struct regulator_gpio_data sd0_vmmc_data = {
+    .enable_pin = SD0_POWER_ENABLE_PIN,
+    .enable_active_low = SD0_POWER_ACTIVE_LOW,
+    .select_pin = -1,
+    .volts = { 3300000 },
+};
+#endif
+
+static const struct regulator_config board_regulators[] = {
+    {
+        .name = "sd0_vqmmc",
+        .driver = &regulator_gpio_driver,
+        .data = &sd0_vqmmc_data,
+        .min_uv = 1800000,
+        .max_uv = 3300000,
+        /* Rise time of the rail to 3.3 V; check on the board. The fall to
+         * 1.8 V is covered by the host's 5 ms wait after the switch. */
+        .settle_us = 1000,
+    },
+#if SD0_POWER_ENABLE_PIN >= 0
+    {
+        .name = "sd0_vmmc",
+        .driver = &regulator_gpio_driver,
+        .data = &sd0_vmmc_data,
+        .min_uv = 3300000,
+        .max_uv = 3300000,
+        /* VDD ramp before the first command; check on the board. */
+        .settle_us = 1000,
+    },
+#endif
+};
+
+/*
+ * Not for this board, where SDIO1 is the Wi-Fi and bank IO50-61 also holds
+ * its REG_ON pin (GPIO53). On a board with the SD card on SDIO1 (MMC1 on
+ * IO54-59), every pad of bank IO50-61 moves to 1.8 V with it. There the rail
+ * regulator becomes the supply of a bank regulator, which the host uses
+ * (CONFIG_RT_USING_REGULATOR_K230_IOBANK=y, CONFIG_RT_SDIO1_UHS=y):
+ *
+ *   The GPIO switching the bank's external rail (pad supply, pull-ups);
+ *   volts[0] with the select pin low, volts[1] with it high:
+ *   static const struct regulator_gpio_data sd1_rail_data = {
+ *       .enable_pin = -1, .select_pin = SD1_IO_SELECT_PIN,
+ *       .volts = { 3300000, 1800000 },
+ *   };
+ *   static const struct regulator_k230_iobank_data sd1_bank_data = {
+ *       .bank = K230_IOBANK_IO50_61, .supply = "sd1_rail", .fall_us = 1000,
+ *   };
+ *   { .name = "sd1_rail", .driver = &regulator_gpio_driver, .data = &sd1_rail_data,
+ *     .min_uv = 1800000, .max_uv = 3300000, .settle_us = 1000 },
+ *   { .name = "sd1_vqmmc", .driver = &regulator_k230_iobank_driver,
+ *     .data = &sd1_bank_data, .min_uv = 1800000, .max_uv = 3300000 },
+ *
+ * The rail entry must come before the bank entry.
+ */
+
+const struct regulator_config *board_regulator_configs(unsigned int *count)
+{
+    *count = ARRAY_SIZE(board_regulators);
+    return board_regulators;
+}

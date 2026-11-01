@@ -382,17 +382,9 @@ static const struct k230_dvfs_step k230_dvfs_display_steps[] = {
       .steps = (_steps), .step_count = sizeof(_steps) / sizeof((_steps)[0]), \
       .caps = (_caps) }
 
-#if defined(RT_USING_REGULATOR_DUMMY) || defined(RT_USING_REGULATOR_CPU)
+/* Rails the board may provide; a domain without one is frequency-only. */
 #define K230_CPU_REGULATOR_NAME "regulator_cpu"
-#else
-#define K230_CPU_REGULATOR_NAME NULL
-#endif
-
-#if defined(RT_USING_REGULATOR_DUMMY) || defined(RT_USING_REGULATOR_KPU)
 #define K230_KPU_REGULATOR_NAME "regulator_kpu"
-#else
-#define K230_KPU_REGULATOR_NAME NULL
-#endif
 
 const struct k230_dvfs_domain_desc k230_dvfs_domain_desc[] = {
     DVFS_DOMAIN("cpu", K230_PD_NONE, K230_CPU_REGULATOR_NAME, k230_dvfs_cpu_steps,

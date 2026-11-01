@@ -6,15 +6,21 @@ cwd     = GetCurrentDir()
 src     = []
 CPPPATH = [cwd]
 
-src += Glob('regulator.c')
+# regulator.h stays on the include path: without RT_USING_REGULATOR it
+# provides stubs, so consumers need no conditional includes.
+if GetDepend(['RT_USING_REGULATOR']):
+    src += Glob('regulator.c')
 
-if GetDepend(['RT_USING_REGULATOR_TPS6286X']):
-    src += Glob('tps6286x.c')
+    if GetDepend(['RT_USING_REGULATOR_TPS6286X']):
+        src += Glob('tps6286x.c')
 
-if GetDepend(['RT_USING_REGULATOR_DUMMY']):
-    src += Glob('dummy.c')
+    if GetDepend(['RT_USING_REGULATOR_GPIO']):
+        src += Glob('regulator_gpio.c')
 
-group = DefineGroup('REGULATOR', src, depend = ['RT_USING_PM', 'RT_USING_REGULATOR'], CPPPATH = CPPPATH)
+    if GetDepend(['RT_USING_REGULATOR_K230_IOBANK']):
+        src += Glob('regulator_k230_iobank.c')
+
+group = DefineGroup('REGULATOR', src, depend = [''], CPPPATH = CPPPATH)
 
 objs = [group]
 

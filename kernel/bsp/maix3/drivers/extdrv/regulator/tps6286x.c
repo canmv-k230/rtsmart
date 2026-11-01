@@ -35,194 +35,112 @@
 #define DBG_COLOR
 #include <rtdbg.h>
 
-#define ARRAY_SIZE(arr)     (sizeof(arr) / sizeof((arr)[0]))
-
-// tps6286x reg
 #define TPS6286X_VOUT1          0x01
 #define TPS6286X_CONTROL        0x03
-#define TPS6286X_CONTROL_FPWM	0x10
-#define TPS6286X_CONTROL_SWEN	0x20
+#define TPS6286X_CONTROL_SWEN   0x20
 
-#define TPS6286X_MIN_MV         400
-#define TPS6286X_MAX_MV         1675
-#define TPS6286X_STEP_MV        5
-
-struct tps6286x_dev {
-    struct regulator_dev dev;
-    const char *dev_name;
-    const char *i2c_name;
-    rt_uint16_t i2c_addr;
-    struct rt_i2c_bus_device *bus;
-    int base_uv;
-    int min_uv;
-    int max_uv;
-    int step_uv;
-};
-
-static int tps6286x_write_reg(struct tps6286x_dev *pdev, uint8_t reg,
-        uint8_t val)
+/* Bound bus ownership independently of unrelated I2C users. The K230
+ * master transfer itself has a hardware deadline. */
+static rt_size_t tps6286x_transfer(struct rt_i2c_bus_device *bus,
+    struct rt_i2c_msg *msgs, rt_uint32_t count)
 {
-    struct rt_i2c_msg msgs;
-    uint8_t buf[] = {reg, val};
-
-    msgs.addr  = pdev->i2c_addr;
-    msgs.flags = RT_I2C_WR;
-    msgs.buf   = buf;
-    msgs.len   = sizeof(buf);
-
-    if (rt_i2c_transfer(pdev->bus, &msgs, 1) != 1)
-        return -RT_ERROR;
-
-    return RT_EOK;
+    rt_size_t ret;
+    if (!bus || !bus->ops->master_xfer ||
+        rt_mutex_take(&bus->lock, rt_tick_from_millisecond(100)) != RT_EOK)
+        return 0;
+    ret = bus->ops->master_xfer(bus, msgs, count);
+    rt_mutex_release(&bus->lock);
+    return ret;
 }
 
-static int tps6286x_read_reg(struct tps6286x_dev *pdev, uint8_t reg,
-        uint8_t *pval)
+static int tps6286x_write_reg(struct regulator_dev *rdev, uint8_t reg, uint8_t val)
+{
+    struct rt_i2c_msg msg;
+    uint8_t buf[] = {reg, val};
+
+    msg.addr  = rdev->config->addr;
+    msg.flags = RT_I2C_WR;
+    msg.buf   = buf;
+    msg.len   = sizeof(buf);
+
+    return tps6286x_transfer(rdev->bus, &msg, 1) == 1 ? RT_EOK : -RT_EIO;
+}
+
+static int tps6286x_read_reg(struct regulator_dev *rdev, uint8_t reg, uint8_t *val)
 {
     struct rt_i2c_msg msgs[2];
 
-    msgs[0].addr  = pdev->i2c_addr;
+    msgs[0].addr  = rdev->config->addr;
     msgs[0].flags = RT_I2C_WR;
     msgs[0].buf   = &reg;
     msgs[0].len   = 1;
 
-    msgs[1].addr  = pdev->i2c_addr;
+    msgs[1].addr  = rdev->config->addr;
     msgs[1].flags = RT_I2C_RD;
-    msgs[1].buf   = pval;
+    msgs[1].buf   = val;
     msgs[1].len   = 1;
 
-    if (rt_i2c_transfer(pdev->bus, msgs, 2) != 2)
-        return -RT_ERROR;
-
-    return RT_EOK;
+    return tps6286x_transfer(rdev->bus, msgs, 2) == 2 ? RT_EOK : -RT_EIO;
 }
 
-static int tps6286x_update_reg(struct tps6286x_dev *pdev, uint8_t reg,
-        uint8_t val, uint8_t mask)
+static int tps6286x_init(struct regulator_dev *rdev)
 {
-    uint8_t reg_val;
-
-    if (tps6286x_read_reg(pdev, reg, &reg_val) != RT_EOK)
-        return -RT_ERROR;
-
-    reg_val &= ~mask;
-    reg_val |= val;
-
-    if (tps6286x_write_reg(pdev, reg, reg_val) != RT_EOK)
-        return -RT_ERROR;
-
-    return RT_EOK;
-}
-
-static int tps6286x_init(struct regulator_dev *pdev)
-{
+    struct rt_i2c_bus_device *bus;
     int ret;
-    struct tps6286x_dev *tps_dev = (struct tps6286x_dev *)pdev;
 
-    tps_dev->bus = (struct rt_i2c_bus_device *)rt_device_find(
-        tps_dev->i2c_name);
-    if (tps_dev->bus == RT_NULL) {
-        LOG_E("Can't find %s device", tps_dev->i2c_name);
+    bus = (struct rt_i2c_bus_device *)rt_device_find(rdev->config->bus);
+    if (bus == RT_NULL) {
+        LOG_E("%s: can't find %s", rdev->config->name, rdev->config->bus);
         return -RT_ERROR;
     }
-
-    ret = rt_device_open((rt_device_t)tps_dev->bus, RT_DEVICE_FLAG_RDWR);
+    ret = rt_device_open((rt_device_t)bus, RT_DEVICE_FLAG_RDWR);
     if (ret != RT_EOK) {
-        LOG_E("open %s device failed: %d", tps_dev->i2c_name, ret);
+        LOG_E("%s: open %s failed: %d", rdev->config->name, rdev->config->bus, ret);
         return -RT_ERROR;
     }
-
-    return ret;
-}
-
-static int tps6286x_deinit(struct regulator_dev *pdev)
-{
-    return 0;
-}
-
-static int tps6286x_enable(struct regulator_dev *pdev, bool enable)
-{
-    struct tps6286x_dev *tps_dev = (struct tps6286x_dev *)pdev;
-
-    return tps6286x_update_reg(tps_dev, TPS6286X_CONTROL, enable ?
-        TPS6286X_CONTROL_SWEN : 0, TPS6286X_CONTROL_SWEN);
-}
-
-static int tps6286x_set_voltage(struct regulator_dev *pdev, int vol_uv)
-{
-    struct tps6286x_dev *tps_dev = (struct tps6286x_dev *)pdev;
-
-    if (vol_uv > tps_dev->max_uv)
-        vol_uv = tps_dev->max_uv;
-    else if (vol_uv < tps_dev->min_uv)
-        vol_uv = tps_dev->min_uv;
-    vol_uv -= tps_dev->base_uv;
-
-    return tps6286x_write_reg(tps_dev, TPS6286X_VOUT1,
-        vol_uv / tps_dev->step_uv);
-}
-
-static int tps6286x_get_voltage(struct regulator_dev *pdev, int *pvol_uv)
-{
-    int ret;
-    uint8_t val;
-    struct tps6286x_dev *tps_dev = (struct tps6286x_dev *)pdev;
-
-    ret = tps6286x_read_reg(tps_dev, TPS6286X_VOUT1, &val);
-    if (ret != RT_EOK)
-        return -RT_ERROR;
-    *pvol_uv = val * tps_dev->step_uv + tps_dev->base_uv;
-
+    rdev->bus = bus;
     return RT_EOK;
 }
 
-static struct regulator_ops tps6286x_ops = {
-    .init = tps6286x_init,
-    .deinit = tps6286x_deinit,
-    .enable = tps6286x_enable,
-    .set_voltage = tps6286x_set_voltage,
-    .get_voltage = tps6286x_get_voltage,
-};
-
-static struct tps6286x_dev dev[2] = {
-#if defined (RT_USING_REGULATOR_CPU)
-    {
-        .dev_name = "regulator_cpu",
-        .i2c_name = RT_REGULATOR_CPU_I2C_DEV,
-        .i2c_addr = 0x49,
-        .base_uv = 400000,
-        .min_uv = 400000,
-        .max_uv = 1675000,
-        .step_uv = 5000,
-    },
-#endif
-
-#if defined (RT_USING_REGULATOR_KPU)
-    {
-        .dev_name = "regulator_kpu",
-        .i2c_name = RT_REGULATOR_KPU_I2C_DEV,
-        .i2c_addr = 0x49,
-        .base_uv = 400000,
-        .min_uv = 400000,
-        .max_uv = 1675000,
-        .step_uv = 5000,
-    },
-#endif
-};
-
-int regulator_tps6286x_init(void)
+static int tps6286x_set_enable(struct regulator_dev *rdev, bool enable)
 {
-    int ret;
+    uint8_t val;
 
-    for (int i = 0; i < ARRAY_SIZE(dev); i++) {
-        ret = regulator_dev_register(&dev[i].dev, &tps6286x_ops,
-            dev[i].dev_name);
-        if (ret) {
-            LOG_E("tps6286x %d register fial: %d\n", i, ret);
-            break;
-        }
-    }
+    if (tps6286x_read_reg(rdev, TPS6286X_CONTROL, &val) != RT_EOK)
+        return -RT_EIO;
+    val &= ~TPS6286X_CONTROL_SWEN;
+    if (enable)
+        val |= TPS6286X_CONTROL_SWEN;
+    return tps6286x_write_reg(rdev, TPS6286X_CONTROL, val);
+}
 
+static int tps6286x_set_selector(struct regulator_dev *rdev, unsigned int sel)
+{
+    return tps6286x_write_reg(rdev, TPS6286X_VOUT1, (uint8_t)sel);
+}
+
+static int tps6286x_get_selector(struct regulator_dev *rdev, unsigned int *sel)
+{
+    uint8_t val;
+    int ret = tps6286x_read_reg(rdev, TPS6286X_VOUT1, &val);
+
+    if (ret == RT_EOK)
+        *sel = val;
     return ret;
 }
-INIT_COMPONENT_EXPORT(regulator_tps6286x_init);
+
+static const struct regulator_ops tps6286x_ops = {
+    .init = tps6286x_init,
+    .set_enable = tps6286x_set_enable,
+    .set_selector = tps6286x_set_selector,
+    .get_selector = tps6286x_get_selector,
+};
+
+/* VOUT1: 0.4 V to 1.675 V in 5 mV steps. */
+const struct regulator_driver regulator_tps6286x_driver = {
+    .name = "tps6286x",
+    .ops = &tps6286x_ops,
+    .min_uv = 400000,
+    .step_uv = 5000,
+    .n_voltages = 256,
+};

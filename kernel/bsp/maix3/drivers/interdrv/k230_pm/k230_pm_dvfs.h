@@ -34,6 +34,10 @@ int k230_pm_dvfs_set_power(k230_pm_uapi_domain domain, bool enable);
 void k230_pm_dvfs_thermal_update(k230_pm_uapi_domain domain, int32_t temp);
 int32_t k230_pm_dvfs_thermal_shutdown_temp(void);
 void k230_pm_dvfs_dump(void);
+/* Before a software SoC reset: external regulators keep their output across
+ * it while boot code runs the maximum clocks. Raises every regulated rail to
+ * its profile-0 voltage and keeps those domains locked. Thread context only. */
+int k230_pm_dvfs_prepare_reset(void);
 
 #ifdef K230_PM_THERMAL_PROTECT
 int k230_pm_thermal_init(void);

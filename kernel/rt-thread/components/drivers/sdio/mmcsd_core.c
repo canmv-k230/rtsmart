@@ -575,6 +575,11 @@ static void mmcsd_power_up(struct rt_mmcsd_host *host)
     host->io_cfg.power_mode = MMCSD_POWER_UP;
     host->io_cfg.bus_width = MMCSD_BUS_WIDTH_1;
     mmcsd_set_iocfg(host);
+    /* Every card starts at 3.3 V signaling, whatever a previous session or
+     * a warm reset left behind. */
+    if (host->ops->switch_signal_voltage &&
+        mmcsd_set_signal_voltage(host, MMCSD_SIGNAL_VOLTAGE_330))
+        LOG_W("%s: failed to restore 3.3 V signaling", host->name);
 
     /*
      * This delay should be sufficient to allow the power supply
@@ -605,6 +610,30 @@ static void mmcsd_power_off(struct rt_mmcsd_host *host)
     host->io_cfg.power_mode = MMCSD_POWER_OFF;
     host->io_cfg.bus_width = MMCSD_BUS_WIDTH_1;
     mmcsd_set_iocfg(host);
+}
+
+/* Power the card off and on, the only way back to 3.3 V signaling once it
+ * has switched to 1.8 V. */
+void mmcsd_power_cycle(struct rt_mmcsd_host *host)
+{
+    mmcsd_power_off(host);
+    /* Let the card supply discharge before it returns. */
+    mmcsd_delay_ms(10);
+    mmcsd_power_up(host);
+}
+
+rt_int32_t mmcsd_set_signal_voltage(struct rt_mmcsd_host *host, unsigned char voltage)
+{
+    unsigned char old = host->io_cfg.signal_voltage;
+    rt_int32_t err;
+
+    if (!host->ops->switch_signal_voltage)
+        return voltage == MMCSD_SIGNAL_VOLTAGE_330 ? RT_EOK : -RT_ENOSYS;
+    host->io_cfg.signal_voltage = voltage;
+    err = host->ops->switch_signal_voltage(host, &host->io_cfg);
+    if (err)
+        host->io_cfg.signal_voltage = old;
+    return err;
 }
 
 int mmcsd_wait_cd_changed(rt_int32_t timeout)

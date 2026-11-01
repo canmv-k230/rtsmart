@@ -459,6 +459,29 @@ int drv_fpioa_set_pin_cfg(int pin, uint32_t value)
     return drv_fpioa_set_pmu_iomux(pin - 64, value);
 }
 
+int drv_fpioa_set_pin_msc(int pin, bool v1p8)
+{
+    volatile uint32_t* iomux_reg;
+    fpioa_iomux_cfg_t cfg;
+
+    if (pin < 0 || pin >= 64) {
+        rt_kprintf("[hal_fpioa]: Invalid pin %d for voltage mode\n", pin);
+        return -1;
+    }
+    iomux_reg = mmap_iomux();
+    if (iomux_reg == NULL) {
+        return -1;
+    }
+
+    drv_fpioa_lock();
+    cfg.u.value = read32(&iomux_reg[pin]);
+    cfg.u.bit.msc = v1p8 ? 1 : 0;
+    write32(&iomux_reg[pin], cfg.u.value);
+    drv_fpioa_unlock();
+
+    return 0;
+}
+
 const fpioa_func_cfg_t* drv_fpioa_get_func_cfg(fpioa_func_t func)
 {
     static fpioa_func_cfg_t gpio_dft_cfg     = { .func = GPIO0, .cfg = 0x18f, .name = "GPIO0" };

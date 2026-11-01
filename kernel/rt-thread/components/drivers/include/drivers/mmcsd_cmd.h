@@ -81,6 +81,7 @@ extern "C" {
 
   /* class 10 */
 #define SD_SWITCH                 6   /* adtc [31:0] See below   R1  */
+#define SD_SWITCH_VOLTAGE        11   /* ac                      R1  */
 
   /* Application commands */
 #define SD_APP_SET_BUS_WIDTH      6   /* ac   [1:0] bus width    R1  */

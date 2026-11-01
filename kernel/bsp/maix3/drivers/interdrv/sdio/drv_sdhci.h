@@ -493,6 +493,8 @@ struct sdhci_command
     uint16_t flags2;                           /*xfer mode*/
 };
 
+struct regulator_dev;
+
 struct sdhci_host
 {
     struct rt_mmcsd_host *host;
@@ -522,6 +524,10 @@ struct sdhci_host
     uint8_t index;
     uint8_t is_emmc_card;
     uint8_t io_fixed_1v8;
+    uint8_t signal_1v8;     /* switched to 1.8 V signaling (UHS-I) */
+    uint8_t power_mode;     /* last MMCSD_POWER_* applied */
+    struct regulator_dev *vmmc;     /* card power, optional */
+    struct regulator_dev *vqmmc;    /* I/O supply; UHS-I needs it */
     uint8_t have_phy;
     uint8_t mshc_ctrl_r;
     uint32_t rx_delay_line; /* SMPLDL_CNFG register value, including RX_EXTDLY_EN */
@@ -538,5 +544,8 @@ void kd_sdhci_change(int id);
 int kd_sdhci_wait_card(int id, int timeout);
 rt_err_t kd_sdhci_reset_host(int id);
 rt_err_t kd_sdhci0_reset(int value);
+/* Before a SoC reset: cut card power and return the I/O to 3.3 V, so the boot
+ * ROM finds the card at 3.3 V signaling. Thread context only. */
+void kd_sdhci_prepare_reset(void);
 
 #endif /*__DRV_SDHCI__*/

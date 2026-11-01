@@ -166,6 +166,8 @@ struct rt_mmcsd_req
 #define R2_SPI_CSD_OVERWRITE    R2_SPI_OUT_OF_RANGE
 
 #define CARD_BUSY   0x80000000  /* Card Power up status bit */
+#define SD_OCR_CCS  (1 << 30)   /* card capacity status */
+#define SD_OCR_S18R (1 << 24)   /* ACMD41: 1.8 V switching request/accepted */
 
 /* R5 response bits */
 #define R5_COM_CRC_ERROR    (1 << 15)
@@ -222,6 +224,8 @@ rt_inline rt_uint32_t __rt_fls(rt_uint32_t val)
 #define MMCSD_HOST_UNPLUGED     1
 
 rt_int32_t mmcsd_excute_tuning(struct rt_mmcsd_card *card);
+rt_int32_t mmcsd_set_signal_voltage(struct rt_mmcsd_host *host, unsigned char voltage);
+void mmcsd_power_cycle(struct rt_mmcsd_host *host);
 int mmcsd_wait_cd_changed(rt_int32_t timeout);
 int mmcsd_wait_host_ready(struct rt_mmcsd_host *host, rt_int32_t timeout);
 void mmcsd_host_lock(struct rt_mmcsd_host *host);

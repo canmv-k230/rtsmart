@@ -24,6 +24,7 @@
 
 #include "tick.h"
 #include "k230_pm.h"
+#include "regulator.h"
 #include "sysctl_boot.h"
 
 #ifdef RT_USING_SDIO
@@ -1383,11 +1384,21 @@ static rt_int32_t sdhci_execute_tuning_cmd(struct rt_mmcsd_host* mmcsd_host, rt_
     if (host->iocfg_error != RT_EOK)
         return host->iocfg_error;
 
-    if (!host->is_emmc_card || mmcsd_host->io_cfg.timing != MMCSD_TIMING_MMC_HS200)
-        return RT_EOK;
-
-    if (opcode != SEND_TUNING_BLOCK_HS200)
-        return -RT_ERROR;
+    if (host->is_emmc_card) {
+        if (mmcsd_host->io_cfg.timing != MMCSD_TIMING_MMC_HS200)
+            return RT_EOK;
+        if (opcode != SEND_TUNING_BLOCK_HS200)
+            return -RT_ERROR;
+    } else {
+        if (mmcsd_host->io_cfg.timing != MMCSD_TIMING_UHS_SDR104 &&
+            mmcsd_host->io_cfg.timing != MMCSD_TIMING_UHS_SDR50)
+            return RT_EOK;
+        if (opcode != SEND_TUNING_BLOCK)
+            return -RT_ERROR;
+    }
+    /* The tuning engine's delay lines are part of the PHY. */
+    if (!host->have_phy)
+        return -RT_ENOSYS;
 
     old_int_enable = sdhci_readl(host, SDHCI_INT_ENABLE);
     old_signal_enable = sdhci_readl(host, SDHCI_SIGNAL_ENABLE);
@@ -1440,13 +1451,13 @@ static rt_int32_t sdhci_execute_tuning_cmd(struct rt_mmcsd_host* mmcsd_host, rt_
         ret = -RT_ETIMEOUT;
 
     if (ret == RT_EOK) {
-        LOG_D("eMMC HS200 tuning passed after %u attempts", attempts);
+        LOG_D("host%d tuning passed after %u attempts", host->index, attempts);
         sdhci_reset(host, SDHCI_RESET_DATA);
     } else {
         sdhci_reset_tuning(host);
         sdhci_reset(host, SDHCI_RESET_CMD | SDHCI_RESET_DATA);
-        LOG_W("eMMC HS200 tuning failed, err=%d, attempts=%u, host_ctrl2=0x%04x, at_stat=0x%08x, err_stat=0x%04x.",
-            ret, attempts, ctrl2, at_stat, host->error_code);
+        LOG_W("host%d tuning failed, err=%d, attempts=%u, host_ctrl2=0x%04x, at_stat=0x%08x, err_stat=0x%04x.",
+            host->index, ret, attempts, ctrl2, at_stat, host->error_code);
     }
 
 restore_interrupts:
@@ -1556,7 +1567,7 @@ static void kd_mmc_set_timing(struct sdhci_host* host, uint32_t timing)
         break;
     }
 
-    if (host->io_fixed_1v8)
+    if (host->io_fixed_1v8 || host->signal_1v8)
         ctrl2 |= SDHCI_CTRL_VDD_180;
 
     sdhci_writew(host, ctrl2, SDHCI_HOST_CONTROL2);
@@ -1580,6 +1591,77 @@ static rt_bool_t kd_mmc_timing_is_high_speed(rt_uint32_t timing)
     }
 }
 
+/* Host side of the UHS-I voltage switch. Without an I/O supply the host
+ * stays at its fixed level, which serves only a 3.3 V request. */
+static rt_int32_t kd_switch_signal_voltage(struct rt_mmcsd_host* mmcsd_host,
+    struct rt_mmcsd_io_cfg* io_cfg)
+{
+    struct sdhci_host* host = (struct sdhci_host*)mmcsd_host->private_data;
+    uint16_t ctrl2;
+    rt_int32_t ret;
+
+    if (!host->vqmmc)
+        return io_cfg->signal_voltage == MMCSD_SIGNAL_VOLTAGE_330 ? RT_EOK : -RT_ENOSYS;
+
+    switch (io_cfg->signal_voltage) {
+    case MMCSD_SIGNAL_VOLTAGE_330:
+        ctrl2 = sdhci_readw(host, SDHCI_HOST_CONTROL2);
+        sdhci_writew(host, ctrl2 & ~SDHCI_CTRL_VDD_180, SDHCI_HOST_CONTROL2);
+        host->signal_1v8 = 0;
+        if (host->have_phy)
+            dwcmshc_phy_3_3v_init(host);
+        ret = regulator_set_voltage(host->vqmmc, 2700000, 3600000);
+        if (ret)
+            return ret;
+        rt_thread_mdelay(5);
+        return (sdhci_readw(host, SDHCI_HOST_CONTROL2) & SDHCI_CTRL_VDD_180) ?
+            -RT_EIO : RT_EOK;
+    case MMCSD_SIGNAL_VOLTAGE_180:
+        ret = regulator_set_voltage(host->vqmmc, 1700000, 1950000);
+        if (ret)
+            return ret;
+        ctrl2 = sdhci_readw(host, SDHCI_HOST_CONTROL2);
+        sdhci_writew(host, ctrl2 | SDHCI_CTRL_VDD_180, SDHCI_HOST_CONTROL2);
+        host->signal_1v8 = 1;
+        if (host->have_phy)
+            dwcmshc_phy_1_8v_init(host);
+        rt_thread_mdelay(5);
+        return (sdhci_readw(host, SDHCI_HOST_CONTROL2) & SDHCI_CTRL_VDD_180) ?
+            RT_EOK : -RT_EIO;
+    default:
+        return -RT_EINVAL;
+    }
+}
+
+/* The card holds DAT[0] low while busy. */
+static rt_int32_t kd_card_busy(struct rt_mmcsd_host* mmcsd_host)
+{
+    struct sdhci_host* host = (struct sdhci_host*)mmcsd_host->private_data;
+
+    return !(sdhci_readl(host, SDHCI_PRESENT_STATE) & (1U << SDHCI_DATA_LVL_SHIFT));
+}
+
+/* Card power follows the core's power state. Power-off also returns the I/O
+ * to 3.3 V, which the bank's other pads and the next card expect. */
+static void kd_set_power(struct sdhci_host* host, struct rt_mmcsd_io_cfg* io_cfg)
+{
+    if (io_cfg->power_mode == host->power_mode)
+        return;
+    host->power_mode = io_cfg->power_mode;
+    if (io_cfg->power_mode == MMCSD_POWER_OFF) {
+        if (host->vmmc)
+            (void)regulator_enable(host->vmmc, false);
+        if (host->signal_1v8) {
+            io_cfg->signal_voltage = MMCSD_SIGNAL_VOLTAGE_330;
+            if (kd_switch_signal_voltage(host->host, io_cfg) != RT_EOK)
+                LOG_E("host%d failed to restore 3.3 V signaling", host->index);
+        }
+    } else if (io_cfg->power_mode == MMCSD_POWER_UP && host->vmmc) {
+        if (regulator_enable(host->vmmc, true) != RT_EOK)
+            LOG_E("host%d failed to power the card", host->index);
+    }
+}
+
 static void kd_set_iocfg(struct rt_mmcsd_host* host, struct rt_mmcsd_io_cfg* io_cfg)
 {
     struct sdhci_host* mmcsd;
@@ -1595,6 +1677,7 @@ static void kd_set_iocfg(struct rt_mmcsd_host* host, struct rt_mmcsd_io_cfg* io_
     mmcsd = (struct sdhci_host*)host->private_data;
     sdhci_clk = io_cfg->clock;
     bus_width = io_cfg->bus_width;
+    kd_set_power(mmcsd, io_cfg);
 
     LOG_D("%s: sdhci_clk=%u, bus_width:%u, timing:%u",
         __func__, sdhci_clk, bus_width, io_cfg->timing);
@@ -1680,7 +1763,89 @@ static const struct rt_mmcsd_host_ops ops = {
     RT_NULL,
     kd_enable_sdio_irq,
     sdhci_execute_tuning_cmd,
+    kd_switch_signal_voltage,
+    kd_card_busy,
 };
+
+/* A card leaves 1.8 V signaling only by losing power. The card switch's reset
+ * default must power it again, now at 3.3 V; without a switch the card keeps
+ * 1.8 V until power-off, and the boot ROM cannot read it. */
+void kd_sdhci_prepare_reset(void)
+{
+    struct sdhci_host* hosts[] = { sdhci_host0, sdhci_host1 };
+    struct rt_mmcsd_io_cfg io_cfg;
+    rt_bool_t cut = RT_FALSE;
+    unsigned int i;
+
+    if (rt_interrupt_get_nest() || !rt_thread_self())
+        return;
+    for (i = 0; i < sizeof(hosts) / sizeof(hosts[0]); ++i) {
+        struct sdhci_host* host = hosts[i];
+
+        if (!host || (!host->vmmc && !host->signal_1v8))
+            continue;
+        if (host->vmmc && regulator_enable(host->vmmc, false) == RT_EOK)
+            cut = RT_TRUE;
+        if (host->signal_1v8) {
+            io_cfg = host->host->io_cfg;
+            io_cfg.signal_voltage = MMCSD_SIGNAL_VOLTAGE_330;
+            if (kd_switch_signal_voltage(host->host, &io_cfg) != RT_EOK)
+                LOG_E("host%d failed to restore 3.3 V signaling", host->index);
+        }
+    }
+    /* Let the card supply discharge before the reset. */
+    if (cut)
+        rt_thread_mdelay(10);
+}
+
+#if defined(RT_SDIO0_UHS) || defined(RT_SDIO1_UHS)
+/* UHS-I needs a switchable I/O supply. The modes follow the controller's
+ * capabilities, its base clock, and the PHY that tuning requires. */
+static void sdhci_setup_uhs(struct sdhci_host* sdhci, struct rt_mmcsd_host* mmcsd,
+    const char* vqmmc, const char* vmmc)
+{
+    uint32_t caps1 = sdhci_readl(sdhci, SDHCI_CAPABILITIES_1);
+    rt_bool_t sdr50_tuning = (caps1 & SDHCI_USE_SDR50_TUNING) != 0;
+
+    if (vmmc && vmmc[0]) {
+        sdhci->vmmc = regulator_get(vmmc);
+        if (!sdhci->vmmc || regulator_status(sdhci->vmmc)) {
+            LOG_W("sd%d: card supply %s unavailable", sdhci->index, vmmc);
+            sdhci->vmmc = RT_NULL;
+        } else {
+            /* Start unpowered: the first power-up then resets a card that a
+             * warm reset left at 1.8 V signaling. */
+            (void)regulator_enable(sdhci->vmmc, false);
+        }
+    }
+    sdhci->vqmmc = regulator_get(vqmmc);
+    if (!sdhci->vqmmc || regulator_status(sdhci->vqmmc)) {
+        LOG_W("sd%d: I/O supply %s unavailable, UHS-I disabled", sdhci->index, vqmmc);
+        sdhci->vqmmc = RT_NULL;
+        return;
+    }
+    if (!sdhci->vmmc)
+        LOG_W("sd%d: no card supply; a card left at 1.8 V needs a power cycle",
+            sdhci->index);
+
+    if (caps1 & SDHCI_SUPPORT_DDR50)
+        mmcsd->flags |= MMCSD_SUP_DDR50;
+    if ((caps1 & SDHCI_SUPPORT_SDR50) && sdhci->max_clk >= 100000000U &&
+        (!sdr50_tuning || sdhci->have_phy)) {
+        mmcsd->flags |= MMCSD_SUP_SDR50;
+        if (sdr50_tuning)
+            mmcsd->flags |= MMCSD_SDR50_TUNING;
+    }
+    if ((caps1 & SDHCI_SUPPORT_SDR104) && sdhci->max_clk >= 200000000U && sdhci->have_phy)
+        mmcsd->flags |= MMCSD_SUP_SDR104;
+    if (mmcsd->flags & MMCSD_SUP_UHS)
+        mmcsd->freq_max = sdhci->max_clk;
+    LOG_I("sd%d: UHS-I%s%s%s", sdhci->index,
+        (mmcsd->flags & MMCSD_SUP_SDR104) ? " SDR104" : "",
+        (mmcsd->flags & MMCSD_SUP_SDR50) ? " SDR50" : "",
+        (mmcsd->flags & MMCSD_SUP_DDR50) ? " DDR50" : "");
+}
+#endif
 
 rt_err_t kd_sdhci0_reset(int value)
 {
@@ -1842,6 +2007,9 @@ static rt_err_t kd_sdhci_init_host0(void *hi_sys_virt_addr)
         mmcsd->flags |= MMCSD_SUP_HS200_1V8;
 #endif
     }
+#ifdef RT_SDIO0_UHS
+    sdhci_setup_uhs(sdhci, mmcsd, RT_SDIO0_VQMMC, RT_SDIO0_VMMC);
+#endif
     mmcsd->valid_ocr = sdhci->io_fixed_1v8 ?
                        VDD_165_195 : VDD_32_33 | VDD_33_34;
     mmcsd->max_seg_size = sdhci->is_emmc_card ?
@@ -1936,6 +2104,9 @@ static rt_err_t kd_sdhci_init_host1(void *hi_sys_virt_addr)
     mmcsd->valid_ocr = VDD_32_33 | VDD_33_34;
     mmcsd->flags = MMCSD_BUSWIDTH_4 | MMCSD_MUTBLKWRITE |
                    MMCSD_SUP_HIGHSPEED | MMCSD_SUP_SDIO_IRQ;
+#ifdef RT_SDIO1_UHS
+    sdhci_setup_uhs(sdhci, mmcsd, RT_SDIO1_VQMMC, RT_SDIO1_VMMC);
+#endif
     mmcsd->max_seg_size = SDHCI_CARD_MAX_SEG_SIZE;
     mmcsd->max_dma_segs = 1;
     mmcsd->max_blk_size = 512;

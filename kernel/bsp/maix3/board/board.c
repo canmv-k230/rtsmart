@@ -26,6 +26,12 @@
 #include "sysctl_boot.h"
 #include "rtconfig.h"
 #include "k230_atag.h"
+#ifdef K230_PM_DVFS
+#include "k230_pm_dvfs.h"
+#endif
+#if defined(RT_USING_SDIO0) || defined(RT_USING_SDIO1)
+#include "drv_sdhci.h"
+#endif
 
 #define MEMORY_RESERVED     (0x1000)
 
@@ -321,6 +327,14 @@ void rt_hw_board_init(void)
 void rt_hw_cpu_reset(void)
 {
     // sbi_shutdown();
+#if defined(RT_USING_SDIO0) || defined(RT_USING_SDIO1)
+    /* A boot card left at 1.8 V signaling cannot be read by the boot ROM. */
+    kd_sdhci_prepare_reset();
+#endif
+#ifdef K230_PM_DVFS
+    /* Best effort; SPL restores the CPU rail for resets that bypass this. */
+    (void)k230_pm_dvfs_prepare_reset();
+#endif
     sysctl_boot_reset_soc();
     while(1);
 }

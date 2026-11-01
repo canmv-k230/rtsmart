@@ -592,6 +592,196 @@ rt_int32_t mmcsd_get_scr(struct rt_mmcsd_card *card, rt_uint32_t *scr)
 }
 
 
+/* UHS-I needs 1.8 V signaling, a 4-bit bus and a host that can switch. */
+static rt_bool_t mmcsd_sd_host_uhs(struct rt_mmcsd_host *host)
+{
+    return !controller_is_spi(host) && (host->flags & MMCSD_SUP_UHS) &&
+           (host->flags & MMCSD_BUSWIDTH_4) && host->ops->switch_signal_voltage;
+}
+
+/*
+ * CMD11 voltage switch sequence (SD Physical Layer 4.2.4.2). On failure the
+ * card may be left between the two levels and must be power cycled.
+ */
+static rt_int32_t mmcsd_sd_switch_voltage(struct rt_mmcsd_host *host)
+{
+    struct rt_mmcsd_cmd cmd;
+    rt_uint32_t clock = host->io_cfg.clock;
+    rt_int32_t err;
+
+    rt_memset(&cmd, 0, sizeof(struct rt_mmcsd_cmd));
+    cmd.cmd_code = SD_SWITCH_VOLTAGE;
+    cmd.arg = 0;
+    cmd.flags = RESP_R1 | CMD_AC;
+    err = mmcsd_send_cmd(host, &cmd, 0);
+    if (err)
+        return err;
+    if (cmd.resp[0] & R1_ERROR)
+        return -RT_EIO;
+
+    /* The card drives CMD and DAT[3:0] low right after the response. */
+    mmcsd_delay_ms(1);
+    if (host->ops->card_busy && !host->ops->card_busy(host))
+        return -RT_EIO;
+
+    /* Stop the clock for at least 5 ms while the signaling changes. */
+    mmcsd_set_clock(host, 0);
+    err = mmcsd_set_signal_voltage(host, MMCSD_SIGNAL_VOLTAGE_180);
+    if (err)
+        return err;
+    mmcsd_delay_ms(10);
+    mmcsd_set_clock(host, clock);
+
+    /* A card that switched releases DAT[3:0] within 1 ms. */
+    mmcsd_delay_ms(1);
+    if (host->ops->card_busy && host->ops->card_busy(host))
+        return -RT_EIO;
+    return RT_EOK;
+}
+
+/* CMD6 for function group 1 (bus speed mode), others unchanged. */
+static rt_int32_t mmcsd_sd_switch_func(struct rt_mmcsd_card *card, rt_bool_t set,
+                                       rt_uint8_t func, rt_uint8_t *status)
+{
+    struct rt_mmcsd_req req;
+    struct rt_mmcsd_cmd cmd;
+    struct rt_mmcsd_data data;
+
+    rt_memset(&cmd, 0, sizeof(struct rt_mmcsd_cmd));
+    cmd.cmd_code = SD_SWITCH;
+    cmd.arg = (set ? 0x80000000 : 0) | 0x00FFFFF0 | (func & 0xF);
+    cmd.flags = RESP_R1 | CMD_ADTC;
+
+    rt_memset(&data, 0, sizeof(struct rt_mmcsd_data));
+    mmcsd_set_data_timeout(&data, card);
+    data.blksize = 64;
+    data.blks = 1;
+    data.flags = DATA_DIR_READ;
+    data.buf = (rt_uint32_t *)status;
+
+    rt_memset(&req, 0, sizeof(struct rt_mmcsd_req));
+    req.cmd = &cmd;
+    req.data = &data;
+    mmcsd_send_request(card->host, &req);
+
+    if (cmd.err)
+        return cmd.err;
+    return data.err;
+}
+
+static const struct
+{
+    rt_uint32_t host_flag;  /* 0: every UHS host */
+    rt_uint8_t  func;       /* function group 1 */
+    rt_uint32_t timing;
+    rt_uint32_t clock;
+} sd_uhs_modes[] =
+{
+    { MMCSD_SUP_SDR104, 3, MMCSD_TIMING_UHS_SDR104, 208000000 },
+    { MMCSD_SUP_SDR50,  2, MMCSD_TIMING_UHS_SDR50,  100000000 },
+    { MMCSD_SUP_DDR50,  4, MMCSD_TIMING_UHS_DDR50,   50000000 },
+    { 0,                1, MMCSD_TIMING_UHS_SDR25,   50000000 },
+    { 0,                0, MMCSD_TIMING_UHS_SDR12,   25000000 },
+};
+
+/*
+ * Select the fastest bus speed mode both sides support, with the bus already
+ * 4 bits wide. A mode whose switch or tuning fails falls back to the next.
+ */
+static rt_int32_t mmcsd_sd_init_uhs(struct rt_mmcsd_card *card)
+{
+    struct rt_mmcsd_host *host = card->host;
+    rt_uint8_t *status;
+    rt_uint32_t i, clock;
+    rt_int32_t err;
+
+    status = (rt_uint8_t *)rt_malloc(64);
+    if (!status)
+        return -RT_ENOMEM;
+
+    err = mmcsd_sd_switch_func(card, RT_FALSE, 0xF, status);
+    if (err)
+        goto out;
+
+    for (i = 0; i < sizeof(sd_uhs_modes) / sizeof(sd_uhs_modes[0]); i++)
+    {
+        rt_bool_t tune;
+
+        if (sd_uhs_modes[i].host_flag && !(host->flags & sd_uhs_modes[i].host_flag))
+            continue;
+        /* Group 1 support bits: byte 13, bit n for function n. */
+        if (!(status[13] & (1U << sd_uhs_modes[i].func)))
+            continue;
+
+        err = mmcsd_sd_switch_func(card, RT_TRUE, sd_uhs_modes[i].func, status);
+        if (err)
+            goto out;
+        if ((status[16] & 0xF) != sd_uhs_modes[i].func)
+            continue;
+
+        clock = sd_uhs_modes[i].clock;
+        if (host->freq_max && clock > host->freq_max)
+            clock = host->freq_max;
+        mmcsd_set_timing(host, sd_uhs_modes[i].timing);
+        mmcsd_set_clock(host, clock);
+        card->hs_max_data_rate = clock;
+
+        tune = sd_uhs_modes[i].timing == MMCSD_TIMING_UHS_SDR104 ||
+               (sd_uhs_modes[i].timing == MMCSD_TIMING_UHS_SDR50 &&
+                (host->flags & MMCSD_SDR50_TUNING));
+        if (tune && mmcsd_excute_tuning(card) != RT_EOK)
+        {
+            LOG_W("%s: tuning failed, trying a slower mode", host->name);
+            /* Back to a clock the untuned bus handles, then re-read the
+             * support bits that the switch replaced in the status. */
+            mmcsd_set_timing(host, MMCSD_TIMING_UHS_SDR12);
+            mmcsd_set_clock(host, 25000000);
+            err = mmcsd_sd_switch_func(card, RT_FALSE, 0xF, status);
+            if (err)
+                goto out;
+            continue;
+        }
+        if (sd_uhs_modes[i].func)
+            card->flags |= CARD_FLAG_HIGHSPEED;
+        err = RT_EOK;
+        goto out;
+    }
+    /* SDR12 (function 0) is the default and always supported. */
+    err = -RT_ERROR;
+
+out:
+    rt_free(status);
+    return err;
+}
+
+static rt_int32_t mmcsd_sd_set_wide_bus(struct rt_mmcsd_card *card)
+{
+    struct rt_mmcsd_host *host = card->host;
+    rt_int32_t err;
+
+    if (!(host->flags & MMCSD_BUSWIDTH_4) ||
+        !(card->scr.sd_bus_widths & SD_SCR_BUS_WIDTH_4))
+        return RT_EOK;
+    err = mmcsd_app_set_bus_width(card, MMCSD_BUS_WIDTH_4);
+    if (!err)
+        mmcsd_set_bus_width(host, MMCSD_BUS_WIDTH_4);
+    return err;
+}
+
+static const char *mmcsd_sd_timing_name(struct rt_mmcsd_host *host)
+{
+    switch (host->io_cfg.timing)
+    {
+    case MMCSD_TIMING_UHS_SDR104: return "UHS SDR104";
+    case MMCSD_TIMING_UHS_SDR50:  return "UHS SDR50";
+    case MMCSD_TIMING_UHS_DDR50:  return "UHS DDR50";
+    case MMCSD_TIMING_UHS_SDR25:  return "UHS SDR25";
+    case MMCSD_TIMING_UHS_SDR12:  return "UHS SDR12";
+    default:
+        return (host->card->flags & CARD_FLAG_HIGHSPEED) ? "SD HS" : "legacy";
+    }
+}
+
 static rt_int32_t mmcsd_sd_init_card(struct rt_mmcsd_host *host,
                                      rt_uint32_t           ocr)
 {
@@ -600,22 +790,45 @@ static rt_int32_t mmcsd_sd_init_card(struct rt_mmcsd_host *host,
     rt_uint32_t resp[4];
     rt_uint32_t max_data_rate;
     rt_uint8_t ssr[64];
+    rt_uint32_t rocr = 0;
+    rt_bool_t uhs = mmcsd_sd_host_uhs(host);
 
+retry:
     mmcsd_go_idle(host);
 
     /*
      * If SD_SEND_IF_COND indicates an SD 2.0
      * compliant card and we should set bit 30
      * of the ocr to indicate that we can handle
-     * block-addressed SDHC cards.
+     * block-addressed SDHC cards. Such a card
+     * may also switch to 1.8 V signaling.
      */
     err = mmcsd_send_if_cond(host, ocr);
     if (!err)
-        ocr |= 1 << 30;
+    {
+        ocr |= SD_OCR_CCS;
+        if (uhs)
+            ocr |= SD_OCR_S18R;
+    }
 
-    err = mmcsd_send_app_op_cond(host, ocr, RT_NULL);
+    err = mmcsd_send_app_op_cond(host, ocr, &rocr);
     if (err)
         goto err;
+
+    if ((ocr & SD_OCR_S18R) &&
+        (rocr & (SD_OCR_CCS | SD_OCR_S18R)) == (SD_OCR_CCS | SD_OCR_S18R))
+    {
+        err = mmcsd_sd_switch_voltage(host);
+        if (err)
+        {
+            LOG_W("%s: 1.8 V switch failed (%d), continuing at 3.3 V",
+                  host->name, err);
+            mmcsd_power_cycle(host);
+            ocr &= ~SD_OCR_S18R;
+            uhs = RT_FALSE;
+            goto retry;
+        }
+    }
 
     if (controller_is_spi(host))
         err = mmcsd_get_cid(host, resp);
@@ -683,6 +896,28 @@ static rt_int32_t mmcsd_sd_init_card(struct rt_mmcsd_host *host,
             goto err1;
     }
 
+    if (host->io_cfg.signal_voltage == MMCSD_SIGNAL_VOLTAGE_180)
+    {
+        /* UHS-I: the bus speed mode is selected on the 4-bit bus. */
+        err = mmcsd_sd_set_wide_bus(card);
+        if (!err)
+            err = mmcsd_sd_init_uhs(card);
+        if (err)
+        {
+            /* The card leaves 1.8 V only by losing power. */
+            LOG_W("%s: UHS-I setup failed (%d), continuing at 3.3 V",
+                  host->name, err);
+            rt_free(card);
+            mmcsd_set_timing(host, MMCSD_TIMING_LEGACY);
+            mmcsd_power_cycle(host);
+            ocr &= ~SD_OCR_S18R;
+            uhs = RT_FALSE;
+            goto retry;
+        }
+        host->card = card;
+        return 0;
+    }
+
     /*
      * change SD card to high-speed, only SD2.0 spec
      */
@@ -706,15 +941,9 @@ static rt_int32_t mmcsd_sd_init_card(struct rt_mmcsd_host *host,
     mmcsd_set_clock(host, max_data_rate);
 
     /*switch bus width*/
-    if ((host->flags & MMCSD_BUSWIDTH_4) &&
-        (card->scr.sd_bus_widths & SD_SCR_BUS_WIDTH_4)) 
-    {
-        err = mmcsd_app_set_bus_width(card, MMCSD_BUS_WIDTH_4);
-        if (err)
-            goto err1;
-
-        mmcsd_set_bus_width(host, MMCSD_BUS_WIDTH_4);
-    }
+    err = mmcsd_sd_set_wide_bus(card);
+    if (err)
+        goto err1;
 
     host->card = card;
 
@@ -782,7 +1011,7 @@ rt_int32_t init_sd(struct rt_mmcsd_host *host, rt_uint32_t ocr)
 
     LOG_I("%s: selected timing: %s, %u-bit, clock=%u Hz",
           host->name,
-          (host->card->flags & CARD_FLAG_HIGHSPEED) ? "SD HS" : "legacy",
+          mmcsd_sd_timing_name(host),
           1U << host->io_cfg.bus_width, host->io_cfg.clock);
 
     return 0;

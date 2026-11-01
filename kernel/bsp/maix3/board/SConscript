@@ -20,6 +20,11 @@ if GetDepend(['CONFIG_BOARD']) and (GetDepend(['RT_BOARD_ENABLE_PINMUX']) or Get
 else:
     SrcRemove(src, ['pinmux.c'])
 
+# Board rails for the regulator framework.
+if GetDepend(['CONFIG_BOARD']) and GetDepend(['RT_USING_REGULATOR']):
+    board = GetConfigValue('CONFIG_BOARD').strip('"')
+    src += Glob('configs/' + board + '/regulator_config.c')
+
 group = DefineGroup('Board', src, depend = [''], CPPPATH = path, CPPDEFINES = CPPDEFINES)
 
 objs = [group]
