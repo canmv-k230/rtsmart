@@ -30,11 +30,8 @@
 
 #include <lwp_user_mm.h>
 
-#include <ioremap.h>
-#include <riscv_io.h>
-
-#include "board.h"
 #include "drv_wdt.h"
+#include "wdt_hw.h"
 #include "sysctl_clk.h"
 #include "k230_pm.h"
 
@@ -84,20 +81,6 @@
 #define KD_WDT_UNUSED
 #endif
 
-#define KD_WDT_REG_CR                   0x00U
-#define KD_WDT_REG_TORR                 0x04U
-#define KD_WDT_REG_CCVR                 0x08U
-#define KD_WDT_REG_CRR                  0x0CU
-#define KD_WDT_REG_STAT                 0x10U
-#define KD_WDT_REG_EOI                  0x14U
-#define KD_WDT_REG_COMP_PARAM_1         0xF4U
-#define KD_WDT_CR_EN                    (1U << 0)
-#define KD_WDT_CR_RMOD                  (1U << 1)
-#define KD_WDT_TORR_TOP_MASK            0x0FU
-#define KD_WDT_TORR_TOP_SHIFT           0U
-#define KD_WDT_CRR_RESTART_KEY          0x76U
-#define KD_WDT_COMP_PARAM_1_USE_FIX_TOP (1U << 6)
-
 /*
  * There are sixteen fixed TOP values in the watchdog.
  * Each entry represents a timeout period of 2^(16 + idx) watchdog input clocks,
@@ -134,8 +117,6 @@ struct kd_wdt_state {
 struct kd_wdt_config {
     const char* name;
     const char* feeder_name;
-    rt_ubase_t  addr;
-    rt_size_t   reg_size;
     int         irqno;
     int         clock_id;
 };
@@ -154,7 +135,6 @@ struct kd_wdt_timeout_choice {
 
 struct kd_wdt_inst {
     struct rt_device            device;
-    void*                       reg;
     const struct kd_wdt_config* config;
     const rt_uint32_t*          tops;
     struct kd_wdt_timeout       timeouts[KD_WDT_NUM_TOPS];
@@ -164,8 +144,6 @@ struct kd_wdt_inst {
 static const struct kd_wdt_config kd_wdt_config = {
     .name        = "watchdog1",
     .feeder_name = "wdt_feed1",
-    .addr        = WDT1_BASE_ADDR,
-    .reg_size    = WDT1_IO_SIZE,
     .irqno       = IRQN_WDT1,
     .clock_id    = SYSCTL_CLK_WDT1_CLK,
 };
@@ -187,17 +165,8 @@ static rt_uint32_t                  kd_wdt_select_timeout_top(struct kd_wdt_inst
 static const struct kd_wdt_timeout* kd_wdt_find_timeout(struct kd_wdt_inst* inst, rt_uint32_t top_val);
 static inline rt_uint32_t           kd_wdt_timeout_factor(struct kd_wdt_inst* inst);
 
-/* Basic device and MMIO helpers. */
+/* Basic device helpers; registers are reached through wdt_hw. */
 static inline struct kd_wdt_inst* kd_wdt_from_device(rt_device_t dev) { return (struct kd_wdt_inst*)dev->user_data; }
-
-static inline void* kd_wdt_reg_ptr(struct kd_wdt_inst* inst, rt_uint32_t reg) { return (rt_uint8_t*)inst->reg + reg; }
-
-static inline rt_uint32_t kd_wdt_readl(struct kd_wdt_inst* inst, rt_uint32_t reg) { return readl(kd_wdt_reg_ptr(inst, reg)); }
-
-static inline void kd_wdt_writel(struct kd_wdt_inst* inst, rt_uint32_t reg, rt_uint32_t value)
-{
-    writel(value, kd_wdt_reg_ptr(inst, reg));
-}
 
 static inline rt_uint32_t kd_wdt_get_root_clock(struct kd_wdt_inst* inst)
 {
@@ -297,63 +266,6 @@ static inline rt_uint32_t kd_wdt_timeout_factor(struct kd_wdt_inst* inst)
 #endif
 }
 
-static inline rt_bool_t kd_wdt_hw_is_enabled(struct kd_wdt_inst* inst)
-{
-    return (kd_wdt_readl(inst, KD_WDT_REG_CR) & KD_WDT_CR_EN) != 0;
-}
-
-static inline void kd_wdt_hw_restart(struct kd_wdt_inst* inst) { kd_wdt_writel(inst, KD_WDT_REG_CRR, KD_WDT_CRR_RESTART_KEY); }
-
-static void kd_wdt_hw_set_response_mode(struct kd_wdt_inst* inst, rt_bool_t irq_mode)
-{
-    rt_uint32_t ctrl = kd_wdt_readl(inst, KD_WDT_REG_CR);
-
-    if (irq_mode) {
-        ctrl |= KD_WDT_CR_RMOD;
-    } else {
-        ctrl &= ~KD_WDT_CR_RMOD;
-    }
-
-    kd_wdt_writel(inst, KD_WDT_REG_CR, ctrl);
-}
-
-static void kd_wdt_hw_enable(struct kd_wdt_inst* inst)
-{
-    rt_uint32_t ctrl = kd_wdt_readl(inst, KD_WDT_REG_CR);
-
-    kd_wdt_hw_restart(inst);
-    ctrl |= KD_WDT_CR_EN;
-    kd_wdt_writel(inst, KD_WDT_REG_CR, ctrl);
-}
-
-static void kd_wdt_hw_set_timeout_top(struct kd_wdt_inst* inst, rt_uint32_t top_val)
-{
-    rt_uint32_t torr = (top_val & KD_WDT_TORR_TOP_MASK) << KD_WDT_TORR_TOP_SHIFT;
-
-    kd_wdt_writel(inst, KD_WDT_REG_TORR, torr);
-}
-
-static inline rt_uint32_t kd_wdt_hw_get_timeout_top(struct kd_wdt_inst* inst)
-{
-    return (kd_wdt_readl(inst, KD_WDT_REG_TORR) >> KD_WDT_TORR_TOP_SHIFT) & KD_WDT_TORR_TOP_MASK;
-}
-
-#if KD_WDT_ENABLE_PRETIMEOUT
-static inline rt_uint32_t kd_wdt_hw_get_counter(struct kd_wdt_inst* inst) { return kd_wdt_readl(inst, KD_WDT_REG_CCVR); }
-
-static inline rt_bool_t kd_wdt_hw_irq_pending(struct kd_wdt_inst* inst)
-{
-    return (kd_wdt_readl(inst, KD_WDT_REG_STAT) & 0x1U) != 0;
-}
-
-static inline void kd_wdt_hw_clear_irq(struct kd_wdt_inst* inst) { (void)kd_wdt_readl(inst, KD_WDT_REG_EOI); }
-#endif
-
-static inline rt_bool_t kd_wdt_hw_uses_fix_top(struct kd_wdt_inst* inst)
-{
-    return (kd_wdt_readl(inst, KD_WDT_REG_COMP_PARAM_1) & KD_WDT_COMP_PARAM_1_USE_FIX_TOP) != 0;
-}
-
 /* Ownership and timeout bookkeeping helpers. */
 static void kd_wdt_runtime_reset_locked(struct kd_wdt_inst* inst)
 {
@@ -366,11 +278,11 @@ static void kd_wdt_runtime_reset_locked(struct kd_wdt_inst* inst)
 
 static void kd_wdt_apply_timeout_locked(struct kd_wdt_inst* inst, rt_uint32_t top_val)
 {
-    kd_wdt_hw_set_timeout_top(inst, top_val);
+    wdt_hw_set_top(top_val);
 
     /* TRM: a new TOP only takes effect after the next restart. */
     if (inst->state.running) {
-        kd_wdt_hw_restart(inst);
+        wdt_hw_restart();
     }
 }
 
@@ -381,7 +293,7 @@ static void kd_wdt_switch_to_kernel_locked(struct kd_wdt_inst* inst)
     const struct kd_wdt_timeout* wdt_timeout;
 
     kd_wdt_runtime_reset_locked(inst);
-    kd_wdt_hw_set_response_mode(inst, RT_FALSE);
+    wdt_hw_set_response_mode(RT_FALSE);
 
     choice = kd_wdt_choose_timeout(inst, KD_WDT_DEFAULT_TIMEOUT_SEC);
     if (choice.div != 0 && kd_wdt_set_clock_div(inst, choice.div) == RT_EOK) {
@@ -407,10 +319,10 @@ static void kd_wdt_claim_user_locked(struct kd_wdt_inst* inst, pid_t pid)
     inst->state.pretimeout_pid = 0;
     inst->state.reset_mode     = KD_WDT_RMOD_RESET;
 #endif
-    kd_wdt_hw_set_response_mode(inst, RT_FALSE);
+    wdt_hw_set_response_mode(RT_FALSE);
 
     if (inst->state.running) {
-        kd_wdt_hw_restart(inst);
+        wdt_hw_restart();
     }
 }
 
@@ -586,7 +498,7 @@ static rt_err_t kd_wdt_runtime_init(struct kd_wdt_inst* inst)
 /* Active watchdog operations. */
 static rt_err_t kd_wdt_feed_inst(struct kd_wdt_inst* inst)
 {
-    kd_wdt_hw_restart(inst);
+    wdt_hw_restart();
 
     return RT_EOK;
 }
@@ -596,7 +508,7 @@ rt_err_t kd_wdt_feed(void)
     struct kd_wdt_inst* inst = &kd_wdt_dev;
     rt_base_t           level;
 
-    if (!inst->state.initialized || inst->reg == RT_NULL) {
+    if (!inst->state.initialized || !wdt_hw_ready()) {
         return -RT_ERROR;
     }
 
@@ -612,7 +524,7 @@ static rt_err_t kd_wdt_enable(struct kd_wdt_inst* inst)
     rt_base_t level;
 
     level = kd_wdt_runtime_lock(inst);
-    kd_wdt_hw_enable(inst);
+    wdt_hw_enable();
     inst->state.running = RT_TRUE;
     kd_wdt_runtime_unlock(inst, level);
 
@@ -654,7 +566,7 @@ static rt_err_t kd_wdt_set_timeout(struct kd_wdt_inst* inst, rt_uint64_t timeout
 static rt_err_t kd_wdt_get_timeout(struct kd_wdt_inst* inst, void* timeout)
 {
     const struct kd_wdt_timeout* wdt_timeout;
-    rt_uint32_t                  top_val = kd_wdt_hw_get_timeout_top(inst);
+    rt_uint32_t                  top_val = wdt_hw_get_top();
     rt_uint32_t                  factor;
     rt_base_t                    level;
 
@@ -689,11 +601,11 @@ static rt_err_t KD_WDT_UNUSED kd_wdt_set_pretimeout(struct kd_wdt_inst* inst, rt
 
         inst->state.pretimeout_pid = inst->state.owner_pid ? inst->state.owner_pid : pid;
         inst->state.reset_mode     = KD_WDT_RMOD_IRQ;
-        kd_wdt_hw_set_response_mode(inst, RT_TRUE);
+        wdt_hw_set_response_mode(RT_TRUE);
     } else {
         inst->state.pretimeout_pid = 0;
         inst->state.reset_mode     = KD_WDT_RMOD_RESET;
-        kd_wdt_hw_set_response_mode(inst, RT_FALSE);
+        wdt_hw_set_response_mode(RT_FALSE);
     }
     current_timeout = inst->state.timeout_sec;
     kd_wdt_runtime_unlock(inst, level);
@@ -715,12 +627,12 @@ static rt_err_t KD_WDT_UNUSED kd_wdt_get_timeleft(struct kd_wdt_inst* inst, void
         return -RT_ERROR;
     }
 
-    counter_sec = ((rt_uint64_t)kd_wdt_hw_get_counter(inst) + wdt_clk - 1) / wdt_clk;
+    counter_sec = ((rt_uint64_t)wdt_hw_counter() + wdt_clk - 1) / wdt_clk;
 
     level              = kd_wdt_runtime_lock(inst);
     reset_mode         = inst->state.reset_mode;
     current_period_sec = inst->state.timeout_sec / reset_mode;
-    irq_pending        = kd_wdt_hw_irq_pending(inst);
+    irq_pending        = wdt_hw_irq_pending();
     kd_wdt_runtime_unlock(inst, level);
 
     if (!irq_pending && reset_mode == KD_WDT_RMOD_IRQ) {
@@ -744,9 +656,9 @@ static rt_err_t kd_wdt_init(struct kd_wdt_inst* inst)
         return ret;
     }
 
-    kd_wdt_hw_set_response_mode(inst, RT_FALSE);
+    wdt_hw_set_response_mode(RT_FALSE);
 
-    inst->tops = kd_wdt_hw_uses_fix_top(inst) ? kd_wdt_fix_tops : RT_NULL;
+    inst->tops = wdt_hw_uses_fix_top() ? kd_wdt_fix_tops : RT_NULL;
     ret        = kd_wdt_timeouts_init(inst);
     if (ret != RT_EOK) {
         LOG_E("watchdog timeout table init failed %d", ret);
@@ -762,7 +674,7 @@ static rt_err_t kd_wdt_init(struct kd_wdt_inst* inst)
 
     inst->state.running = RT_FALSE;
     kd_wdt_switch_to_kernel_locked(inst);
-    kd_wdt_hw_enable(inst);
+    wdt_hw_enable();
     inst->state.running = RT_TRUE;
 
     kd_wdt_runtime_unlock(inst, level);
@@ -871,15 +783,15 @@ static void kd_wdt_irq_handler(int irq, void* param)
     (void)irq;
 
     level = kd_wdt_runtime_lock(inst);
-    if (!kd_wdt_hw_irq_pending(inst)) {
+    if (!wdt_hw_irq_pending()) {
         kd_wdt_runtime_unlock(inst, level);
         return;
     }
 
     pretimeout_pid = inst->state.pretimeout_pid;
     kd_wdt_runtime_reset_locked(inst);
-    kd_wdt_hw_set_response_mode(inst, RT_FALSE);
-    kd_wdt_hw_clear_irq(inst);
+    wdt_hw_set_response_mode(RT_FALSE);
+    wdt_hw_clear_irq();
     kd_wdt_runtime_unlock(inst, level);
 
     rt_kprintf("watchdog pretimeout\n");
@@ -923,11 +835,12 @@ int rt_hw_wdt_init(void)
         return ret;
     }
 
-    inst->reg = rt_ioremap((void*)inst->config->addr, inst->config->reg_size);
-    if (inst->reg == RT_NULL) {
-        LOG_E("ioremap failed for %s", inst->config->name);
+    /* The PM reference held from here on keeps WDT1 clocked for wdt_hw. */
+    ret = wdt_hw_init();
+    if (ret != RT_EOK) {
+        LOG_E("wdt_hw_init failed for %s: %d", inst->config->name, ret);
         (void)k230_pm_put(K230_PM_DEV_WDT1);
-        return -RT_ENOMEM;
+        return ret;
     }
 
     inst->device.type        = RT_Device_Class_WDT;
@@ -949,8 +862,7 @@ int rt_hw_wdt_init(void)
     ret = rt_device_register(&inst->device, inst->config->name, RT_DEVICE_FLAG_RDWR | RT_DEVICE_FLAG_STANDALONE);
     if (ret != RT_EOK) {
         LOG_E("register %s failed %d", inst->config->name, ret);
-        rt_iounmap(inst->reg);
-        inst->reg = RT_NULL;
+        wdt_hw_deinit();
         (void)k230_pm_put(K230_PM_DEV_WDT1);
         return ret;
     }
@@ -967,8 +879,7 @@ int rt_hw_wdt_init(void)
         rt_hw_interrupt_mask(inst->config->irqno);
 #endif
         rt_device_unregister(&inst->device);
-        rt_iounmap(inst->reg);
-        inst->reg = RT_NULL;
+        wdt_hw_deinit();
         (void)k230_pm_put(K230_PM_DEV_WDT1);
         return ret;
     }
