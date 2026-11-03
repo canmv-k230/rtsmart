@@ -68,4 +68,17 @@ int k230_pmu_rtc_set_alarm(const struct kd_alarm_setup *setup);
 void k230_pmu_rtc_stop_alarm(void);
 void k230_pmu_rtc_stop_tick(void);
 
+/* Ordinary shutdown with the configured power-key, pad and RTC wake policy. */
+void k230_pmu_shutdown(void);
+
+/* Final thermal power-off request, using the driver's startup mappings.
+ * Call with interrupts disabled and never resume clients afterwards. Does not
+ * allocate, take locks, or invoke RTC workers. Returns an error if unmapped;
+ * success means the request was issued, not that rail removal was confirmed.
+ * On error the caller must fall back; k230_pm halts and keeps the watchdog fed.
+ * Needs the PMU's 32 kHz domain (RTC crystal and LP-LDO): without it any PMU
+ * register access stalls the CPU, so boards that lack it must not enable the
+ * PMU driver. */
+int k230_pmu_shutdown_thermal(void);
+
 #endif /* DRV_PMU_H__ */

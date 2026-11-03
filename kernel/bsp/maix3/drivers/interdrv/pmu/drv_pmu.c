@@ -161,22 +161,74 @@ void pmu_set_detect_en_locked(struct pmu_dev *pmu, uint32_t mask, bool enable)
     pmu_update_bits_locked(pmu, PMU_INT_DETECT_EN, mask, enable);
 }
 
-int pmu_ensure_access(struct pmu_dev *pmu)
+/* Register-only access for final shutdown; mapping belongs to initialization. */
+static int pmu_enable_access(struct pmu_dev *pmu)
 {
-    volatile rt_uint8_t *base;
-    volatile rt_uint8_t *pwr_base;
     uint32_t value;
 
-    base = pmu_get_base(pmu);
-    pwr_base = pmu_get_pwr_base(pmu);
-    if ((base == RT_NULL) || (pwr_base == RT_NULL))
+    if ((pmu->base == RT_NULL) || (pmu->pwr_base == RT_NULL))
         return -RT_ERROR;
 
-    value = readl(pwr_base + PMU_PWR_ISO_CTRL_REG);
+    value = readl(pmu->pwr_base + PMU_PWR_ISO_CTRL_REG);
     if (value & PMU_ISO_ACCESS_MASK)
         writel(value & ~PMU_ISO_ACCESS_MASK,
-               pwr_base + PMU_PWR_ISO_CTRL_REG);
+               pmu->pwr_base + PMU_PWR_ISO_CTRL_REG);
 
+    return RT_EOK;
+}
+
+int pmu_ensure_access(struct pmu_dev *pmu)
+{
+    pmu_get_base(pmu);
+    pmu_get_pwr_base(pmu);
+    return pmu_enable_access(pmu);
+}
+
+/* Common power-off sequence. Callers have checked that pmu->base is mapped
+ * and prepared the wake sources. */
+static void pmu_request_poweroff(struct pmu_dev *pmu)
+{
+    if (pmu->base == RT_NULL)
+        return;
+    writel(PMU_STATUS_NORMAL_PD, pmu->base + PMU_STATUS);
+    writel(PMU_SYSCTRL_TO_CTRL_1_REG_O | PMU_SYSCTRL_TO_CTRL_0_REG_O,
+           pmu->base + PMU_SYSCTRL_REG);
+    writel(PMU_CLR_ALL, pmu->base + PMU_INT_DETECT_CLR);
+    writel(0U, pmu->base + PMU_SYSCTRL_REG);
+    __sync_synchronize();
+}
+
+/* Read-modify-write for the interrupts-off power-off path: uses the mapping
+ * made at init (no lazy ioremap like pmu_update_bits_locked()) and leaves
+ * bits outside mask unchanged. */
+static void pmu_update_raw(struct pmu_dev *pmu, uint32_t reg, uint32_t mask,
+               uint32_t bits)
+{
+    writel((readl(pmu->base + reg) & ~mask) | bits, pmu->base + reg);
+}
+
+/* Used by K230 thermal protection (k230_pm) for its final power-off. */
+int k230_pmu_shutdown_thermal(void)
+{
+    struct pmu_dev *pmu = pmu_get_dev();
+
+    /* Do not initialize the driver or cancel RTC work here: IRQs are disabled,
+     * and shutdown must work even if optional device initialization failed. */
+    if (pmu_enable_access(pmu) != RT_EOK)
+        return -RT_ERROR;
+
+    /* Suppress scheduled RTC and generic PAD wakeups. Only a deliberately
+     * held power key may restart a system stopped by thermal protection.
+     * Same registers and masks as pmu_prepare_wakeup_sources(); bit 12 of
+     * the routing registers selects OR/AND and is kept. The power-key timing
+     * matches pmu_configure_pwrkey(), whether or not that ran. */
+    pmu_update_raw(pmu, PMU_IO_CFG_0, PMU_IO_CFG_IO_SEL_MASK, PMU_IO_CFG_PMU_SEL);
+    writel(PMU_PWRKEY_LONG_PRESS_TICKS, pmu->base + PMU_INT0_LONG_PRESS_TRIGGER_VAL);
+    writel(PMU_PWRKEY_DEBOUNCE_TICKS, pmu->base + PMU_INT0_LEVEL_DEBOUNCE_VAL);
+    pmu_update_raw(pmu, PMU_INT0_TO_CTL_REGISTER, PMU_CPU_IRQ_MASK, PMU_IRQ_KEY_LONG);
+    pmu_update_raw(pmu, PMU_INT1_TO_CTL_REGISTER, PMU_CPU_IRQ_MASK, PMU_IRQ_KEY_LONG);
+    pmu_update_raw(pmu, PMU_INT_DETECT_EN, PMU_DET_SOURCE_MASK, PMU_DET_KEY_LONG);
+    pmu_request_poweroff(pmu);
     return RT_EOK;
 }
 
@@ -623,16 +675,17 @@ static void pmu_poweroff(struct pmu_dev *pmu)
     }
 
     pmu_prepare_wakeup_sources(pmu);
-    pmu_writel(pmu, PMU_STATUS_NORMAL_PD, PMU_STATUS);
-    pmu_writel(pmu, PMU_SYSCTRL_TO_CTRL_1_REG_O |
-           PMU_SYSCTRL_TO_CTRL_0_REG_O, PMU_SYSCTRL_REG);
-    pmu_writel(pmu, PMU_CLR_ALL, PMU_INT_DETECT_CLR);
-    pmu_writel(pmu, 0U, PMU_SYSCTRL_REG);
+    pmu_request_poweroff(pmu);
+}
+
+void k230_pmu_shutdown(void)
+{
+    pmu_poweroff(pmu_get_dev());
 }
 
 void rt_hw_board_shutdown(void)
 {
-    pmu_poweroff(pmu_get_dev());
+    k230_pmu_shutdown();
 }
 
 static void pmu_shutdown_cmd_entry(void)
