@@ -27,6 +27,7 @@
 #define __DRV_TS__
 
 #include <rtdef.h>
+#include <stdint.h>
 
 #define RT_DEVICE_TS_CTRL_SET_MODE          _IOW('T', 1, uint8_t)
 #define RT_DEVICE_TS_CTRL_GET_MODE          _IOR('T', 2, uint8_t)
@@ -36,12 +37,12 @@
 #define RT_DEVICE_TS_CTRL_MODE_SINGLE       0x01
 #define RT_DEVICE_TS_CTRL_MODE_CONTINUUOS   0x02
 
-void tsensor_init(void);
+int tsensor_init(void);
 
-void tsensor_set_trim(uint8_t trim);
+int tsensor_set_trim(uint8_t trim);
 uint8_t tsensor_get_trim(void);
 
-void tsensor_set_mode(uint8_t mode);
+int tsensor_set_mode(uint8_t mode);
 uint8_t tsensor_get_mode(void);
 
 int tsensor_read_temp(double *temp);
