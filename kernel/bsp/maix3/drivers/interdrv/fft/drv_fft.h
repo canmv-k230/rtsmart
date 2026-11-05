@@ -83,7 +83,7 @@ typedef struct {
     uint32_t output_mode;
     uint16_t shift;
     uint16_t reserved0;
-    uint32_t timeout_ms;
+    uint32_t timeout_ms; /* 0 = 1000 ms default; above 10000 ms fails with -EINVAL */
     uint64_t input_phy_addr;
     uint32_t input_len;
     uint32_t reserved1;

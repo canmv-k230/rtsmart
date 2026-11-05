@@ -27,7 +27,6 @@
 
 #include <board.h>
 #include <ioremap.h>
-#include <lwp_pid.h>
 #include <lwp_user_mm.h>
 #include <rthw.h>
 
@@ -54,6 +53,9 @@
 #define FFT_IRQN               (16 + 174)
 #define FFT_FIFO_REG_ADDR      (FFT_BASE_ADDR + 0x40)
 #define FFT_DEFAULT_TIMEOUT_MS 1000U
+/* Waits convert to rt_int32_t ms, where negative means forever. Bound the
+ * user value so a caller cannot hold the device forever. */
+#define FFT_MAX_TIMEOUT_MS     10000U
 
 #define FFT_EVENT_DONE        (1U << 0)
 #define FFT_EVENT_ERR_WRITE   (1U << 1)
@@ -85,6 +87,9 @@ typedef struct {
     struct rt_event      event;
     volatile fft_reg_st* reg;
     rt_uint32_t          last_event;
+    /* Set while a run waits for its interrupt; the IRQ drops anything else,
+     * such as a completion from a run that already timed out. */
+    volatile rt_bool_t   armed;
     rt_bool_t            inited;
     rt_bool_t            pm_vote_held;
 } fft_device_t;
@@ -149,6 +154,15 @@ static int fft_validate_request(const k_fft_run_request* req)
         return -EINVAL;
     }
 
+    if (req->timeout_ms > FFT_MAX_TIMEOUT_MS) {
+        return -EINVAL;
+    }
+
+    /* The register field is 12 bits; reject rather than silently truncate. */
+    if (req->shift > 0xfff) {
+        return -EINVAL;
+    }
+
     if (req->input_phy_addr == 0 || req->output_phy_addr == 0) {
         return -EINVAL;
     }
@@ -164,7 +178,11 @@ static int fft_validate_request(const k_fft_run_request* req)
     return 0;
 }
 
-static void fft_disable(fft_device_t* dev) { writeq(0, &dev->reg->enable); }
+static void fft_disable(fft_device_t* dev)
+{
+    dev->armed = RT_FALSE;
+    writeq(0, &dev->reg->enable);
+}
 
 static int fft_start_input_dma(const k_fft_run_request* req)
 {
@@ -219,7 +237,9 @@ static int fft_run_locked(fft_device_t* dev, const k_fft_run_request* req)
     cfg_reg.im            = (k_fft_input_mode_e)req->input_mode;
     cfg_reg.om            = (k_fft_out_mode_e)req->output_mode;
     cfg_reg.shift         = req->shift;
-    cfg_reg.time_out      = req->timeout_ms;
+    /* Leave the hardware watchdog off: its units are undocumented and every
+     * caller in the tree runs with 0. The waits below enforce timeout_ms. */
+    cfg_reg.time_out      = 0;
     cfg_reg.fft_intr_mask = 0;
 
     LOG_D("run point=%u mode=%u im=%u om=%u shift=0x%x timeout=%u", req->point, req->mode, req->input_mode, req->output_mode,
@@ -230,6 +250,11 @@ static int fft_run_locked(fft_device_t* dev, const k_fft_run_request* req)
     dev->last_event = 0;
     writeq(cfg_reg.cfg_value, &dev->reg->cfg);
     writeq(1, &dev->reg->int_clr);
+    /* A run that timed out can leave a late completion in the event object.
+     * Drop it and only then accept interrupts, or this run would take it as
+     * done and read the FIFO before the FFT has finished. */
+    rt_event_control(&dev->event, RT_IPC_CMD_RESET, RT_NULL);
+    dev->armed = RT_TRUE;
     writeq(1, &dev->reg->enable);
 
     ret = fft_start_input_dma(req);
@@ -367,7 +392,6 @@ static rt_err_t fft_device_close(rt_device_t dev)
 static rt_err_t fft_device_control(rt_device_t dev, int cmd, void* args)
 {
     k_fft_run_request req;
-    int               pid;
 
     (void)dev;
 
@@ -377,8 +401,6 @@ static rt_err_t fft_device_control(rt_device_t dev, int cmd, void* args)
     }
 
     LOG_D("ioctl cmd=0x%x args=%p", cmd, args);
-
-    pid = lwp_getpid();
 
     switch (cmd) {
     case KD_IOC_CMD_FFT_RUN:
@@ -417,7 +439,11 @@ static void fft_irq_handler(int irq, void* data)
     intr_num = (rt_uint32_t)readq(&dev->reg->intr_num);
     writeq(1, &dev->reg->int_clr);
 
-    LOG_D("irq intr_num=%u", intr_num);
+    LOG_D("irq intr_num=%u armed=%d", intr_num, dev->armed);
+
+    if (!dev->armed) {
+        return;
+    }
 
     switch (intr_num) {
     case 0:

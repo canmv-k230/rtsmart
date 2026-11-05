@@ -45,16 +45,20 @@
 #define PV_OFFSET 0x0
 #endif
 
-/* GSDMA exported functions are linked from the MPP kernel module. */
+/* Linked from the MPP kernel module. Hand-written mirrors of mpp
+ * kernel/ext_inc/gsdma_ext.h and mmz_ext.h: keep the signatures in sync.
+ * mmz_ext_phys_range_put(NULL) is a no-op. */
 extern int  gsdma_sdma_reserve_channel(uint8_t ch_num);
 extern int  gsdma_sdma_abort_channel(uint8_t ch_num);
 extern void gsdma_sdma_release_channel(uint8_t ch_num);
 extern int  gsdma_sdma_ch_submit(uint8_t ch_num, uint32_t ch_cfg_value, uint32_t llt_phys_addr,
                                  void (*callback)(void* arg), void* arg);
+extern void* mmz_ext_phys_range_get(uint64_t phys_addr, uint64_t size);
+extern void  mmz_ext_phys_range_put(void* handle);
 
 /* ---- Hardware constants ---- */
 #define UGZIP_BASE 0x80808000UL
-#define UGZIP_SIZE 0x10
+#define UGZIP_SIZE 0x1C
 
 #define ZIP_LINE_SIZE (128 * 1024) /* 128KB per SDMA LLI node */
 #define ZIP_RD_CH     0 /* SDMA CH0: read (src DDR → SRAM) */
@@ -68,11 +72,24 @@ extern int  gsdma_sdma_ch_submit(uint8_t ch_num, uint32_t ch_cfg_value, uint32_t
 /* Default timeout for decompression (ms) */
 #define GZIP_DEFAULT_TIMEOUT_MS 5000
 
+/* DECOMP_STATUS fields. Bits 11 (set when the length matched ISIZE, despite
+ * its RTL name deflate_size_err) and 12 (header_err: the header differs from
+ * the one template the engine checks, which ordinary streams do) say nothing
+ * about failure. */
+#define DECOMP_STATUS_CRC_OK    (0x1u << 10)
+
 /* SRAM addresses used by UGZIP hardware for intermediate data.
  * UGZIP is hardwired to read compressed input from SRAM_RD and write
  * decompressed output to SRAM_WR. These are physical addresses — the SDMA
  * hardware accesses them directly, unaffected by RT-Smart's MMU.
- * SDMA shuttles data: user DDR ↔ SRAM ↔ UGZIP. */
+ * SDMA shuttles data: user DDR ↔ SRAM ↔ UGZIP.
+ *
+ * The 768KB from 0x80200000 to 0x802BFFFF (banks mem0/1/2/8 out, mem9/10 in)
+ * belong to the shared SRAM GNNE/KPU uses. While decompression is enabled
+ * the KPU is locked out of them, and decompression overwrites whatever the
+ * KPU kept there; nothing in hardware or this driver arbitrates. Use gzip
+ * only while the KPU does not use that SRAM, e.g. to unpack a model before
+ * it runs. */
 #define SRAM_WR_ADDR 0x80200000UL /* UGZIP writes decompressed → SDMA reads from here */
 #define SRAM_RD_ADDR 0x80280000UL /* SDMA writes compressed here → UGZIP reads */
 #define SRAM_RD_BUFS 2 /* ping-pong for read channel */
@@ -83,10 +100,13 @@ extern int  gsdma_sdma_ch_submit(uint8_t ch_num, uint32_t ch_cfg_value, uint32_t
  * Data is fed via SDMA CH0 (read) and CH1 (write) with hardware handshake.
  */
 struct ugzip_reg {
-    volatile uint32_t decomp_start; /* 0x00 W1: bit0=start */
+    volatile uint32_t decomp_start; /* 0x00: bit0=start, bit1=backpressure_en */
     volatile uint32_t gzip_src_size; /* 0x04 RW: bit31=enable | [30:0]=compressed size */
     volatile uint32_t dma_out_size; /* 0x08 RW: decompressed output size */
-    volatile uint32_t decomp_intstat; /* 0x0C RO: bit10=crc_ok */
+    volatile uint32_t decomp_status; /* 0x0C RO: bit10=crc_ok, [3:0]=engine state */
+    volatile uint32_t decomp_int_status; /* 0x10: never set in this SoC, poll 0x0C */
+    volatile uint32_t gzip_dma_hw; /* 0x14 RW: DMA handshake enable */
+    volatile uint32_t gzip_div; /* 0x18 RW: clock divider pattern */
 };
 
 /*
@@ -113,6 +133,13 @@ struct gzip_decomp_dev {
     struct rt_device  dev;
     struct rt_mutex   mutex;
     struct ugzip_reg* reg;
+    /* Keep these alive after a failed SDMA STOP. The next ioctl retries
+     * cleanup under mutex before it can submit another transfer. */
+    struct {
+        struct sdma_llt *rd_llt, *wr_llt;
+        void *src_pin, *dst_pin;
+        int rd_reserved, wr_reserved, pm_held;
+    } held;
 };
 
 static struct gzip_decomp_dev g_gzip_decomp_dev;
@@ -122,9 +149,16 @@ static uint32_t gzip_get_le32(const uint8_t* data)
     return (uint32_t)data[0] | ((uint32_t)data[1] << 8) | ((uint32_t)data[2] << 16) | ((uint32_t)data[3] << 24);
 }
 
+/* Every SDMA node moves a whole ZIP_LINE_SIZE line, so the engine may touch
+ * up to the next line boundary past len. */
+static uint64_t gzip_dma_span(uint32_t len)
+{
+    return ((uint64_t)len + ZIP_LINE_SIZE - 1) & ~((uint64_t)ZIP_LINE_SIZE - 1);
+}
+
 static int gzip_dma_range_valid(uint64_t phys, uint32_t len)
 {
-    uint64_t span = ((uint64_t)len + ZIP_LINE_SIZE - 1) & ~((uint64_t)ZIP_LINE_SIZE - 1);
+    uint64_t span = gzip_dma_span(len);
 
     return span != 0 && phys <= UINT32_MAX && phys + span - 1 <= UINT32_MAX;
 }
@@ -230,24 +264,56 @@ static struct sdma_llt* build_wr_llt(uint32_t dst_phys, uint32_t dst_len, uint32
     return llt;
 }
 
-static int gzip_decomp_do_gunzip(struct gzip_decomp_dev* dev, uint64_t src_phys, uint32_t src_len, uint64_t dst_phys,
-                                 uint32_t dst_len, int32_t timeout_ms)
+/* Called with dev->mutex held. No descriptor or pin may be released until
+ * both channels acknowledge STOP; resetting shared GSDMA would abort other
+ * clients as well. A permanently stuck channel retains its resources. */
+static int gzip_decomp_release_resources(struct gzip_decomp_dev* dev)
 {
-    struct sdma_llt *   rd_llt = RT_NULL, *wr_llt = RT_NULL;
+    int rd_ret = 0, wr_ret = 0;
+
+    if (dev->held.wr_reserved)
+        wr_ret = gsdma_sdma_abort_channel(ZIP_WR_CH);
+    if (dev->held.rd_reserved)
+        rd_ret = gsdma_sdma_abort_channel(ZIP_RD_CH);
+    if (rd_ret != 0 || wr_ret != 0) {
+        LOG_E("SDMA did not stop; retaining gzip buffers and descriptors");
+        return -RT_EBUSY;
+    }
+
+    if (dev->held.wr_reserved)
+        gsdma_sdma_release_channel(ZIP_WR_CH);
+    if (dev->held.rd_reserved)
+        gsdma_sdma_release_channel(ZIP_RD_CH);
+    dev->held.rd_reserved = dev->held.wr_reserved = 0;
+    if (dev->held.wr_llt)
+        rt_free_align(dev->held.wr_llt);
+    if (dev->held.rd_llt)
+        rt_free_align(dev->held.rd_llt);
+    dev->held.rd_llt = dev->held.wr_llt = RT_NULL;
+    mmz_ext_phys_range_put(dev->held.dst_pin);
+    mmz_ext_phys_range_put(dev->held.src_pin);
+    dev->held.src_pin = dev->held.dst_pin = RT_NULL;
+    if (dev->held.pm_held) {
+        int ret = k230_pm_put(K230_PM_DEV_GZIP);
+        if (ret != 0)
+            return ret;
+        dev->held.pm_held = 0;
+    }
+    return RT_EOK;
+}
+
+static int gzip_decomp_run(struct gzip_decomp_dev* dev, uint64_t src_phys, uint32_t src_len, uint64_t dst_phys,
+                           uint32_t dst_len, int32_t timeout_ms)
+{
     struct rt_semaphore wr_done_sem;
     uint32_t            rd_count = 0, wr_count = 0;
     uint32_t            decomp_intstat;
-    int                 rd_reserved = 0;
-    int                 wr_reserved = 0;
     int                 sem_initialized = 0;
-    int                 pm_held = 0;
-    int                 ret;
+    int                 ret, cleanup_ret;
 
     ret = gzip_validate_stream(src_phys, src_len, dst_phys, dst_len);
     if (ret != RT_EOK)
-        return ret;
-
-    rt_mutex_take(&dev->mutex, RT_WAITING_FOREVER);
+        goto out;
 
     LOG_D("gunzip: src=0x%08x len=%u dst=0x%08x len=%u", (uint32_t)src_phys, src_len, (uint32_t)dst_phys, dst_len);
 
@@ -258,7 +324,7 @@ static int gzip_decomp_do_gunzip(struct gzip_decomp_dev* dev, uint64_t src_phys,
         ret = -RT_ERROR;
         goto out;
     }
-    pm_held = 1;
+    dev->held.pm_held = 1;
 
     /* 2. Reserve SDMA CH0 (read) and CH1 (write) */
     if (gsdma_sdma_reserve_channel(ZIP_RD_CH) != 0) {
@@ -266,22 +332,22 @@ static int gzip_decomp_do_gunzip(struct gzip_decomp_dev* dev, uint64_t src_phys,
         ret = -RT_EBUSY;
         goto out;
     }
-    rd_reserved = 1;
+    dev->held.rd_reserved = 1;
     if (gsdma_sdma_reserve_channel(ZIP_WR_CH) != 0) {
         LOG_E("Failed to reserve SDMA CH%d", ZIP_WR_CH);
         ret = -RT_EBUSY;
         goto out_release;
     }
-    wr_reserved = 1;
+    dev->held.wr_reserved = 1;
 
     /* 3. Build SDMA LLI chains */
-    rd_llt = build_rd_llt((uint32_t)src_phys, src_len, &rd_count);
-    if (!rd_llt) {
+    dev->held.rd_llt = build_rd_llt((uint32_t)src_phys, src_len, &rd_count);
+    if (!dev->held.rd_llt) {
         ret = -RT_ENOMEM;
         goto out_release;
     }
-    wr_llt = build_wr_llt((uint32_t)dst_phys, dst_len, &wr_count);
-    if (!wr_llt) {
+    dev->held.wr_llt = build_wr_llt((uint32_t)dst_phys, dst_len, &wr_count);
+    if (!dev->held.wr_llt) {
         ret = -RT_ENOMEM;
         goto out_release;
     }
@@ -301,9 +367,9 @@ static int gzip_decomp_do_gunzip(struct gzip_decomp_dev* dev, uint64_t src_phys,
     /* 6. Submit SDMA channels via GSDMA driver workflow:
      *    CH0 (read): src DDR → SRAM_RD, dec_en=1 for gzip handshake
      *    CH1 (write): SRAM_WR → dst DDR, callback releases semaphore */
-    if (gsdma_sdma_ch_submit(ZIP_RD_CH, SDMA_CH_CFG_RD, (uint32_t)((uint64_t)rd_llt + PV_OFFSET),
+    if (gsdma_sdma_ch_submit(ZIP_RD_CH, SDMA_CH_CFG_RD, (uint32_t)((uint64_t)dev->held.rd_llt + PV_OFFSET),
                              gzip_rd_done_callback, RT_NULL) != 0 ||
-        gsdma_sdma_ch_submit(ZIP_WR_CH, SDMA_CH_CFG_WR, (uint32_t)((uint64_t)wr_llt + PV_OFFSET),
+        gsdma_sdma_ch_submit(ZIP_WR_CH, SDMA_CH_CFG_WR, (uint32_t)((uint64_t)dev->held.wr_llt + PV_OFFSET),
                              gzip_wr_done_callback, &wr_done_sem) != 0) {
         LOG_E("Failed to submit SDMA channels");
         ret = -RT_ERROR;
@@ -319,8 +385,8 @@ static int gzip_decomp_do_gunzip(struct gzip_decomp_dev* dev, uint64_t src_phys,
     ret = rt_sem_take(&wr_done_sem, rt_tick_from_millisecond(timeout_ms > 0 ? timeout_ms : GZIP_DEFAULT_TIMEOUT_MS));
 
     if (ret == RT_EOK) {
-        decomp_intstat = readl(&dev->reg->decomp_intstat);
-        if (decomp_intstat & (0x1 << 10)) {
+        decomp_intstat = readl(&dev->reg->decomp_status);
+        if (decomp_intstat & DECOMP_STATUS_CRC_OK) {
             LOG_D("CRC OK: decomp_intstat=0x%08x", decomp_intstat);
             ret = RT_EOK;
         } else {
@@ -328,7 +394,7 @@ static int gzip_decomp_do_gunzip(struct gzip_decomp_dev* dev, uint64_t src_phys,
             ret = -RT_ERROR;
         }
     } else {
-        LOG_E("Timeout: decomp_intstat=0x%08x", readl(&dev->reg->decomp_intstat));
+        LOG_E("Timeout: decomp_intstat=0x%08x", readl(&dev->reg->decomp_status));
         ret = -RT_ETIMEOUT;
     }
 
@@ -343,32 +409,55 @@ out_reset:
         sysctl_reset(SYSCTL_RESET_DECOMPRESS);
 
 out_release:
-    if (wr_reserved) {
-        if (ret != RT_EOK)
-            gsdma_sdma_abort_channel(ZIP_WR_CH);
-        gsdma_sdma_release_channel(ZIP_WR_CH);
-    }
-    if (rd_reserved) {
-        if (ret != RT_EOK)
-            gsdma_sdma_abort_channel(ZIP_RD_CH);
-        gsdma_sdma_release_channel(ZIP_RD_CH);
-    }
-
+out:
+    /* Abort removes callbacks even if STOP fails, so the stack semaphore
+     * can be detached. Descriptors, pins and clocks stay owned by dev. */
+    cleanup_ret = gzip_decomp_release_resources(dev);
     if (sem_initialized)
         rt_sem_detach(&wr_done_sem);
+    return cleanup_ret != RT_EOK ? cleanup_ret : ret;
+}
 
-    if (wr_llt)
-        rt_free_align(wr_llt);
-    if (rd_llt)
-        rt_free_align(rd_llt);
+/*
+ * The reserved channels take raw descriptors that GSDMA cannot check, so the
+ * same rule as for every other SDMA transfer is applied here: both buffers
+ * come from user space as physical addresses and must lie in one allocated
+ * MMZ buffer each, padded to the whole 128KB nodes the DMA reads and writes.
+ * They stay pinned until both channels stop, including a failed STOP; the
+ * kernel also reads the source header, so pin before validating it.
+ */
+static int gzip_decomp_do_gunzip(struct gzip_decomp_dev* dev, uint64_t src_phys, uint32_t src_len, uint64_t dst_phys,
+                                 uint32_t dst_len, int32_t timeout_ms)
+{
+    uint64_t src_span = gzip_dma_span(src_len);
+    uint64_t dst_span = gzip_dma_span(dst_len);
+    void*    src_pin;
+    void*    dst_pin;
+    int      ret;
+
+    if (!src_span || !dst_span)
+        return -RT_EINVAL;
+
+    rt_mutex_take(&dev->mutex, RT_WAITING_FOREVER);
+    ret = gzip_decomp_release_resources(dev);
+    if (ret != RT_EOK)
+        goto out;
+
+    src_pin = mmz_ext_phys_range_get(src_phys, src_span);
+    dst_pin = src_pin ? mmz_ext_phys_range_get(dst_phys, dst_span) : RT_NULL;
+    if (!dst_pin) {
+        mmz_ext_phys_range_put(src_pin);
+        LOG_E("buffers not in MMZ: src=0x%lx+%lu dst=0x%lx+%lu", (unsigned long)src_phys, (unsigned long)src_span,
+              (unsigned long)dst_phys, (unsigned long)dst_span);
+        ret = -RT_EINVAL;
+        goto out;
+    }
+
+    dev->held.src_pin = src_pin;
+    dev->held.dst_pin = dst_pin;
+    ret = gzip_decomp_run(dev, src_phys, src_len, dst_phys, dst_len, timeout_ms);
 
 out:
-    if (pm_held) {
-        int pm_ret = k230_pm_put(K230_PM_DEV_GZIP);
-
-        if (ret == RT_EOK && pm_ret != 0)
-            ret = pm_ret;
-    }
     rt_mutex_release(&dev->mutex);
     return ret;
 }
