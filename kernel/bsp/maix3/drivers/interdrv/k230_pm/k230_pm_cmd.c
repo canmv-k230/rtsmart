@@ -6,9 +6,12 @@
 
 #include <rtthread.h>
 
+#if defined(RT_USING_MSH) && defined(K230_PM_CMD)
+
 #include "k230_pm.h"
 #ifdef K230_PM_DVFS
 #include "k230_pm_dvfs.h"
+#include "k230_pm_thermal.h"
 #endif
 
 #define K230_CLK_DUMP_MAX_DEPTH 32
@@ -517,3 +520,56 @@ static int k230_pm_selftest(int argc, char **argv)
     return failures == 0 ? 0 : -1;
 }
 MSH_CMD_EXPORT(k230_pm_selftest, run K230 PM clock selftest);
+
+#ifdef K230_PM_THERMAL_PROTECT
+#if defined(K230_PM_THERMAL_SHUTDOWN_NONE)
+#define K230_THERMAL_BACKEND_NAME "none"
+#elif defined(K230_PM_THERMAL_SHUTDOWN_PMU)
+#define K230_THERMAL_BACKEND_NAME "pmu"
+#else
+#define K230_THERMAL_BACKEND_NAME "halt"
+#endif
+
+static void k230_pm_thermal_dump(int argc, char **argv)
+{
+    struct k230_thermal_status status;
+    const struct k230_thermal_policy *policy = &status.policy;
+    struct k230_thermal_config config;
+    struct k230_thermal_reading sample = {0};
+    unsigned int d;
+
+    (void)argc;
+    (void)argv;
+
+    if (!k230_pm_thermal_get_status(&status)) {
+        rt_kprintf("thermal: not started\n");
+        return;
+    }
+    k230_pm_thermal_config(&config);
+    (void)k230_pm_thermal_reading(&sample);
+    rt_kprintf("thermal: stage=%u health=%u reason=%u required=%u applied=%d blocked=%u at_minimum=%u backend=%s terminal=%u\n",
+        policy->stage, policy->health, k230_pm_shutdown_reason(), policy->required,
+        policy->applied, k230_pm_thermal_accelerators_blocked(), policy->at_minimum,
+        K230_THERMAL_BACKEND_NAME, k230_pm_shutdown_terminal());
+    rt_kprintf("thermal: temp_mc=%d seq=%u age_ticks=%u valid=%u stale=%u error=%d critical_mc=%d sustained_mc=%d sustained_hold_ticks=%u\n",
+        sample.millicelsius, sample.sequence,
+        sample.sequence ? (unsigned)(rt_tick_get() - sample.tick) : 0U,
+        sample.valid, sample.stale, sample.error, k230_pm_dvfs_thermal_shutdown_mc(),
+        config.sustained_mc, config.sustained_ticks);
+    for (d = 0; d < K230_THERMAL_DOMAINS; ++d)
+        rt_kprintf("thermal: %s cap=%u requested=%u actual=%u error=%d powered=%u\n",
+            status.domains[d].name, status.domains[d].cap_hz,
+            status.domains[d].requested_hz, status.domains[d].actual_hz,
+            status.domains[d].error, status.domains[d].powered);
+    rt_kprintf("thermal: regulation=%u tables_valid=%u target_mc=%d switch_on_mc=%d control_ticks=%u level=%u/%u decision_mc=%d\n",
+        config.regulation, status.regulator_enabled, config.target_mc,
+        config.target_mc - config.hysteresis_mc, config.control_ticks, status.regulator_level,
+        status.regulator_levels ? status.regulator_levels - 1 : 0, status.regulator_decision_mc);
+    rt_kprintf("thermal: sample_ticks=%u cached_interval_ticks=%u\n",
+        status.sample_ticks, (unsigned)sample.interval_ticks);
+}
+MSH_CMD_EXPORT(k230_pm_thermal_dump, dump K230 thermal samples health and verified clocks);
+#undef K230_THERMAL_BACKEND_NAME
+#endif
+
+#endif /* RT_USING_MSH && K230_PM_CMD */

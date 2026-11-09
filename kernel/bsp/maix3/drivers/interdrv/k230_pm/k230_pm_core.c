@@ -7,6 +7,8 @@
 #include <rtthread.h>
 #include <rthw.h>
 #include "k230_pm.h"
+#include "k230_pm_uapi.h"
+#include "k230_pm_thermal.h"
 #include "sysctl_boot.h"
 #include "sysctl_pwr.h"
 #include "sysctl_rst.h"
@@ -45,6 +47,152 @@ static struct k230_clk_state k230_clk_state[SYSCTL_CLK_NODE_MAX];
 static struct k230_pd_state k230_pd_state[SYSCTL_PD_MAX];
 static struct k230_pm_dev_state k230_pm_dev_state[K230_PM_DEV_ID_MAX];
 static bool k230_clk_ready;
+
+/* The clock and PM paths may consume these without taking a DVFS lock. */
+static unsigned int thermal_shutdown_reason;
+/* Unrestricted until the thermal controller publishes its first ceilings. */
+static bool thermal_block_accelerators;
+static uint32_t thermal_cpu_hz = UINT32_MAX;
+static uint32_t thermal_kpu_hz = UINT32_MAX;
+static uint32_t thermal_vpu_hz = UINT32_MAX;
+
+bool k230_pm_shutdown_latch(unsigned int reason)
+{
+    unsigned int expected = 0;
+    return reason && __atomic_compare_exchange_n(&thermal_shutdown_reason,
+        &expected, reason, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+}
+
+unsigned int k230_pm_shutdown_reason(void)
+{
+    return __atomic_load_n(&thermal_shutdown_reason, __ATOMIC_ACQUIRE);
+}
+
+bool k230_pm_shutdown_terminal(void)
+{
+#ifdef K230_PM_THERMAL_SHUTDOWN_NONE
+    return false;
+#else
+    return k230_pm_shutdown_reason() != 0;
+#endif
+}
+
+void k230_pm_thermal_block_accelerators(bool block)
+{
+#ifdef K230_PM_THERMAL_SHUTDOWN_NONE
+    block = false;
+#endif
+    __atomic_store_n(&thermal_block_accelerators, block, __ATOMIC_RELEASE);
+}
+
+bool k230_pm_thermal_accelerators_blocked(void)
+{
+    return k230_pm_shutdown_terminal() ||
+        __atomic_load_n(&thermal_block_accelerators, __ATOMIC_ACQUIRE);
+}
+
+void k230_pm_thermal_set_limits(uint32_t cpu_hz, uint32_t kpu_hz, uint32_t vpu_hz)
+{
+    __atomic_store_n(&thermal_cpu_hz, cpu_hz, __ATOMIC_RELEASE);
+    __atomic_store_n(&thermal_kpu_hz, kpu_hz, __ATOMIC_RELEASE);
+    __atomic_store_n(&thermal_vpu_hz, vpu_hz, __ATOMIC_RELEASE);
+}
+
+uint32_t k230_pm_thermal_limit(sysctl_clk_node_e node)
+{
+    if (node == SYSCTL_CLK_CPU1_CORE_CLK_ROOT)
+        return __atomic_load_n(&thermal_cpu_hz, __ATOMIC_ACQUIRE);
+    if (node == SYSCTL_CLK_AI_CORE_CLK)
+        return __atomic_load_n(&thermal_kpu_hz, __ATOMIC_ACQUIRE);
+    /* Also the VPU bus and DDR port 2 (shared with the DPU) via its dividers. */
+    if (node == SYSCTL_CLK_VPU_CLK_ROOT)
+        return __atomic_load_n(&thermal_vpu_hz, __ATOMIC_ACQUIRE);
+    return UINT32_MAX;
+}
+
+static bool thermal_accelerator_pd(int pd)
+{
+    return pd == SYSCTL_PD_AI || pd == SYSCTL_PD_DPU || pd == SYSCTL_PD_VPU;
+}
+
+static bool thermal_pd_blocked(int pd)
+{
+    return k230_pm_shutdown_terminal() ||
+        (thermal_accelerator_pd(pd) && k230_pm_thermal_accelerators_blocked());
+}
+
+static bool thermal_dev_uses_clock(const struct k230_pm_dev_desc *d,
+    sysctl_clk_node_e node)
+{
+    unsigned int j;
+    for (j = 0; j < d->clock_count; ++j)
+        if (d->clocks[j] == node)
+            return true;
+    return false;
+}
+
+/* Only clocks that accelerator devices use alone are refused. A shared one,
+ * such as the DDR port 2 AXI clock of the display and 2D engines, stays
+ * available; the power-domain block keeps accelerators off. */
+static bool thermal_clock_blocked(sysctl_clk_node_e node)
+{
+    bool accelerator = false;
+    unsigned int i;
+    if (k230_pm_shutdown_terminal())
+        return true;
+    if (!k230_pm_thermal_accelerators_blocked())
+        return false;
+    for (i = 0; i < k230_pm_dev_desc_count; ++i) {
+        const struct k230_pm_dev_desc *d = &k230_pm_dev_desc[i];
+        if (!thermal_dev_uses_clock(d, node))
+            continue;
+        if (!thermal_accelerator_pd(d->pd))
+            return false;
+        accelerator = true;
+    }
+    return accelerator;
+}
+
+static bool thermal_rate_allowed(sysctl_clk_node_e node, sysctl_clk_node_e parent,
+    uint32_t numerator, uint32_t denominator)
+{
+    uint32_t cap = k230_pm_thermal_limit(node);
+    if (!denominator)
+        return false;
+    /* The source shares CPU1_CLK_CFG with the root. Only change it together
+     * with the root divider while a cap is in force. */
+    if (node == SYSCTL_CLK_CPU1_CORE_CLK_SRC &&
+        k230_pm_thermal_limit(SYSCTL_CLK_CPU1_CORE_CLK_ROOT) != UINT32_MAX)
+        return false;
+    if (cap == UINT32_MAX)
+        return !k230_pm_shutdown_terminal();
+    /* Profiles and readback use integer Hz. Divide before comparing so a
+     * fractional rate (e.g. 1.6 GHz / 3) fits its own rounded profile ceiling. */
+    return (uint64_t)sysctl_media_clk_get_leaf_freq(parent) * numerator / denominator <= cap;
+}
+
+/* KPU voltage is identical in every existing profile. Its always-on divider
+ * can therefore be capped before a power-up without taking a DVFS mutex. */
+static int thermal_prepare_ai(void)
+{
+    const struct k230_dvfs_domain_desc *d = &k230_dvfs_domain_desc[K230_PM_DOMAIN_KPU];
+    uint32_t cap = k230_pm_thermal_limit(SYSCTL_CLK_AI_CORE_CLK);
+    unsigned int i;
+    if (sysctl_media_clk_get_leaf_freq(SYSCTL_CLK_AI_CORE_CLK) <= cap)
+        return 0;
+    for (i = 0; i < d->step_count; ++i) {
+        const struct k230_dvfs_step *step = &d->steps[i];
+        if ((uint32_t)step->freq <= cap) {
+            int ret = k230_clk_set_parent_div(step->leaf, step->parent,
+                step->div_num, step->div_den);
+            if (ret)
+                return ret;
+            return sysctl_media_clk_get_leaf_freq(step->leaf) <= cap ?
+                0 : -K230_PM_ETIMEOUT;
+        }
+    }
+    return -K230_PM_EINVAL;
+}
 
 static bool k230_clk_is_fixed_root(sysctl_clk_node_e node)
 {
@@ -378,7 +526,8 @@ static int k230_clk_check_ready(void)
     return 0;
 }
 
-int k230_clk_get(sysctl_clk_node_e node)
+/* thermal_check is false only when a rollback restores a vote it dropped. */
+static int k230_clk_get_vote(sysctl_clk_node_e node, bool thermal_check)
 {
     sysctl_clk_node_e path[K230_CLK_PATH_MAX];
     int parents[K230_CLK_PATH_MAX];
@@ -386,11 +535,18 @@ int k230_clk_get(sysctl_clk_node_e node)
     int ret;
     int i;
 
+    if (thermal_check && thermal_clock_blocked(node))
+        return -K230_PM_ECTX;
+
     ret = k230_clk_check_ready();
     if (ret != 0)
         return ret;
 
     rt_mutex_take(&k230_clk_mutex, RT_WAITING_FOREVER);
+    if (thermal_check && thermal_clock_blocked(node)) {
+        rt_mutex_release(&k230_clk_mutex);
+        return -K230_PM_ECTX;
+    }
     ret = k230_clk_collect_path(node, path, parents, &count);
     if (ret == 0) {
         for (i = count - 1; i >= 0; i--) {
@@ -405,6 +561,11 @@ int k230_clk_get(sysctl_clk_node_e node)
     rt_mutex_release(&k230_clk_mutex);
 
     return ret;
+}
+
+int k230_clk_get(sysctl_clk_node_e node)
+{
+    return k230_clk_get_vote(node, true);
 }
 
 int k230_clk_put(sysctl_clk_node_e node)
@@ -488,10 +649,18 @@ int k230_clk_set_div(sysctl_clk_node_e node, uint32_t numerator,
     if (desc == RT_NULL || denominator == 0)
         return -K230_PM_EINVAL;
 
-    rt_mutex_take(&k230_clk_mutex, RT_WAITING_FOREVER);
+    if (rt_mutex_take(&k230_clk_mutex, rt_tick_from_millisecond(100)) != RT_EOK)
+        return -K230_PM_ETIMEOUT;
+    if (!thermal_rate_allowed(node, sysctl_clk_get_leaf_parent(node), numerator, denominator)) {
+        rt_mutex_release(&k230_clk_mutex);
+        return -K230_PM_ECTX;
+    }
     ret = sysctl_clk_set_leaf_div(node, numerator, denominator) ?
         0 : -K230_PM_EINVAL;
     rt_mutex_release(&k230_clk_mutex);
+    if (!ret && (node == SYSCTL_CLK_CPU1_CORE_CLK_ROOT || node == SYSCTL_CLK_AI_CORE_CLK ||
+        node == SYSCTL_CLK_VPU_CLK_ROOT))
+        k230_pm_thermal_clock_changed();
 
     return ret;
 }
@@ -539,7 +708,12 @@ int k230_clk_set_parent_div(sysctl_clk_node_e node, sysctl_clk_node_e parent,
         return k230_clk_set_div(node, numerator, denominator);
     }
 
-    rt_mutex_take(&k230_clk_mutex, RT_WAITING_FOREVER);
+    if (rt_mutex_take(&k230_clk_mutex, rt_tick_from_millisecond(100)) != RT_EOK)
+        return -K230_PM_ETIMEOUT;
+    if (!thermal_rate_allowed(node, parent, numerator, denominator)) {
+        rt_mutex_release(&k230_clk_mutex);
+        return -K230_PM_ECTX;
+    }
     state = &k230_clk_state[parent_owner];
     old_parent = k230_clk_parent_cached(parent_owner);
     transfer_votes = state->parent_refcount;
@@ -637,6 +811,9 @@ rollback_new:
     }
 out:
     rt_mutex_release(&k230_clk_mutex);
+    if (!ret && (node == SYSCTL_CLK_CPU1_CORE_CLK_ROOT || node == SYSCTL_CLK_AI_CORE_CLK ||
+        node == SYSCTL_CLK_VPU_CLK_ROOT))
+        k230_pm_thermal_clock_changed();
     return ret;
 }
 
@@ -749,12 +926,15 @@ static bool k230_pd_hw_set_power(sysctl_pwr_domain_e pd, bool enable)
     return sysctl_pwr_set_power(pd, false);
 }
 
-int k230_pd_get(sysctl_pwr_domain_e pd)
+/* thermal_check is false only when a rollback restores a vote it dropped. */
+static int k230_pd_get_vote(sysctl_pwr_domain_e pd, bool thermal_check)
 {
     const struct k230_pd_desc *desc = k230_pd_desc_find(pd);
     struct k230_pd_state *state;
     int ret;
 
+    if (thermal_check && thermal_pd_blocked(pd))
+        return -K230_PM_ECTX;
     ret = k230_pd_check_ready();
     if (ret != 0)
         return ret;
@@ -763,7 +943,7 @@ int k230_pd_get(sysctl_pwr_domain_e pd)
 
     state = &k230_pd_state[pd];
     rt_mutex_take(&k230_pd_mutex, RT_WAITING_FOREVER);
-    if (state->emergency_off) {
+    if (state->emergency_off || (thermal_check && thermal_pd_blocked(pd))) {
         rt_mutex_release(&k230_pd_mutex);
 #ifdef K230_PM_DEBUG
         rt_kprintf("k230_pm: pd_get %s blocked by emergency-off latch\n",
@@ -780,7 +960,11 @@ int k230_pd_get(sysctl_pwr_domain_e pd)
         return -K230_PM_EINVAL;
     }
 
-    if (state->refcount == 0 && !k230_pd_hw_set_power(pd, true)) {
+    /* The first vote always runs the full power-up, including the LPI exit,
+     * even if a failed power-off left the domain powered but idle. Later
+     * votes re-power a domain that thermal protection forced off. */
+    if ((state->refcount == 0 || !k230_pd_hw_powered(pd)) &&
+        !k230_pd_hw_set_power(pd, true)) {
         rt_mutex_release(&k230_pd_mutex);
 #ifdef K230_PM_DEBUG
         rt_kprintf("k230_pm: pd_get %s power-up failed\n", desc->name);
@@ -788,13 +972,33 @@ int k230_pd_get(sysctl_pwr_domain_e pd)
         return -K230_PM_ETIMEOUT;
     }
 
+    if (pd == SYSCTL_PD_AI && (ret = thermal_prepare_ai()) != 0) {
+        if (state->refcount == 0)
+            (void)k230_pd_hw_set_power(pd, false);
+        rt_mutex_release(&k230_pd_mutex);
+        return ret;
+    }
+    /* Blocked during power-up: undo it, as for a failed AI preparation. */
+    if (thermal_check && thermal_pd_blocked(pd)) {
+        if (state->refcount == 0)
+            (void)k230_pd_hw_set_power(pd, false);
+        rt_mutex_release(&k230_pd_mutex);
+        return -K230_PM_ECTX;
+    }
     state->refcount++;
     rt_mutex_release(&k230_pd_mutex);
+    if (pd == SYSCTL_PD_AI)
+        k230_pm_thermal_clock_changed();
 
 #ifdef K230_PM_DEBUG
     rt_kprintf("k230_pm: pd_get %s ref=%d\n", desc->name, state->refcount);
 #endif
     return 0;
+}
+
+int k230_pd_get(sysctl_pwr_domain_e pd)
+{
+    return k230_pd_get_vote(pd, true);
 }
 
 static int k230_pd_put_internal(sysctl_pwr_domain_e pd)
@@ -821,7 +1025,9 @@ static int k230_pd_put_internal(sysctl_pwr_domain_e pd)
 
     state->refcount--;
     if (state->refcount == 0 && (desc->flags & K230_PD_F_ALWAYS_ON) == 0U) {
-        bool powered_off = k230_pd_hw_set_power(pd, false);
+        /* Thermal protection may have forced the domain off already; the
+         * LPI idle request of a power-off cannot complete on an off domain. */
+        bool powered_off = !k230_pd_hw_powered(pd) || k230_pd_hw_set_power(pd, false);
 
         if (!powered_off) {
             state->refcount++;
@@ -976,6 +1182,9 @@ int k230_pm_get(enum k230_pm_dev_id dev)
     if (desc == RT_NULL || desc->id < 0 || desc->id >= K230_PM_DEV_ID_MAX)
         return -K230_PM_EINVAL;
 
+    if (thermal_pd_blocked(desc->pd))
+        return -K230_PM_ECTX;
+
     ret = k230_pd_check_ready();
     if (ret != 0)
         return ret;
@@ -984,12 +1193,26 @@ int k230_pm_get(enum k230_pm_dev_id dev)
 
     rt_mutex_take(&k230_pm_mutex, RT_WAITING_FOREVER);
 
+    if (thermal_pd_blocked(desc->pd)) {
+        ret = -K230_PM_ECTX;
+        goto out;
+    }
+    if (desc->pd == SYSCTL_PD_AI && (ret = thermal_prepare_ai()) != 0)
+        goto out;
+
     if (state->refcount >= K230_PM_DEV_REF_MAX) {
         ret = -K230_PM_EINVAL;
         goto out;
     }
 
     if (state->refcount > 0) {
+        if (desc->pd >= 0 && !k230_pd_hw_powered((sysctl_pwr_domain_e)desc->pd)) {
+            ret = k230_pd_get((sysctl_pwr_domain_e)desc->pd);
+            if (ret != 0)
+                goto out;
+            /* Balance the temporary vote; existing references keep it on. */
+            (void)k230_pd_put((sysctl_pwr_domain_e)desc->pd);
+        }
         state->refcount++;
         goto out;
     }
@@ -1029,6 +1252,11 @@ int k230_pm_get(enum k230_pm_dev_id dev)
         goto rollback_pd;
     }
 
+    if (thermal_pd_blocked(desc->pd) ||
+        (desc->pd == SYSCTL_PD_AI && (ret = thermal_prepare_ai()) != 0)) {
+        if (!ret) ret = -K230_PM_ECTX;
+        goto rollback_pd;
+    }
     state->refcount = 1;
     goto out;
 
@@ -1104,12 +1332,14 @@ int k230_pm_put(enum k230_pm_dev_id dev)
     goto out;
 
 rollback_clks:
+    /* Restore the votes this put dropped, even while thermal protection
+     * blocks new ones; the controller forces a blocked domain off again. */
     while (released_count > 0) {
         released_count--;
-        (void)k230_clk_get(released[released_count]);
+        (void)k230_clk_get_vote(released[released_count], false);
     }
     if (pd_released)
-        (void)k230_pd_get((sysctl_pwr_domain_e)desc->pd);
+        (void)k230_pd_get_vote((sysctl_pwr_domain_e)desc->pd, false);
 out:
     rt_mutex_release(&k230_pm_mutex);
     return ret;
@@ -1128,6 +1358,56 @@ int k230_pm_refcount(enum k230_pm_dev_id dev)
     rt_mutex_release(&k230_pm_mutex);
 
     return refcount;
+}
+
+int k230_pm_thermal_off(enum k230_pm_dev_id dev, bool force)
+{
+    const struct k230_pm_dev_desc *desc = k230_pm_dev_desc_find(dev);
+    int ret;
+    if (desc == RT_NULL || desc->pd < 0)
+        return -K230_PM_EINVAL;
+    if (rt_mutex_take(&k230_pm_mutex, rt_tick_from_millisecond(50)) != RT_EOK)
+        return -K230_PM_ETIMEOUT;
+    if (rt_mutex_take(&k230_pd_mutex, rt_tick_from_millisecond(50)) != RT_EOK) {
+        rt_mutex_release(&k230_pm_mutex);
+        return -K230_PM_ETIMEOUT;
+    }
+    if (!force && k230_pd_state[desc->pd].refcount > 0)
+        ret = 0;
+    else
+        ret = (!k230_pd_hw_powered((sysctl_pwr_domain_e)desc->pd) ||
+            k230_pd_hw_set_power((sysctl_pwr_domain_e)desc->pd, false)) ?
+            0 : -K230_PM_ETIMEOUT;
+    rt_mutex_release(&k230_pd_mutex);
+    rt_mutex_release(&k230_pm_mutex);
+    return ret;
+}
+
+unsigned int k230_pm_thermal_quiesce_raw(void)
+{
+    /* Producers first: camera capture, then AI, encode and 2D processing, the
+     * display that scans frames out of DDR, and the idle little core. */
+    static const sysctl_pwr_domain_e domains[] = {
+        SYSCTL_PD_ISP, SYSCTL_PD_AI, SYSCTL_PD_VPU, SYSCTL_PD_DPU, SYSCTL_PD_DISP,
+        SYSCTL_PD_CPU0
+    };
+    unsigned int i, still_on = 0;
+    /* No client runs after this point, so every runtime-switchable domain may
+     * go; the always-on ones stay (DDR holds this code, LS the console UART).
+     * Same LPI idle and power-off handshakes as k230_pd_hw_set_power(), each
+     * bounded by a 1 ms busy-wait. A thread preempted mid-transition never
+     * resumes, so the PD mutex and reference counts are deliberately bypassed. */
+    for (i = 0; i < sizeof(domains) / sizeof(domains[0]); ++i) {
+        sysctl_pwr_domain_e pd = domains[i];
+        if (!k230_pd_hw_powered(pd) || k230_pd_hw_set_power(pd, false))
+            continue;
+        /* A standalone DISP LPI request can fail where the PCU's integrated
+         * idle/power-off sequence succeeds (see the boot-pin release). */
+        if (pd == SYSCTL_PD_DISP && sysctl_pwr_set_power(pd, false))
+            continue;
+        still_on |= 1U << pd;
+    }
+    return still_on;
 }
 
 int k230_pm_emergency_off(enum k230_pm_dev_id dev)

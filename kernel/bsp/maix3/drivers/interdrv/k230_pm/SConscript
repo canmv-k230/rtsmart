@@ -20,7 +20,9 @@ if GetDepend('K230_PM_DVFS'):
     ]
 
 if GetDepend('K230_PM_DVFS') and GetDepend('K230_PM_THERMAL_PROTECT'):
-    src += ['k230_pm_thermal.c']
+    src += ['k230_pm_thermal.c', 'k230_pm_thermal_policy.c',
+        'k230_pm_thermal_reading.c', 'k230_pm_thermal_regulator.c',
+        'k230_pm_shutdown.c']
 
 group = DefineGroup('K230_PM', src, depend = ['K230_PM_RUNTIME'], CPPPATH = CPPPATH)
 

@@ -132,10 +132,16 @@ static int gnne_device_lock(struct gnne_dev_handle *handle, rt_bool_t wait)
         return -RT_EINVAL;
 
     while (1) {
+        if (k230_pm_thermal_accelerators_blocked())
+            return -RT_EBUSY;
         ret = rt_mutex_take(&g_gnne_lock_mutex, RT_WAITING_FOREVER);
         if (ret != RT_EOK)
             return -RT_ERROR;
 
+        if (k230_pm_thermal_accelerators_blocked()) {
+            rt_mutex_release(&g_gnne_lock_mutex);
+            return -RT_EBUSY;
+        }
         if (g_gnne_lock_owner == RT_NULL) {
             g_gnne_lock_owner = handle;
             rt_mutex_release(&g_gnne_lock_mutex);
@@ -198,6 +204,13 @@ static int gnne_device_open(struct dfs_fd *file)
     if (ret != RT_EOK) {
         rt_free(handle);
         return -RT_ERROR;
+    }
+
+    /* Existing client references must not bypass a thermal admission block. */
+    if (k230_pm_thermal_accelerators_blocked()) {
+        rt_mutex_release(&g_gnne_pm_mutex);
+        rt_free(handle);
+        return -RT_EBUSY;
     }
 
     if (g_gnne_open_count == 0) {

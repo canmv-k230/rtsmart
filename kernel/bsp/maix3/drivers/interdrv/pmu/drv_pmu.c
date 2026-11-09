@@ -683,10 +683,13 @@ void k230_pmu_shutdown(void)
     pmu_poweroff(pmu_get_dev());
 }
 
+#ifndef K230_PM_THERMAL_PROTECT
+/* Thermal builds provide the board hook in K230 power management. */
 void rt_hw_board_shutdown(void)
 {
     k230_pmu_shutdown();
 }
+#endif
 
 static void pmu_shutdown_cmd_entry(void)
 {

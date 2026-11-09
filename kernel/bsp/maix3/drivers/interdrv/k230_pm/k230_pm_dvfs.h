@@ -10,6 +10,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "k230_pm_uapi.h"
+#include "k230_pm_thermal_policy.h"
 
 int k230_pm_dvfs_init(void);
 int k230_pm_dvfs_get_stat(k230_pm_uapi_domain domain);
@@ -31,8 +32,17 @@ int k230_pm_dvfs_set_thermal_shutdown(int32_t temp);
 int k230_pm_dvfs_get_thermal_shutdown(int32_t *temp);
 int k230_pm_dvfs_set_clock(k230_pm_uapi_domain domain, bool enable);
 int k230_pm_dvfs_set_power(k230_pm_uapi_domain domain, bool enable);
-void k230_pm_dvfs_thermal_update(k230_pm_uapi_domain domain, int32_t temp);
+struct k230_thermal_clocks {
+    uint32_t requested_hz;
+    uint32_t actual_hz;
+    int error;
+};
+int k230_pm_dvfs_thermal_apply(k230_pm_uapi_domain domain,
+    const struct k230_thermal_sample *sample, bool may_raise,
+    struct k230_thermal_clocks *status);
 int32_t k230_pm_dvfs_thermal_shutdown_temp(void);
+/* Effective limit: runtime setting may tighten, never raise the compiled policy. */
+int32_t k230_pm_dvfs_thermal_shutdown_mc(void);
 void k230_pm_dvfs_dump(void);
 /* Before a software SoC reset: external regulators keep their output across
  * it while boot code runs the maximum clocks. Raises every regulated rail to

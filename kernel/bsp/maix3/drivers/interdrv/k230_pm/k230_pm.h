@@ -44,4 +44,25 @@ int k230_pm_refcount(enum k230_pm_dev_id dev);
 int k230_pm_emergency_off(enum k230_pm_dev_id dev);
 int k230_pm_release_boot_pins(void);
 
+/* Thermal admission state is lock-free and checked before reference fast paths.
+ * The NONE backend ignores accelerator blocks and enforces clock caps only. */
+bool k230_pm_shutdown_latch(unsigned int reason);
+unsigned int k230_pm_shutdown_reason(void);
+/* True only when the configured thermal backend makes a latched reason
+ * terminal. NONE retains protection while allowing the system to run. */
+bool k230_pm_shutdown_terminal(void);
+void k230_pm_thermal_block_accelerators(bool block);
+bool k230_pm_thermal_accelerators_blocked(void);
+void k230_pm_thermal_set_limits(uint32_t cpu_hz, uint32_t kpu_hz, uint32_t vpu_hz);
+uint32_t k230_pm_thermal_limit(sysctl_clk_node_e node);
+/* Without force, a domain still referenced by clients or boot owners stays on. */
+int k230_pm_thermal_off(enum k230_pm_dev_id dev, bool force);
+/* Terminal shutdown only: interrupts disabled, register access, no mutexes.
+ * Powers off every runtime-switchable domain; returns a mask (1 << pd) of
+ * domains whose handshake failed and that are still powered. */
+unsigned int k230_pm_thermal_quiesce_raw(void);
+/* Enter the terminal thermal board hook without the generic device-console
+ * diagnostic. This function does not return. */
+void k230_pm_thermal_shutdown_enter(void);
+
 #endif

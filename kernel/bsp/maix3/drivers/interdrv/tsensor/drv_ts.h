@@ -45,6 +45,8 @@ uint8_t tsensor_get_trim(void);
 int tsensor_set_mode(uint8_t mode);
 uint8_t tsensor_get_mode(void);
 
+/* With K230_PM_THERMAL_PROTECT the thermal monitor owns the sensor: reads
+ * return its latest reading, and mode/trim changes fail with -RT_EBUSY. */
 int tsensor_read_temp(double *temp);
 
 #endif /*__DRV_TS__*/

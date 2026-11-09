@@ -788,8 +788,14 @@ bool sysctl_pwr_set_power_multi(sysctl_pwr_domain_e powerdomain, bool enable)
     else
         ret = k230_pd_put(powerdomain);
 
-    if (ret == -K230_PM_ECTX)
+    if (ret == -K230_PM_ECTX) {
+        /* ECTX is also thermal protection refusing a power-up: never bypass
+         * it with raw register access. */
+        if (enable && (k230_pm_shutdown_terminal() ||
+                       k230_pm_thermal_accelerators_blocked()))
+            return false;
         return sysctl_pwr_set_power(powerdomain, enable);
+    }
     if (!enable && ret == -K230_PM_EUNDERFLOW)
         return true;
 

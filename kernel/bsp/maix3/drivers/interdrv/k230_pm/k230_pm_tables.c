@@ -369,8 +369,15 @@ static const struct k230_dvfs_step k230_dvfs_dpu_steps[] = {
     DVFS_STEP(594000000, 0, SYSCTL_CLK_DPU_CLK, SYSCTL_CLK_PLL1_OCLK_DIV4, 1, 1),
 };
 
+/* VPU_CLK_ROOT divides pll0_div2 by n/16; it also clocks the VPU bus and
+ * DDR port 2 through their own dividers. The VPU shares the core rail, so
+ * these steps change frequency only. */
 static const struct k230_dvfs_step k230_dvfs_vpu_steps[] = {
-    DVFS_STEP(800000000, 0, SYSCTL_CLK_VPU_CLK_ROOT, SYSCTL_CLK_PLL0_OCLK_DIV2, 1, 1),
+    DVFS_STEP(800000000, 0, SYSCTL_CLK_VPU_CLK_ROOT, SYSCTL_CLK_PLL0_OCLK_DIV2, 16, 16),
+    DVFS_STEP(600000000, 0, SYSCTL_CLK_VPU_CLK_ROOT, SYSCTL_CLK_PLL0_OCLK_DIV2, 12, 16),
+    DVFS_STEP(400000000, 0, SYSCTL_CLK_VPU_CLK_ROOT, SYSCTL_CLK_PLL0_OCLK_DIV2, 8, 16),
+    DVFS_STEP(300000000, 0, SYSCTL_CLK_VPU_CLK_ROOT, SYSCTL_CLK_PLL0_OCLK_DIV2, 6, 16),
+    DVFS_STEP(200000000, 0, SYSCTL_CLK_VPU_CLK_ROOT, SYSCTL_CLK_PLL0_OCLK_DIV2, 4, 16),
 };
 
 static const struct k230_dvfs_step k230_dvfs_display_steps[] = {
@@ -392,7 +399,8 @@ const struct k230_dvfs_domain_desc k230_dvfs_domain_desc[] = {
     DVFS_DOMAIN("kpu", K230_PM_DEV_AI, K230_KPU_REGULATOR_NAME, k230_dvfs_kpu_steps,
         K230_DVFS_CAP_THERMAL),
     DVFS_DOMAIN("dpu", K230_PM_DEV_DPU, NULL, k230_dvfs_dpu_steps, 0),
-    DVFS_DOMAIN("vpu", K230_PM_DEV_VPU, NULL, k230_dvfs_vpu_steps, 0),
+    DVFS_DOMAIN("vpu", K230_PM_DEV_VPU, NULL, k230_dvfs_vpu_steps,
+        K230_DVFS_CAP_THERMAL),
     DVFS_DOMAIN("display", K230_PM_DEV_DISP, NULL, k230_dvfs_display_steps, 0),
 };
 

@@ -105,6 +105,13 @@ static int ai_2d_device_open(struct dfs_fd *file)
         return -RT_ERROR;
     }
 
+    /* Existing client references must not bypass a thermal admission block. */
+    if (k230_pm_thermal_accelerators_blocked()) {
+        rt_mutex_release(&g_ai_2d_pm_mutex);
+        rt_free(handle);
+        return -RT_EBUSY;
+    }
+
     if (g_ai_2d_open_count == 0) {
         if (g_ai_2d_pm_vote_held) {
             ret = k230_pm_put(K230_PM_DEV_AI);

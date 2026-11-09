@@ -10,6 +10,7 @@
 #include <stdint.h>
 #include "k230_pm.h"
 #include "k230_pm_dvfs.h"
+#include "k230_pm_thermal.h"
 #include "k230_pm_pid.h"
 #include "usage.h"
 #include "regulator.h"
@@ -17,10 +18,21 @@
 #define PROFILE_IS_UP(from, to) ((from) > (to))
 #define K230_DVFS_MAX_PROFILES K230_PM_MAX_PROFILE_COUNT
 #define K230_DVFS_THERMAL_DEFAULT_TEMP 85
+#define K230_DVFS_SHUTDOWN_MAX_TEMP 115
+#ifdef K230_PM_THERMAL_PROTECT
+/* The compiled thermal policy supplies the effective default limit. */
+#define K230_DVFS_SHUTDOWN_DEFAULT_TEMP K230_DVFS_SHUTDOWN_MAX_TEMP
+#else
 #define K230_DVFS_SHUTDOWN_DEFAULT_TEMP 100
+#endif
 #define K230_DVFS_THERMAL_HYSTERESIS_TEMP 5
 #define K230_DVFS_THERMAL_MIN_TEMP (-40)
+#ifdef K230_PM_THERMAL_PROTECT
+#define K230_DVFS_THERMAL_MAX_TEMP (K230_DVFS_SHUTDOWN_MAX_TEMP - 1)
+#else
+/* Nothing enforces these without thermal protection: keep the sensor range. */
 #define K230_DVFS_THERMAL_MAX_TEMP 125
+#endif
 #define K230_DVFS_AUTO_THREAD_PRIORITY (RT_THREAD_PRIORITY_MAX - 8)
 #define K230_DVFS_USAGE_THREAD_PRIORITY (K230_DVFS_AUTO_THREAD_PRIORITY - 1)
 #define K230_DVFS_USAGE_DEFAULT_PRIORITY (RT_THREAD_PRIORITY_MAX - 2)
@@ -47,19 +59,27 @@ struct k230_dvfs_domain {
     int32_t expect_profile_idx;
     int32_t actual_profile_idx;
     bool profile_valid;
+    bool voltage_valid;
+    int verified_voltage;
     k230_pm_uapi_governor governor;
     int32_t thermal_protect_temp;
     int32_t thermal_protect_idx;
     bool thermal_over;
+    bool thermal_recovering;
+    bool thermal_restore_pending;
+    rt_tick_t thermal_recovery_tick;
+    struct k230_thermal_sample thermal_sample;
     struct regulator_dev *regulator;
     /* The board has this rail but its provider failed: transitions blocked. */
     bool regulator_failed;
 };
 
 static struct k230_dvfs_domain k230_dvfs_domains[K230_PM_DOMAIN_NR];
+/* Runtime ceiling in whole degrees; the compiled policy may require less. */
 static int32_t k230_dvfs_thermal_shutdown = K230_DVFS_SHUTDOWN_DEFAULT_TEMP;
 static bool k230_dvfs_domains_initialized;
 static bool k230_dvfs_ready;
+static struct rt_mutex k230_dvfs_config_mutex;
 
 static bool auto_load_enable;
 static bool auto_thread_started;
@@ -126,6 +146,11 @@ static bool k230_dvfs_thermal_temp_valid(int32_t temp)
 {
     return temp >= K230_DVFS_THERMAL_MIN_TEMP &&
         temp <= K230_DVFS_THERMAL_MAX_TEMP;
+}
+
+static int32_t k230_dvfs_mc_to_c_floor(int32_t temp_mc)
+{
+    return temp_mc / 1000 - (temp_mc % 1000 < 0);
 }
 
 static bool k230_dvfs_freq_match(uint32_t actual, uint32_t expected)
@@ -269,105 +294,179 @@ static int k230_dvfs_get_expect_profile(struct k230_dvfs_domain *domain)
     return 0;
 }
 
-static int k230_dvfs_set_voltage(struct k230_dvfs_domain *domain, int32_t idx)
+static int k230_dvfs_safe_voltage(struct k230_dvfs_domain *domain, int voltage)
 {
-    return regulator_set_voltage(domain->regulator, domain->desc->steps[idx].volt,
-        domain->desc->steps[0].volt);
+    int actual = 0;
+    int ret;
+    if (k230_pm_shutdown_terminal())
+        return K230_ERR_PM_BUSY;
+    domain->voltage_valid = false;
+    /* The regulator waits for a rise to settle before returning. */
+    ret = regulator_set_voltage(domain->regulator, voltage, domain->desc->steps[0].volt);
+    if (k230_pm_shutdown_terminal())
+        return K230_ERR_PM_BUSY;
+    /* A successful write alone does not establish a known-safe voltage. */
+    if (ret == 0)
+        ret = regulator_get_voltage(domain->regulator, &actual);
+    if (k230_pm_shutdown_terminal())
+        return K230_ERR_PM_BUSY;
+    domain->voltage_valid = ret == 0 && actual >= voltage &&
+        actual <= domain->desc->steps[0].volt;
+    if (domain->voltage_valid)
+        domain->verified_voltage = actual;
+    return domain->voltage_valid ? 0 : K230_ERR_PM_NOTREADY;
+}
+
+static int32_t k230_dvfs_limit_index(struct k230_dvfs_domain *domain)
+{
+    uint32_t limit = k230_pm_thermal_limit(domain->desc->steps[0].leaf);
+    int32_t i;
+    for (i = 0; i < (int32_t)domain->desc->step_count; i++)
+        if ((uint32_t)domain->desc->steps[i].freq <= limit)
+            return i;
+    return domain->desc->step_count - 1;
+}
+
+static int k230_dvfs_apply_locked(struct k230_dvfs_domain *domain, bool may_raise)
+{
+    int ret = 0;
+    int32_t from, to, limit;
+    bool known;
+
+    if (k230_pm_shutdown_terminal())
+        return K230_ERR_PM_BUSY;
+    if (domain->regulator_failed)
+        return K230_ERR_PM_NOTREADY;
+    to = k230_dvfs_profile_index_transform(domain, domain->expect_profile_idx);
+    limit = k230_dvfs_limit_index(domain);
+    if (domain->thermal_over) {
+        int32_t extra = k230_dvfs_profile_index_transform(domain, domain->thermal_protect_idx);
+        if (extra > limit)
+            limit = extra;
+    }
+    if (to < limit)
+        to = limit;
+
+    /* Core power-up enforcement and external clock callers can change the
+     * divider. Never trust a previously cached profile as clock readback. */
+    known = k230_dvfs_read_hw_profile(domain, &domain->actual_profile_idx);
+    domain->profile_valid = known;
+    from = k230_dvfs_profile_index_transform(domain, domain->actual_profile_idx);
+    if (!may_raise && known && from > to)
+        to = from;
+    if (!known && !may_raise) {
+        uint32_t actual_hz = sysctl_media_clk_get_leaf_freq(domain->desc->steps[0].leaf);
+        /* A valid lower boot/custom rate need not match a profile. A thermal
+         * ceiling must not raise it merely to obtain a profile index. */
+        if (actual_hz && actual_hz <= (uint32_t)domain->desc->steps[to].freq) {
+            if (domain->regulator && (!domain->voltage_valid ||
+                domain->verified_voltage < domain->desc->steps[to].volt))
+                return k230_dvfs_safe_voltage(domain, domain->desc->steps[0].volt);
+            return 0;
+        }
+    }
+    if (known && from == to) {
+        if (domain->regulator && (!domain->voltage_valid ||
+            domain->verified_voltage < domain->desc->steps[to].volt))
+            return k230_dvfs_safe_voltage(domain, domain->desc->steps[to].volt);
+        return 0;
+    }
+
+    if (domain->regulator == RT_NULL) {
+        ret = k230_dvfs_set_clock_step(domain, to);
+    } else if (!known) {
+        ret = k230_dvfs_safe_voltage(domain, domain->desc->steps[0].volt);
+        if (ret == 0)
+            ret = k230_dvfs_set_clock_step(domain, to);
+        /* Maximum voltage is safe for this profile. A subsequent transition
+         * may reduce it once the clock state is known. */
+    } else if (PROFILE_IS_UP(from, to)) {
+        ret = k230_dvfs_safe_voltage(domain, domain->desc->steps[to].volt);
+        if (ret == 0) {
+            if (k230_pm_shutdown_terminal())
+                ret = K230_ERR_PM_BUSY;
+            else
+                ret = k230_dvfs_set_clock_step(domain, to);
+        }
+    } else {
+        ret = k230_dvfs_set_clock_step(domain, to);
+        if (ret == 0 && domain->desc->steps[from].volt != domain->desc->steps[to].volt) {
+            ret = k230_dvfs_safe_voltage(domain, domain->desc->steps[to].volt);
+            if (ret != 0) {
+                /* Keep the lower clock. Restore and verify the known-safe
+                 * voltage, never the previous hotter clock. */
+                ret = k230_dvfs_safe_voltage(domain, domain->desc->steps[from].volt);
+            }
+        }
+    }
+    domain->profile_valid = k230_dvfs_read_hw_profile(domain, &domain->actual_profile_idx);
+    if (!domain->profile_valid || domain->actual_profile_idx < limit)
+        return K230_ERR_PM_NOTREADY;
+    return ret;
 }
 
 static int k230_dvfs_set_actual_profile_locked(struct k230_dvfs_domain *domain)
 {
-    int ret;
-    int rollback_ret;
-    int32_t from_idx_cvt;
-    int32_t to_idx;
-    int32_t to_idx_cvt;
-    int32_t expect_profile_idx;
-    int32_t expect_profile_idx_cvt;
-    int32_t thermal_protect_idx;
-    int32_t thermal_protect_idx_cvt;
+    return k230_dvfs_apply_locked(domain, true);
+}
 
-    thermal_protect_idx = domain->thermal_protect_idx;
-    expect_profile_idx = domain->expect_profile_idx;
-    thermal_protect_idx_cvt = k230_dvfs_profile_index_transform(domain,
-        thermal_protect_idx);
-    expect_profile_idx_cvt = k230_dvfs_profile_index_transform(domain,
-        expect_profile_idx);
+/* Match the sensor's cadence plus conversion/scheduling allowance. Samples
+ * arrive only from the thermal controller. */
+static rt_tick_t k230_dvfs_sample_fresh_ticks(uint32_t interval_ticks)
+{
+#ifdef K230_PM_THERMAL_PROTECT
+    struct k230_thermal_config config;
+    k230_pm_thermal_config(&config);
+    return k230_thermal_fresh_ticks(&config, interval_ticks);
+#else
+    (void)interval_ticks;
+    return rt_tick_from_millisecond(6500);
+#endif
+}
 
-    if (domain->thermal_over &&
-        PROFILE_IS_UP(thermal_protect_idx_cvt, expect_profile_idx_cvt)) {
-        to_idx = thermal_protect_idx;
-        to_idx_cvt = thermal_protect_idx_cvt;
-    } else {
-        to_idx = expect_profile_idx;
-        to_idx_cvt = expect_profile_idx_cvt;
+static rt_tick_t k230_dvfs_recovery_ticks(void)
+{
+#ifdef K230_PM_THERMAL_PROTECT
+    struct k230_thermal_config config;
+    k230_pm_thermal_config(&config);
+    return config.recovery_ticks;
+#else
+    return rt_tick_from_millisecond(5000);
+#endif
+}
+
+static void k230_dvfs_extra_limit(struct k230_dvfs_domain *dvfs,
+    const struct k230_thermal_sample *sample)
+{
+    rt_tick_t fresh = k230_dvfs_sample_fresh_ticks(sample ? sample->interval_ticks : 0);
+    rt_tick_t gap = k230_dvfs_sample_fresh_ticks(dvfs->thermal_sample.interval_ticks);
+    rt_tick_t recovery = k230_dvfs_recovery_ticks();
+    bool new_sample = sample && sample->valid &&
+        (!dvfs->thermal_sample.valid || sample->sequence != dvfs->thermal_sample.sequence);
+    if (gap < fresh)
+        gap = fresh;
+    if (!sample || !sample->valid || sample->error ||
+        (rt_tick_t)(rt_tick_get() - sample->tick) >= fresh) {
+        dvfs->thermal_recovering = false;
+        return;
     }
-
-    if (!domain->profile_valid &&
-        k230_dvfs_read_hw_profile(domain, &domain->actual_profile_idx))
-        domain->profile_valid = true;
-
-    from_idx_cvt = k230_dvfs_profile_index_transform(domain,
-        domain->actual_profile_idx);
-    if (domain->profile_valid && from_idx_cvt == to_idx_cvt) {
-        return 0;
-    }
-    if (domain->regulator_failed)
-        return K230_ERR_PM_NOTREADY;
-
-    if (domain->regulator == RT_NULL) {
-        ret = k230_dvfs_set_clock_step(domain, to_idx_cvt);
-    } else if (!domain->profile_valid) {
-        /* With an unknown boot frequency, raise to the maximum required
-         * voltage before changing the clock, then settle at the target. */
-        ret = k230_dvfs_set_voltage(domain, 0);
-        if (ret == 0)
-            ret = k230_dvfs_set_clock_step(domain, to_idx_cvt);
-        if (ret == 0 && domain->desc->steps[0].volt !=
-            domain->desc->steps[to_idx_cvt].volt) {
-            ret = k230_dvfs_set_voltage(domain, to_idx_cvt);
-        }
-    } else if (PROFILE_IS_UP(from_idx_cvt, to_idx_cvt)) {
-        if (domain->desc->steps[from_idx_cvt].volt ==
-            domain->desc->steps[to_idx_cvt].volt) {
-            ret = 0;
-        } else {
-            ret = k230_dvfs_set_voltage(domain, to_idx_cvt);
-        }
-        if (ret == 0)
-            ret = k230_dvfs_set_clock_step(domain, to_idx_cvt);
-    } else {
-        ret = k230_dvfs_set_clock_step(domain, to_idx_cvt);
-        if (ret == 0 && domain->desc->steps[from_idx_cvt].volt !=
-            domain->desc->steps[to_idx_cvt].volt) {
-            ret = k230_dvfs_set_voltage(domain, to_idx_cvt);
-            if (ret != 0) {
-                rollback_ret = k230_dvfs_set_clock_step(domain, from_idx_cvt);
-                if (rollback_ret != 0)
-                    rt_kprintf("k230_pm_dvfs: %s clock rollback failed: %d\n",
-                        domain->desc->name, rollback_ret);
-            }
+    if (sample->temperature_mc >= dvfs->thermal_protect_temp * 1000) {
+        dvfs->thermal_over = true;
+        dvfs->thermal_recovering = false;
+    } else if (sample->temperature_mc >=
+        (dvfs->thermal_protect_temp - K230_DVFS_THERMAL_HYSTERESIS_TEMP) * 1000) {
+        dvfs->thermal_recovering = false;
+    } else if (new_sample && dvfs->thermal_over) {
+        if (!dvfs->thermal_recovering ||
+            (rt_tick_t)(sample->tick - dvfs->thermal_sample.tick) >= gap) {
+            dvfs->thermal_recovering = true;
+            dvfs->thermal_recovery_tick = sample->tick;
+        } else if ((rt_tick_t)(sample->tick - dvfs->thermal_recovery_tick) >= recovery) {
+            dvfs->thermal_over = false;
+            dvfs->thermal_recovering = false;
         }
     }
-
-    if (ret == 0) {
-        domain->actual_profile_idx = to_idx;
-        domain->profile_valid = true;
-    } else {
-        domain->profile_valid = k230_dvfs_read_hw_profile(domain,
-            &domain->actual_profile_idx);
-        if (domain->profile_valid && domain->regulator != RT_NULL) {
-            int32_t actual_idx_cvt = k230_dvfs_profile_index_transform(domain,
-                domain->actual_profile_idx);
-
-            rollback_ret = k230_dvfs_set_voltage(domain, actual_idx_cvt);
-            if (rollback_ret != 0)
-                rt_kprintf("k230_pm_dvfs: %s voltage reconcile failed: %d\n",
-                    domain->desc->name, rollback_ret);
-        }
-    }
-
-    return ret;
+    dvfs->thermal_sample = *sample;
 }
 
 static int k230_dvfs_start_auto_thread(void);
@@ -435,9 +534,10 @@ static int k230_dvfs_set_domain_governor(struct k230_dvfs_domain *domain,
 
     if (governor == K230_PM_GOVERNOR_MANUAL) {
         memset(domain->profile_lock, 0, sizeof(domain->profile_lock));
-        domain->manual_profile_idx = domain->profile_valid ?
-            domain->actual_profile_idx : domain->expect_profile_idx;
-        domain->expect_profile_idx = domain->manual_profile_idx;
+        /* Keep the requested profile, not the running one: a thermal
+         * ceiling may be holding the clock lower and must not become the
+         * manual choice once it lifts. */
+        domain->manual_profile_idx = domain->expect_profile_idx;
     }
     rt_mutex_release(&domain->mutex);
 
@@ -761,21 +861,30 @@ int k230_pm_dvfs_set_thermal_protect(k230_pm_uapi_domain domain,
 {
     struct k230_dvfs_domain *dvfs = k230_dvfs_domain_get(domain);
     int ret;
-
     if (dvfs == RT_NULL)
         return k230_dvfs_domain_check(domain);
     if ((dvfs->desc->caps & K230_DVFS_CAP_THERMAL) == 0U)
         return K230_ERR_PM_NOT_SUPPORT;
-    if (!k230_dvfs_thermal_temp_valid(temp) ||
-        !k230_dvfs_profile_index_valid(dvfs, index))
+    if (!k230_dvfs_thermal_temp_valid(temp) || !k230_dvfs_profile_index_valid(dvfs, index))
         return K230_ERR_PM_ILLEGAL_PARAM;
-
-    rt_mutex_take(&dvfs->mutex, RT_WAITING_FOREVER);
+    if (rt_mutex_take(&k230_dvfs_config_mutex, rt_tick_from_millisecond(100)) != RT_EOK)
+        return K230_ERR_PM_BUSY;
+    if (temp * 1000 >= k230_pm_dvfs_thermal_shutdown_mc()) {
+        rt_mutex_release(&k230_dvfs_config_mutex);
+        return K230_ERR_PM_ILLEGAL_PARAM;
+    }
+    if (rt_mutex_take(&dvfs->mutex, rt_tick_from_millisecond(100)) != RT_EOK) {
+        rt_mutex_release(&k230_dvfs_config_mutex);
+        return K230_ERR_PM_BUSY;
+    }
     dvfs->thermal_protect_temp = temp;
     dvfs->thermal_protect_idx = index;
-
+    dvfs->thermal_recovering = false;
+    rt_mutex_release(&k230_dvfs_config_mutex);
+    k230_dvfs_extra_limit(dvfs, &dvfs->thermal_sample);
     ret = k230_dvfs_set_actual_profile_locked(dvfs);
     rt_mutex_release(&dvfs->mutex);
+    k230_pm_thermal_notify();
     return ret;
 }
 
@@ -800,11 +909,36 @@ int k230_pm_dvfs_get_thermal_protect(k230_pm_uapi_domain domain,
 
 int k230_pm_dvfs_set_thermal_shutdown(int32_t temp)
 {
+#ifdef K230_PM_THERMAL_PROTECT
+    struct k230_thermal_config config;
+    uint32_t i;
+    if (temp < K230_DVFS_THERMAL_MIN_TEMP || temp > K230_DVFS_SHUTDOWN_MAX_TEMP)
+        return K230_ERR_PM_ILLEGAL_PARAM;
+    k230_pm_thermal_config(&config);
+    if (!k230_thermal_config_valid(&config) ||
+        temp * 1000 <= config.sustained_mc || temp * 1000 > config.critical_mc)
+        return K230_ERR_PM_ILLEGAL_PARAM;
+    if (rt_mutex_take(&k230_dvfs_config_mutex, rt_tick_from_millisecond(100)) != RT_EOK)
+        return K230_ERR_PM_BUSY;
+    for (i = 0; i < k230_dvfs_domain_desc_count; ++i) {
+        const struct k230_dvfs_domain *dvfs = &k230_dvfs_domains[i];
+        if (dvfs->desc && (dvfs->desc->caps & K230_DVFS_CAP_THERMAL) &&
+            dvfs->thermal_protect_temp >= temp) {
+            rt_mutex_release(&k230_dvfs_config_mutex);
+            return K230_ERR_PM_ILLEGAL_PARAM;
+        }
+    }
+    __atomic_store_n(&k230_dvfs_thermal_shutdown, temp, __ATOMIC_RELEASE);
+    rt_mutex_release(&k230_dvfs_config_mutex);
+    k230_pm_thermal_notify();
+    return 0;
+#else
+    /* Stored for /dev/pm only; nothing acts on it without thermal protection. */
     if (!k230_dvfs_thermal_temp_valid(temp))
         return K230_ERR_PM_ILLEGAL_PARAM;
-
-    k230_dvfs_thermal_shutdown = temp;
+    __atomic_store_n(&k230_dvfs_thermal_shutdown, temp, __ATOMIC_RELEASE);
     return 0;
+#endif
 }
 
 int k230_pm_dvfs_get_thermal_shutdown(int32_t *temp)
@@ -812,13 +946,25 @@ int k230_pm_dvfs_get_thermal_shutdown(int32_t *temp)
     if (temp == RT_NULL)
         return K230_ERR_PM_NULL_PTR;
 
-    *temp = k230_dvfs_thermal_shutdown;
+    *temp = k230_pm_dvfs_thermal_shutdown_temp();
     return 0;
 }
 
 int32_t k230_pm_dvfs_thermal_shutdown_temp(void)
 {
-    return k230_dvfs_thermal_shutdown;
+    return k230_dvfs_mc_to_c_floor(k230_pm_dvfs_thermal_shutdown_mc());
+}
+
+int32_t k230_pm_dvfs_thermal_shutdown_mc(void)
+{
+    int32_t limit = __atomic_load_n(&k230_dvfs_thermal_shutdown, __ATOMIC_ACQUIRE) * 1000;
+#ifdef K230_PM_THERMAL_PROTECT
+    struct k230_thermal_config config;
+    k230_pm_thermal_config(&config);
+    if (config.critical_mc < limit)
+        limit = config.critical_mc;
+#endif
+    return limit;
 }
 
 int k230_pm_dvfs_set_clock(k230_pm_uapi_domain domain, bool enable)
@@ -903,36 +1049,46 @@ int k230_pm_dvfs_set_power(k230_pm_uapi_domain domain, bool enable)
     return ret == 0 ? 0 : K230_ERR_PM_BUSY;
 }
 
-void k230_pm_dvfs_thermal_update(k230_pm_uapi_domain domain, int32_t temp)
+int k230_pm_dvfs_thermal_apply(k230_pm_uapi_domain domain,
+    const struct k230_thermal_sample *sample, bool may_raise,
+    struct k230_thermal_clocks *status)
 {
     struct k230_dvfs_domain *dvfs = k230_dvfs_domain_get(domain);
-    bool thermal_over;
-
-    if (dvfs == RT_NULL)
-        return;
-    if ((dvfs->desc->caps & K230_DVFS_CAP_THERMAL) == 0U)
-        return;
-
-    rt_mutex_take(&dvfs->mutex, RT_WAITING_FOREVER);
-    if (dvfs->thermal_over)
-        thermal_over = temp > dvfs->thermal_protect_temp -
-            K230_DVFS_THERMAL_HYSTERESIS_TEMP;
-    else
-        thermal_over = temp > dvfs->thermal_protect_temp;
-
-    if (thermal_over != dvfs->thermal_over) {
-        if (thermal_over)
-            rt_kprintf("k230_pm_dvfs: domain %s thermal protect: temp=%d C limit=%d C profile=%d\n",
-                dvfs->desc->name, temp, dvfs->thermal_protect_temp,
-                dvfs->thermal_protect_idx);
-        else
-            rt_kprintf("k230_pm_dvfs: domain %s thermal protect clear: temp=%d C limit=%d C\n",
-                dvfs->desc->name, temp, dvfs->thermal_protect_temp);
+    int ret;
+    if (dvfs == RT_NULL || status == RT_NULL)
+        return K230_ERR_PM_ILLEGAL_PARAM;
+    status->requested_hz = k230_pm_thermal_limit(dvfs->desc->steps[0].leaf);
+    status->actual_hz = sysctl_media_clk_get_leaf_freq(dvfs->desc->steps[0].leaf);
+    if (rt_mutex_take(&dvfs->mutex, rt_tick_from_millisecond(100)) != RT_EOK) {
+        status->error = K230_ERR_PM_BUSY;
+        return status->error;
     }
-
-    dvfs->thermal_over = thermal_over;
-    (void)k230_dvfs_set_actual_profile_locked(dvfs);
+    {
+        bool was_over = dvfs->thermal_over;
+        k230_dvfs_extra_limit(dvfs, sample);
+        if (dvfs->thermal_over)
+            dvfs->thermal_restore_pending = false;
+        else if (was_over)
+            dvfs->thermal_restore_pending = true;
+        int32_t limit = k230_dvfs_limit_index(dvfs);
+        if (dvfs->thermal_over) {
+            int32_t extra = k230_dvfs_profile_index_transform(dvfs, dvfs->thermal_protect_idx);
+            if (extra > limit) limit = extra;
+        }
+        status->requested_hz = dvfs->desc->steps[limit].freq;
+        /* Clearing the extra cap is an edge, but restoring the saved request
+         * may need retries even when the system ceiling never changes. */
+        ret = k230_dvfs_apply_locked(dvfs, may_raise || dvfs->thermal_restore_pending);
+    }
+    status->actual_hz = sysctl_media_clk_get_leaf_freq(dvfs->desc->steps[0].leaf);
+    if (ret == 0 && status->actual_hz > status->requested_hz +
+        (status->requested_hz == UINT32_MAX ? 0 : K230_DVFS_FREQ_TOLERANCE_HZ))
+        ret = K230_ERR_PM_NOTREADY;
+    status->error = ret;
+    if (ret == 0)
+        dvfs->thermal_restore_pending = false;
     rt_mutex_release(&dvfs->mutex);
+    return ret;
 }
 
 void k230_pm_dvfs_dump(void)
@@ -1005,6 +1161,14 @@ int k230_pm_dvfs_init(void)
         return 0;
 
     if (!k230_dvfs_domains_initialized) {
+        int32_t thermal_default = K230_DVFS_THERMAL_DEFAULT_TEMP;
+#ifdef K230_PM_THERMAL_PROTECT
+        struct k230_thermal_config config;
+        k230_pm_thermal_config(&config);
+        thermal_default = k230_dvfs_mc_to_c_floor(config.min_mc);
+#endif
+        if (rt_mutex_init(&k230_dvfs_config_mutex, "thermcfg", RT_IPC_FLAG_PRIO) != RT_EOK)
+            return K230_ERR_PM_NOTREADY;
         for (i = 0; i < k230_dvfs_domain_desc_count; i++) {
             const struct k230_dvfs_domain_desc *desc =
                 &k230_dvfs_domain_desc[i];
@@ -1028,8 +1192,13 @@ int k230_pm_dvfs_init(void)
             dvfs->manual_profile_idx = 0;
             dvfs->expect_profile_idx = dvfs->manual_profile_idx;
             dvfs->governor = K230_PM_GOVERNOR_MANUAL;
-            dvfs->thermal_protect_temp = K230_DVFS_THERMAL_DEFAULT_TEMP;
+            dvfs->thermal_protect_temp = thermal_default;
             dvfs->thermal_protect_idx = dvfs->desc->step_count - 1;
+#ifdef K230_PM_THERMAL_PROTECT
+            /* The system monitor walks the profiles. An implicit per-domain
+             * minimum would bypass that ramp; explicit user caps still apply. */
+            dvfs->thermal_protect_idx = 0;
+#endif
 
             /* No board rail: frequency-only. A failed one blocks transitions. */
             dvfs->regulator = regulator_get(dvfs->desc->regulator_name);
@@ -1060,6 +1229,7 @@ int k230_pm_dvfs_init(void)
                 dvfs->desc->name, ret);
     }
 
+    /* Does not wait for a reading: the first one lowers clocks if needed. */
     ret = k230_pm_thermal_init();
     if (ret != 0)
         return ret;

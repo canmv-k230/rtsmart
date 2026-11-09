@@ -624,11 +624,253 @@ menu "InterDriver"
                     protection and the userspace-compatible /dev/pm device from the
                     k230_pm driver.
 
-            config K230_PM_THERMAL_PROTECT
+            menuconfig K230_PM_THERMAL_PROTECT
                 bool "Enable K230 PM thermal protection"
                 default y
                 depends on K230_PM_DVFS
                 select RT_USING_TS
+                help
+                    Monitor-owned temperature sampling, fixed protection
+                    stages with verified clock ceilings, optional step-wise
+                    regulation below them, and latched critical and
+                    sustained-heat responses. Boot does not wait for the
+                    sensor: default profiles apply at once and the first
+                    reading lowers them if needed. A sensor that stops reporting
+                    forces minimum clocks. Thresholds and time budgets
+                    require board validation.
+
+            if K230_PM_THERMAL_PROTECT
+                comment "Protection and shutdown"
+
+                config K230_PM_THERMAL_CRITICAL_C
+                    int "Critical shutdown temperature (C)"
+                    range 50 115
+                    default 105
+                    help
+                        A reading at this temperature, confirmed by an
+                        immediate second successful reading within the sensor
+                        noise band, requests the selected shutdown backend. A
+                        failed confirmation keeps minimum protection pending
+                        and is retried; it does not by itself request shutdown.
+                        With the NONE backend, a confirmed event instead stays
+                        at minimum clocks while CPU, KPU and VPU work remains
+                        available. The
+                        stage step is the
+                        smaller of 5 C and (critical - target) / 4, retaining
+                        fractional degrees: WARM -3 steps, HOT -2, MIN -1.
+                        Hysteresis follows the step. Sustained
+                        shutdown follows 30 s at MIN heat once every throttled
+                        domain is verified at its minimum clock. The default
+                        105 C with target 85 C gives stages of 90/95/100 C.
+
+                        Stage ceilings come from each domain's DVFS table:
+                        WARM one profile below maximum, HOT two below, MIN the
+                        minimum. CPU 1188/800/200 MHz, KPU 400/266/100 MHz,
+                        VPU 600/400/200 MHz.
+
+                        The datasheet specifies the sensor to 125 C with
+                        +/-3 C untrimmed accuracy but no maximum die
+                        temperature: validate the board before raising this.
+                        For board testing, lower this value and the regulation
+                        target directly. The same protection stages apply.
+
+                choice
+                    prompt "Thermal shutdown backend"
+                    default K230_PM_THERMAL_SHUTDOWN_NONE
+                    help
+                        The default NONE backend keeps the system and all
+                        domains available at minimum clocks after a shutdown
+                        condition. This is a development-safe default.
+                        Production configurations that require terminal
+                        thermal protection must explicitly select and validate
+                        HALT or PMU. PMU rail removal must be verified on the
+                        board; a CPU halt does not prove power-off.
+                    config K230_PM_THERMAL_SHUTDOWN_NONE
+                        bool "No system shutdown (hold minimum protection)"
+                        help
+                            Latch and report the first shutdown reason and
+                            retain minimum clock caps, but do not block CPU,
+                            KPU or VPU work, quiesce the system, disable
+                            interrupts, halt, reset or request PMU rail
+                            power-off. The latched reason and minimum caps
+                            remain until a normal reboot.
+                    config K230_PM_THERMAL_SHUTDOWN_PMU
+                        bool "PMU rail power-off request with halt fallback"
+                        depends on RT_USING_RTC_PMU
+                        help
+                            Needs the PMU 32 kHz domain (RTC crystal and
+                            LP-LDO), as does RT_USING_RTC_PMU: on boards
+                            without it any PMU register access stalls the CPU.
+                    config K230_PM_THERMAL_SHUTDOWN_HALT
+                        bool "Halt fallback (no verified PMU rail control)"
+                endchoice
+
+                config K230_PM_THERMAL_COOLDOWN_RESTART
+                    bool "Restart after a thermal halt once the chip has cooled"
+                    default y
+                    depends on !K230_PM_THERMAL_SHUTDOWN_NONE
+                    help
+                        When the halt fallback is reached (HALT backend, or a
+                        PMU request that did not remove power), keep reading
+                        the sensor and reset the SoC after 60 s below the lower
+                        of 70 C and the configured thermal target. With a low
+                        test target the idle die may never get that cool, and
+                        the board then stays halted.
+                        Regulators keep the low voltages DVFS left them at
+                        across the reset: SPL must restore the CPU rail before
+                        the big core runs (U-Boot with the TPS6286x regulator
+                        and the boot-on vdd_cpu rail). An older SPL boots the
+                        big core at full clock on the low voltage.
+                        Startup applies the default profiles without waiting;
+                        the first fresh reading lowers them when required.
+                        Not used after a sensor outage or a thermal
+                        initialization failure. In a persistently hot
+                        enclosure the board cycles slowly instead of staying
+                        off.
+
+                config K230_PM_THERMAL_SHUTDOWN_ON_SENSOR_FAULT
+                    bool "Shut down on persistent temperature sensor outage"
+                    default n
+                    depends on !K230_PM_THERMAL_SHUTDOWN_NONE
+                    help
+                        Without this option, a sensor outage lasting ten
+                        seconds beyond the next scheduled acquisition holds
+                        minimum clocks, refuses new accelerator work and
+                        powers off idle accelerator domains until fresh
+                        measurements satisfy the recovery hold. Domains still
+                        referenced by a client stay powered.
+
+                comment "Regulation"
+
+                config K230_PM_THERMAL_REGULATION
+                    bool "Step-wise thermal regulation below the protection stages"
+                    default y
+                    help
+                        Best-effort regulation toward a target below WARM,
+                        modelled on Linux's step_wise governor. One ladder
+                        interleaves the CPU, KPU and VPU DVFS profiles in the
+                        order set by the cut weights. Every two seconds above
+                        the target it lowers the next profile that reduces a
+                        running clock; after 10 s below the target band it
+                        raises one, so a cut that briefly cools the die is not
+                        undone at once. Regulation starts one stage step below the
+                        target, and missing samples hold its position. The
+                        protection stages, critical and sustained shutdown
+                        work independently and are the only verified
+                        protection. Disable to keep the stages alone.
+
+                config K230_PM_THERMAL_TARGET_C
+                    int "Thermal target temperature (C)"
+                    range 30 95
+                    default 30 if K230_PM_THERMAL_CRITICAL_C < 55
+                    default 35 if K230_PM_THERMAL_CRITICAL_C < 60
+                    default 40 if K230_PM_THERMAL_CRITICAL_C < 65
+                    default 45 if K230_PM_THERMAL_CRITICAL_C < 70
+                    default 50 if K230_PM_THERMAL_CRITICAL_C < 75
+                    default 55 if K230_PM_THERMAL_CRITICAL_C < 80
+                    default 60 if K230_PM_THERMAL_CRITICAL_C < 85
+                    default 65 if K230_PM_THERMAL_CRITICAL_C < 90
+                    default 70 if K230_PM_THERMAL_CRITICAL_C < 95
+                    default 75 if K230_PM_THERMAL_CRITICAL_C < 100
+                    default 80 if K230_PM_THERMAL_CRITICAL_C < 105
+                    default 85 if K230_PM_THERMAL_CRITICAL_C < 110
+                    default 90 if K230_PM_THERMAL_CRITICAL_C < 115
+                    default 95
+                    help
+                        Must be at least 8 C below critical, allowing four
+                        bands of at least 2 C. Stage spacing is calculated as
+                        (critical - target) / 4, capped at 5 C. For example,
+                        critical 55 C and target 45 C give 2.5 C steps and
+                        WARM/HOT/MIN at 47.5/50/52.5 C. The sensor noise band
+                        is 1 C, reduced to 0.9 C for 2 C steps.
+
+                        This also sets protection spacing and cooldown when
+                        regulation is disabled. The
+                        default follows the critical temperature but a saved
+                        value does not, so lower both together for board
+                        testing. The default is critical minus 20 C rounded
+                        down to a multiple of 5 C.
+
+                config K230_PM_THERMAL_WEIGHT_CPU
+                    int "Cut weight: CPU"
+                    depends on K230_PM_THERMAL_REGULATION
+                    range 0 8
+                    default 1
+                    help
+                        Cut order. Each domain's profile steps are spread over
+                        the ladder by their fraction of its range divided by
+                        its weight, so a heavier domain is lowered sooner.
+                        Equal weights interleave the domains evenly. Weight 0
+                        leaves a domain to the protection stages only; with
+                        every weight 0 regulation has nothing to lower.
+
+                        EVB measurements with an AI and video pipeline:
+                        halving the KPU clock cost about 5% of inference rate;
+                        one CPU step (1188 -> 800 MHz, with its voltage)
+                        cooled the die about 2.5 C; halving the VPU clock saved
+                        0.4 C under full load (1.3 C alone) for half the video
+                        throughput. For such a pipeline KPU 4, CPU 2, VPU 0
+                        is a good starting point.
+
+                config K230_PM_THERMAL_WEIGHT_KPU
+                    int "Cut weight: KPU"
+                    depends on K230_PM_THERMAL_REGULATION
+                    range 0 8
+                    default 1
+                    help
+                        See the CPU weight. On the EVB the KPU clock barely
+                        limited inference rate, which makes it the cheapest
+                        cut.
+
+                config K230_PM_THERMAL_WEIGHT_VPU
+                    int "Cut weight: VPU"
+                    depends on K230_PM_THERMAL_REGULATION
+                    range 0 8
+                    default 1
+                    help
+                        See the CPU weight. The VPU steps through
+                        800/600/400/300/200 MHz at a fixed voltage, so each
+                        cut saves little heat. Its clock also drives the VPU
+                        bus and DDR port 2, which the DPU shares.
+
+                comment "Diagnostics"
+
+                choice
+                    prompt "Thermal log level"
+                    default K230_PM_THERMAL_LOG_EVENTS
+                    help
+                        Configuration errors, unconfirmed critical readings and
+                        shutdowns are logged at every level.
+                    config K230_PM_THERMAL_LOG_ERRORS
+                        bool "Errors: sensor faults"
+                        help
+                            Log a sensor entering or leaving a fault, and every
+                            10 s while it lasts.
+                    config K230_PM_THERMAL_LOG_EVENTS
+                        bool "Events: errors and protection stage changes"
+                        help
+                            Also log each change of protection stage, so
+                            throttling starting and stopping is visible. A
+                            normal boot logs nothing.
+                    config K230_PM_THERMAL_LOG_VERBOSE
+                        bool "Verbose: also configuration and sensor start"
+                        help
+                            Also print the thresholds, stage ceilings and cut
+                            weights at startup, and every sensor state change,
+                            including the sensor coming up at boot.
+                endchoice
+
+                config K230_PM_THERMAL_TRACE
+                    bool "Log every thermal observation"
+                    default n
+                    help
+                        Prints acquisition tick, temperature, sequence, stage,
+                        ceiling, regulation level, and the caps and read-back
+                        clocks of every domain for each new sample: up to
+                        four lines per second while throttled. For heating
+                        and cooling-rate measurements.
+
+            endif
 
         endif
 

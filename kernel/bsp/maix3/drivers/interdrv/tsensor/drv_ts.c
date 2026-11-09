@@ -30,16 +30,25 @@
 #include <rtthread.h>
 #include "sysctl_clk.h"
 #include "ts_hw.h"
+#ifdef K230_PM_THERMAL_PROTECT
+#include "k230_pm_thermal.h"
+#endif
 
 /*
  * RT-Smart device for the temperature sensor, on top of the bare ts_hw
- * driver, which owns the registers.
+ * driver. With K230_PM_THERMAL_PROTECT the thermal monitor owns the sensor:
+ * this wrapper never touches it, reads return the monitor's latest reading,
+ * and the configuration is fixed at the monitor's single mode and trim.
  */
 
+static bool ts_ready;
+#ifdef K230_PM_THERMAL_PROTECT
+static const uint8_t ts_trim = TS_HW_DEFAULT_TRIM;
+static const uint8_t ts_mode = RT_DEVICE_TS_CTRL_MODE_SINGLE;
+#else
 #define TS_LOCK_TIMEOUT_MS 500
 
 static struct rt_mutex ts_mutex;
-static bool ts_ready;
 static uint8_t ts_trim = TS_HW_DEFAULT_TRIM;
 static uint8_t ts_mode = RT_DEVICE_TS_CTRL_MODE_CONTINUUOS;
 
@@ -49,6 +58,7 @@ static int ts_lock(void)
         return -RT_ENOSYS;
     return rt_mutex_take(&ts_mutex, rt_tick_from_millisecond(TS_LOCK_TIMEOUT_MS));
 }
+#endif
 
 static int ts_check_mode(uint8_t mode)
 {
@@ -56,6 +66,51 @@ static int ts_check_mode(uint8_t mode)
         mode == RT_DEVICE_TS_CTRL_MODE_CONTINUUOS ? RT_EOK : -RT_EINVAL;
 }
 
+#ifdef K230_PM_THERMAL_PROTECT
+int tsensor_init(void)
+{
+    return ts_ready ? RT_EOK : -RT_ENOSYS;
+}
+
+/* The monitor's calibration may be requested again, never changed. */
+int tsensor_set_trim(uint8_t trim)
+{
+    if (trim > 15)
+        return -RT_EINVAL;
+    if (!ts_ready)
+        return -RT_ENOSYS;
+    return trim == ts_trim ? RT_EOK : -RT_EBUSY;
+}
+
+int tsensor_set_mode(uint8_t mode)
+{
+    if (ts_check_mode(mode) != RT_EOK)
+        return -RT_EINVAL;
+    if (!ts_ready)
+        return -RT_ENOSYS;
+    return mode == ts_mode ? RT_EOK : -RT_EBUSY;
+}
+
+int tsensor_read_temp(double *temp)
+{
+    struct k230_thermal_reading reading;
+    int ret;
+
+    if (temp == RT_NULL)
+        return -RT_EINVAL;
+    ret = k230_pm_thermal_reading(&reading);
+    if (ret != RT_EOK)
+        return ret;
+    if (!reading.valid)
+        return -RT_EEMPTY;
+    if (reading.stale)
+        return -RT_ETIMEOUT;
+    if (reading.error != RT_EOK)
+        return reading.error;
+    *temp = reading.millicelsius / 1000.0;
+    return RT_EOK;
+}
+#else
 static void ts_sleep_1ms(void)
 {
     rt_thread_mdelay(1);
@@ -177,6 +232,7 @@ int tsensor_read_temp(double *temp)
 {
     return ts_read(temp, RT_NULL, RT_NULL);
 }
+#endif
 
 uint8_t tsensor_get_trim(void)
 {
@@ -197,6 +253,7 @@ static rt_err_t ts_device_open(rt_device_t dev, rt_uint16_t oflag)
 
 static rt_err_t ts_device_close(rt_device_t dev)
 {
+#ifndef K230_PM_THERMAL_PROTECT
     /* rt_device_close() calls this only when the last reference is dropped;
      * the last client stops a continuous conversion. */
     int ret = ts_lock();
@@ -205,6 +262,7 @@ static rt_err_t ts_device_close(rt_device_t dev)
         return ret;
     ts_hw_disable();
     rt_mutex_release(&ts_mutex);
+#endif
     return RT_EOK;
 }
 
@@ -256,11 +314,13 @@ static int rt_hw_ts_init(void)
 
     if (ret != RT_EOK)
         return ret;
+#ifndef K230_PM_THERMAL_PROTECT
     ret = rt_mutex_init(&ts_mutex, "dev_ts", RT_IPC_FLAG_PRIO);
     if (ret != RT_EOK)
         return ret;
     /* Stop whatever earlier boot stages left running. */
     ts_hw_configure(ts_trim, ts_mode == RT_DEVICE_TS_CTRL_MODE_CONTINUUOS);
+#endif
     ts_ready = true;
 #ifdef DRV_TS_USE_RT_DEVICE
 #ifdef RT_USING_DEVICE_OPS
@@ -285,9 +345,14 @@ static void chip_temp(void)
     double temp;
     int32_t milli;
     uint32_t magnitude;
+#ifdef K230_PM_THERMAL_PROTECT
+    /* The monitor's latest reading; it does not keep the raw conversion. */
+    int ret = tsensor_read_temp(&temp);
+#else
     uint16_t raw;
     uint32_t ctrl;
     int ret = ts_read(&temp, &raw, &ctrl);
+#endif
 
     if (ret != RT_EOK) {
         rt_kprintf("chip temperature unavailable: %d\n", ret);
@@ -297,10 +362,12 @@ static void chip_temp(void)
     magnitude = milli < 0 ? (uint32_t)-milli : (uint32_t)milli;
     rt_kprintf("chip temperature: %s%u.%03u C\n", milli < 0 ? "-" : "",
         magnitude / 1000, magnitude % 1000);
+#ifndef K230_PM_THERMAL_PROTECT
     rt_kprintf("tsensor: raw=%u (0x%03x) ctrl=0x%02x trim=%u mode=%s clock=%u Hz\n",
         (unsigned)raw, (unsigned)raw, (unsigned)ctrl, (unsigned)ts_trim,
         ts_mode == RT_DEVICE_TS_CTRL_MODE_CONTINUUOS ? "continuous" : "single",
         (unsigned)sysctl_clk_get_leaf_freq(SYSCTL_CLK_TS_CLK));
+#endif
 }
 MSH_CMD_EXPORT(chip_temp, dump chip temperature);
 #endif
