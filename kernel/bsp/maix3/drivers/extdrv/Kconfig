@@ -24,16 +24,24 @@ menu "Wi-Fi Drivers"
 
             choice
                 prompt "Host controller"
-                default BSP_WIFI_SDIO_HOST_1 if RT_USING_SDIO1
-                default BSP_WIFI_SDIO_HOST_0
+                default BSP_WIFI_SDIO_HOST_1
+                help
+                    Select the controller wired to the board's Wi-Fi module.
+                    Many SD-card-boot boards use SDIO0 for Wi-Fi, while
+                    01Studio uses SDIO1. Confirm with the board schematic.
+                    This selection enables the required SDIO controller;
+                    disabling a controller must not move Wi-Fi to another bus.
+                    The boot disk and Wi-Fi must use different controllers.
+                    Disable all SDIO Wi-Fi drivers/transports before disabling
+                    their controller to save power. USB Wi-Fi can stay enabled.
 
                 config BSP_WIFI_SDIO_HOST_0
                     bool "SDIO0"
-                    depends on RT_USING_SDIO0
+                    select RT_USING_SDIO0
 
                 config BSP_WIFI_SDIO_HOST_1
                     bool "SDIO1"
-                    depends on RT_USING_SDIO1
+                    select RT_USING_SDIO1
             endchoice
 
             config BSP_WIFI_SDIO_HOST

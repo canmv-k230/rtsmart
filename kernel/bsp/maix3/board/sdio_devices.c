@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 #include <rtthread.h>
+#include "sdio_config.h"
 #include <drivers/mmcsd_core.h>
 
 #ifdef MOUNT_SECOND_CARD
