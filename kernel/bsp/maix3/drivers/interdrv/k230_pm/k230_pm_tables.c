@@ -420,7 +420,9 @@ const unsigned int k230_dvfs_domain_desc_count =
 #define VICAP_CSI0_CLOCKS
 #endif
 
-#ifdef CONFIG_MPP_ENABLE_CSI_DEV_1
+/* CSI0 4LANE drives lane2/3 through PHY1, which is clocked by the CSI1 leaves. */
+#if defined(CONFIG_MPP_ENABLE_CSI_DEV_1) || \
+    (defined(CONFIG_MPP_ENABLE_CSI_DEV_0) && defined(CONFIG_MPP_CSI0_LINK_MODE_4LANE))
 #define VICAP_CSI1_CLOCKS \
     SYSCTL_CLK_CSI1_CFG_CLK, SYSCTL_CLK_CSI1_PIXEL_CLK, SYSCTL_CLK_CSI1_PCLK,
 #else
