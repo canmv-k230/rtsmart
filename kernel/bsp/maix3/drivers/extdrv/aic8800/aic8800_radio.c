@@ -1449,22 +1449,20 @@ static rt_err_t aic_wire_send(struct aic8800_context *context,
     return result;
 }
 
-/* Linux sends the complete transport-specific union: SDIO ends at v3/2x,
- * while USB includes the later v4/2x-v2 members. */
+/* Both vendor transports send the complete union, including members that are
+ * newer than the active chip. Some RF-test images reject a truncated union. */
 static rt_size_t aic_wire_tx_power_request_length(
     const struct aic8800_context *context)
 {
-    return context->transport == AIC8800_TRANSPORT_SDIO ?
-           sizeof(struct aic_wire_tx_power_v3) :
-           sizeof(struct aic_wire_mm_set_tx_power_req);
+    (void)context;
+    return sizeof(struct aic_wire_mm_set_tx_power_req);
 }
 
 static rt_size_t aic_wire_tx_power_offset_request_length(
     const struct aic8800_context *context)
 {
-    return context->transport == AIC8800_TRANSPORT_SDIO ?
-           sizeof(struct aic_wire_tx_power_offset_2x) :
-           sizeof(struct aic_wire_mm_set_tx_power_offset_req);
+    (void)context;
+    return sizeof(struct aic_wire_mm_set_tx_power_offset_req);
 }
 
 static rt_err_t aic_wire_send_tx_power_index(
@@ -1694,7 +1692,8 @@ static rt_err_t aic_wire_send_rf_calibration(
                          &request, sizeof(request));
 }
 
-rt_err_t aic8800_radio_initialize(struct aic8800_context *context)
+static rt_err_t aic_radio_initialize(struct aic8800_context *context,
+                                     rt_bool_t rf_test)
 {
     rt_err_t result;
 
@@ -1722,7 +1721,7 @@ rt_err_t aic8800_radio_initialize(struct aic8800_context *context)
         {
             result = aic_wire_send_tx_power_offset(context);
         }
-        if (result == RT_EOK)
+        if (result == RT_EOK && !rf_test)
         {
             result = aic_wire_send_rf_calibration(context, 0xbfU, 0x3fU);
         }
@@ -1790,26 +1789,26 @@ rt_err_t aic8800_radio_initialize(struct aic8800_context *context)
         {
             result = aic_wire_send_tx_power_offset(context);
         }
-        if (result == RT_EOK)
+        if (result == RT_EOK && !rf_test)
         {
             result = aic_wire_send_rf_config(context, 0, 1, tx_gain, 32);
         }
-        if (result == RT_EOK)
+        if (result == RT_EOK && !rf_test)
         {
             result = aic_wire_send_rf_config(context, 16, 1,
                                              tx_gain_dsss, 32);
         }
-        if (result == RT_EOK)
+        if (result == RT_EOK && !rf_test)
         {
             result = aic_wire_send_rf_config(
                 context, 0, 0, g_aic8800dc_rx_gain_24ghz_20mhz, 64);
         }
-        if (result == RT_EOK)
+        if (result == RT_EOK && !rf_test)
         {
             result = aic_wire_send_rf_config(
                 context, 32, 0, g_aic8800dc_rx_gain_24ghz_40mhz, 64);
         }
-        if (result == RT_EOK)
+        if (result == RT_EOK && (!rf_test || context->chip_sub_id >= 1U))
         {
             result = aic_wire_send_rf_calibration(context, 0x0f8fU, 0);
         }
@@ -1822,9 +1821,20 @@ rt_err_t aic8800_radio_initialize(struct aic8800_context *context)
     }
     if (result == RT_EOK)
     {
-        LOG_I("RF initialized for product 0x%04x", context->product_id);
+        LOG_I("%sRF initialized for product 0x%04x",
+              rf_test ? "test " : "", context->product_id);
     }
     return result;
+}
+
+rt_err_t aic8800_radio_initialize(struct aic8800_context *context)
+{
+    return aic_radio_initialize(context, RT_FALSE);
+}
+
+rt_err_t aic8800_radio_initialize_rf_test(struct aic8800_context *context)
+{
+    return aic_radio_initialize(context, RT_TRUE);
 }
 
 rt_bool_t aic8800_radio_supports_80mhz(

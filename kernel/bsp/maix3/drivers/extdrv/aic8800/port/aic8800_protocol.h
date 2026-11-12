@@ -78,6 +78,12 @@
 
 #define AIC_DBG_MEM_MASK_WRITE_REQ AIC_WIRE_MSG(AIC_WIRE_TASK_DBG, 17)
 #define AIC_DBG_MEM_MASK_WRITE_CFM AIC_WIRE_MSG(AIC_WIRE_TASK_DBG, 18)
+#define AIC_DBG_RFTEST_CMD_REQ      AIC_WIRE_MSG(AIC_WIRE_TASK_DBG, 19)
+#define AIC_DBG_RFTEST_CMD_CFM      AIC_WIRE_MSG(AIC_WIRE_TASK_DBG, 20)
+
+#define AIC_RFTEST_ARGUMENT_SIZE              30U
+#define AIC_RFTEST_RESULT_SIZE               128U
+#define AIC_RFTEST_REQUEST_SIZE               40U
 
 /* AIC firmware ships with two incompatible MM_VERSION feature layouts.  The
  * full layout appears in the vendor USB driver, while current D80 firmware and

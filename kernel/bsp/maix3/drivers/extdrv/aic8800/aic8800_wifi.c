@@ -3284,6 +3284,7 @@ static rt_bool_t aic_command_is_confirmation(rt_uint16_t id)
     case AIC_MM_SET_TXPWR_ADJ_CFM:
     case AIC_MM_SET_COEX_CFM:
     case AIC_DBG_MEM_MASK_WRITE_CFM:
+    case AIC_DBG_RFTEST_CMD_CFM:
     case AIC_SCANU_START_CFM:
     case AIC_SCANU_START_ACCEPTED:
     case AIC_SCANU_VENDOR_IE_CFM:
@@ -3336,6 +3337,15 @@ static rt_err_t aic_handle_command(struct aic8800_context *context,
               id, (unsigned int)parameter_length,
               (unsigned int)length);
     }
+#ifdef AIC8800_WIFI_RF_TEST_MODE
+    if (id == AIC_DBG_RFTEST_CMD_CFM)
+    {
+        rt_wlan_offload_command_complete(
+            &context->commands, 0, id, RT_EOK, parameter,
+            parameter_length);
+    }
+    return RT_EOK;
+#endif
     switch (id)
     {
     case AIC_SCANU_RESULT_IND:
@@ -5782,7 +5792,11 @@ rt_err_t aic8800_core_receive(struct rt_wlan_offload_bus *bus, const void *data,
 
         if ((type & AIC_USB_TYPE_CONFIG) != AIC_USB_TYPE_CONFIG)
         {
+#ifdef AIC8800_WIFI_RF_TEST_MODE
+            last_result = RT_EOK;
+#else
             last_result = aic_handle_data(context, cursor, raw_length);
+#endif
         }
         else if (type == AIC_USB_TYPE_COMMAND)
         {
@@ -5790,8 +5804,12 @@ rt_err_t aic8800_core_receive(struct rt_wlan_offload_bus *bus, const void *data,
         }
         else if (type == AIC_USB_TYPE_DATA_CONFIRM)
         {
+#ifdef AIC8800_WIFI_RF_TEST_MODE
+            last_result = RT_EOK;
+#else
             last_result = aic_handle_data_confirmation(
                 context, cursor, raw_length);
+#endif
         }
         else if (type == AIC_USB_TYPE_PRINT)
         {
@@ -5925,18 +5943,11 @@ static rt_err_t aic_configure_channels(struct aic8800_context *context)
     return result;
 }
 
-static rt_err_t aic_configure_firmware(struct aic8800_context *context)
+static rt_err_t aic_start_firmware_stack(struct aic8800_context *context)
 {
     struct aic_wire_mm_set_stack_start_req stack_request;
     struct aic_wire_mm_set_stack_start_cfm stack_response;
-    struct aic_wire_mm_get_fw_version_cfm runtime_version;
-    rt_uint8_t runtime_version_request = 0;
-    rt_uint8_t version[28];
-    rt_uint8_t mac_response[6];
-    rt_uint8_t get_mac[4];
-    struct rt_wlan_offload_firmware_info info;
     rt_size_t response_length = 0;
-    rt_uint32_t raw_features;
     rt_bool_t disable_5ghz_profile;
     rt_err_t result;
 
@@ -5977,9 +5988,17 @@ static rt_err_t aic_configure_firmware(struct aic8800_context *context)
           stack_response.supports_5ghz, stack_response.vendor_info);
     context->firmware_supports_5ghz = stack_response.supports_5ghz != 0;
     context->firmware_capabilities_valid = RT_TRUE;
+    return RT_EOK;
+}
+
+static void aic_log_runtime_version(struct aic8800_context *context)
+{
+    struct aic_wire_mm_get_fw_version_cfm runtime_version;
+    rt_uint8_t runtime_version_request = 0;
+    rt_size_t response_length = 0;
+    rt_err_t result;
 
     rt_memset(&runtime_version, 0, sizeof(runtime_version));
-    response_length = 0;
     result = aic_execute(context, AIC_MM_GET_FW_VERSION_REQ,
                          AIC_MM_GET_FW_VERSION_CFM,
                          &runtime_version_request,
@@ -6006,6 +6025,24 @@ static rt_err_t aic_configure_firmware(struct aic8800_context *context)
         LOG_I("runtime firmware: %.*s", (int)version_length,
               runtime_version.version);
     }
+}
+
+static rt_err_t aic_configure_firmware(struct aic8800_context *context)
+{
+    rt_uint8_t version[28];
+    rt_uint8_t mac_response[6];
+    rt_uint8_t get_mac[4];
+    struct rt_wlan_offload_firmware_info info;
+    rt_size_t response_length = 0;
+    rt_uint32_t raw_features;
+    rt_err_t result;
+
+    result = aic_start_firmware_stack(context);
+    if (result != RT_EOK)
+    {
+        return result;
+    }
+    aic_log_runtime_version(context);
 
     result = aic8800_radio_initialize(context);
     if (result != RT_EOK)
@@ -10480,6 +10517,121 @@ static rt_uint16_t aic8800_protocol_version(
            AIC_WIRE_MSG_API_VERSION_SDIO : AIC_WIRE_MSG_API_VERSION_USB;
 }
 
+#ifdef AIC8800_WIFI_RF_TEST_MODE
+static void aic8800_rf_bus_event(
+    struct rt_wlan_offload_bus *bus,
+    enum rt_wlan_offload_bus_event event, rt_err_t status, void *parameter)
+{
+    struct aic8800_context *context = parameter;
+
+    if (!context || bus != &context->bus ||
+        (event != RT_WLAN_OFFLOAD_BUS_EVENT_ERROR &&
+         event != RT_WLAN_OFFLOAD_BUS_EVENT_UNAVAILABLE))
+    {
+        return;
+    }
+    rt_wlan_offload_command_manager_fail(
+        &context->commands, status == RT_EOK ? -RT_EIO : status);
+}
+
+static rt_err_t aic8800_rf_core_attach(struct aic8800_context *context)
+{
+    struct rt_wlan_offload_command_manager_config command_config;
+    rt_err_t result;
+
+    result = rt_sem_init(&context->command_gate, "aic-cmd", 1,
+                         RT_IPC_FLAG_PRIO);
+    if (result != RT_EOK)
+    {
+        return result;
+    }
+    context->command_gate_initialized = RT_TRUE;
+    rt_memset(&command_config, 0, sizeof(command_config));
+    command_config.max_pending = 1;
+    command_config.push = aic_command_push;
+    command_config.driver_data = context;
+    result = rt_wlan_offload_command_manager_init(&context->commands,
+                                                   &command_config);
+    if (result != RT_EOK)
+    {
+        aic_command_gate_deinit(context);
+        return result;
+    }
+    rt_wlan_offload_bus_set_callbacks(
+        &context->bus, aic8800_core_receive, aic8800_rf_bus_event, context);
+    result = rt_wlan_offload_bus_start(&context->bus);
+    if (result != RT_EOK)
+    {
+        rt_wlan_offload_bus_set_callbacks(&context->bus, RT_NULL, RT_NULL,
+                                          RT_NULL);
+        rt_wlan_offload_command_manager_deinit(&context->commands);
+        aic_command_gate_deinit(context);
+        return result;
+    }
+    result = aic_start_firmware_stack(context);
+    if (result != RT_EOK)
+    {
+        LOG_E("RF-test stack initialization failed: %d", result);
+        rt_wlan_offload_bus_stop(&context->bus);
+        rt_wlan_offload_bus_set_callbacks(&context->bus, RT_NULL, RT_NULL,
+                                          RT_NULL);
+        rt_wlan_offload_command_manager_deinit(&context->commands);
+        aic_command_gate_deinit(context);
+        return result;
+    }
+    aic_log_runtime_version(context);
+    result = aic8800_radio_initialize_rf_test(context);
+    if (result != RT_EOK)
+    {
+        LOG_E("RF-test initialization failed: %d", result);
+        rt_wlan_offload_bus_stop(&context->bus);
+        rt_wlan_offload_bus_set_callbacks(&context->bus, RT_NULL, RT_NULL,
+                                          RT_NULL);
+        rt_wlan_offload_command_manager_deinit(&context->commands);
+        aic_command_gate_deinit(context);
+        return result;
+    }
+    result = aic8800_rf_test_register(context);
+    if (result != RT_EOK)
+    {
+        rt_wlan_offload_bus_stop(&context->bus);
+        rt_wlan_offload_bus_set_callbacks(&context->bus, RT_NULL, RT_NULL,
+                                          RT_NULL);
+        rt_wlan_offload_command_manager_deinit(&context->commands);
+        aic_command_gate_deinit(context);
+        return result;
+    }
+    context->attached = RT_TRUE;
+    return RT_EOK;
+}
+
+static rt_err_t aic8800_rf_core_detach(struct aic8800_context *context)
+{
+    rt_err_t result;
+
+    result = aic8800_rf_test_unregister(context);
+    if (result != RT_EOK)
+    {
+        return result;
+    }
+    result = rt_wlan_offload_bus_stop(&context->bus);
+    if (result != RT_EOK)
+    {
+        return result;
+    }
+    rt_wlan_offload_bus_set_callbacks(&context->bus, RT_NULL, RT_NULL,
+                                      RT_NULL);
+    result = rt_wlan_offload_command_manager_deinit(&context->commands);
+    if (result != RT_EOK)
+    {
+        return result;
+    }
+    aic_command_gate_deinit(context);
+    context->attached = RT_FALSE;
+    return RT_EOK;
+}
+#endif
+
 rt_err_t aic8800_core_attach(struct aic8800_context *context)
 {
     struct rt_wlan_offload_command_manager_config command_config;
@@ -10494,6 +10646,9 @@ rt_err_t aic8800_core_attach(struct aic8800_context *context)
     {
         return -RT_EIO;
     }
+#ifdef AIC8800_WIFI_RF_TEST_MODE
+    return aic8800_rf_core_attach(context);
+#endif
     result = aic8800_radio_load_config(context);
     if (result != RT_EOK)
     {
@@ -10723,6 +10878,9 @@ rt_err_t aic8800_core_detach(struct aic8800_context *context)
     {
         return context ? RT_EOK : -RT_EINVAL;
     }
+#ifdef AIC8800_WIFI_RF_TEST_MODE
+    return aic8800_rf_core_detach(context);
+#endif
     aic8800_core_cancel_work(context);
     if (context->mgmt_confirmation_timer_initialized)
     {

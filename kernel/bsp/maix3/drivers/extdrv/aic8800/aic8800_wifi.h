@@ -254,6 +254,7 @@ static inline rt_bool_t aic8800_usb_is_timeout(int result)
 #endif
 
 struct aic8800_context;
+struct aic8800_rf_test_device;
 
 /* Host-only ownership carried beside queued wire records. */
 struct aic8800_tx_metadata
@@ -602,6 +603,9 @@ struct aic8800_context
     struct rt_wlan_offload_bus bus;
     struct rt_wlan_offload_command_manager commands;
     struct rt_semaphore command_gate;
+#ifdef AIC8800_WIFI_RF_TEST_MODE
+    struct aic8800_rf_test_device *rf_test_device;
+#endif
 
     enum aic8800_transport transport;
     rt_uint16_t vendor_id;
@@ -1017,6 +1021,10 @@ void aic8800_core_tx_complete(
 void aic8800_core_tx_pending_reset(struct aic8800_context *context);
 rt_err_t aic8800_core_attach(struct aic8800_context *context);
 rt_err_t aic8800_core_detach(struct aic8800_context *context);
+#ifdef AIC8800_WIFI_RF_TEST_MODE
+rt_err_t aic8800_rf_test_register(struct aic8800_context *context);
+rt_err_t aic8800_rf_test_unregister(struct aic8800_context *context);
+#endif
 rt_err_t aic8800_core_receive(struct rt_wlan_offload_bus *bus, const void *data,
                               rt_size_t length, void *parameter);
 #ifdef AIC8800_WIFI_TRANSPORT_USB
@@ -1048,6 +1056,7 @@ rt_err_t aic8800_protocol_command(struct aic8800_context *context,
                                 rt_size_t response_capacity,
                                 rt_size_t *response_length);
 rt_err_t aic8800_radio_initialize(struct aic8800_context *context);
+rt_err_t aic8800_radio_initialize_rf_test(struct aic8800_context *context);
 #ifdef AIC8800_WIFI_THERMAL_CONTROL
 /* Re-send the chip's calibrated TX levels lowered by loss_db; 0 restores them.
  * Legacy power-index firmware returns -RT_ENOSYS, as it has no vendor back-off. */

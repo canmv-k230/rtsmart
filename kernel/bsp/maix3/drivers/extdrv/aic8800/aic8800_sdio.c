@@ -277,6 +277,7 @@ static void aic8800_sdio_disable_functions(
     mmcsd_host_unlock(context->sdio_card->host);
 }
 
+#ifndef AIC8800_WIFI_RF_TEST_MODE
 static rt_err_t aic8800_sdio_runtime_wakeup(
     struct aic8800_context *context)
 {
@@ -309,6 +310,7 @@ static rt_err_t aic8800_sdio_runtime_wakeup(
     }
     return -RT_ETIMEOUT;
 }
+#endif
 
 static rt_err_t aic8800_sdio_receive_length_locked(
     struct aic8800_context *context, struct rt_sdio_function *function,
@@ -2101,12 +2103,14 @@ static void aic8800_sdio_attach_work(struct rt_work *work, void *work_data)
         result = -RT_EIO;
         goto fail;
     }
+#ifndef AIC8800_WIFI_RF_TEST_MODE
     result = aic8800_sdio_runtime_wakeup(context);
     if (result != RT_EOK)
     {
         LOG_E("SDIO runtime wake failed: %d", result);
         goto fail;
     }
+#endif
     rt_memset(&bus_config, 0, sizeof(bus_config));
     bus_config.type = RT_WLAN_OFFLOAD_BUS_SDIO;
     bus_config.ops = &g_aic8800_sdio_bus_ops;

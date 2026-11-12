@@ -958,10 +958,17 @@ static rt_err_t aic_firmware_mem_block_write(
 {
     rt_uint8_t *request;
     rt_uint8_t response[4];
+    rt_size_t transfer_length;
     rt_size_t response_length = 0;
     rt_err_t result;
 
     if (!data || !length || length > AIC_FW_BLOCK_SIZE)
+    {
+        return -RT_EINVAL;
+    }
+    transfer_length = (length + sizeof(rt_uint32_t) - 1U) &
+                      ~(sizeof(rt_uint32_t) - 1U);
+    if (transfer_length > AIC_FW_BLOCK_SIZE)
     {
         return -RT_EINVAL;
     }
@@ -973,7 +980,8 @@ static rt_err_t aic_firmware_mem_block_write(
     }
     rt_memset(request, 0, AIC_FW_BLOCK_REQUEST_SIZE);
     aic_fw_put_le32(request, address);
-    aic_fw_put_le32(request + 4, (rt_uint32_t)length);
+    /* The D80 SDIO boot ROM rejects a non-word-sized final firmware block. */
+    aic_fw_put_le32(request + 4, (rt_uint32_t)transfer_length);
     rt_memcpy(request + 8, data, length);
     result = aic_firmware_debug_command(
         context, AIC_DBG_MEM_BLOCK_REQ, AIC_DBG_MEM_BLOCK_CFM,
@@ -993,13 +1001,34 @@ static rt_err_t aic_firmware_start_app(struct aic8800_context *context,
                                        rt_uint32_t type)
 {
     rt_uint8_t request[8];
+    rt_uint8_t response[4];
+    rt_size_t response_length = 0;
+    rt_uint16_t confirmation_id = 0;
     rt_err_t result;
 
     aic_fw_put_le32(request, address);
     aic_fw_put_le32(request + 4, type);
+#ifdef AIC8800_WIFI_TRANSPORT_SDIO
+    if (context->transport == AIC8800_TRANSPORT_SDIO)
+    {
+        /* The SDIO device remains attached while the downloaded image starts.
+         * Consume its start confirmation before handing the FIFO to the
+         * runtime command manager; otherwise that stale DBG response is
+         * mistaken for the first runtime command response. */
+        confirmation_id = AIC_DBG_START_APP_CFM;
+    }
+#endif
     result = aic_firmware_debug_command(
-        context, AIC_DBG_START_APP_REQ, 0, request, sizeof(request),
-        RT_NULL, 0, RT_NULL);
+        context, AIC_DBG_START_APP_REQ, confirmation_id,
+        request, sizeof(request),
+        confirmation_id ? response : RT_NULL,
+        confirmation_id ? sizeof(response) : 0,
+        confirmation_id ? &response_length : RT_NULL);
+    if (result == RT_EOK && confirmation_id &&
+        response_length < sizeof(response))
+    {
+        result = -RT_EIO;
+    }
     if (result == RT_EOK)
     {
         rt_thread_mdelay(20);
@@ -1158,6 +1187,7 @@ static rt_err_t aic_firmware_upload(struct aic8800_context *context,
     LOG_D("uploading %s to 0x%08x", path, address);
     while (1)
     {
+        rt_memset(block, 0, AIC_FW_BLOCK_SIZE);
         ssize_t length = read(descriptor, block, AIC_FW_BLOCK_SIZE);
 
         if (length < 0)
@@ -1180,7 +1210,9 @@ static rt_err_t aic_firmware_upload(struct aic8800_context *context,
         }
         if (length >= 4)
         {
-            last_word = aic_fw_get_le32(block + length - 4);
+            rt_size_t last_offset = ((rt_size_t)length - 1U) & ~3U;
+
+            last_word = aic_fw_get_le32(block + last_offset);
         }
         crc = aic_firmware_crc32_update(crc, block, (rt_size_t)length);
         result = aic_firmware_mem_block_write(
@@ -1211,7 +1243,7 @@ static rt_err_t aic_firmware_upload(struct aic8800_context *context,
         if (result == RT_EOK)
         {
             result = aic_firmware_mem_read(
-                context, address + total - 4U, &target_last);
+                context, address + ((total - 1U) & ~3U), &target_last);
         }
         if (result == RT_EOK &&
             (target_first != first_word || target_last != last_word))
@@ -1710,6 +1742,7 @@ static rt_err_t aic_firmware_download_8800(
     const char *adid_name;
     const char *patch_name;
     const char *table_name;
+    const char *firmware_name;
     rt_uint32_t firmware_base;
     rt_err_t result;
 
@@ -1724,11 +1757,16 @@ static rt_err_t aic_firmware_download_8800(
                  "fw_patch_u03.bin" : "fw_patch.bin";
     table_name = chip_id == AIC_CHIP_REV_U03 ?
                  "fw_patch_table_u03.bin" : "fw_patch_table.bin";
+#ifdef AIC8800_WIFI_RF_TEST_MODE
+    firmware_name = "fmacfw_rf.bin";
+#else
+    firmware_name = "fmacfw.bin";
+#endif
     firmware_base = context->transport == AIC8800_TRANSPORT_SDIO ?
                     0x00120000 : 0x00110000;
 
     result = aic_firmware_upload(context, AIC_FW_FAMILY_8800,
-                                 "fmacfw.bin", firmware_base);
+                                 firmware_name, firmware_base);
     if (result == RT_EOK)
     {
         result = aic_firmware_upload(context, AIC_FW_FAMILY_8800,
@@ -1998,20 +2036,29 @@ static rt_err_t aic_firmware_download_d80(
     high_id = (chip_id & AIC_CHIP_ID_H_MASK) == AIC_CHIP_ID_H_MASK;
     if (revision == AIC_CHIP_REV_U01 && !high_id)
     {
+#ifdef AIC8800_WIFI_RF_TEST_MODE
+        LOG_E("AIC8800D80 U01 RF-test firmware is not packaged");
+        return -RT_ENOSYS;
+#else
         table_name = "fw_patch_table_8800d80.bin";
         adid_name = "fw_adid_8800d80.bin";
         patch_name = "fw_patch_8800d80.bin";
         fmac_name = "fmacfw_8800d80.bin";
         firmware_base = 0x00100000;
+#endif
     }
     else
     {
         table_name = "fw_patch_table_8800d80_u02.bin";
         adid_name = "fw_adid_8800d80_u02.bin";
         patch_name = "fw_patch_8800d80_u02.bin";
+#ifdef AIC8800_WIFI_RF_TEST_MODE
+        fmac_name = "lmacfw_rf_8800d80_u02.bin";
+#else
         fmac_name = high_id ?
                     "fmacfw_8800d80_h_u02.bin" :
                     "fmacfw_8800d80_u02.bin";
+#endif
         firmware_base = 0x00120000;
     }
     result = aic_firmware_read_patch_table(
@@ -2048,12 +2095,14 @@ static rt_err_t aic_firmware_download_d80(
         result = aic_firmware_upload(context, AIC_FW_FAMILY_D80,
                                      fmac_name, firmware_base);
     }
+#ifndef AIC8800_WIFI_RF_TEST_MODE
     if (result == RT_EOK &&
         (revision != AIC_CHIP_REV_U01 || high_id))
     {
         result = aic_firmware_config_patch_d80(
             context, firmware_base, 0x198U, RT_FALSE);
     }
+#endif
     if (patch_table)
     {
         rt_free(patch_table);
@@ -2144,6 +2193,8 @@ static rt_err_t aic_firmware_download_d80x2(
     const char *adid_name;
     const char *patch_name;
     const char *ext_prefix;
+    const char *firmware_name;
+    rt_uint32_t firmware_base;
     rt_err_t result;
 
     result = aic_firmware_system_config_d80x2(
@@ -2166,6 +2217,14 @@ static rt_err_t aic_firmware_download_d80x2(
         patch_name = "fw_patch_8800d80x2_u05.bin";
         ext_prefix = "fw_patch_8800d80x2_u05_ext";
     }
+#ifdef AIC8800_WIFI_RF_TEST_MODE
+    firmware_name = "lmacfw_rf_8800d80x2.bin";
+    firmware_base = context->transport == AIC8800_TRANSPORT_SDIO ?
+                    0x00120000 : 0x00128000;
+#else
+    firmware_name = "fmacfw_8800d80x2.bin";
+    firmware_base = 0x00120000;
+#endif
     result = aic_firmware_read_patch_table(
         context, AIC_FW_FAMILY_D80X2, table_name, &patch_table,
         &patch_table_length);
@@ -2203,13 +2262,15 @@ static rt_err_t aic_firmware_download_d80x2(
     {
         result = aic_firmware_upload(
             context, AIC_FW_FAMILY_D80X2,
-            "fmacfw_8800d80x2.bin", 0x00120000);
+            firmware_name, firmware_base);
     }
+#ifndef AIC8800_WIFI_RF_TEST_MODE
     if (result == RT_EOK && chip_id < AIC_CHIP_REV_U05)
     {
         result = aic_firmware_config_patch_d80(
-            context, 0x00120000, 0x1a8U, RT_TRUE);
+            context, firmware_base, 0x1a8U, RT_TRUE);
     }
+#endif
     if (patch_table)
     {
         rt_free(patch_table);
@@ -2217,7 +2278,7 @@ static rt_err_t aic_firmware_download_d80x2(
     if (result == RT_EOK)
     {
         result = aic_firmware_start_app(
-            context, 0x00120000, AIC_START_APP_AUTO);
+            context, firmware_base, AIC_START_APP_AUTO);
     }
     return result;
 }
@@ -2248,7 +2309,11 @@ static rt_bool_t aic_firmware_required_files_available(
     {
     case AIC_FW_FAMILY_8800:
         return aic_firmware_file_available(
+#ifdef AIC8800_WIFI_RF_TEST_MODE
+                   context, family, "fmacfw_rf.bin") &&
+#else
                    context, family, "fmacfw.bin") &&
+#endif
                aic_firmware_file_available(
                    context, family, "fw_adid.bin") &&
                aic_firmware_file_available(
@@ -2256,6 +2321,16 @@ static rt_bool_t aic_firmware_required_files_available(
                aic_firmware_file_available(
                    context, family, "fw_patch_table.bin");
     case AIC_FW_FAMILY_D80:
+#ifdef AIC8800_WIFI_RF_TEST_MODE
+        return aic_firmware_file_available(
+                   context, family, "lmacfw_rf_8800d80_u02.bin") &&
+               aic_firmware_file_available(
+                   context, family, "fw_adid_8800d80_u02.bin") &&
+               aic_firmware_file_available(
+                   context, family, "fw_patch_8800d80_u02.bin") &&
+               aic_firmware_file_available(
+                   context, family, "fw_patch_table_8800d80_u02.bin");
+#else
         base = aic_firmware_file_available(
                    context, family, "fmacfw_8800d80.bin") &&
                aic_firmware_file_available(
@@ -2275,7 +2350,27 @@ static rt_bool_t aic_firmware_required_files_available(
                      context, family, "fmacfw_8800d80_u02.bin") ||
                  aic_firmware_file_available(
                      context, family, "fmacfw_8800d80_h_u02.bin")));
+#endif
     case AIC_FW_FAMILY_D80X2:
+#ifdef AIC8800_WIFI_RF_TEST_MODE
+        base = aic_firmware_file_available(
+                   context, family, "lmacfw_rf_8800d80x2.bin") &&
+               aic_firmware_file_available(
+                   context, family, "fw_adid_8800d80x2_u03.bin") &&
+               aic_firmware_file_available(
+                   context, family, "fw_patch_8800d80x2_u03.bin") &&
+               aic_firmware_file_available(
+                   context, family, "fw_patch_table_8800d80x2_u03.bin");
+        return base ||
+               (aic_firmware_file_available(
+                    context, family, "lmacfw_rf_8800d80x2.bin") &&
+                aic_firmware_file_available(
+                    context, family, "fw_adid_8800d80x2_u05.bin") &&
+                aic_firmware_file_available(
+                    context, family, "fw_patch_8800d80x2_u05.bin") &&
+                aic_firmware_file_available(
+                    context, family, "fw_patch_table_8800d80x2_u05.bin"));
+#else
         base = aic_firmware_file_available(
                    context, family, "fmacfw_8800d80x2.bin") &&
                aic_firmware_file_available(
@@ -2293,6 +2388,7 @@ static rt_bool_t aic_firmware_required_files_available(
                     context, family, "fw_patch_8800d80x2_u05.bin") &&
                 aic_firmware_file_available(
                     context, family, "fw_patch_table_8800d80x2_u05.bin"));
+#endif
     default:
         return RT_FALSE;
     }
@@ -2973,6 +3069,26 @@ static rt_err_t aic_firmware_prepare_dc_runtime(
     {
         result = aic_firmware_dc_prepare_calibration(context);
     }
+#ifdef AIC8800_WIFI_RF_TEST_MODE
+    if (result == RT_EOK)
+    {
+        result = aic_firmware_upload(
+            context, AIC_FW_FAMILY_DC, "lmacfw_rf_8800dc.bin",
+            AIC_DC_ROM_ENTRY);
+    }
+    if (result == RT_EOK)
+    {
+        result = aic_firmware_start_app(
+            context, AIC_DC_ROM_ENTRY, AIC_START_APP_AUTO);
+    }
+    if (result != RT_EOK)
+    {
+        LOG_E("DC/DW RF-test firmware preparation failed: %d", result);
+        return result;
+    }
+    LOG_I("DC%s RF-test firmware ready", high_id ? " H" : "");
+    return RT_EOK;
+#endif
     if (result == RT_EOK && context->chip_sub_id < 2U)
     {
         result = aic_firmware_mem_mask_write(
@@ -3100,16 +3216,23 @@ rt_err_t aic8800_firmware_probe(struct aic8800_context *context,
             context->firmware_runtime_ready = RT_TRUE;
             return RT_EOK;
         }
-#ifdef AIC8800_WIFI_FORCE_FIRMWARE_DOWNLOAD
+#if defined(AIC8800_WIFI_FORCE_FIRMWARE_DOWNLOAD) || \
+    defined(AIC8800_WIFI_RF_TEST_MODE)
         if (g_firmware_state == AIC_FW_STATE_COLD)
         {
             if (!aic_firmware_required_files_available(context, family))
             {
+#ifdef AIC8800_WIFI_RF_TEST_MODE
+                LOG_E("RF-test firmware files unavailable under %s",
+                      AIC8800_WIFI_FIRMWARE_PATH);
+                return -RT_EIO;
+#else
                 LOG_W("firmware files unavailable under %s; using running firmware",
                       AIC8800_WIFI_FIRMWARE_PATH);
                 g_firmware_state = AIC_FW_STATE_READY;
                 context->firmware_runtime_ready = RT_TRUE;
                 return RT_EOK;
+#endif
             }
             LOG_I("rebooting runtime device into the AIC USB loader");
             g_firmware_state = AIC_FW_STATE_WAIT_BOOT;

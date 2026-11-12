@@ -9,6 +9,9 @@ src = [
     'aic8800_radio.c',
 ]
 
+if GetDepend(['AIC8800_WIFI_RF_TEST_MODE']):
+    src += ['aic8800_rf_test.c']
+
 if GetDepend(['AIC8800_WIFI_TRANSPORT_USB']):
     src += ['aic8800_usb.c', 'aic8800_tx_queue.c']
 

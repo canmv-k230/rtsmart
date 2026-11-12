@@ -7,6 +7,7 @@ This directory contains the Apache-2.0 RT-Smart AIC8800 source implementation:
   AIC8800D80X2 devices;
 - an SDIO transport and boot-ROM firmware loader for AIC8801, AIC8800D80,
   and AIC8800DC/DW/DL devices;
+- a Wi-Fi RF manufacturing-test firmware interface;
 - a USB Bluetooth HCI transport for BLE host stacks.
 
 `SConscript` builds the top-level `aic8800_*.c` files and the fixed-width
@@ -160,6 +161,35 @@ registers the WLAN offload radio. If card discovery completes before `/bin` is
 mounted, attachment waits for the firmware files up to the configured command
 timeout. Do not substitute the USB FMAC binaries: the files have the same
 vendor names but different contents.
+
+## RF manufacturing test mode
+
+The AIC reference source includes `src/tools/aicrf_test/wifi_test.c` and RF
+firmware for its supported chip families. Enable
+`AIC8800_WIFI_RF_TEST_MODE=y` to load those RF images and expose the firmware's
+`DBG_RFTEST_CMD_REQ/CFM` protocol as `/dev/aicrfN`. In this mode the device is
+dedicated to manufacturing test and does not register station or AP network
+interfaces.
+
+The corresponding RT-Smart application is
+`src/rtsmart/examples/peripheral/aic8800_rf_test`. It provides named commands
+for continuous transmit, receive counters, RSSI, calibration, MAC data, and
+power controls, plus a bounded `raw` form for the rest of the vendor command
+IDs. The ioctl accepts at most 30 argument bytes and returns the complete
+128-byte firmware confirmation. Quick examples are documented in that
+application's `README.md`; its `TESTING.md` contains the complete RT-Smart
+build, deployment, RF procedure, argument, and recovery guide.
+
+RF images are packaged for AIC8800/AIC8801, D80 U02, DC/DW/DL, and USB D80X2.
+The packaged firmware does not contain a D80 U01 RF image, so that revision is
+rejected instead of starting normal WLAN firmware. Some commands can
+permanently write eFuse or flash; manufacturing images should restrict access
+to `/dev/aicrfN` and should not enable this mode in deployed products.
+
+The reference directory also contains `bt_test.c`. Bluetooth RF test is an HCI
+test path, not the Wi-Fi `DBG_RFTEST` protocol added here. USB modules can use
+the existing H:4 `/dev/hciX` interface when `AIC8800_WIFI_BLE=y`; UART and SDIO
+Bluetooth test transports are outside this driver's current scope.
 
 Supported Wi-Fi USB IDs are:
 

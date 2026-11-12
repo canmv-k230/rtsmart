@@ -83,9 +83,25 @@ if RT_USING_AIC8800_WIFI
 
     menu "General Settings"
 
+        config AIC8800_WIFI_RF_TEST_MODE
+            bool "RF manufacturing test mode"
+            default n
+            help
+                Load the AIC RF-test firmware instead of the normal WLAN
+                runtime and expose its manufacturing commands through
+                /dev/aicrfN. Normal station and AP networking are unavailable
+                in this mode. Build the aic8800_rf_test userspace example to
+                issue transmit, receive, calibration, and raw RF commands.
+
+                Some RF commands permanently program eFuse or flash. Enable
+                this option only in a controlled manufacturing image. RT-Smart
+                does not provide per-process UID or capability checks for
+                /dev/aicrfN, so every process in that image is trusted.
+
         config AIC8800_WIFI_AUTO_START
             bool "Initialize station and AP interfaces during device attachment"
             depends on RT_WLAN_MANAGE_ENABLE
+            depends on !AIC8800_WIFI_RF_TEST_MODE
             default y
             help
                 Register both AIC virtual interfaces with RT-Thread WLAN
