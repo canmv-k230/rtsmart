@@ -92,6 +92,7 @@ static void event_callback(struct netconn *conn, enum netconn_evt evt, u16_t len
     int s;
     struct lwip_sock *sock;
     uint32_t event = 0;
+    int check_waiters = 1;
     SYS_ARCH_DECL_PROTECT(lev);
 
     LWIP_UNUSED_ARG(len);
@@ -133,20 +134,30 @@ static void event_callback(struct netconn *conn, enum netconn_evt evt, u16_t len
     }
 
     SYS_ARCH_PROTECT(lev);
-    /* Set event as required */
+    /* Set event as required. Match lwIP's select callback: wake only when
+     * readability, writability, or an error newly appears. A socket that is
+     * already readable or writable stays level-triggered through the poll
+     * scan, so further packets and ACKs must not resume the waiter again.
+     */
     switch (evt)
     {
     case NETCONN_EVT_RCVPLUS:
         sock->rcvevent++;
+        if (sock->rcvevent > 1)
+            check_waiters = 0;
         break;
     case NETCONN_EVT_RCVMINUS:
         sock->rcvevent--;
+        check_waiters = 0;
         break;
     case NETCONN_EVT_SENDPLUS:
+        if (sock->sendevent)
+            check_waiters = 0;
         sock->sendevent = 1;
         break;
     case NETCONN_EVT_SENDMINUS:
         sock->sendevent = 0;
+        check_waiters = 0;
         break;
     case NETCONN_EVT_ERROR:
         sock->errevent = 1;
@@ -156,20 +167,23 @@ static void event_callback(struct netconn *conn, enum netconn_evt evt, u16_t len
         break;
     }
 
+    if (check_waiters)
+    {
 #if LWIP_VERSION >= 0x20100ff
-    if ((void*)(sock->lastdata.pbuf) || (sock->rcvevent > 0))
+        if ((void*)(sock->lastdata.pbuf) || (sock->rcvevent > 0))
 #else
-    if ((void*)(sock->lastdata) || (sock->rcvevent > 0))
+        if ((void*)(sock->lastdata) || (sock->rcvevent > 0))
 #endif
-        event |= POLLIN;
-    if (sock->sendevent)
-        event |= POLLOUT;
-    if (sock->errevent)
-        event |= POLLERR;
+            event |= POLLIN;
+        if (sock->sendevent)
+            event |= POLLOUT;
+        if (sock->errevent)
+            event |= POLLERR;
+    }
 
     SYS_ARCH_UNPROTECT(lev);
 
-    if (event)
+    if (check_waiters && event)
     {
         /* A poller must not consume the only wakeup intended for a receiver. */
         rt_wqueue_wakeup_all(&sock->wait_head, (void*)(size_t)event);

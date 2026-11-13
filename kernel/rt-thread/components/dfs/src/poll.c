@@ -51,12 +51,16 @@ static int __wqueue_pollwake(struct rt_wqueue_node *wait, void *key)
     pn->pt->triggered = 1;
 
     /* Waitqueue callbacks run with interrupts disabled. Keep readiness even
-     * during a scan, but do not resume a thread blocked on a backend mutex. */
+     * during a scan, but do not resume a thread blocked on a backend mutex.
+     * A timeout may already have made the sleeper runnable without clearing
+     * sleeping; the event is recorded in triggered and must not resume it. */
     if (!pn->pt->sleeping)
         return -1;
 
     pn->pt->sleeping = RT_FALSE;
     pn->pt->polling_thread->error = RT_EOK;
+    if ((pn->pt->polling_thread->stat & RT_THREAD_SUSPEND_MASK) != RT_THREAD_SUSPEND_MASK)
+        return -1;
     return __wqueue_default_wake(wait, key);
 }
 
