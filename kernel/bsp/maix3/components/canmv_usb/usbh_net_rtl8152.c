@@ -18,6 +18,10 @@
 #include "usbh_rtl8152.h"
 #include "usbh_netdev.h"
 
+#define DBG_TAG "rtl8152"
+#define DBG_LVL DBG_INFO
+#include <rtdbg.h>
+
 static struct eth_device rtl8152_dev;
 static bool rtl8152_netdev_inited;
 
@@ -111,6 +115,13 @@ int usbh_rtl8152_run(struct usbh_rtl8152 *rtl8152_class)
         rtl8152_dev.parent.user_data = RT_NULL;
         return -USB_ERR_NOMEM;
     }
+
+    LOG_I("%s attached as %s, MAC %02x:%02x:%02x:%02x:%02x:%02x",
+          rtl8152_class->chip_ops->name,
+          rtl8152_dev.parent.parent.name,
+          rtl8152_class->mac[0], rtl8152_class->mac[1],
+          rtl8152_class->mac[2], rtl8152_class->mac[3],
+          rtl8152_class->mac[4], rtl8152_class->mac[5]);
     return 0;
 }
 
@@ -127,6 +138,10 @@ void usbh_rtl8152_stop(struct usbh_rtl8152 *rtl8152_class)
     while (rtl8152_class->rx_thread_running) {
         usb_osal_msleep(10);
     }
+
+    LOG_I("%s detached from %s",
+          rtl8152_class->chip_ops->name,
+          rtl8152_dev.parent.parent.name);
     /* Keep the RT-Thread netdev registered across unplug/replug. Tearing it
      * down here can block the USB hub disconnect path long enough to miss the
      * following connect sequence under high CPU load. */

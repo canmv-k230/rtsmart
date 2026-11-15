@@ -122,7 +122,7 @@ static int usbh_cdc_acm_connect(struct usbh_hubport *hport, uint8_t intf)
 
     snprintf(hport->config.intf[intf].devname, CONFIG_USBHOST_DEV_NAMELEN, DEV_FORMAT, cdc_acm_class->minor);
 
-    USB_LOG_INFO("Register CDC ACM Class:%s\r\n", hport->config.intf[intf].devname);
+    USB_LOG_DBG("Register CDC ACM Class:%s\r\n", hport->config.intf[intf].devname);
 
 #if 0
     USB_LOG_INFO("Test cdc acm rx and tx and rx for 5 times, baudrate is 115200\r\n");
@@ -178,7 +178,7 @@ static int usbh_cdc_acm_disconnect(struct usbh_hubport *hport, uint8_t intf)
 #endif
 
         if (hport->config.intf[intf].devname[0] != '\0') {
-            USB_LOG_INFO("Unregister CDC ACM Class:%s\r\n", hport->config.intf[intf].devname);
+            USB_LOG_DBG("Unregister CDC ACM Class:%s\r\n", hport->config.intf[intf].devname);
             usbh_cdc_acm_stop(cdc_acm_class);
         }
 

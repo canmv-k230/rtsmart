@@ -64,7 +64,7 @@ static int usbh_allocate_devaddr(struct usbh_devaddr_map *devgen)
             return (int)devaddr;
         }
 
-        if (startaddr == devaddr) {
+        if (startaddr == devgen->next) {
             return -USB_ERR_NOMEM;
         }
     }
@@ -248,18 +248,6 @@ static int parse_config_descriptor(struct usbh_hubport *hport, struct usb_config
                         while (1) {
                         }
                     }
-#if 1
-                    USB_LOG_RAW("Interface Descriptor:\r\n");
-                    USB_LOG_RAW("\tbLength: 0x%02x            \r\n", intf_desc->bLength);
-                    USB_LOG_RAW("\tbDescriptorType: 0x%02x    \r\n", intf_desc->bDescriptorType);
-                    USB_LOG_RAW("\tbInterfaceNumber: 0x%02x   \r\n", intf_desc->bInterfaceNumber);
-                    USB_LOG_RAW("\tbAlternateSetting: 0x%02x  \r\n", intf_desc->bAlternateSetting);
-                    USB_LOG_RAW("\tbNumEndpoints: 0x%02x      \r\n", intf_desc->bNumEndpoints);
-                    USB_LOG_RAW("\tbInterfaceClass: 0x%02x    \r\n", intf_desc->bInterfaceClass);
-                    USB_LOG_RAW("\tbInterfaceSubClass: 0x%02x \r\n", intf_desc->bInterfaceSubClass);
-                    USB_LOG_RAW("\tbInterfaceProtocol: 0x%02x \r\n", intf_desc->bInterfaceProtocol);
-                    USB_LOG_RAW("\tiInterface: 0x%02x         \r\n", intf_desc->iInterface);
-#endif
                     usb_memcpy(&hport->config.intf[cur_iface].altsetting[cur_alt_setting].intf_desc, intf_desc, 9);
                     hport->config.intf[cur_iface].altsetting_num = cur_alt_setting + 1;
                     break;
@@ -280,6 +268,7 @@ static int parse_config_descriptor(struct usbh_hubport *hport, struct usb_config
     return 0;
 }
 
+#if defined(RT_USING_MSH) && defined(CHERRY_USB_HOST_ENABLE_BUILTIN_CMD)
 static void usbh_print_hubport_info(struct usbh_hubport *hport)
 {
     USB_LOG_RAW("Device Descriptor:\r\n");
@@ -337,6 +326,7 @@ static void usbh_print_hubport_info(struct usbh_hubport *hport)
         }
     }
 }
+#endif
 
 static int usbh_get_default_mps(int speed)
 {
@@ -494,14 +484,14 @@ int usbh_enumerate(struct usbh_hubport *hport)
     /* Assign a function address to the device connected to this port */
     dev_addr = usbh_get_xhci_devaddr(hport->ep0);
     if (dev_addr < 0) {
-        USB_LOG_ERR("Failed to allocate devaddr,errorcode:%d\r\n", ret);
+        USB_LOG_ERR("Failed to allocate devaddr,errorcode:%d\r\n", dev_addr);
         goto errout;
     }
 #else
     /* Assign a function address to the device connected to this port */
     dev_addr = usbh_allocate_devaddr(&hport->bus->devgen);
     if (dev_addr < 0) {
-        USB_LOG_ERR("Failed to allocate devaddr,errorcode:%d\r\n", ret);
+        USB_LOG_ERR("Failed to allocate devaddr,errorcode:%d\r\n", dev_addr);
         goto errout;
     }
 #endif
@@ -904,34 +894,42 @@ void *usbh_find_class_instance(const char *devname)
     return NULL;
 }
 
+#if defined(RT_USING_MSH) && defined(CHERRY_USB_HOST_ENABLE_BUILTIN_CMD)
+static void lsusb_print_usage(void)
+{
+    USB_LOG_RAW("Usage: lsusb [options]...\r\n");
+    USB_LOG_RAW("List USB devices\r\n");
+    USB_LOG_RAW("  -v, --verbose\r\n");
+    USB_LOG_RAW("      Increase verbosity (show descriptors)\r\n");
+    // USB_LOG_RAW("  -s [[bus]:[devnum]]\r\n");
+    // USB_LOG_RAW("      Show only devices with specified device and/or bus numbers (in decimal)\r\n");
+    // USB_LOG_RAW("  -d vendor:[product]\r\n");
+    // USB_LOG_RAW("      Show only devices with the specified vendor and product ID numbers (in hexadecimal)\r\n");
+    USB_LOG_RAW("  -t, --tree\r\n");
+    USB_LOG_RAW("      Dump the physical USB device hierachy as a tree\r\n");
+    USB_LOG_RAW("  -V, --version\r\n");
+    USB_LOG_RAW("      Show version of program\r\n");
+    USB_LOG_RAW("  -h, --help\r\n");
+    USB_LOG_RAW("      Show usage and help\r\n");
+}
+
 int lsusb(int argc, char **argv)
 {
     usb_slist_t *hub_list;
     usb_slist_t *bus_list;
     struct usbh_hubport *hport;
 
-    if (argc < 2) {
-        USB_LOG_RAW("Usage: lsusb [options]...\r\n");
-        USB_LOG_RAW("List USB devices\r\n");
-        USB_LOG_RAW("  -v, --verbose\r\n");
-        USB_LOG_RAW("      Increase verbosity (show descriptors)\r\n");
-        // USB_LOG_RAW("  -s [[bus]:[devnum]]\r\n");
-        // USB_LOG_RAW("      Show only devices with specified device and/or bus numbers (in decimal)\r\n");
-        // USB_LOG_RAW("  -d vendor:[product]\r\n");
-        // USB_LOG_RAW("      Show only devices with the specified vendor and product ID numbers (in hexadecimal)\r\n");
-        USB_LOG_RAW("  -t, --tree\r\n");
-        USB_LOG_RAW("      Dump the physical USB device hierachy as a tree\r\n");
-        USB_LOG_RAW("  -V, --version\r\n");
-        USB_LOG_RAW("      Show version of program\r\n");
-        USB_LOG_RAW("  -h, --help\r\n");
-        USB_LOG_RAW("      Show usage and help\r\n");
-        return 0;
-    }
     if (argc > 3) {
         return 0;
     }
 
-    if (strcmp(argv[1], "-t") == 0) {
+    if (argc >= 2 &&
+        (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0)) {
+        lsusb_print_usage();
+        return 0;
+    }
+
+    if (argc < 2 || strcmp(argv[1], "-t") == 0 || strcmp(argv[1], "--tree") == 0) {
         usb_slist_for_each(bus_list, &g_bus_head)
         {
             struct usbh_bus *bus = usb_slist_entry(bus_list, struct usbh_bus, list);
@@ -984,7 +982,8 @@ int lsusb(int argc, char **argv)
         }
     }
 
-    if (strcmp(argv[1], "-v") == 0) {
+    if (argc >= 2 &&
+        (strcmp(argv[1], "-v") == 0 || strcmp(argv[1], "--verbose") == 0)) {
         usb_slist_for_each(bus_list, &g_bus_head)
         {
             struct usbh_bus *bus = usb_slist_entry(bus_list, struct usbh_bus, list);
@@ -1011,3 +1010,4 @@ int lsusb(int argc, char **argv)
     return 0;
 }
 MSH_CMD_EXPORT(lsusb, list usb under usb host)
+#endif

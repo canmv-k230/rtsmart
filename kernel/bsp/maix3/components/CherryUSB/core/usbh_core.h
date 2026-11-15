@@ -64,7 +64,28 @@ extern "C" {
 #define CLASS_INFO_DEFINE __attribute__((section(".usbh_class_info"))) __USED __ALIGNED(1)
 #endif
 
-#define USBH_GET_URB_INTERVAL(interval, speed) (speed < USB_SPEED_HIGH ? interval: (1 << (interval - 1)))
+/*
+ * URB interval in (micro)frames. bInterval is a linear frame count only for
+ * full/low-speed interrupt endpoints; high-speed endpoints and full-speed
+ * isochronous endpoints use 2^(bInterval - 1) (USB 2.0 table 9-13).
+ */
+static inline uint32_t usbh_get_urb_interval(const struct usb_endpoint_descriptor *ep,
+                                             uint8_t speed)
+{
+    uint8_t interval = ep->bInterval;
+
+    if (speed < USB_SPEED_HIGH &&
+        USB_GET_ENDPOINT_TYPE(ep->bmAttributes) != USB_ENDPOINT_TYPE_ISOCHRONOUS) {
+        return interval;
+    }
+
+    if (interval < 1) {
+        interval = 1;
+    } else if (interval > 16) {
+        interval = 16;
+    }
+    return 1U << (interval - 1);
+}
 
 #define USBH_EP_INIT(ep, ep_desc)                                            \
     do {                                                                     \
@@ -190,6 +211,13 @@ struct usbh_hub {
     uint8_t *int_buffer;
     uint8_t force_reenumerate;
     struct usb_osal_timer *int_timer;
+    /* Recovery re-enumerations of each port's device in the current window */
+    struct {
+        uint8_t count;
+        uint32_t start_ms;
+    } reenum_budget[CONFIG_USBHOST_MAX_EHPORTS];
+    /* Ports whose device was already reported as unreachable (bit = port) */
+    uint8_t unreachable_reported;
 };
 
 struct usbh_devaddr_map {
@@ -297,7 +325,7 @@ static inline void usbh_int_urb_fill(struct usbh_urb *urb,
     urb->timeout = timeout;
     urb->complete = complete;
     urb->arg = arg;
-    urb->interval = USBH_GET_URB_INTERVAL(ep->bInterval, hport->speed);
+    urb->interval = usbh_get_urb_interval(ep, hport->speed);
 }
 
 extern struct usbh_bus g_usbhost_bus[];

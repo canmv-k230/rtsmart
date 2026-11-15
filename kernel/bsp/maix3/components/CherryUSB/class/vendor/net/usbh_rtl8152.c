@@ -2785,7 +2785,7 @@ static int usbh_rtl8152_connect(struct usbh_hubport *hport, uint8_t intf)
         ret = -USB_ERR_NOTSUPP;
         goto probe_failed;
     } else {
-        USB_LOG_INFO("rtl8152 version 0x%04x\r\n", rtl8152_class->version);
+        USB_LOG_DBG("rtl8152 version 0x%04x\r\n", rtl8152_class->version);
     }
 
     /* MTU range: 68 - 1500 or 9194 */
@@ -2855,7 +2855,7 @@ static int usbh_rtl8152_connect(struct usbh_hubport *hport, uint8_t intf)
     if (ret < 0)
         goto probe_failed;
 
-    USB_LOG_INFO("%s MAC address %02x:%02x:%02x:%02x:%02x:%02x\r\n",
+    USB_LOG_DBG("%s MAC address %02x:%02x:%02x:%02x:%02x:%02x\r\n",
                  rtl8152_class->chip_ops->name,
                  rtl8152_class->mac[0],
                  rtl8152_class->mac[1],
@@ -2886,8 +2886,8 @@ static int usbh_rtl8152_connect(struct usbh_hubport *hport, uint8_t intf)
     hport->config.intf[intf].priv = rtl8152_class;
     usb_memcpy(hport->config.intf[intf].devname, DEV_FORMAT, CONFIG_USBHOST_DEV_NAMELEN);
 
-    USB_LOG_INFO("Register %s Class:%s\r\n", rtl8152_class->chip_ops->name,
-                 hport->config.intf[intf].devname);
+    USB_LOG_DBG("Register %s Class:%s\r\n", rtl8152_class->chip_ops->name,
+                hport->config.intf[intf].devname);
 
     ret = usbh_rtl8152_run(rtl8152_class);
     if (ret < 0) {
@@ -2926,7 +2926,7 @@ static int usbh_rtl8152_disconnect(struct usbh_hubport *hport, uint8_t intf)
         }
 
         if (registered) {
-            USB_LOG_INFO("Unregister rtl8152 Class:%s\r\n", DEV_FORMAT);
+            USB_LOG_DBG("Unregister rtl8152 Class:%s\r\n", DEV_FORMAT);
             usbh_rtl8152_stop(rtl8152_class);
         }
 
@@ -3002,7 +3002,7 @@ void usbh_rtl8152_rx_thread(void *argument)
     unsigned int link_down_count;
 #endif
 
-    USB_LOG_INFO("Create rtl8152 rx thread\r\n");
+    USB_LOG_DBG("Create rtl8152 rx thread\r\n");
     g_rtl8152_class.rx_thread_running = true;
     // clang-format off
 find_class:
@@ -3232,7 +3232,7 @@ find_class:
     }
     // clang-format off
 delete:
-    USB_LOG_INFO("Delete rtl8152 rx thread\r\n");
+    USB_LOG_DBG("Delete rtl8152 rx thread\r\n");
     usbh_rtl8152_prepare_recovery(&g_rtl8152_class, false);
     g_rtl8152_class.rx_thread_running = false;
     usb_osal_thread_delete(NULL);

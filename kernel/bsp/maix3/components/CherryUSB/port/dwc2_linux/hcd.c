@@ -28,6 +28,7 @@ __WEAK void usb_hc_low_level_deinit(struct usbh_bus *bus)
 
 static void dwc2_kill_all_urbs(struct dwc2_hsotg *hsotg);
 static void dwc2_hcd_cleanup_channels(struct dwc2_hsotg *hsotg);
+static int dwc2_hcd_reclaim_quarantined_channels(struct dwc2_hsotg *hsotg);
 
 /* Convert Linux-style HCD status values at the CherryUSB API boundary. */
 static int dwc2_cherryusb_status(int status)
@@ -165,6 +166,7 @@ void dwc2_hc_halt(struct dwc2_hsotg *hsotg, struct dwc2_host_chan *chan,
                   enum dwc2_halt_status halt_status)
 {
     u32 nptxsts, hptxsts, hcchar;
+    bool cannot_halt_periodic;
 
     if (dbg_hc(chan))
         dev_vdbg(hsotg->dev, "%s()\n", __func__);
@@ -175,16 +177,12 @@ void dwc2_hc_halt(struct dwc2_hsotg *hsotg, struct dwc2_host_chan *chan,
      * uframe/frame (in the worst case), the core generates a channel
      * halted and disables the channel automatically.
      */
-    if ((hsotg->params.g_dma && !hsotg->params.g_dma_desc) ||
-        hsotg->hw_params.arch == GHWCFG2_EXT_DMA_ARCH) {
-        if (!chan->do_split &&
-            (chan->ep_type == USB_ENDPOINT_XFER_ISOC ||
-             chan->ep_type == USB_ENDPOINT_XFER_INT)) {
-            dev_err(hsotg->dev, "%s() Channel can't be halted\n",
-                    __func__);
-            return;
-        }
-    }
+    cannot_halt_periodic =
+        ((hsotg->params.host_dma && !hsotg->params.dma_desc_enable) ||
+         hsotg->hw_params.arch == GHWCFG2_EXT_DMA_ARCH) &&
+        !chan->do_split &&
+        (chan->ep_type == USB_ENDPOINT_XFER_ISOC ||
+         chan->ep_type == USB_ENDPOINT_XFER_INT);
 
     if (halt_status == DWC2_HC_XFER_NO_HALT_STATUS)
         dev_err(hsotg->dev, "!!! halt_status = %d !!!\n", halt_status);
@@ -229,10 +227,23 @@ void dwc2_hc_halt(struct dwc2_hsotg *hsotg, struct dwc2_host_chan *chan,
              * dequeued. Don't want to halt a channel that hasn't
              * started yet.
              */
-            dev_err(hsotg->dev, "already halt\n");
+            dev_dbg(hsotg->dev, "already halted\n");
             return;
         }
     }
+
+    if (cannot_halt_periodic) {
+        /*
+         * A buffer-DMA periodic channel halts itself at the frame boundary.
+         * For dequeue, the block above first records URB_DEQUEUE and masks
+         * every interrupt except CHHLTD so that the natural halt releases the
+         * channel after the QTD has been removed.
+         */
+        dev_vdbg(hsotg->dev, "%s() waiting for periodic channel halt\n",
+                 __func__);
+        return;
+    }
+
     if (chan->halt_pending) {
         /*
          * A halt has already been issued for this channel. This might
@@ -519,6 +530,7 @@ void dwc2_hc_cleanup(struct dwc2_hsotg *hsotg, struct dwc2_host_chan *chan)
     u32 hcintmsk;
 
     chan->xfer_started = 0;
+    chan->cleanup_generation++;
 
     list_del_init(&chan->split_order_list_entry);
 
@@ -1386,23 +1398,25 @@ static void dwc2_wakeup_detected(void *arg)
     dev_err(hsotg->dev, "%s\n", __func__);
 }
 
+/* Give back every QTD of @qh with @status. Must be called with the lock held. */
+void dwc2_hcd_qh_giveback_qtds(struct dwc2_hsotg *hsotg, struct dwc2_qh *qh,
+                               int status)
+{
+    struct dwc2_qtd *qtd, *qtd_tmp;
+
+    list_for_each_entry_safe(qtd, qtd_tmp, &qh->qtd_list, qtd_list_entry) {
+        dwc2_host_complete(hsotg, qtd, status);
+        dwc2_hcd_qtd_unlink_and_free(hsotg, qtd, qh);
+    }
+}
+
 static void dwc2_kill_urbs_in_qh_list(struct dwc2_hsotg *hsotg,
                                       struct list_head *qh_list)
 {
     struct dwc2_qh *qh, *qh_tmp;
-    struct dwc2_qtd *qtd, *qtd_tmp;
 
-    list_for_each_entry_safe(qh, qh_tmp, qh_list, qh_list_entry) {
-        list_for_each_entry_safe(qtd, qtd_tmp, &qh->qtd_list,
-                                 qtd_list_entry) {
-#if 1
-            dwc2_host_complete(hsotg, qtd, -ECONNRESET);
-            dwc2_hcd_qtd_unlink_and_free(hsotg, qtd, qh);
-#else
-            dwc2_release_channel(hsotg, qtd->qh->channel, qtd, DWC2_HC_XFER_PERIODIC_INCOMPLETE);
-#endif
-        }
-    }
+    list_for_each_entry_safe(qh, qh_tmp, qh_list, qh_list_entry)
+        dwc2_hcd_qh_giveback_qtds(hsotg, qh, -ECONNRESET);
 }
 
 static void dwc2_qh_list_free(struct dwc2_hsotg *hsotg, struct list_head *qh_list)
@@ -2640,6 +2654,17 @@ int usbh_roothub_control(struct usbh_bus *bus, struct usb_setup_packet *setup,
             hprt0 &= ~HPRT0_RST;
             dwc2_writel(hsotg, hprt0, HPRT0);
             hsotg->lx_state = DWC2_L0; /* Now back to On state */
+
+            {
+                rt_base_t level = rt_spin_lock_irqsave(&hsotg->lock);
+                int reclaimed = dwc2_hcd_reclaim_quarantined_channels(hsotg);
+
+                rt_spin_unlock_irqrestore(&hsotg->lock, level);
+                if (reclaimed)
+                    dev_err(hsotg->dev,
+                            "root port reset: returned %d stuck host channel(s) to service\n",
+                            reclaimed);
+            }
             break;
 
         case USB_PORT_FEAT_INDICATOR:
@@ -3112,6 +3137,49 @@ static void dwc2_kill_all_urbs(struct dwc2_hsotg *hsotg)
     dwc2_kill_urbs_in_qh_list(hsotg, &hsotg->periodic_sched_queued);
 }
 
+/*
+ * Return channels taken out of service by dwc2_quarantine_channel() once they
+ * have really stopped. Called on a root port reset: the hub code releases
+ * every device behind the port first, so no QH can still refer to them.
+ *
+ * Must be called with hsotg->lock held.
+ */
+static int dwc2_hcd_reclaim_quarantined_channels(struct dwc2_hsotg *hsotg)
+{
+    int reclaimed = 0;
+    int i;
+
+    for (i = 0; i < hsotg->params.host_channels; i++) {
+        struct dwc2_host_chan *chan = hsotg->hc_ptr_array[i];
+        u32 hcchar;
+
+        if (!chan || !chan->quarantined)
+            continue;
+
+        hcchar = dwc2_readl(hsotg, HCCHAR(i));
+        if (hcchar & HCCHAR_CHENA) {
+            dwc2_writel(hsotg, hcchar | HCCHAR_CHENA | HCCHAR_CHDIS,
+                        HCCHAR(i));
+            if (dwc2_readl(hsotg, HCCHAR(i)) & HCCHAR_CHENA)
+                continue;
+        }
+
+        chan->quarantined = 0;
+        chan->qh = NULL;
+        dwc2_hc_return_to_free_list(hsotg, chan);
+        reclaimed++;
+    }
+
+    return reclaimed;
+}
+
+bool usbh_dwc2_split_supported(struct usbh_bus *bus)
+{
+    struct dwc2_hsotg *hsotg = dwc2_hcd_to_hsotg(&bus->hcd);
+
+    return !hsotg->params.dma_desc_enable;
+}
+
 /* Must be called with interrupt disabled and spinlock held */
 static void dwc2_hcd_cleanup_channels(struct dwc2_hsotg *hsotg)
 {
@@ -3147,6 +3215,7 @@ static void dwc2_hcd_cleanup_channels(struct dwc2_hsotg *hsotg)
         }
 
         dwc2_hc_cleanup(hsotg, channel);
+        channel->quarantined = 0;
         list_add_tail(&channel->hc_list_entry, &hsotg->free_hc_list);
         /*
          * Added for Descriptor DMA to prevent channel double cleanup in
@@ -4034,10 +4103,16 @@ static void dwc2_dump_channel_info(struct dwc2_hsotg *hsotg, struct dwc2_host_ch
 }
 
 /* Must be called with interrupt disabled and spinlock held */
-static int dwc2_hcd_urb_dequeue(struct dwc2_hsotg *hsotg, struct dwc2_hcd_urb *urb)
+static int dwc2_hcd_urb_dequeue(struct dwc2_hsotg *hsotg,
+                                struct dwc2_hcd_urb *urb,
+                                struct dwc2_host_chan **halt_chan,
+                                u32 *cleanup_generation)
 {
     struct dwc2_qh *qh;
     struct dwc2_qtd *urb_qtd;
+    struct dwc2_host_chan *idle_chan = NULL;
+
+    *halt_chan = NULL;
 
     urb_qtd = urb->qtd;
     if (!urb_qtd) {
@@ -4057,7 +4132,8 @@ static int dwc2_hcd_urb_dequeue(struct dwc2_hsotg *hsotg, struct dwc2_hcd_urb *u
         dwc2_dump_channel_info(hsotg, qh->channel);
 
         /* The QTD is in process (it has been assigned to a channel) */
-        if (hsotg->flags.b.port_connect_status)
+        if (hsotg->flags.b.port_connect_status &&
+            qh->channel->xfer_started) {
             /*
              * If still connected (i.e. in host mode), halt the
              * channel so it can be used for other transfers. If
@@ -4065,8 +4141,12 @@ static int dwc2_hcd_urb_dequeue(struct dwc2_hsotg *hsotg, struct dwc2_hcd_urb *u
              * written to halt the channel since the core is in
              * device mode.
              */
-            dwc2_hc_halt(hsotg, qh->channel,
-                         DWC2_HC_XFER_URB_DEQUEUE);
+            *halt_chan = qh->channel;
+            *cleanup_generation = qh->channel->cleanup_generation;
+            dwc2_hc_halt(hsotg, *halt_chan, DWC2_HC_XFER_URB_DEQUEUE);
+        } else if (hsotg->flags.b.port_connect_status) {
+            idle_chan = qh->channel;
+        }
     }
 
     /*
@@ -4087,7 +4167,183 @@ static int dwc2_hcd_urb_dequeue(struct dwc2_hsotg *hsotg, struct dwc2_hcd_urb *u
         dwc2_hcd_qtd_unlink_and_free(hsotg, urb_qtd, qh);
     }
 
+    /*
+     * The channel was assigned but never started (a periodic QH waits for
+     * queue space until the next SOF): nothing to halt, release it. Buffer
+     * DMA already detached it from the QH above. Descriptor DMA keeps the
+     * channel on the QH, so release it there, the way a completion does.
+     */
+    if (idle_chan) {
+        if (!hsotg->params.dma_desc_enable)
+            dwc2_release_channel(hsotg, idle_chan, NULL,
+                                 DWC2_HC_XFER_URB_DEQUEUE);
+        else if (qh->channel == idle_chan)
+            dwc2_hcd_release_channel_requeue_ddma(hsotg, qh);
+    }
+
     return 0;
+}
+
+/*
+ * A halting channel stops within a (micro)frame; a periodic buffer-DMA
+ * channel halts at the end of its frame by itself. Allow generous margins
+ * for interrupt latency before falling back.
+ */
+#define DWC2_KILL_HALT_TIMEOUT_MS  500
+#define DWC2_KILL_FORCE_TIMEOUT_MS 100
+
+/* Must be called with hsotg->lock held */
+static bool dwc2_channel_cleaned(struct dwc2_hsotg *hsotg,
+                                 struct dwc2_host_chan *chan,
+                                 u32 cleanup_generation)
+{
+    return chan->cleanup_generation != cleanup_generation ||
+           !hsotg->flags.b.port_connect_status;
+}
+
+static bool dwc2_wait_channel_cleaned(struct dwc2_hsotg *hsotg,
+                                      struct dwc2_host_chan *chan,
+                                      u32 cleanup_generation, u32 timeout_ms)
+{
+    rt_tick_t start = rt_tick_get();
+    const rt_tick_t timeout = rt_tick_from_millisecond(timeout_ms);
+
+    for (;;) {
+        bool cleaned;
+        rt_base_t level = rt_spin_lock_irqsave(&hsotg->lock);
+
+        cleaned = dwc2_channel_cleaned(hsotg, chan, cleanup_generation);
+        rt_spin_unlock_irqrestore(&hsotg->lock, level);
+
+        if (cleaned)
+            return true;
+        if ((rt_tick_t)(rt_tick_get() - start) >= timeout)
+            return false;
+        msleep(1);
+    }
+}
+
+/*
+ * The channel ignored the disable request. Take it out of service: mask its
+ * interrupts, detach it from its QH and keep it off the free list, so the
+ * stack keeps running on the remaining channels. The next root port reset
+ * (dwc2_hcd_reclaim_quarantined_channels()) or disconnect returns it. The
+ * caller's buffer can then be released; a channel this stuck is not moving
+ * data.
+ *
+ * Must be called with hsotg->lock held.
+ */
+static void dwc2_quarantine_channel(struct dwc2_hsotg *hsotg,
+                                    struct dwc2_host_chan *chan)
+{
+    struct dwc2_qh *qh = chan->qh;
+    u32 haintmsk;
+
+    dwc2_hc_cleanup(hsotg, chan);
+    haintmsk = dwc2_readl(hsotg, HAINTMSK);
+    haintmsk &= ~(1 << chan->hc_num);
+    dwc2_writel(hsotg, haintmsk, HAINTMSK);
+    chan->halt_pending = 0;
+    chan->halt_on_queue = 0;
+    chan->quarantined = 1;
+
+    /*
+     * Buffer DMA: the dequeue already cleared qh->channel, and chan->qh may
+     * be stale (endpoint_disable frees the QH without clearing it), so the
+     * QH must not be touched. Descriptor DMA keeps both links and
+     * endpoint_disable clears chan->qh through qh->channel.
+     */
+    if (hsotg->params.dma_desc_enable && qh && qh->channel == chan) {
+        dwc2_hcd_qh_detach_channel_ddma(hsotg, qh);
+        /*
+         * The remaining QTDs may be partly armed on descriptors that are
+         * now cleared (and ntd is 0): give them back, as the halt path in
+         * dwc2_hcd_complete_xfer_ddma() does.
+         */
+        dwc2_hcd_qh_giveback_qtds(hsotg, qh, -ECONNRESET);
+        dwc2_hcd_qh_unlink(hsotg, qh);
+        if (!list_empty(&qh->qtd_list))
+            dwc2_hcd_qh_add(hsotg, qh);
+    }
+    chan->qh = NULL;
+}
+
+/*
+ * The channel is disabled in hardware but its halt was never handled (lost
+ * interrupt): release it the way the channel-halted handler does for a
+ * dequeued transfer. Must be called with hsotg->lock held.
+ */
+static void dwc2_release_halted_dequeued_channel(struct dwc2_hsotg *hsotg,
+                                                 struct dwc2_host_chan *chan)
+{
+    if (!hsotg->params.dma_desc_enable)
+        dwc2_release_channel(hsotg, chan, NULL, DWC2_HC_XFER_URB_DEQUEUE);
+    else if (chan->qh)
+        dwc2_hcd_complete_xfer_ddma(hsotg, chan, chan->hc_num,
+                                    DWC2_HC_XFER_URB_DEQUEUE);
+    else
+        /* No QH left to account the channel against */
+        dwc2_quarantine_channel(hsotg, chan);
+}
+
+
+/*
+ * A kill is synchronous from the class driver's point of view. In buffer DMA
+ * the QTD giveback can otherwise happen before CHHLTD, allowing the caller to
+ * free a transfer buffer while the controller still owns it.
+ *
+ * The wait is bounded: a channel that never halts must not block the caller
+ * (often the hub thread) forever. Past the timeout the channel is released
+ * if it did halt (lost interrupt), otherwise disabled explicitly (buffer DMA
+ * periodic channels and descriptor DMA halts do not write CHDIS), and taken
+ * out of service if even that is ignored. Messages are printed after the
+ * lock is dropped: the console is slow.
+ */
+static void dwc2_wait_for_channel_cleanup(struct dwc2_hsotg *hsotg,
+                                          struct dwc2_host_chan *chan,
+                                          u32 cleanup_generation)
+{
+    u32 timeout_ms = DWC2_KILL_HALT_TIMEOUT_MS;
+    int pass;
+
+    for (pass = 0; pass < 2; pass++) {
+        const char *what = NULL;
+        rt_base_t level;
+        u32 hcchar = 0;
+
+        if (dwc2_wait_channel_cleaned(hsotg, chan, cleanup_generation,
+                                      timeout_ms))
+            return;
+
+        level = rt_spin_lock_irqsave(&hsotg->lock);
+        if (!dwc2_channel_cleaned(hsotg, chan, cleanup_generation)) {
+            hcchar = dwc2_readl(hsotg, HCCHAR(chan->hc_num));
+            if (!(hcchar & HCCHAR_CHENA)) {
+                dwc2_release_halted_dequeued_channel(hsotg, chan);
+                what = "halted without an interrupt; released it";
+            } else if (pass == 0) {
+                /* CHENA was read just above, so this cannot restart a
+                 * channel that halted by itself. */
+                chan->halt_status = DWC2_HC_XFER_URB_DEQUEUE;
+                dwc2_writel(hsotg, HCINTMSK_CHHLTD, HCINTMSK(chan->hc_num));
+                dwc2_writel(hsotg, hcchar | HCCHAR_CHENA | HCCHAR_CHDIS,
+                            HCCHAR(chan->hc_num));
+                what = "did not halt; forcing disable";
+            } else {
+                dwc2_quarantine_channel(hsotg, chan);
+                what = "is stuck; out of service until the next root port reset";
+            }
+        }
+        rt_spin_unlock_irqrestore(&hsotg->lock, level);
+
+        if (!what)
+            return;
+        dev_err(hsotg->dev, "host channel %u %s during URB kill (hcchar 0x%08x)\n",
+                chan->hc_num, what, hcchar);
+        if (!(hcchar & HCCHAR_CHENA) || pass == 1)
+            return;
+        timeout_ms = DWC2_KILL_FORCE_TIMEOUT_MS;
+    }
 }
 
 int usbh_dwc2_reset_endpoint(struct usbh_hubport *hport, uint8_t endpoint)
@@ -4196,6 +4452,8 @@ int dwc2_hcd_endpoint_disable(struct usb_hcd *hcd, struct usb_host_endpoint *ep,
 static int _dwc2_hcd_urb_dequeue(struct urb *urb, int status)
 {
     struct dwc2_hsotg *hsotg = dwc2_hcd_to_hsotg(&urb->hport->bus->hcd);
+    struct dwc2_host_chan *halt_chan = NULL;
+    u32 cleanup_generation = 0;
     int rc;
     rt_base_t level;
 
@@ -4210,7 +4468,8 @@ static int _dwc2_hcd_urb_dequeue(struct urb *urb, int status)
         goto wail_kill;
     }
 
-    rc = dwc2_hcd_urb_dequeue(hsotg, urb->hcpriv);
+    rc = dwc2_hcd_urb_dequeue(hsotg, urb->hcpriv, &halt_chan,
+                              &cleanup_generation);
 
 #if !INTERRUPT_MALLOC
     rt_free(urb->hcpriv);
@@ -4222,6 +4481,10 @@ static int _dwc2_hcd_urb_dequeue(struct urb *urb, int status)
 
     /* Higher layer software sets URB status */
     rt_spin_unlock_irqrestore(&hsotg->lock, level);
+
+    if (halt_chan)
+        dwc2_wait_for_channel_cleanup(hsotg, halt_chan,
+                                      cleanup_generation);
 
     urb->errorcode = status;
     usb_hcd_giveback_urb(urb);

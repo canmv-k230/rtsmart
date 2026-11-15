@@ -200,7 +200,7 @@ get_mac:
         cdc_ncm_class->mac[j] = (unsigned char)byte;
     }
 
-    USB_LOG_INFO("CDC NCM MAC address %02x:%02x:%02x:%02x:%02x:%02x\r\n",
+    USB_LOG_DBG("CDC NCM MAC address %02x:%02x:%02x:%02x:%02x:%02x\r\n",
                  cdc_ncm_class->mac[0],
                  cdc_ncm_class->mac[1],
                  cdc_ncm_class->mac[2],
@@ -211,7 +211,7 @@ get_mac:
     if (cdc_ncm_class->max_segment_size > sizeof(g_cdc_ncm_rx_buffer)) {
         USB_LOG_ERR("CDC NCM Max Segment Size is overflow, buffer is %u, but device reports %u\r\n", (unsigned)sizeof(g_cdc_ncm_rx_buffer), cdc_ncm_class->max_segment_size);
     } else {
-        USB_LOG_INFO("CDC NCM Max Segment Size:%u\r\n", cdc_ncm_class->max_segment_size);
+        USB_LOG_DBG("CDC NCM Max Segment Size:%u\r\n", cdc_ncm_class->max_segment_size);
     }
 
     ret = usbh_cdc_ncm_get_ntb_parameters(cdc_ncm_class, &cdc_ncm_class->ntb_param);
@@ -237,7 +237,7 @@ get_mac:
             }
         }
 
-        USB_LOG_INFO("Select cdc ncm altsetting: %d\r\n", altsetting);
+        USB_LOG_DBG("Select cdc ncm altsetting: %d\r\n", altsetting);
         usbh_set_interface(cdc_ncm_class->hport, cdc_ncm_class->data_intf, altsetting);
     } else {
         for (uint8_t i = 0; i < hport->config.intf[intf + 1].altsetting[0].intf_desc.bNumEndpoints; i++) {
@@ -253,7 +253,7 @@ get_mac:
 
     usb_memcpy(hport->config.intf[intf].devname, DEV_FORMAT, CONFIG_USBHOST_DEV_NAMELEN);
 
-    USB_LOG_INFO("Register CDC NCM Class:%s\r\n", hport->config.intf[intf].devname);
+    USB_LOG_DBG("Register CDC NCM Class:%s\r\n", hport->config.intf[intf].devname);
 
     usbh_cdc_ncm_run(cdc_ncm_class);
     return ret;
@@ -291,7 +291,7 @@ static int usbh_cdc_ncm_disconnect(struct usbh_hubport *hport, uint8_t intf)
         }
 
         if (registered) {
-            USB_LOG_INFO("Unregister CDC NCM Class:%s\r\n", DEV_FORMAT);
+            USB_LOG_DBG("Unregister CDC NCM Class:%s\r\n", DEV_FORMAT);
             usbh_cdc_ncm_stop(cdc_ncm_class);
         }
 
@@ -309,7 +309,7 @@ void usbh_cdc_ncm_rx_thread(void *argument)
     struct pbuf *p;
     struct netif *netif = (struct netif *)argument;
 
-    USB_LOG_INFO("Create cdc ncm rx thread\r\n");
+    USB_LOG_DBG("Create cdc ncm rx thread\r\n");
     g_cdc_ncm_class.rx_thread_running = true;
     // clang-format off
 find_class:
@@ -434,7 +434,7 @@ find_class:
     // clang-format off
 delete:
     g_cdc_ncm_class.rx_thread_running = false;
-    USB_LOG_INFO("Delete cdc ncm rx thread\r\n");
+    USB_LOG_DBG("Delete cdc ncm rx thread\r\n");
     usb_osal_thread_delete(NULL);
     // clang-format on
 }

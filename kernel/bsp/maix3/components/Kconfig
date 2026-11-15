@@ -297,6 +297,14 @@ menu "Components Configuration"
 
                 if ENABLE_CHERRY_USB_HOST
 
+                    config CHERRY_USB_HOST_ENABLE_BUILTIN_CMD
+                        bool "Enable CherryUSB host shell commands"
+                        depends on RT_USING_MSH
+                        default y
+                        help
+                            Enable lsusb and other built-in CherryUSB host
+                            diagnostic commands in MSH.
+
                     config CHERRY_USB_K230_HOST_COMPDISTUNE
                         int "K230 host PHY disconnect threshold override"
                         depends on !ENABLE_CHERRY_USB_OTG
@@ -324,6 +332,12 @@ menu "Components Configuration"
                                 config DWC2_DRV_DMA_DESC_ENABLE
                                     bool "Enable descriptor DMA mode"
                                     default n
+                                    help
+                                        Descriptor DMA cannot issue split transactions, so
+                                        full- and low-speed devices behind a high-speed hub
+                                        (keyboards, mice, serial adapters, FS storage) fail
+                                        to enumerate. Leave this off unless every device is
+                                        high-speed or attached directly to the root port.
 
                                 config CHERRY_USB_DWC2_TIMEOUT_DEBUG
                                     bool "Enable DWC2 timeout register dumps"
@@ -368,9 +382,20 @@ menu "Components Configuration"
                                 default n
 
                             if CHERRY_USB_HC_DRV_DWC2
-                                config CHERRY_USB_HOST_ENABLE_CLASS_UVC
+                                menuconfig CHERRY_USB_HOST_ENABLE_CLASS_UVC
                                     bool "Enable UVC"
                                     default n
+
+                                    if CHERRY_USB_HOST_ENABLE_CLASS_UVC
+                                        config CHERRY_USB_HOST_UVC_DIAGNOSTIC_CMDS
+                                            bool "Enable UVC diagnostic shell commands"
+                                            depends on CHERRY_USB_HOST_ENABLE_BUILTIN_CMD
+                                            default y
+                                            help
+                                                Export uvc_host_formats and the
+                                                uvc_host_profile, uvc_host_profile_dump,
+                                                and uvc_host_profile_reset commands to MSH.
+                                    endif
                             endif
 
                             config CHERRY_USB_HOST_ENABLE_CLASS_CDC_ACM

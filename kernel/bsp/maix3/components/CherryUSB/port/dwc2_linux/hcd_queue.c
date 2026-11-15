@@ -1024,7 +1024,7 @@ void dwc2_hcd_qh_free(struct dwc2_hsotg *hsotg, struct dwc2_qh *qh)
     if (rt_timer_stop(&qh->unreserve_timer) == RT_EOK) {
         rt_base_t level;
 
-        rt_spin_lock_irqsave(&hsotg->lock);
+        level = rt_spin_lock_irqsave(&hsotg->lock);
         dwc2_do_unreserve(hsotg, qh);
         rt_spin_unlock_irqrestore(&hsotg->lock, level);
     }
@@ -1531,7 +1531,10 @@ static int dwc2_do_reserve(struct dwc2_hsotg *hsotg, struct dwc2_qh *qh)
         dev_err(hsotg->dev,
                 "%s: Insufficient periodic bandwidth for periodic transfer\n",
                 __func__);
-        RT_ASSERT(0);
+        /*
+         * Not fatal: the enqueue fails with -ENOSPC, which the submitter
+         * gets as -USB_ERR_RANGE (e.g. a camera altsetting too large).
+         */
         return status;
     }
 

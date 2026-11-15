@@ -494,6 +494,181 @@ static u16 dwc2_recalc_initial_desc_idx(struct dwc2_hsotg *hsotg,
     return skip_frames;
 }
 
+/*
+ * Where the core is in an isochronous descriptor list.
+ *
+ * The core services the slot of the current (micro)frame: the HS list is 32
+ * frames of 8 descriptors, so a microframe number masked to the list size is
+ * its slot (the same mapping dwc2_frame_to_desc_idx() uses to pick td_first);
+ * the FS list has one descriptor per frame. Armed descriptors run from
+ * td_first (oldest not yet scanned) to td_last (next free slot).
+ *
+ * A slot alone cannot say whether the core is short of td_first, working
+ * through the armed span or past td_last (possibly by more than a lap), so
+ * qh->isoc_td_last_frame keeps the (micro)frame number at which the core
+ * reaches td_last. Every slot of the span maps to one (micro)frame, and the
+ * 14-bit frame counter tells ahead from behind over +-8191 (micro)frames. The
+ * 64-entry frame-list index Linux compares instead cannot even express the
+ * 160 of 256 HS slots UVC keeps armed.
+ */
+struct dwc2_isoc_hw_pos {
+    u16 first;	/* td_first when sampled */
+    int span;	/* slots from td_first to td_last (the whole list when full) */
+    int done;	/* (micro)frames from td_first to the core; < 0: not there yet */
+};
+
+/*
+ * (micro)frames td_last must stay ahead of the core when init samples the
+ * frame number: the core has fetched the next slot already, and init may
+ * cross a (micro)frame boundary before it writes the descriptor.
+ */
+#define DWC2_ISOC_FETCH_AHEAD	3
+
+/*
+ * Tracking needs a power-of-two interval (re-armed slots must keep the phase
+ * the frame list and schinfo were programmed for) and one short enough that
+ * a list lap holds several descriptors. Others keep the Linux behaviour.
+ */
+static bool dwc2_isoc_track_hw(struct dwc2_qh *qh)
+{
+    u16 inc = qh->host_interval;
+
+    return inc && !(inc & (inc - 1)) && inc < 32;
+}
+
+/* a - b in (micro)frames, modulo the 14-bit frame counter */
+static int dwc2_isoc_frame_diff(u16 a, u16 b)
+{
+    int d = (a - b) & HFNUM_MAX_FRNUM;
+
+    return d > HFNUM_MAX_FRNUM / 2 ? d - (HFNUM_MAX_FRNUM + 1) : d;
+}
+
+static void dwc2_isoc_hw_pos(struct dwc2_qh *qh, u16 frame,
+                             struct dwc2_isoc_hw_pos *pos)
+{
+    u16 n = dwc2_max_desc_num(qh);
+
+    pos->first = qh->td_first;
+    pos->span = (qh->td_last - qh->td_first) & (n - 1);
+    if (qh->ntd && !pos->span)
+        pos->span = n;
+    pos->done = dwc2_isoc_frame_diff(frame, qh->isoc_td_last_frame) +
+        pos->span;
+    /*
+     * td_first is never more than a list ahead of the core, so a larger
+     * negative distance means the signed difference wrapped: more than half
+     * the frame counter (1 s HS, 8 s FS) went by without service. The core
+     * is far past everything armed; the scan's active-bit check still
+     * guards each descriptor.
+     */
+    if (pos->done < -(int)n)
+        pos->done = HFNUM_MAX_FRNUM + 1;
+}
+
+/*
+ * True if the core was past armed slot @slot when @pos was sampled. That
+ * does not prove its writeback and IOC have landed (the transfer may finish
+ * late); the scan checks the descriptor's active bit for that.
+ */
+static bool dwc2_isoc_hw_passed(struct dwc2_qh *qh,
+                                const struct dwc2_isoc_hw_pos *pos, u16 slot)
+{
+    return ((slot - pos->first) & (dwc2_max_desc_num(qh) - 1)) < pos->done;
+}
+
+/* Descriptor slot of packet @packet of an isochronous QTD */
+static u16 dwc2_isoc_qtd_desc_idx(struct dwc2_qh *qh, struct dwc2_qtd *qtd,
+                                  u32 packet)
+{
+    return (qtd->isoc_td_first + packet * qh->host_interval) &
+        (dwc2_max_desc_num(qh) - 1);
+}
+
+/*
+ * Returns how many descriptors may be armed from td_last on: up to td_first
+ * one lap on, and never in the slots from the core to td_first while the
+ * core has not reached td_first yet (after a fresh start). If the core has
+ * reached td_last, td_last is first moved to the next slot of the
+ * endpoint's phase safely ahead of the core; this is Linux's "current frame
+ * number overstep last descriptor" recovery, done on the armed span.
+ * Called with hsotg->frame_number freshly read.
+ */
+static u16 dwc2_isoc_make_room(struct dwc2_hsotg *hsotg, struct dwc2_qh *qh)
+{
+    u16 n = dwc2_max_desc_num(qh), mask = n - 1;
+    u16 frame = hsotg->frame_number, cur = frame & mask;
+    u16 inc = qh->host_interval;
+    struct dwc2_isoc_hw_pos pos;
+    struct dwc2_qtd *qtd, *partial = NULL;
+    u16 next, lead;
+    int room;
+
+    if (!qh->ntd) {
+        /*
+         * Fresh start: td_first == td_last was just chosen ahead of the core
+         * (HS at least 4 uframes, FS only 2 frames); keep it at least
+         * DWC2_ISOC_FETCH_AHEAD ahead, in the endpoint's phase.
+         */
+        while (((qh->td_last - cur) & mask) < DWC2_ISOC_FETCH_AHEAD)
+            qh->td_first = qh->td_last = (qh->td_last + inc) & mask;
+        qh->isoc_td_last_frame = (frame + ((qh->td_last - cur) & mask)) &
+            HFNUM_MAX_FRNUM;
+    }
+
+    dwc2_isoc_hw_pos(qh, frame, &pos);
+
+    if (!qh->ntd || pos.done < 0) {
+        /* Keep the slots between the core and td_first empty */
+        room = n - dwc2_isoc_frame_diff(qh->isoc_td_last_frame, frame);
+        return room > 0 ? DIV_ROUND_UP(room, inc) : 0;
+    }
+
+    if (pos.done + DWC2_ISOC_FETCH_AHEAD <= pos.span)
+        /* The core is inside the armed span, td_last still ahead of it */
+        return (n - pos.span) / inc;
+
+    /*
+     * The core is on the last armed slot or past td_last: arming at td_last
+     * would make the core reach it only a lap later (up to 32 ms for HS), and
+     * later packets of the same URB before it.
+     *
+     * The armed descriptors are done or on their last slot, and the IOC
+     * interrupt that retires them is still to be handled: the scan retires
+     * a QTD early only if the core passed it before the channel interrupt
+     * was cleared. Until then td_first holds those descriptors. A partly
+     * armed QTD continues after the skipped slots, which needs its armed
+     * packets scanned first (init rebases its packet to slot mapping), so
+     * wait for that interrupt in that case.
+     */
+    list_for_each_entry(qtd, &qh->qtd_list, qtd_list_entry) {
+        if (qtd->isoc_frame_index_last < qtd->urb->packet_count) {
+            if (qtd->isoc_frame_index_last)
+                partial = qtd;
+            break;
+        }
+    }
+    if (partial && partial->isoc_frame_index < partial->isoc_frame_index_last)
+        return 0;
+
+    next = cur + (qh->dev_speed == USB_SPEED_HIGH ? 4 : DWC2_ISOC_FETCH_AHEAD);
+    next = (next + ((qh->td_last - next) & (inc - 1))) & mask;
+    lead = (next - cur) & mask;
+
+    /* td_first + n bounds the re-armed span: a core a lap ahead waits too */
+    room = n - (pos.done + lead);
+    if (room <= 0)
+        return 0;
+
+    dev_vdbg(hsotg->dev,
+             "isoc: core at slot %d overstepped td_last %d, re-arm at %d\n",
+             cur, qh->td_last, next);
+    qh->td_last = next;
+    qh->isoc_td_last_frame = (frame + lead) & HFNUM_MAX_FRNUM;
+
+    return DIV_ROUND_UP(room, inc);
+}
+
 static void dwc2_fill_host_isoc_dma_desc(struct dwc2_hsotg *hsotg,
                                          struct dwc2_qtd *qtd,
                                          struct dwc2_qh *qh, u32 max_xfer_size,
@@ -537,31 +712,39 @@ static void dwc2_init_isoc_dma_desc(struct dwc2_hsotg *hsotg,
     struct dwc2_qtd *qtd;
     u32 max_xfer_size;
     u16 idx, inc, n_desc = 0, ntd_max = 0;
-    u16 cur_idx;
-    u16 next_idx;
+    u16 room = 0xffff;
+    u16 cur_idx, next_idx;
+    bool more = false, track;
 
-    idx = qh->td_last;
     inc = qh->host_interval;
     hsotg->frame_number = dwc2_hcd_get_frame_number(hsotg);
-    cur_idx = idx;
-    next_idx = dwc2_desclist_idx_inc(qh->td_last, inc, qh->dev_speed);
 
     /*
-     * Ensure current frame number didn't overstep last scheduled
-     * descriptor. If it happens, the only way to recover is to move
-     * qh->td_last to current frame number + 1.
-     * So that next isoc descriptor will be scheduled on frame number + 1
-     * and not on a past frame.
+     * If the core overstepped the last scheduled descriptor, move td_last
+     * ahead of it so nothing is armed on a past frame. dwc2_isoc_make_room()
+     * does this on the armed span; see struct dwc2_isoc_hw_pos for why the
+     * upstream frame-list index test is not used.
      */
-    if (dwc2_frame_idx_num_gt(cur_idx, next_idx) || (cur_idx == next_idx)) {
-        if (inc < 32) {
+    track = dwc2_isoc_track_hw(qh);
+    if (track) {
+        room = dwc2_isoc_make_room(hsotg, qh);
+    } else {
+        /* Upstream recovery for non-power-of-two intervals, which only a
+         * caller setting urb->interval itself can produce; it never fires
+         * for intervals of 32 or more. */
+        cur_idx = dwc2_frame_list_idx(hsotg->frame_number);
+        next_idx = dwc2_desclist_idx_inc(qh->td_last, inc,
+                                         qh->dev_speed);
+        if (inc < 32 &&
+            (dwc2_frame_idx_num_gt(cur_idx, next_idx) ||
+             cur_idx == next_idx)) {
             dev_vdbg(hsotg->dev,
                      "current frame number overstep last descriptor\n");
             qh->td_last = dwc2_desclist_idx_inc(cur_idx, inc,
                                                 qh->dev_speed);
-            idx = qh->td_last;
         }
     }
+    idx = qh->td_last;
 
     if (qh->host_interval) {
         ntd_max = (dwc2_max_desc_num(qh) + qh->host_interval - 1) /
@@ -579,23 +762,48 @@ static void dwc2_init_isoc_dma_desc(struct dwc2_hsotg *hsotg,
             qtd->urb->packet_count)
             continue;
 
-        qtd->isoc_td_first = idx;
-        while (qh->ntd < ntd_max && qtd->isoc_frame_index_last <
-               qtd->urb->packet_count) {
+        /*
+         * isoc_td_first is the slot of packet 0 (see
+         * dwc2_isoc_qtd_desc_idx()). A QTD armed in several passes
+         * normally continues right after its last armed slot; if td_last
+         * moved meanwhile (fresh start, or re-arm after an overstep), its
+         * armed packets are all scanned and the mapping is rebased so the
+         * remaining packets continue at td_last.
+         */
+        if (qh->ntd < ntd_max && n_desc < room &&
+            qtd->isoc_frame_index_last < qtd->urb->packet_count) {
+            if (!qtd->isoc_frame_index_last)
+                qtd->isoc_td_first = idx;
+            else if (dwc2_isoc_qtd_desc_idx(qh, qtd,
+                                            qtd->isoc_frame_index_last) != idx)
+                qtd->isoc_td_first = (idx - qtd->isoc_frame_index_last * inc) &
+                    (dwc2_max_desc_num(qh) - 1);
+        }
+        while (qtd->isoc_frame_index_last < qtd->urb->packet_count) {
+            if (qh->ntd >= ntd_max || n_desc >= room) {
+                more = true;
+                break;
+            }
             dwc2_fill_host_isoc_dma_desc(hsotg, qtd, qh,
                                          max_xfer_size, idx);
             idx = dwc2_desclist_idx_inc(idx, inc, qh->dev_speed);
             n_desc++;
         }
-        qtd->isoc_td_last = idx;
         qtd->in_process = 1;
     }
 
     qh->td_last = idx;
+    if (track)
+        qh->isoc_td_last_frame = (qh->isoc_td_last_frame + n_desc * inc) &
+            HFNUM_MAX_FRNUM;
 
 #ifdef ISOC_URB_GIVEBACK_ASAP
-    /* Set IOC for last descriptor if descriptor list is full */
-    if (qh->ntd == ntd_max) {
+    /*
+     * Set IOC for last descriptor if descriptor list is full, or if packets
+     * are left unarmed for lack of room: the scan stops at that descriptor
+     * and the completion arms the rest.
+     */
+    if (qh->ntd == ntd_max || (more && n_desc)) {
         idx = dwc2_desclist_idx_dec(qh->td_last, inc, qh->dev_speed);
         qh->desc_list[idx].status |= HOST_DMA_IOC;
         dma_sync_single_for_device((void *)qh->desc_list + (idx * sizeof(struct dwc2_dma_desc)),
@@ -715,20 +923,39 @@ static void dwc2_desc_list_free(struct dwc2_hsotg *hsotg, struct dwc2_qh *qh)
     qh->n_bytes = NULL;
 }
 
+/*
+ * Detach @qh from its channel without returning the channel: clear its
+ * frame-list bits and descriptors (withdrawing any active bits the core
+ * would still fetch). Must be called with hsotg->lock held.
+ */
+void dwc2_hcd_qh_detach_channel_ddma(struct dwc2_hsotg *hsotg,
+                                     struct dwc2_qh *qh)
+{
+    if (!qh->channel)
+        return;
+
+    if (!dwc2_qh_is_non_per(qh))
+        dwc2_update_frame_list(hsotg, qh, 0);
+
+    qh->channel = NULL;
+    qh->ntd = 0;
+
+    if (qh->desc_list) {
+        memset(qh->desc_list, 0, sizeof(struct dwc2_dma_desc) *
+               dwc2_max_desc_num(qh));
+        dma_sync_single_for_device(qh->desc_list, qh->desc_list_sz);
+    }
+}
+
 static void dwc2_release_channel_ddma(struct dwc2_hsotg *hsotg,
                                       struct dwc2_qh *qh)
 {
     struct dwc2_host_chan *chan = qh->channel;
 
-    if (dwc2_qh_is_non_per(qh)) {
-        if (hsotg->params.uframe_sched)
-            hsotg->available_host_channels++;
-        else
-            hsotg->non_periodic_channels--;
-    } else {
-        dwc2_update_frame_list(hsotg, qh, 0);
+    if (dwc2_qh_is_non_per(qh) && !hsotg->params.uframe_sched)
+        hsotg->non_periodic_channels--;
+    else
         hsotg->available_host_channels++;
-    }
 
     /*
      * The condition is added to prevent double cleanup try in case of
@@ -742,12 +969,24 @@ static void dwc2_release_channel_ddma(struct dwc2_hsotg *hsotg,
         chan->qh = NULL;
     }
 
-    qh->channel = NULL;
-    qh->ntd = 0;
+    dwc2_hcd_qh_detach_channel_ddma(hsotg, qh);
+}
 
-    if (qh->desc_list)
-        memset(qh->desc_list, 0, sizeof(struct dwc2_dma_desc) *
-               dwc2_max_desc_num(qh));
+/*
+ * Release @qh's channel and put the QH back on the inactive schedule if it
+ * still has QTDs, as after a completion. Must be called with hsotg->lock
+ * held.
+ */
+void dwc2_hcd_release_channel_requeue_ddma(struct dwc2_hsotg *hsotg,
+                                        struct dwc2_qh *qh)
+{
+    if (!qh->channel)
+        return;
+
+    dwc2_release_channel_ddma(hsotg, qh);
+    dwc2_hcd_qh_unlink(hsotg, qh);
+    if (!list_empty(&qh->qtd_list))
+        dwc2_hcd_qh_add(hsotg, qh);
 }
 
 static void dwc2_per_sched_disable(struct dwc2_hsotg *hsotg)
@@ -852,7 +1091,9 @@ int dwc2_hcd_qh_init_ddma(struct dwc2_hsotg *hsotg, struct dwc2_qh *qh,
 
     if (qh->do_split) {
         dev_err(hsotg->dev,
-                "SPLIT Transfers are not supported in Descriptor DMA mode.\n");
+                "SPLIT Transfers are not supported in Descriptor DMA mode; "
+                "a full/low-speed device behind a hub needs "
+                "DWC2_DRV_DMA_DESC_ENABLE disabled.\n");
         retval = -EINVAL;
         goto err0;
     }
@@ -903,14 +1144,17 @@ static int dwc2_cmpl_host_isoc_dma_desc(struct dwc2_hsotg *hsotg,
 
     usb_urb = qtd->urb->priv;
 
-    dma_sync_single_for_cpu((void *)qh->desc_list + (idx * sizeof(struct dwc2_dma_desc)),
-                            sizeof(struct dwc2_dma_desc));
-
+    /* The caller synced this descriptor to check its active bit. */
     dma_desc = &qh->desc_list[idx];
-    frame_desc_idx = (idx - qtd->isoc_td_first) & (usb_urb->num_of_iso_packets - 1);
+    /*
+     * Packets complete in order, so the next one is isoc_frame_index. The
+     * slot distance from isoc_td_first is a multiple of host_interval and
+     * would make packets of an interval >= 2 endpoint share frame descriptors.
+     */
+    frame_desc_idx = qtd->isoc_frame_index;
 
     frame_desc = &qtd->urb->iso_descs[frame_desc_idx];
-    if (idx == qtd->isoc_td_first)
+    if (!frame_desc_idx)
         usb_urb->start_frame = dwc2_hcd_get_frame_number(hsotg);
     dma_desc->buf = (u32)(qtd->urb->dma + frame_desc->offset);
     if (chan->ep_is_in)
@@ -966,7 +1210,10 @@ static void dwc2_complete_isoc_xfer_ddma(struct dwc2_hsotg *hsotg,
 {
     struct dwc2_hcd_iso_packet_desc *frame_desc;
     struct dwc2_qtd *qtd, *qtd_tmp;
+    struct dwc2_isoc_hw_pos pos = { 0 };
     struct dwc2_qh *qh;
+    bool track;
+    bool scanned_one = false;
     u16 idx;
     int rc;
 
@@ -1011,59 +1258,75 @@ static void dwc2_complete_isoc_xfer_ddma(struct dwc2_hsotg *hsotg,
         return;
     }
 
-    list_for_each_entry_safe(qtd, qtd_tmp, &qh->qtd_list, qtd_list_entry) {
-        if (!qtd->in_process)
+    /*
+     * The interrupt reports that the descriptors up to the next IOC are
+     * done. When it ran late, later IOC descriptors finished too and their
+     * interrupts merged into this one; scan those as well, as Linux does,
+     * or every later interrupt would complete the URB before the one that
+     * just finished and the armed list would never drain.
+     *
+     * A QTD is scanned on only if the core was past it and no XferCompl is
+     * latched again since the handler cleared it: its IOC then fired before
+     * that clear, so no later interrupt is coming for it. Otherwise the
+     * pending interrupt scans it. The frame number cannot show that a
+     * transfer's writeback has landed, so every descriptor's active bit is
+     * checked too (below); a stale interrupt thus retires nothing.
+     */
+    track = dwc2_isoc_track_hw(qh);
+    if (track) {
+        dwc2_isoc_hw_pos(qh, dwc2_hcd_get_frame_number(hsotg), &pos);
+        if (dwc2_readl(hsotg, HCINT(chan->hc_num)) & HCINTMSK_XFERCOMPL)
+            track = false;
+    }
+
+    while (!list_empty(&qh->qtd_list)) {
+        qtd = list_first_entry(&qh->qtd_list, struct dwc2_qtd,
+                               qtd_list_entry);
+        if (!qtd->in_process ||
+            qtd->isoc_frame_index >= qtd->isoc_frame_index_last)
+            break;
+
+        if (scanned_one && (!track || !dwc2_isoc_hw_passed(qh, &pos,
+                         dwc2_isoc_qtd_desc_idx(qh, qtd,
+                                                qtd->isoc_frame_index_last - 1))))
             break;
 
         /*
-         * Ensure idx corresponds to descriptor where first urb of this
-         * qtd was added. In fact, during isoc desc init, dwc2 may skip
-         * an index if current frame number is already over this index.
+         * Start at the slot of the next packet to complete. A new QTD may
+         * start further on than where the previous one ended: init skips
+         * the slots the core overstepped.
          */
-        if (idx != qtd->isoc_td_first) {
-            dev_vdbg(hsotg->dev,
-                     "try to complete %d instead of %d\n",
-                     idx, qtd->isoc_td_first);
-            idx = qtd->isoc_td_first;
-        }
-
+        idx = dwc2_isoc_qtd_desc_idx(qh, qtd, qtd->isoc_frame_index);
         do {
-            struct dwc2_qtd *qtd_next;
-            u16 cur_idx;
-
+            /*
+             * The core clears the active bit when it writes the status
+             * back (the non-isoc path relies on that too). A descriptor
+             * still active is not done: its writeback and IOC are late, or
+             * this interrupt is stale. Stop there; packets already scanned
+             * stay retired and its own IOC brings the scan back.
+             */
+            dma_sync_single_for_cpu((void *)qh->desc_list +
+                                    (idx * sizeof(struct dwc2_dma_desc)),
+                                    sizeof(struct dwc2_dma_desc));
+            if (qh->desc_list[idx].status & HOST_DMA_A) {
+                qh->td_first = idx;
+                return;
+            }
             rc = dwc2_cmpl_host_isoc_dma_desc(hsotg, chan, qtd, qh,
                                               idx);
             if (rc < 0)
                 return;
             idx = dwc2_desclist_idx_inc(idx, qh->host_interval,
                                         chan->speed);
-            if (rc == 0)
-                continue;
+            /* rc != 0: URB done (qtd freed) or IOC descriptor reached */
+        } while (!rc && qtd->isoc_frame_index < qtd->isoc_frame_index_last);
 
-            if (rc == DWC2_CMPL_DONE || rc == DWC2_CMPL_STOP)
-                goto stop_scan;
-
-            /* rc == DWC2_CMPL_STOP */
-
-            if (qh->host_interval >= 32)
-                goto stop_scan;
-
-            qh->td_first = idx;
-            cur_idx = dwc2_frame_list_idx(hsotg->frame_number);
-            qtd_next = list_first_entry(&qh->qtd_list,
-                                        struct dwc2_qtd,
-                                        qtd_list_entry);
-            if (dwc2_frame_idx_num_gt(cur_idx,
-                                      qtd_next->isoc_td_last))
-                break;
-
-            goto stop_scan;
-
-        } while (idx != qh->td_first);
+        qh->td_first = idx;
+        if (!rc)
+            /* Armed packets ran out without an IOC; nothing more is due */
+            break;
+        scanned_one = true;
     }
-
-stop_scan:
-    qh->td_first = idx;
 }
 
 static bool dwc2_ddma_desc_error_should_log(struct dwc2_hsotg *hsotg)
@@ -1388,20 +1651,11 @@ void dwc2_hcd_complete_xfer_ddma(struct dwc2_hsotg *hsotg,
         /* Release the channel if halted or session completed */
         if (halt_status != DWC2_HC_XFER_COMPLETE ||
             list_empty(&qh->qtd_list)) {
-            struct dwc2_qtd *qtd, *qtd_tmp;
-
             /*
              * Kill all remainings QTDs since channel has been
              * halted.
              */
-            list_for_each_entry_safe(qtd, qtd_tmp,
-                                     &qh->qtd_list,
-                                     qtd_list_entry) {
-                dwc2_host_complete(hsotg, qtd,
-                                   -ECONNRESET);
-                dwc2_hcd_qtd_unlink_and_free(hsotg,
-                                             qtd, qh);
-            }
+            dwc2_hcd_qh_giveback_qtds(hsotg, qh, -ECONNRESET);
 
             /* Halt the channel if session completed */
             if (halt_status == DWC2_HC_XFER_COMPLETE)
@@ -1430,16 +1684,7 @@ void dwc2_hcd_complete_xfer_ddma(struct dwc2_hsotg *hsotg,
          */
         dwc2_complete_non_isoc_xfer_ddma(hsotg, chan, chnum,
                                          halt_status);
-        dwc2_release_channel_ddma(hsotg, qh);
-        dwc2_hcd_qh_unlink(hsotg, qh);
-
-        if (!list_empty(&qh->qtd_list)) {
-            /*
-             * Add back to inactive non-periodic schedule on normal
-             * completion
-             */
-            dwc2_hcd_qh_add(hsotg, qh);
-        }
+        dwc2_hcd_release_channel_requeue_ddma(hsotg, qh);
     }
 
     tr_type = dwc2_hcd_select_transactions(hsotg);

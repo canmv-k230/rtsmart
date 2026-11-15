@@ -11,6 +11,29 @@
 static struct usbh_ec200m *g_ec200m[EC200M_MAX_TTY_INTF];
 static uint8_t g_dev_inuse = 0;
 
+static const char *usbh_cellular_product_name(const struct usbh_hubport *hport)
+{
+    uint16_t vid = hport->device_desc.idVendor;
+    uint16_t pid = hport->device_desc.idProduct;
+
+    if (vid == 0x2c7c && pid == 0x6002) {
+        return "EC200M";
+    }
+    if (vid == 0x2c7c && pid == 0x6005) {
+        return "EC200A";
+    }
+    if (vid == 0x2ecc && pid == 0x3012) {
+        return "ML307B";
+    }
+    if (vid == 0x1e0e && pid == 0x9011) {
+        return "A7680C";
+    }
+    if (vid == 0x3563 && pid == 0x2000) {
+        return "ML307H";
+    }
+    return "USB cellular modem";
+}
+
 static struct usbh_ec200m *get_usbh_ec200m(void)
 {
     uint8_t devno;
@@ -202,7 +225,7 @@ static int usbh_ec200m_connect(struct usbh_hubport *hport, uint8_t intf)
 
     struct usbh_ec200m *ec200m = get_usbh_ec200m();
     if (ec200m == NULL) {
-        rt_kprintf("Fail to get ec200m\n");
+        USB_LOG_ERR("no free USB cellular serial slot\n");
         ret = -USB_ERR_RANGE;
         goto err_out;
     }
@@ -238,7 +261,7 @@ static int usbh_ec200m_connect(struct usbh_hubport *hport, uint8_t intf)
     ec200m->bulkin_buffer = rt_malloc_align(ec200m->bulkin->wMaxPacketSize, ALIGN_SIZE);
     if (ec200m->bulkin_buffer == NULL) {
         ret = -USB_ERR_NOMEM;
-        rt_kprintf("Fail to alloc bulk in buffer\n");
+        USB_LOG_ERR("failed to allocate USB cellular receive buffer\n");
         hport->config.intf[intf].priv = NULL;
         goto free_class;
     }
@@ -254,13 +277,15 @@ static int usbh_ec200m_connect(struct usbh_hubport *hport, uint8_t intf)
     ret = rt_hw_serial_register(&ec200m->serial, hport->config.intf[intf].devname,
                                 RT_DEVICE_FLAG_RDWR | RT_DEVICE_FLAG_DMA_RX | RT_DEVICE_FLAG_DMA_TX, ec200m);
     if (ret) {
-        rt_kprintf("ec200m device register fail\n");
+        USB_LOG_ERR("failed to register USB cellular serial device: %d\n", ret);
         goto free_inbuffer;
     }
 
     rt_sem_init(&(ec200m->wait_close), "ec200m_wait_close", 1, RT_IPC_FLAG_FIFO);
 
-    USB_LOG_INFO("register ec200m class:%s = 0x%x\r\n", hport->config.intf[intf].devname, ec200m);
+    USB_LOG_INFO("%s interface %u attached as /dev/%s\r\n",
+                 usbh_cellular_product_name(hport), intf,
+                 hport->config.intf[intf].devname);
 
     return 0;
 
@@ -304,11 +329,13 @@ static int usbh_ec200m_disconnect(struct usbh_hubport *hport, uint8_t intf)
         rt_sem_detach(&(ec200m->wait_close));
         rt_free_align(ec200m->bulkin_buffer);
         rt_hw_serial_unregister(&ec200m->serial);
-        put_usbh_ec200m(ec200m);
 
         if (hport->config.intf[intf].devname[0] != '\0') {
-            USB_LOG_INFO("unregister ec200m class:%s = 0x%x\r\n", hport->config.intf[intf].devname, ec200m);
+            USB_LOG_INFO("%s interface %u detached from /dev/%s\r\n",
+                         usbh_cellular_product_name(hport), intf,
+                         hport->config.intf[intf].devname);
         }
+        put_usbh_ec200m(ec200m);
     }
 
     return ret;

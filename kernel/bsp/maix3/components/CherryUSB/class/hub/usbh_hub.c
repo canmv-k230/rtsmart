@@ -17,10 +17,29 @@
 #define HUB_DEBOUNCE_STABLE    100
 #define DELAY_TIME_AFTER_RESET 200
 #define HUB_PORT_RESET_RETRIES 5
+#define HUB_PORT_RESET_BOUNCE_DELAY 1000
+/*
+ * Recovery re-enumerations (a port the hub disabled, a hub that stopped
+ * answering) per port and window. The budget lives in the parent hub, so it
+ * survives the re-enumeration it limits; a real reconnect resets it.
+ */
+#define HUB_REENUM_MAX       3
+#define HUB_REENUM_WINDOW_MS 60000
 #define DELAY_TIME_BEFORE_ENUMERATE 20
 #define DELAY_TIME_ENUM_NOTCONN_BACKOFF 100
 
 #define EXTHUB_FIRST_INDEX 2
+
+/*
+ * Port bitmaps (int_buffer, force_reenumerate, unreachable_reported) are
+ * 8 bits wide with bit 0 for the hub itself, and the root hub uses child[].
+ */
+#if CONFIG_USBHOST_MAX_EHPORTS > 7
+#error "CONFIG_USBHOST_MAX_EHPORTS > 7 needs wider hub port bitmaps"
+#endif
+#if CONFIG_USBHOST_MAX_RHPORTS > CONFIG_USBHOST_MAX_EHPORTS
+#error "CONFIG_USBHOST_MAX_RHPORTS must not exceed CONFIG_USBHOST_MAX_EHPORTS"
+#endif
 
 USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t g_hub_buf[CONFIG_USBHOST_MAX_BUS][USB_ALIGN_UP(32, CONFIG_USB_ALIGN_SIZE)];
 USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t g_hub_intbuf[CONFIG_USBHOST_MAX_BUS][CONFIG_USBHOST_MAX_EXTHUBS + 1][USB_ALIGN_UP(1, CONFIG_USB_ALIGN_SIZE)];
@@ -88,6 +107,7 @@ static void usbh_hub_class_free(struct usbh_hub *hub_class)
 static int _usbh_hub_get_hub_descriptor(struct usbh_hub *hub, uint8_t *buffer)
 {
     struct usb_setup_packet *setup;
+    uint8_t nports;
     int ret;
 
     setup = hub->parent->setup;
@@ -111,7 +131,20 @@ static int _usbh_hub_get_hub_descriptor(struct usbh_hub *hub, uint8_t *buffer)
     if (ret < 0) {
         return ret;
     }
-    usb_memcpy(buffer, g_hub_buf, USB_SIZEOF_HUB_DESC);
+
+    /*
+     * Every per-port array (child[], reenum_budget[], g_setup_buffer) has
+     * CONFIG_USBHOST_MAX_EHPORTS entries and is indexed by bNbrPorts, so
+     * reject a hub reporting more ports. Check before copying: on failure the
+     * disconnect path walks hub_desc.bNbrPorts, which must stay 0.
+     */
+    nports = ((struct usb_hub_descriptor *)g_hub_buf[hub->bus->busid])->bNbrPorts;
+    if (nports == 0 || nports > CONFIG_USBHOST_MAX_EHPORTS) {
+        USB_LOG_ERR("Hub reports %u ports, only 1-%u supported (CONFIG_USBHOST_MAX_EHPORTS)\r\n",
+                    nports, CONFIG_USBHOST_MAX_EHPORTS);
+        return -USB_ERR_INVAL;
+    }
+    usb_memcpy(buffer, g_hub_buf[hub->bus->busid], USB_SIZEOF_HUB_DESC);
     return ret;
 }
 #if 0
@@ -214,15 +247,10 @@ static int parse_hub_descriptor(struct usb_hub_descriptor *desc, uint16_t length
         USB_LOG_ERR("unexpected descriptor 0x%02x\r\n", desc->bDescriptorType);
         return -2;
     } else {
-        USB_LOG_RAW("Hub Descriptor:\r\n");
-        USB_LOG_RAW("bLength: 0x%02x             \r\n", desc->bLength);
-        USB_LOG_RAW("bDescriptorType: 0x%02x     \r\n", desc->bDescriptorType);
-        USB_LOG_RAW("bNbrPorts: 0x%02x           \r\n", desc->bNbrPorts);
-        USB_LOG_RAW("wHubCharacteristics: 0x%04x \r\n", desc->wHubCharacteristics);
-        USB_LOG_RAW("bPwrOn2PwrGood: 0x%02x      \r\n", desc->bPwrOn2PwrGood);
-        USB_LOG_RAW("bHubContrCurrent: 0x%02x    \r\n", desc->bHubContrCurrent);
-        USB_LOG_RAW("DeviceRemovable: 0x%02x     \r\n", desc->DeviceRemovable);
-        USB_LOG_RAW("PortPwrCtrlMask: 0x%02x     \r\n", desc->PortPwrCtrlMask);
+        USB_LOG_DBG("Hub: ports=%u characteristics=0x%04x power-good=%u current=%u removable=0x%02x power-mask=0x%02x\r\n",
+                    desc->bNbrPorts, desc->wHubCharacteristics,
+                    desc->bPwrOn2PwrGood, desc->bHubContrCurrent,
+                    desc->DeviceRemovable, desc->PortPwrCtrlMask);
     }
     return 0;
 }
@@ -403,13 +431,13 @@ static int usbh_hub_connect(struct usbh_hubport *hport, uint8_t intf)
         return -1;
         break;
     case USB_HUB_PR_HS_SINGLE_TT:
-        USB_LOG_INFO("Single TT\n");
+        USB_LOG_DBG("Single TT\n");
         hub->tt.hub = hport;
         break;
     case USB_HUB_PR_HS_MULTI_TT:
         ret = usbh_set_interface(hport, 0, 1);
         if (ret > 0) {
-            USB_LOG_INFO("TT per port\n");
+            USB_LOG_DBG("TT per port\n");
             hub->tt.multi = 1;
         } else
             USB_LOG_ERR("Using single TT (err %d)\n", ret);
@@ -502,7 +530,7 @@ static int usbh_hub_connect(struct usbh_hubport *hport, uint8_t intf)
 
     for (uint8_t port = 0; port < hub->hub_desc.bNbrPorts; port++) {
         ret = usbh_hub_get_portstatus(hub, port + 1, &port_status);
-        USB_LOG_INFO("port %u, status:0x%02x, change:0x%02x\r\n", port + 1, port_status.wPortStatus, port_status.wPortChange);
+        USB_LOG_DBG("port %u, status:0x%02x, change:0x%02x\r\n", port + 1, port_status.wPortStatus, port_status.wPortChange);
         if (ret < 0) {
             return ret;
         }
@@ -513,7 +541,9 @@ static int usbh_hub_connect(struct usbh_hubport *hport, uint8_t intf)
 
     usb_slist_add_tail(&hub->bus->hub_list, &hub->list);
 
-    USB_LOG_INFO("Register HUB Class:%s\r\n", hport->config.intf[intf].devname);
+    USB_LOG_INFO("USB hub attached as %s, %u port(s)\r\n",
+                 hport->config.intf[intf].devname,
+                 hub->hub_desc.bNbrPorts);
 
     hub->int_buffer = g_hub_intbuf[hub->bus->busid][hub->index - 1];
 
@@ -557,7 +587,8 @@ static int usbh_hub_disconnect(struct usbh_hubport *hport, uint8_t intf)
         }
 
         if (hport->config.intf[intf].devname[0] != '\0') {
-            USB_LOG_INFO("Unregister HUB Class:%s\r\n", hport->config.intf[intf].devname);
+            USB_LOG_INFO("USB hub detached from %s\r\n",
+                         hport->config.intf[intf].devname);
             usb_slist_remove(&hub->bus->hub_list, &hub->list);
         }
 
@@ -577,6 +608,41 @@ static void usbh_hubport_enumerate_thread(void *argument)
         USB_LOG_ERR("Port %u enumerate fail\r\n", child->port);
     }
     usb_osal_thread_delete(NULL);
+}
+
+/* Take one recovery re-enumeration of @port (0-based) of @hub, if any is left. */
+static bool usbh_hub_reenum_budget_take(struct usbh_hub *hub, uint8_t port)
+{
+    uint32_t now = usb_osal_timestamp();
+
+    if (hub->reenum_budget[port].count == 0 ||
+        now - hub->reenum_budget[port].start_ms >= HUB_REENUM_WINDOW_MS) {
+        hub->reenum_budget[port].count = 0;
+        hub->reenum_budget[port].start_ms = now;
+    }
+    if (hub->reenum_budget[port].count >= HUB_REENUM_MAX) {
+        return false;
+    }
+    hub->reenum_budget[port].count++;
+    return true;
+}
+
+/*
+ * An external hub whose port-status requests time out has stopped answering
+ * (seen after a downstream power dip: every device behind it went silent).
+ * Reset it from its upstream port; returns true if that was requested.
+ */
+static bool usbh_hub_recover_unresponsive(struct usbh_hub *hub, int err)
+{
+    if (hub->is_roothub || !hub->parent || !hub->parent->parent ||
+        err != -USB_ERR_TIMEOUT ||
+        !usbh_hub_reenum_budget_take(hub->parent->parent, hub->parent->port - 1)) {
+        return false;
+    }
+
+    USB_LOG_WRN("Bus %u, Hub %u stopped answering (%d); resetting it from its upstream port\r\n",
+                hub->bus->busid, hub->index, err);
+    return usbh_hubport_reenumerate(hub->parent) >= 0;
 }
 
 static void usbh_hub_events(struct usbh_hub *hub)
@@ -620,11 +686,19 @@ static void usbh_hub_events(struct usbh_hub *hub)
         ret = usbh_hub_get_portstatus(hub, port + 1, &port_status);
         if (ret < 0) {
             USB_LOG_ERR("Failed to read port %u status, errorcode: %d\r\n", port + 1, ret);
+            /* The other ports would time out too; the reset re-reads all. */
+            if (usbh_hub_recover_unresponsive(hub, ret)) {
+                break;
+            }
             continue;
         }
 
         portstatus = port_status.wPortStatus;
         portchange = port_status.wPortChange;
+
+        if (!(portstatus & HUB_PORT_STATUS_CONNECTION)) {
+            hub->unreachable_reported &= ~(1 << port);
+        }
 
         USB_LOG_DBG("port %u, status:0x%02x, change:0x%02x\r\n", port + 1, portstatus, portchange);
 
@@ -645,6 +719,39 @@ static void usbh_hub_events(struct usbh_hub *hub)
         }
 
         portchange = port_status.wPortChange;
+
+        if (!hub->is_roothub && hub->child[port].connected) {
+            if (portchange & HUB_PORT_STATUS_C_OVERCURRENT) {
+                USB_LOG_WRN("Bus %u, Hub %u, Port %u over-current change, status:0x%04x\r\n",
+                            hub->bus->busid, hub->index, port + 1, portstatus);
+            }
+            if (portchange & HUB_PORT_STATUS_C_CONNECTION) {
+                /* Info only: firmware-loading devices (AIC8800) reconnect on purpose. */
+                USB_LOG_INFO("Bus %u, Hub %u, Port %u connection changed under an active device, status:0x%04x, change:0x%04x\r\n",
+                            hub->bus->busid, hub->index, port + 1, portstatus, portchange);
+            } else if ((portchange & HUB_PORT_STATUS_C_ENABLE) &&
+                       !(portstatus & HUB_PORT_STATUS_ENABLE) &&
+                       (portstatus & HUB_PORT_STATUS_CONNECTION) && !forced) {
+                /*
+                 * The hub disabled the port without a disconnect (babble or
+                 * another port error). Every transfer to the device now fails,
+                 * so re-enumerate it, as Linux does for "port disabled by hub".
+                 */
+                if (usbh_hub_reenum_budget_take(hub, port)) {
+                    USB_LOG_WRN("Bus %u, Hub %u, Port %u disabled by hub, status:0x%04x; re-enumerating\r\n",
+                                hub->bus->busid, hub->index, port + 1, portstatus);
+                    forced = true;
+                } else {
+                    USB_LOG_ERR("Bus %u, Hub %u, Port %u keeps being disabled by the hub; leaving it disabled until replug\r\n",
+                                hub->bus->busid, hub->index, port + 1);
+                }
+            }
+        }
+
+        if (portchange & HUB_PORT_STATUS_C_CONNECTION) {
+            /* A replug (or a deliberate reconnect) starts the limit over. */
+            hub->reenum_budget[port].count = 0;
+        }
 
         /* Second, if port changes, debounces first */
         if ((portchange & HUB_PORT_STATUS_C_CONNECTION) || forced) {
@@ -697,6 +804,8 @@ static void usbh_hub_events(struct usbh_hub *hub)
                     child = &hub->child[port];
                     usbh_hubport_release(child);
                 }
+                bool connection_bounced = false;
+
                 for (uint8_t reset_retry = 0; reset_retry < HUB_PORT_RESET_RETRIES; reset_retry++) {
                     ret = usbh_hub_set_feature(hub, port + 1, HUB_PORT_FEATURE_RESET);
                     if (ret < 0) {
@@ -713,8 +822,28 @@ static void usbh_hub_events(struct usbh_hub *hub)
 
                     portstatus = port_status.wPortStatus;
                     portchange = port_status.wPortChange;
+                    connection_bounced = (portchange & HUB_PORT_STATUS_C_CONNECTION) != 0;
+
+                    if (portchange & HUB_PORT_STATUS_C_RESET) {
+                        ret = usbh_hub_clear_feature(hub, port + 1, HUB_PORT_FEATURE_C_RESET);
+                        if (ret < 0) {
+                            USB_LOG_ERR("Failed to clear port %u reset change, errorcode: %d\r\n", port + 1, ret);
+                            break;
+                        }
+                    }
+
+                    if (connection_bounced) {
+                        ret = usbh_hub_clear_feature(hub, port + 1, HUB_PORT_FEATURE_C_CONNECTION);
+                        if (ret < 0) {
+                            USB_LOG_ERR("Failed to clear port %u connection change after reset, errorcode: %d\r\n",
+                                        port + 1, ret);
+                            break;
+                        }
+                    }
+
                     if (!(portstatus & HUB_PORT_STATUS_RESET) &&
-                        (portstatus & HUB_PORT_STATUS_ENABLE)) {
+                        (portstatus & HUB_PORT_STATUS_ENABLE) &&
+                        !connection_bounced) {
                         break;
                     }
                     if (!(portstatus & HUB_PORT_STATUS_CONNECTION)) {
@@ -723,19 +852,19 @@ static void usbh_hub_events(struct usbh_hub *hub)
 
                     USB_LOG_DBG("Port %u reset attempt %u did not enable, status:0x%04x, change:0x%04x\r\n",
                                 port + 1, reset_retry + 1, portstatus, portchange);
+
+                    if (connection_bounced && reset_retry + 1 < HUB_PORT_RESET_RETRIES) {
+                        /* Do not keep a reconnecting device in a reset storm. */
+                        usb_osal_msleep(HUB_PORT_RESET_BOUNCE_DELAY);
+                    }
                 }
                 if (ret < 0) {
                     continue;
                 }
 
-                if (!(portstatus & HUB_PORT_STATUS_RESET) && (portstatus & HUB_PORT_STATUS_ENABLE)) {
-                    if (portchange & HUB_PORT_STATUS_C_RESET) {
-                        ret = usbh_hub_clear_feature(hub, port + 1, HUB_PORT_FEATURE_C_RESET);
-                        if (ret < 0) {
-                            USB_LOG_ERR("Failed to clear port %u reset change, errorcode: %d\r\n", port + 1, ret);
-                        }
-                    }
-
+                if (!(portstatus & HUB_PORT_STATUS_RESET) &&
+                    (portstatus & HUB_PORT_STATUS_ENABLE) &&
+                    !connection_bounced) {
                     if (portstatus & HUB_PORT_STATUS_HIGH_SPEED) {
                         speed = USB_SPEED_HIGH;
                     } else if (portstatus & HUB_PORT_STATUS_LOW_SPEED) {
@@ -763,6 +892,25 @@ static void usbh_hub_events(struct usbh_hub *hub)
                     child = &hub->child[port];
                     /** release child sources first */
                     usbh_hubport_release(child);
+
+#ifdef CHERRY_USB_HC_DRV_DWC2
+                    /*
+                     * A full/low-speed device behind a high-speed hub needs
+                     * split transactions, which DWC2 descriptor DMA cannot
+                     * issue. Every attempt would fail: leave the port alone and
+                     * report it once per connected device.
+                     */
+                    if (hub->parent && speed != USB_SPEED_HIGH &&
+                        hub->parent->speed == USB_SPEED_HIGH &&
+                        !usbh_dwc2_split_supported(hub->bus)) {
+                        if (!(hub->unreachable_reported & (1 << port))) {
+                            hub->unreachable_reported |= 1 << port;
+                            USB_LOG_WRN("Bus %u, Hub %u, Port %u: %s device needs split transactions, which descriptor DMA cannot do; not enumerating it\r\n",
+                                        hub->bus->busid, hub->index, port + 1, speed_table[speed]);
+                        }
+                        continue;
+                    }
+#endif
 
                     usbh_hubport_reset(child);
                     child->parent = hub;
@@ -887,13 +1035,6 @@ static void usbh_hub_events(struct usbh_hub *hub)
                     child = &hub->child[port];
                     /** release child sources */
                     usbh_hubport_release(child);
-
-                    if (portchange & HUB_PORT_STATUS_C_RESET) {
-                        ret = usbh_hub_clear_feature(hub, port + 1, HUB_PORT_FEATURE_C_RESET);
-                        if (ret < 0) {
-                            USB_LOG_ERR("Failed to clear port %u reset change, errorcode: %d\r\n", port + 1, ret);
-                        }
-                    }
 
                     if (portstatus & HUB_PORT_STATUS_CONNECTION) {
                         USB_LOG_WRN("Port %u failed to enable after %u reset attempts, status:0x%04x, change:0x%04x\r\n",

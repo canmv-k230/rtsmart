@@ -17,6 +17,10 @@
 #include "usbh_cdc_ecm.h"
 #include "usbh_netdev.h"
 
+#define DBG_TAG "usb.ecm"
+#define DBG_LVL DBG_INFO
+#include <rtdbg.h>
+
 struct netif g_cdc_ecm_netif;
 
 static struct eth_device cdc_ecm_dev;
@@ -99,7 +103,21 @@ void usbh_cdc_ecm_run(struct usbh_cdc_ecm *cdc_ecm_class)
     eth_device_linkchange(&cdc_ecm_dev, RT_FALSE);
 
     cdc_ecm_class->rx_thread_running = true;
-    usb_osal_thread_create("usbh_cdc_ecm_rx", 4096, CONFIG_USBHOST_PSC_PRIO + 1, usbh_cdc_ecm_rx_thread, cdc_ecm_dev.netif);
+    if (usb_osal_thread_create("usbh_cdc_ecm_rx", 4096,
+                               CONFIG_USBHOST_PSC_PRIO + 1,
+                               usbh_cdc_ecm_rx_thread,
+                               cdc_ecm_dev.netif) == NULL) {
+        cdc_ecm_class->rx_thread_running = false;
+        cdc_ecm_dev.parent.user_data = RT_NULL;
+        LOG_E("failed to start CDC ECM receive thread");
+        return;
+    }
+
+    LOG_I("CDC ECM attached as %s, MAC %02x:%02x:%02x:%02x:%02x:%02x",
+          cdc_ecm_dev.parent.parent.name,
+          cdc_ecm_class->mac[0], cdc_ecm_class->mac[1],
+          cdc_ecm_class->mac[2], cdc_ecm_class->mac[3],
+          cdc_ecm_class->mac[4], cdc_ecm_class->mac[5]);
 }
 
 void usbh_cdc_ecm_stop(struct usbh_cdc_ecm *cdc_ecm_class)
@@ -111,6 +129,8 @@ void usbh_cdc_ecm_stop(struct usbh_cdc_ecm *cdc_ecm_class)
     while (cdc_ecm_class->rx_thread_running) {
         usb_osal_msleep(10);
     }
+
+    LOG_I("CDC ECM detached from %s", cdc_ecm_dev.parent.parent.name);
 }
 
 void usbh_cdc_ecm_link_changed(struct usbh_cdc_ecm *cdc_ecm_class, bool state)

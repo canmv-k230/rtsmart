@@ -138,7 +138,7 @@ void usbh_cdc_acm_run(struct usbh_cdc_acm *cdc_acm_class)
     struct rt_device *dev = NULL;
     uint8_t minor = cdc_acm_class->minor;
 
-    if(minor > ARRAY_SIZE(usbh_cdc_acm_dev)) {
+    if(minor >= ARRAY_SIZE(usbh_cdc_acm_dev)) {
         LOG_E("cdc acm device id(%d) too large\n", minor);
         return;
     }
@@ -151,16 +151,18 @@ void usbh_cdc_acm_run(struct usbh_cdc_acm *cdc_acm_class)
     snprintf(name, sizeof(name), "ttyACM%d", minor);
 
     if(rt_device_find(name)) {
-        LOG_E("/dev/%s already exists\n");
+        LOG_E("/dev/%s already exists\n", name);
         return;
     }
 
-    LOG_I("register /dev/%s\n", name);
-
-    rt_device_register(dev, name, RT_DEVICE_FLAG_RDWR);
+    if (rt_device_register(dev, name, RT_DEVICE_FLAG_RDWR) != RT_EOK) {
+        LOG_E("failed to register /dev/%s\n", name);
+        return;
+    }
     dev->fops = &usbh_cdc_acm_dev_ops;
 
     rt_event_init(&dev_wrap->evt, "usb_acm", RT_IPC_FLAG_FIFO);
+    LOG_I("CDC ACM attached as /dev/%s", name);
 }
 
 void usbh_cdc_acm_stop(struct usbh_cdc_acm *cdc_acm_class)
@@ -169,17 +171,17 @@ void usbh_cdc_acm_stop(struct usbh_cdc_acm *cdc_acm_class)
     struct usbh_cdc_acm_dev_wrap *dev_wrap = NULL;
     uint8_t minor = cdc_acm_class->minor;
 
-    if(minor > ARRAY_SIZE(usbh_cdc_acm_dev)) {
+    if(minor >= ARRAY_SIZE(usbh_cdc_acm_dev)) {
         LOG_E("cdc acm device id(%d) too large\n", minor);
         return;
     }
     dev_wrap = &usbh_cdc_acm_dev[minor];
 
     snprintf(name, sizeof(name), "ttyACM%d", minor);
-    LOG_I("unregister /dev/%s\n", name);
 
     rt_device_unregister(&dev_wrap->dev);
     rt_event_detach(&dev_wrap->evt);
+    LOG_I("CDC ACM detached from /dev/%s", name);
 
     memset(dev_wrap, 0, sizeof(*dev_wrap));
 }

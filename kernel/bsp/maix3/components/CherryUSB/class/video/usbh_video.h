@@ -88,6 +88,7 @@ struct usbh_video {
     uint16_t isoin_mps;
     uint16_t isoout_mps;
     bool is_opened;
+    uint8_t current_altsetting; /* streaming altsetting chosen by usbh_video_open() */
     uint8_t current_format_type;
     uint32_t current_fourcc;
     struct request_frame current_frame;

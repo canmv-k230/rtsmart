@@ -157,7 +157,7 @@ int usbh_hid_connect(struct usbh_hubport *hport, uint8_t intf)
 
     snprintf(hport->config.intf[intf].devname, CONFIG_USBHOST_DEV_NAMELEN, DEV_FORMAT, hid_class->minor);
 
-    USB_LOG_INFO("Register HID Class:%s\r\n", hport->config.intf[intf].devname);
+    USB_LOG_DBG("Register HID Class:%s\r\n", hport->config.intf[intf].devname);
 
     usbh_hid_run(hid_class);
     return ret;
@@ -173,7 +173,7 @@ int usbh_hid_disconnect(struct usbh_hubport *hport, uint8_t intf)
         /* Stop HID first so callbacks see hid_class==NULL and won't resubmit
          * URBs while usbh_kill_urb races with the deferred giveback workqueue */
         if (hport->config.intf[intf].devname[0] != '\0') {
-            USB_LOG_INFO("Unregister HID Class:%s\r\n", hport->config.intf[intf].devname);
+            USB_LOG_DBG("Unregister HID Class:%s\r\n", hport->config.intf[intf].devname);
             usbh_hid_stop(hid_class);
         }
 

@@ -286,7 +286,7 @@ static int usbh_msc_connect(struct usbh_hubport *hport, uint8_t intf)
         }
     }
 
-    USB_LOG_INFO("Get max LUN:%u\r\n", g_msc_buf[msc_class->sdchar - 'a'][0] + 1);
+    USB_LOG_DBG("Get max LUN:%u\r\n", g_msc_buf[msc_class->sdchar - 'a'][0] + 1);
 
     for (uint8_t i = 0; i < hport->config.intf[intf].altsetting[0].intf_desc.bNumEndpoints; i++) {
         ep_desc = &hport->config.intf[intf].altsetting[0].ep[i].ep_desc;
@@ -336,8 +336,9 @@ static int usbh_msc_connect(struct usbh_hubport *hport, uint8_t intf)
     }
 
     if (msc_class->blocksize > 0) {
-        USB_LOG_INFO("Capacity info:\r\n");
-        USB_LOG_INFO("Block num:%d,block size:%d\r\n", (unsigned int)msc_class->blocknum, (unsigned int)msc_class->blocksize);
+        USB_LOG_DBG("Capacity: blocks=%u block-size=%u\r\n",
+                    (unsigned int)msc_class->blocknum,
+                    (unsigned int)msc_class->blocksize);
         if (msc_class->blocksize <= CONFIG_USB_ALIGN_SIZE) {
             USB_LOG_ERR("blocksize is too small\n");
         }
@@ -348,7 +349,7 @@ static int usbh_msc_connect(struct usbh_hubport *hport, uint8_t intf)
 
     snprintf(hport->config.intf[intf].devname, CONFIG_USBHOST_DEV_NAMELEN, DEV_FORMAT, msc_class->sdchar);
 
-    USB_LOG_INFO("Register MSC Class:%s\r\n", hport->config.intf[intf].devname);
+    USB_LOG_DBG("Register MSC Class:%s\r\n", hport->config.intf[intf].devname);
 
     usbh_msc_run(msc_class);
     return ret;
@@ -370,7 +371,7 @@ static int usbh_msc_disconnect(struct usbh_hubport *hport, uint8_t intf)
         }
 
         if (hport->config.intf[intf].devname[0] != '\0') {
-            USB_LOG_INFO("Unregister MSC Class:%s\r\n", hport->config.intf[intf].devname);
+            USB_LOG_DBG("Unregister MSC Class:%s\r\n", hport->config.intf[intf].devname);
             usbh_msc_stop(msc_class);
         }
 

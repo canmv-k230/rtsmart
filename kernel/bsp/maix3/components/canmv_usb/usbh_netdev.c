@@ -53,7 +53,7 @@ rt_err_t canmv_usbh_netdev_init(struct eth_device *device)
             return -RT_EIO;
         }
         netdev_set_type(netdev, NETDEV_TYPE_LAN);
-        LOG_I("registered LAN interface as %s", name);
+        LOG_D("registered LAN interface as %s", name);
         return RT_EOK;
     }
 

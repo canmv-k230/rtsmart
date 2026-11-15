@@ -9,15 +9,15 @@
 #include "rtthread.h"
 #include <dfs_fs.h>
 
+#define DBG_TAG "usb.msc"
+#define DBG_LVL DBG_INFO
+#include <rtdbg.h>
+
 #define DEV_FORMAT "sd%c"
 
 #ifndef CONFIG_USB_DFS_MOUNT_POINT
 #define CONFIG_USB_DFS_MOUNT_POINT "/udisk"
 #endif
-
-#define RT_ALIGN_SIZE CONFIG_USB_ALIGN_SIZE
-
-USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t msc_sector[512];
 
 static rt_err_t rt_udisk_init(rt_device_t dev)
 {
@@ -30,30 +30,29 @@ static rt_size_t rt_udisk_read(rt_device_t dev, rt_off_t pos, void *buffer,
     struct usbh_msc *msc_class = (struct usbh_msc *)dev->user_data;
     int ret;
 
-    rt_uint32_t *align_buf;
+    bool bounce = ((uintptr_t)buffer & (CONFIG_USB_ALIGN_SIZE - 1)) != 0;
+    uint8_t *dma_buf = buffer;
 
-    if ((uint32_t)buffer & (RT_ALIGN_SIZE - 1)) {
-        align_buf = rt_malloc_align(size * msc_class->blocksize, RT_ALIGN_SIZE);
-        if (!align_buf) {
+    if (bounce) {
+        dma_buf = rt_malloc_align(size * msc_class->blocksize,
+                                  CONFIG_USB_ALIGN_SIZE);
+        if (!dma_buf) {
             rt_kprintf("msc get align buf failed\n");
             return 0;
         }
-    } else {
-        align_buf = (rt_uint32_t *)buffer;
     }
 
-    ret = usbh_msc_scsi_read10(msc_class, pos, (uint8_t *)align_buf, size);
+    ret = usbh_msc_scsi_read10(msc_class, pos, dma_buf, size);
     if (ret < 0) {
         rt_kprintf("usb mass_storage read failed\n");
-        return 0;
+    } else if (bounce) {
+        rt_memcpy(buffer, dma_buf, size * msc_class->blocksize);
+    }
+    if (bounce) {
+        rt_free_align(dma_buf);
     }
 
-    if ((uint32_t)buffer & (RT_ALIGN_SIZE - 1)) {
-        rt_memcpy(buffer, align_buf, size * msc_class->blocksize);
-        rt_free_align(align_buf);
-    }
-
-    return size;
+    return ret < 0 ? 0 : size;
 }
 
 static rt_size_t rt_udisk_write(rt_device_t dev, rt_off_t pos, const void *buffer,
@@ -62,30 +61,28 @@ static rt_size_t rt_udisk_write(rt_device_t dev, rt_off_t pos, const void *buffe
     struct usbh_msc *msc_class = (struct usbh_msc *)dev->user_data;
     int ret;
 
-    rt_uint32_t *align_buf;
+    bool bounce = ((uintptr_t)buffer & (CONFIG_USB_ALIGN_SIZE - 1)) != 0;
+    uint8_t *dma_buf = (uint8_t *)buffer;
 
-    if ((uint32_t)buffer & (RT_ALIGN_SIZE - 1)) {
-        align_buf = rt_malloc_align(size * msc_class->blocksize, RT_ALIGN_SIZE);
-        if (!align_buf) {
+    if (bounce) {
+        dma_buf = rt_malloc_align(size * msc_class->blocksize,
+                                  CONFIG_USB_ALIGN_SIZE);
+        if (!dma_buf) {
             rt_kprintf("msc get align buf failed\n");
             return 0;
         }
-
-        rt_memcpy(align_buf, buffer, size * msc_class->blocksize);
-    } else {
-        align_buf = (rt_uint32_t *)buffer;
+        rt_memcpy(dma_buf, buffer, size * msc_class->blocksize);
     }
 
-    ret = usbh_msc_scsi_write10(msc_class, pos, (uint8_t *)align_buf, size);
+    ret = usbh_msc_scsi_write10(msc_class, pos, dma_buf, size);
     if (ret < 0) {
         rt_kprintf("usb mass_storage write failed\n");
-        return 0;
     }
-    if ((uint32_t)buffer & (RT_ALIGN_SIZE - 1)) {
-        rt_free_align(align_buf);
+    if (bounce) {
+        rt_free_align(dma_buf);
     }
 
-    return size;
+    return ret < 0 ? 0 : size;
 }
 
 static rt_err_t rt_udisk_control(rt_device_t dev, int cmd, void *args)
@@ -123,36 +120,41 @@ const static struct rt_device_ops udisk_device_ops = {
 int udisk_init(struct usbh_msc *msc_class)
 {
     rt_err_t ret = 0;
-    rt_uint8_t i;
+    uint8_t *sector;
     struct dfs_partition part0;
     struct rt_device *dev;
     char name[CONFIG_USBHOST_DEV_NAMELEN];
     char mount_point[CONFIG_USBHOST_DEV_NAMELEN];
 
-    dev = rt_malloc(sizeof(struct rt_device));
-    memset(dev, 0, sizeof(struct rt_device));
+    if (msc_class->blocksize < 512)
+        return -RT_EINVAL;
+
+    dev = rt_calloc(1, sizeof(struct rt_device));
+    if (!dev)
+        return -RT_ENOMEM;
+
+    sector = rt_malloc_align(msc_class->blocksize, CONFIG_USB_ALIGN_SIZE);
+    if (!sector) {
+        rt_free(dev);
+        return -RT_ENOMEM;
+    }
 
     snprintf(name, CONFIG_USBHOST_DEV_NAMELEN, DEV_FORMAT, msc_class->sdchar);
     snprintf(mount_point, CONFIG_USBHOST_DEV_NAMELEN, CONFIG_USB_DFS_MOUNT_POINT, msc_class->sdchar);
 
-    ret = usbh_msc_scsi_read10(msc_class, 0, msc_sector, 1);
+    ret = usbh_msc_scsi_read10(msc_class, 0, sector, 1);
     if (ret != RT_EOK) {
-        rt_kprintf("usb mass_storage read failed\n");
+        LOG_E("USB storage partition read failed: %d", ret);
+        rt_free_align(sector);
         rt_free(dev);
         return ret;
     }
 
-    for (i = 0; i < 4; i++) {
-        /* Get the first partition */
-        ret = dfs_filesystem_get_partition(&part0, msc_sector, i);
-        if (ret == RT_EOK) {
-            rt_kprintf("Found partition %d: type = %d, offet=0x%x, size=0x%x\n",
-                       i, part0.type, part0.offset, part0.size);
-            break;
-        } else {
-            break;
-        }
+    if (dfs_filesystem_get_partition(&part0, sector, 0) == RT_EOK) {
+        LOG_D("partition 0: type=%d offset=0x%x size=0x%x",
+              part0.type, part0.offset, part0.size);
     }
+    rt_free_align(sector);
 
     dev->type = RT_Device_Class_Block;
 #ifdef RT_USING_DEVICE_OPS
@@ -167,15 +169,18 @@ int udisk_init(struct usbh_msc *msc_class)
 
     ret = rt_device_register(dev, name, RT_DEVICE_FLAG_RDWR | RT_DEVICE_FLAG_REMOVABLE | RT_DEVICE_FLAG_STANDALONE);
     if (ret) {
-        rt_kprintf("%s register fail\n", name);
+        LOG_E("failed to register USB storage /dev/%s: %d", name, ret);
+        rt_free(dev);
         goto out;
     }
 
     ret = dfs_mount(name, mount_point, "elm", 0, 0);
     if (ret == 0) {
-        rt_kprintf("udisk: %s mount successfully\n", name);
+        LOG_I("USB storage attached as /dev/%s, mounted at %s", name,
+              mount_point);
     } else {
-        rt_kprintf("udisk: %s mount failed, ret = %d\n", name, ret);
+        LOG_W("USB storage attached as /dev/%s, mount at %s failed: %d",
+              name, mount_point, ret);
     }
 
 out:
@@ -202,5 +207,6 @@ void usbh_msc_stop(struct usbh_msc *msc_class)
     if (dev) {
         rt_device_unregister(dev);
         rt_free(dev);
+        LOG_I("USB storage detached from /dev/%s", name);
     }
 }

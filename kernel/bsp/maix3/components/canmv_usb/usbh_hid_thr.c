@@ -6,6 +6,10 @@
 #include "usbh_hid.h"
 #include "usbh_hid_report_parser.h"
 
+#define DBG_TAG "usb.hid"
+#define DBG_LVL DBG_INFO
+#include <rtdbg.h>
+
 #define HID_POINTER_BUTTON_MASK 0x1f
 
 enum hid_device_type
@@ -464,7 +468,8 @@ void usbh_hid_run(struct usbh_hid *hid_class)
             return;
         }
 
-        rt_kprintf("HID keyboard started on /dev/%s\n", hid_kbd_dev.input.parent.parent.name);
+        LOG_I("HID keyboard attached as /dev/%s",
+              hid_kbd_dev.input.parent.parent.name);
         return;
     }
 
@@ -543,25 +548,32 @@ void usbh_hid_run(struct usbh_hid *hid_class)
         return;
     }
 
-    rt_kprintf("HID %s started on /dev/%s\n",
-               hid_pointer_dev.type == HID_DEV_TOUCH ? "touch" : "mouse",
-               hid_pointer_dev.input.parent.parent.name);
-    rt_kprintf("  report_id=%u has_id=%d x=%d y=%d buttons=%d wheel=%d absolute=%d\n",
-               hid_pointer_dev.report_map.pointer_report_id,
-               hid_pointer_dev.report_map.pointer_has_report_id,
-               hid_pointer_dev.report_map.x_index,
-               hid_pointer_dev.report_map.y_index,
-               hid_pointer_dev.report_map.button_count,
-               hid_pointer_dev.report_map.wheel_index,
-               hid_pointer_dev.report_map.is_absolute);
+    LOG_I("HID %s attached as /dev/%s",
+          hid_pointer_dev.type == HID_DEV_TOUCH ? "touch" : "mouse",
+          hid_pointer_dev.input.parent.parent.name);
+    LOG_D("report_id=%u has_id=%d x=%d y=%d buttons=%d wheel=%d absolute=%d",
+          hid_pointer_dev.report_map.pointer_report_id,
+          hid_pointer_dev.report_map.pointer_has_report_id,
+          hid_pointer_dev.report_map.x_index,
+          hid_pointer_dev.report_map.y_index,
+          hid_pointer_dev.report_map.button_count,
+          hid_pointer_dev.report_map.wheel_index,
+          hid_pointer_dev.report_map.is_absolute);
 }
 
 /* Stop HID device */
 void usbh_hid_stop(struct usbh_hid *hid_class)
 {
-    if (hid_kbd_dev.registered && hid_kbd_dev.hid_class == hid_class)
+    if (hid_kbd_dev.registered && hid_kbd_dev.hid_class == hid_class) {
+        LOG_I("HID keyboard detached from /dev/%s",
+              hid_kbd_dev.input.parent.parent.name);
         hid_cleanup_device(&hid_kbd_dev);
+    }
 
-    if (hid_pointer_dev.registered && hid_pointer_dev.hid_class == hid_class)
+    if (hid_pointer_dev.registered && hid_pointer_dev.hid_class == hid_class) {
+        LOG_I("HID %s detached from /dev/%s",
+              hid_pointer_dev.type == HID_DEV_TOUCH ? "touch" : "mouse",
+              hid_pointer_dev.input.parent.parent.name);
         hid_cleanup_device(&hid_pointer_dev);
+    }
 }

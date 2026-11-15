@@ -433,6 +433,38 @@ no_qtd:
  * channel is available.
  */
 /* it is static */
+/*
+ * Clean up @chan and put it back on the free list, with the channel
+ * accounting of a buffer DMA release. Must be called with hsotg->lock held.
+ */
+void dwc2_hc_return_to_free_list(struct dwc2_hsotg *hsotg,
+                                 struct dwc2_host_chan *chan)
+{
+    if (!list_empty(&chan->hc_list_entry))
+        list_del(&chan->hc_list_entry);
+    dwc2_hc_cleanup(hsotg, chan);
+    list_add_tail(&chan->hc_list_entry, &hsotg->free_hc_list);
+
+    if (hsotg->params.uframe_sched) {
+        hsotg->available_host_channels++;
+    } else {
+        switch (chan->ep_type) {
+        case USB_ENDPOINT_XFER_CONTROL:
+        case USB_ENDPOINT_XFER_BULK:
+            hsotg->non_periodic_channels--;
+            break;
+        default:
+            /*
+             * Don't release reservations for periodic channels
+             * here. That's done when a periodic transfer is
+             * descheduled (i.e. when the QH is removed from the
+             * periodic schedule).
+             */
+            break;
+        }
+    }
+}
+
 void dwc2_release_channel(struct dwc2_hsotg *hsotg,
                                  struct dwc2_host_chan *chan,
                                  struct dwc2_qtd *qtd,
@@ -488,29 +520,7 @@ cleanup:
      * function clears the channel interrupt enables and conditions, so
      * there's no need to clear the Channel Halted interrupt separately.
      */
-    if (!list_empty(&chan->hc_list_entry))
-        list_del(&chan->hc_list_entry);
-    dwc2_hc_cleanup(hsotg, chan);
-    list_add_tail(&chan->hc_list_entry, &hsotg->free_hc_list);
-
-    if (hsotg->params.uframe_sched) {
-        hsotg->available_host_channels++;
-    } else {
-        switch (chan->ep_type) {
-        case USB_ENDPOINT_XFER_CONTROL:
-        case USB_ENDPOINT_XFER_BULK:
-            hsotg->non_periodic_channels--;
-            break;
-        default:
-            /*
-             * Don't release reservations for periodic channels
-             * here. That's done when a periodic transfer is
-             * descheduled (i.e. when the QH is removed from the
-             * periodic schedule).
-             */
-            break;
-        }
-    }
+    dwc2_hc_return_to_free_list(hsotg, chan);
 
     haintmsk = dwc2_readl(hsotg, HAINTMSK);
     haintmsk &= ~(1 << chan->hc_num);
@@ -1580,7 +1590,7 @@ void hub_tt_work(struct rt_work* work, void* work_data)
 
         rt_free(clear);
         DDD("canaan -- usb_tt_clear = %d\n", sizeof(*clear));
-        rt_spin_lock_irqsave(&hub->tt.lock);
+        level = rt_spin_lock_irqsave(&hub->tt.lock);
     }
     rt_spin_unlock_irqrestore(&hub->tt.lock, level);
 }
@@ -1733,7 +1743,7 @@ static void dwc2_hc_frmovrun_intr(struct dwc2_hsotg *hsotg,
     enum dwc2_halt_status halt_status;
 
     if (dbg_hc(chan))
-        dev_err(hsotg->dev, "--Host Channel %d Interrupt: Frame Overrun--\n",
+        dev_dbg(hsotg->dev, "--Host Channel %d Interrupt: Frame Overrun--\n",
                 chnum);
 
     dwc2_hc_handle_tt_clear(hsotg, chan, qtd);

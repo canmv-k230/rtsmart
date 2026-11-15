@@ -7,6 +7,7 @@
 #define USB_HC_H
 
 #include <stdint.h>
+#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -134,6 +135,9 @@ int usbh_kill_urb(struct usbh_urb *urb);
  * hardware channel to retire, then resets the host toggle and PING state.
  * Keep submissions stopped until the device's halt has also been cleared. */
 int usbh_dwc2_reset_endpoint(struct usbh_hubport *hport, uint8_t endpoint);
+/* Whether full/low-speed devices behind a high-speed hub can be reached
+ * (descriptor DMA cannot issue split transactions). */
+bool usbh_dwc2_split_supported(struct usbh_bus *bus);
 #endif
 
 #ifdef __cplusplus

@@ -134,6 +134,7 @@ struct dwc2_qh;
  * @ntd:                Number of transfer descriptors for the transfer
  * @halt_status:        Reason for halting the host channel
  * @hcint:               Contents of the HCINT register when the interrupt came
+ * @cleanup_generation: Incremented whenever channel DMA has been quiesced
  * @qh:                 QH for the transfer being processed by this channel
  * @hc_list_entry:      For linking to list of host channels
  * @desc_list_addr:     Current QH's descriptor list DMA address
@@ -172,6 +173,7 @@ struct dwc2_host_chan {
     u8 do_ping;
     u8 error_state;
     u8 halt_on_queue;
+    u8 quarantined;
     u8 halt_pending;
     u8 do_split;
     u8 complete_split;
@@ -188,6 +190,7 @@ struct dwc2_host_chan {
     u16 ntd;
     enum dwc2_halt_status halt_status;
     u32 hcint;
+    u32 cleanup_generation;
     struct dwc2_qh *qh;
     struct list_head hc_list_entry;
     struct dwc2_dma_desc *desc_list;
@@ -337,6 +340,8 @@ struct dwc2_hs_transfer_time {
  *                           speed.  Note that this is in "schedule slice" which
  *                           is tightly packed.
  * @ntd:                Actual number of transfer descriptors in a list
+ * @isoc_td_last_frame: Isochronous descriptor DMA: (micro)frame number at
+ *                      which the core reaches td_last
  * @dw_align_buf:       Used instead of original buffer if its physical address
  *                      is not dword-aligned
  * @dw_align_buf_dma:   DMA address for dw_align_buf
@@ -389,6 +394,7 @@ struct dwc2_qh {
     struct dwc2_hs_transfer_time hs_transfers[DWC2_HS_SCHEDULE_UFRAMES];
     u32 ls_start_schedule_slice;
     u16 ntd;
+    u16 isoc_td_last_frame;
     u8 *dw_align_buf;
     dma_addr_t dw_align_buf_dma;
     struct list_head qtd_list;
@@ -443,7 +449,6 @@ struct dwc2_qh {
  * @qtd_list_entry:     For linking to the QH's list of QTDs
  * @isoc_td_first:	Index of first activated isochronous transfer
  *			descriptor in Descriptor DMA mode
- * @isoc_td_last:	Index of last activated isochronous transfer
  *			descriptor in Descriptor DMA mode
  *
  * A Queue Transfer Descriptor (QTD) holds the state of a bulk, control,
@@ -466,7 +471,6 @@ struct dwc2_qtd {
     u8 isoc_split_pos;
     u16 isoc_frame_index;
     u16 isoc_split_offset;
-    u16 isoc_td_last;
     u16 isoc_td_first;
     u32 ssplit_out_xfer_count;
     u8 error_count;
@@ -625,6 +629,14 @@ void dwc2_hcd_start_xfer_ddma(struct dwc2_hsotg *hsotg,
 void dwc2_hcd_complete_xfer_ddma(struct dwc2_hsotg *hsotg,
                                  struct dwc2_host_chan *chan, int chnum,
                                  enum dwc2_halt_status halt_status);
+void dwc2_hc_return_to_free_list(struct dwc2_hsotg *hsotg,
+                                 struct dwc2_host_chan *chan);
+void dwc2_hcd_qh_giveback_qtds(struct dwc2_hsotg *hsotg, struct dwc2_qh *qh,
+                               int status);
+void dwc2_hcd_qh_detach_channel_ddma(struct dwc2_hsotg *hsotg,
+                                     struct dwc2_qh *qh);
+void dwc2_hcd_release_channel_requeue_ddma(struct dwc2_hsotg *hsotg,
+                                           struct dwc2_qh *qh);
 
 int dwc2_hcd_qh_init_ddma(struct dwc2_hsotg *hsotg, struct dwc2_qh *qh,
                           gfp_t mem_flags);

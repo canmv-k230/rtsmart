@@ -7,6 +7,57 @@
 #include <lwp_user_mm.h>
 #include "tick.h"
 #include "rvv_ops.h"
+#include <errno.h>
+#include "usb_errno.h"
+
+#define DBG_TAG "uvc"
+#define DBG_LVL DBG_INFO
+#include <rtdbg.h>
+
+/*
+ * The /dev/videoN fops return 0 or a negative POSIX errno, which dfs hands
+ * to user space. CherryUSB (-USB_ERR_*) and RT-Thread (-RT_E*) codes share
+ * small numbers with errno (USB_ERR_IO == ENOMEM == 12), so convert each code
+ * exactly once, where its origin is known. This converts a CherryUSB result.
+ */
+static int uvc_usb_to_errno(int ret)
+{
+    if (ret >= 0) {
+        return ret;
+    }
+
+    switch (-ret) {
+    case USB_ERR_NOMEM:
+        return -ENOMEM;
+    case USB_ERR_INVAL:
+        return -EINVAL;
+    case USB_ERR_NODEV:
+    case USB_ERR_NOTCONN:
+        return -ENODEV;
+    case USB_ERR_NOTSUPP:
+        return -EOPNOTSUPP;
+    case USB_ERR_BUSY:
+        return -EBUSY;
+    case USB_ERR_RANGE:
+        return -ENOSPC;
+    case USB_ERR_STALL:
+        return -EPIPE;
+    case USB_ERR_BABBLE:
+        return -EOVERFLOW;
+    case USB_ERR_NAK:
+        return -EAGAIN;
+    case USB_ERR_DT:
+        return -EPROTO;
+    case USB_ERR_IO:
+        return -EIO;
+    case USB_ERR_SHUTDOWN:
+        return -ESHUTDOWN;
+    case USB_ERR_TIMEOUT:
+        return -ETIMEDOUT;
+    default:
+        return -EIO;
+    }
+}
 
 #define UVC_USE_RVV_COPY 1
 #define UVC_PROFILE_WINDOW_MS 1000
@@ -60,10 +111,28 @@ struct uvc_queue {
     struct usbh_urb *urb[UVC_URBS];
     char *urb_buffer[UVC_URBS];
     uint64_t urb_dma[UVC_URBS];
-    rt_bool_t disconnect;
     rt_bool_t streaming;
     rt_bool_t opened;
+    /* Device and its slot generation when the fd was opened. */
+    struct usbh_video *video;
+    uint32_t generation;
 };
+
+/*
+ * Liveness of each video slot, kept outside struct usbh_video because
+ * usbh_video_class_free() clears the slot on disconnect while an fd may still
+ * point at it. A disconnect bumps the generation; an fd keeps the generation
+ * it was opened with, so it stays dead after the camera re-enumerates into the
+ * same slot, until it is closed. Slots are matched by pointer only, so a dead
+ * fd never reads the cleared struct. Protected by io_mutex.
+ */
+struct uvc_slot {
+    struct usbh_video *video;
+    uint32_t generation;
+    rt_bool_t present;
+};
+
+static struct uvc_slot uvc_slots[CONFIG_USBHOST_MAX_VIDEO_CLASS];
 
 /* Values for bmHeaderInfo (Video and Still Image Payload Headers, 2.4.3.3) */
 #define UVC_STREAM_EOH	(1 << 7)
@@ -298,6 +367,7 @@ static void uvc_profile_reset(void)
     rt_hw_interrupt_enable(level);
 }
 
+#ifdef CHERRY_USB_HOST_UVC_DIAGNOSTIC_CMDS
 static void uvc_profile_set_enabled(rt_bool_t enable)
 {
     if (enable) {
@@ -401,6 +471,7 @@ static int uvc_profile_reset_cmd(int argc, char **argv)
 MSH_CMD_EXPORT_ALIAS(uvc_profile_dump_cmd, uvc_host_profile_dump, dump last completed uvc host copy profile window);
 MSH_CMD_EXPORT_ALIAS(uvc_profile_reset_cmd, uvc_host_profile_reset, reset uvc host copy profile windows);
 MSH_CMD_EXPORT_ALIAS(uvc_profile_cmd, uvc_host_profile, get or set uvc host copy profile state);
+#endif
 
 static inline void uvc_copy_payload(struct uvc_buffer *uvc_buf, void *dst, const void *src, uint32_t nbytes)
 {
@@ -886,6 +957,8 @@ static int uvc_init_urbs(struct usbh_video *video_class)
     USB_LOG_DBG("b4 npackets = %d, size = %d, psize = %d\n", npackets, size, psize);
     if (npackets > UVC_MAX_PACKETS)
         npackets = UVC_MAX_PACKETS;
+    if (npackets < 1)
+        npackets = 1;
 
     size = psize * npackets;
     USB_LOG_DBG("af npackets = %d, size = %d, psize = %d\n", npackets, size, psize);
@@ -925,7 +998,7 @@ static int uvc_init_urbs(struct usbh_video *video_class)
         if (video_class->num_of_intf_altsettings > 1) {
             urb->num_of_iso_packets = npackets;
             urb->ep = video_class->isoin;
-            urb->interval = USBH_GET_URB_INTERVAL(video_class->isoin->bInterval,
+            urb->interval = usbh_get_urb_interval(video_class->isoin,
                                                   video_class->hport->speed);
             for (j = 0; j < npackets; ++j) {
                 urb->iso_packet[j].offset = j * psize;
@@ -973,6 +1046,28 @@ static void uvc_uninit_urbs(void)
 
 static void usbh_video_off(struct usbh_video *video_class);
 
+/* One line per stream start: what was negotiated and how it is transferred. */
+static void uvc_log_stream_on(struct usbh_video *video_class)
+{
+    struct usb_endpoint_descriptor *ep;
+    uint16_t wmps;
+
+    ep = (video_class->num_of_intf_altsettings > 1) ? video_class->isoin : video_class->bulkin;
+    wmps = ep ? ep->wMaxPacketSize : 0;
+
+    LOG_I("stream on: %s %ux%u format %u frame %u interval %u, "
+          "max frame %u payload %u, alt %u ep 0x%02x mps %ux%u",
+          uvc_fourcc_to_name(video_class->current_fourcc),
+          video_class->current_frame.wWidth, video_class->current_frame.wHeight,
+          video_class->commit.bFormatIndex, video_class->commit.bFrameIndex,
+          (unsigned int)video_class->commit.dwFrameInterval,
+          (unsigned int)video_class->commit.dwMaxVideoFrameSize,
+          (unsigned int)video_class->commit.dwMaxPayloadTransferSize,
+          video_class->current_altsetting, ep ? ep->bEndpointAddress : 0,
+          USB_GET_MAXPACKETSIZE(wmps), USB_GET_MULT(wmps) + 1);
+}
+
+/* Returns 0 or a negative POSIX errno. */
 static int usbh_video_on(struct usbh_video *video_class)
 {
     int ret;
@@ -981,8 +1076,11 @@ static int usbh_video_on(struct usbh_video *video_class)
                           video_class->current_frame.wWidth,
                           video_class->current_frame.wHeight, -1);
     if (ret < 0) {
+        ret = uvc_usb_to_errno(ret);
         goto out;
     }
+
+    uvc_log_stream_on(video_class);
 
     USB_LOG_DBG("video params:\n");
     USB_LOG_DBG("bmHint                   = %d\n", video_class->commit.hintUnion1.bmHint);
@@ -1028,7 +1126,7 @@ static int usbh_video_on(struct usbh_video *video_class)
         if ((ret = usbh_submit_urb(uvc_queue.urb[i])) < 0) {
             USB_LOG_ERR("%s: Failed to submit URB %u (%d).\n", __func__, i, ret);
             usbh_video_off(video_class);
-            return ret;
+            return uvc_usb_to_errno(ret);
         }
     }
 
@@ -1038,6 +1136,10 @@ out:
     return ret;
 }
 
+/*
+ * Call with io_mutex held: STREAMOFF, close and disconnect all stop the same
+ * uvc_queue.urb[]. Idempotent: a second call finds no URBs and a closed stream.
+ */
 static void usbh_video_off(struct usbh_video *video_class)
 {
     rt_bool_t need_close = video_class->is_opened;
@@ -1066,20 +1168,30 @@ int uvc_iomutex_init(void)
     return rt_mutex_init(&io_mutex, "io_mutex", RT_IPC_FLAG_PRIO);
 }
 
-static inline rt_err_t io_lock(void)
+/* Returns 0 or -ETIMEDOUT. */
+static inline int io_lock(void)
 {
-    rt_err_t ret;
+    rt_err_t ret = rt_mutex_take(&io_mutex, rt_tick_from_millisecond(10000));
 
-    ret = rt_mutex_take(&io_mutex, rt_tick_from_millisecond(10000));
-    if (ret != RT_EOK) {
-        if (ret == -RT_ETIMEOUT) {
-            USB_LOG_ERR("uvc take iolock timeout\n");
-        } else {
-            RT_ASSERT(0);
-        }
+    if (ret == -RT_ETIMEOUT) {
+        USB_LOG_ERR("uvc take iolock timeout\n");
+        return -ETIMEDOUT;
     }
+    RT_ASSERT(ret == RT_EOK);
+    return 0;
+}
 
-    return ret;
+/*
+ * For hotplug and close, which must not give up: hotplug would otherwise stop
+ * the stream under a close or STREAMOFF in progress, and a failed close makes
+ * DFS retry later from another thread, without the process that mapped the
+ * buffers. Every holder finishes without waiting for these callers (one in a
+ * control transfer fails fast once the port is marked lost), so waiting
+ * without a timeout is safe.
+ */
+static inline void io_lock_forever(void)
+{
+    rt_mutex_take(&io_mutex, RT_WAITING_FOREVER);
 }
 
 static inline void io_unlock(void)
@@ -1089,19 +1201,104 @@ static inline void io_unlock(void)
 
 INIT_COMPONENT_EXPORT(uvc_iomutex_init);
 
+/* Call with io_mutex held. */
+static struct uvc_slot *uvc_slot_find(struct usbh_video *video)
+{
+    for (int i = 0; i < CONFIG_USBHOST_MAX_VIDEO_CLASS; i++) {
+        if (uvc_slots[i].video == video) {
+            return &uvc_slots[i];
+        }
+    }
+
+    return RT_NULL;
+}
+
+#ifdef CHERRY_USB_HOST_UVC_DIAGNOSTIC_CMDS
+static int uvc_host_formats_cmd(int argc, char **argv)
+{
+    rt_bool_t found = RT_FALSE;
+    int err;
+
+    (void)argv;
+    if (argc != 1) {
+        rt_kprintf("Usage: uvc_host_formats\n");
+        return -RT_ERROR;
+    }
+
+    err = io_lock();
+    if (err) {
+        return err;
+    }
+
+    for (int i = 0; i < CONFIG_USBHOST_MAX_VIDEO_CLASS; i++) {
+        struct usbh_video *video = uvc_slots[i].video;
+
+        if (!uvc_slots[i].present || video == RT_NULL) {
+            continue;
+        }
+
+        rt_kprintf("/dev/%s:\n",
+                   video->hport->config.intf[video->ctrl_intf].devname);
+        usbh_video_list_info(video);
+        found = RT_TRUE;
+    }
+
+    if (!found) {
+        rt_kprintf("No UVC camera connected\n");
+    }
+
+    io_unlock();
+    return 0;
+}
+
+MSH_CMD_EXPORT_ALIAS(uvc_host_formats_cmd, uvc_host_formats, list connected UVC camera formats);
+#endif
+
+/*
+ * Whether the open fd still addresses the device instance it was opened on.
+ * Call with io_mutex held. When false, do not touch uvc_queue.video: it may
+ * be cleared or reused by a re-enumerated camera.
+ */
+static rt_bool_t uvc_fd_alive(void)
+{
+    struct uvc_slot *slot;
+
+    if (!uvc_queue.opened || uvc_queue.video == RT_NULL) {
+        return RT_FALSE;
+    }
+
+    slot = uvc_slot_find(uvc_queue.video);
+
+    return slot != RT_NULL && slot->present &&
+           slot->generation == uvc_queue.generation;
+}
+
 static int uvc_fops_open(struct dfs_fd *fd)
 {
-    if (io_lock() != RT_EOK) {
-        return -RT_ERROR;
+    struct usbh_video *video = (struct usbh_video *)fd->fnode->data;
+    struct uvc_slot *slot;
+    int err;
+
+    err = io_lock();
+    if (err) {
+        return err;
     }
 
     if (uvc_queue.opened) {
         io_unlock();
-        return -RT_EBUSY;
+        return -EBUSY;
+    }
+
+    /* Raced with a disconnect after devfs found the device. */
+    slot = video ? uvc_slot_find(video) : RT_NULL;
+    if (slot == RT_NULL || !slot->present) {
+        io_unlock();
+        return -ENODEV;
     }
 
     uvc_queue.opened = RT_TRUE;
-    uvc_queue.disconnect = RT_FALSE;
+    uvc_queue.video = video;
+    uvc_queue.generation = slot->generation;
     uvc_queue.streaming = RT_FALSE;
     uvc_queue.count = 0;
     uvc_queue.buffer_size = 0;
@@ -1129,14 +1326,11 @@ static int uvc_fops_open(struct dfs_fd *fd)
 
 static int uvc_fops_close(struct dfs_fd *fd)
 {
-    if (io_lock() != RT_EOK) {
-        return -RT_ERROR;
-    }
+    io_lock_forever();
 
-    rt_device_t device = (rt_device_t)fd->fnode->data;
-    struct usbh_video *video = (struct usbh_video *)device;
-    if (video) {
-        usbh_video_off(video);
+    /* A dead fd's stream was stopped on disconnect; its slot may be reused. */
+    if (uvc_fd_alive()) {
+        usbh_video_off(uvc_queue.video);
     }
 
     if (lwp_self() != NULL) {
@@ -1152,26 +1346,28 @@ static int uvc_fops_close(struct dfs_fd *fd)
 
     uvc_release_buffers();
     uvc_queue.opened = RT_FALSE;
-    uvc_queue.disconnect = RT_FALSE;
+    uvc_queue.video = RT_NULL;
     io_unlock();
 
     return 0;
 }
 
+/* Returns 0 or a negative POSIX errno, which dfs/lwp hand to user space. */
 static int uvc_fops_ioctl(struct dfs_fd *fd, int cmd, void *args)
 {
     int ret;
-    rt_device_t device;
+    int err;
 
-    if (io_lock() != RT_EOK) {
-        return -RT_ERROR;
+    err = io_lock();
+    if (err) {
+        return err;
     }
-    if (uvc_queue.disconnect) {
+    if (!uvc_fd_alive()) {
         ret = -ENODEV;
         goto out;
     }
-    device = (rt_device_t)fd->fnode->data;
-    ret = rt_device_control(device, cmd, args);
+    /* uvc_control() already returns POSIX errno. */
+    ret = rt_device_control(&uvc_queue.video->device, cmd, args);
 
 out:
     io_unlock();
@@ -1181,7 +1377,19 @@ out:
 
 static int uvc_fops_read(struct dfs_fd *fd, void *buf, size_t count)
 {
-    return 0;
+    int ret = 0;
+    int err;
+
+    err = io_lock();
+    if (err) {
+        return err;
+    }
+    if (!uvc_fd_alive()) {
+        ret = -ENODEV;
+    }
+    io_unlock();
+
+    return ret;
 }
 
 static int uvc_fops_write(struct dfs_fd *fd, const void *buf, size_t count)
@@ -1200,11 +1408,12 @@ static int uvc_fops_poll(struct dfs_fd *fd, struct rt_pollreq *req)
     device = (rt_device_t)fd->fnode->data;
     RT_ASSERT(device != RT_NULL);
 
-    if (io_lock() != RT_EOK) {
+    if (io_lock()) {
         return POLLERR;
     }
-    if (uvc_queue.disconnect) {
-        mask |= POLLERR;
+    /* POLLHUP too: select() reports it as readable, so a waiter returns now. */
+    if (!uvc_fd_alive()) {
+        mask |= POLLERR | POLLHUP;
         goto done;
     }
 
@@ -1254,9 +1463,15 @@ const static struct dfs_file_ops uvc_fops =
     uvc_fops_poll,      /* poll */
 };
 
+/*
+ * The device is used only through uvc_fops. rt_device_register() clears
+ * device->fops, so a devfs open landing between it and the fops assignment in
+ * usbh_video_run() would come here and get an fd without the I/O lock and
+ * liveness checks: refuse it (devfs then fails the open).
+ */
 static rt_err_t uvc_open(rt_device_t dev, rt_uint16_t oflag)
 {
-    return RT_EOK;
+    return -RT_EBUSY;
 }
 
 rt_err_t uvc_close(rt_device_t dev)
@@ -1305,6 +1520,10 @@ static struct uvc_format_desc uvc_fmts[] = {
 #include "cache.h"
 extern rt_mmu_info mmu_info;
 
+/*
+ * Returns 0 or a negative POSIX errno: uvc_fops_ioctl() passes it to user
+ * space unchanged, so do not return RT-Thread or CherryUSB codes here.
+ */
 static rt_err_t uvc_control(rt_device_t dev, int cmd, void *args)
 {
     struct usbh_video *video = (struct usbh_video *)dev;
@@ -1374,7 +1593,7 @@ static rt_err_t uvc_control(rt_device_t dev, int cmd, void *args)
         idx = fmt->index;
 
         if (idx >= video->num_of_formats) {
-            ret = -RT_EINVAL;
+            ret = -EINVAL;
             goto out;
         }
 
@@ -1416,12 +1635,12 @@ static rt_err_t uvc_control(rt_device_t dev, int cmd, void *args)
 
         if (format == NULL) {
             USB_LOG_ERR("unmatch video format fourcc: %s %d\n", __func__, __LINE__);
-            ret = -RT_EINVAL;
+            ret = -EINVAL;
             goto out;
         }
 
         if (frame_desc->index >= format->num_of_frames) {
-            ret = -RT_EINVAL;
+            ret = -EINVAL;
             goto out;
         }
 
@@ -1454,7 +1673,7 @@ static rt_err_t uvc_control(rt_device_t dev, int cmd, void *args)
 
         if (format == NULL) {
             USB_LOG_ERR("unmatch video format fourcc: %s %d\n", __func__, __LINE__);
-            ret = -RT_EINVAL;
+            ret = -EINVAL;
             goto out;
         }
 
@@ -1467,13 +1686,13 @@ static rt_err_t uvc_control(rt_device_t dev, int cmd, void *args)
         if (frame == NULL) {
             USB_LOG_ERR("unmatch frame size: %ux%u\n",
                         fps_desc->width, fps_desc->height);
-            ret = -RT_EINVAL;
+            ret = -EINVAL;
             goto out;
         }
 
         if (frame->bFrameIntervalType) {
             if (fps_desc->index >= frame->bFrameIntervalType) {
-                ret = -RT_EINVAL;
+                ret = -EINVAL;
                 goto out;
             }
 
@@ -1508,7 +1727,7 @@ static rt_err_t uvc_control(rt_device_t dev, int cmd, void *args)
         uvc_format = uvc_find_format(video, fmt->fourcc);
         if (uvc_format == RT_NULL) {
             USB_LOG_ERR("Unsupport video format fourcc: %s %d\n", __func__, __LINE__);
-            ret = -RT_EINVAL;
+            ret = -EINVAL;
             goto out;
         }
 
@@ -1537,7 +1756,7 @@ static rt_err_t uvc_control(rt_device_t dev, int cmd, void *args)
 
         if (frame == NULL) {
             USB_LOG_ERR("Unsupported size %ux%u.\n", fmt->width, fmt->height);
-            ret = -RT_EINVAL;
+            ret = -EINVAL;
             goto out;
         }
 
@@ -1547,8 +1766,11 @@ static rt_err_t uvc_control(rt_device_t dev, int cmd, void *args)
         }
 
         if (i >= frame->bFrameIntervalType) {
-            USB_LOG_ERR("Unsupported interval %d in (%ux%u). use default interval = %d\n",
-                        fmt->frameinterval, fmt->width, fmt->height, frame->dwDefaultFrameInterval);
+            /* 0 asks for the default interval: not an error. */
+            if (fmt->frameinterval != 0) {
+                USB_LOG_ERR("Unsupported interval %d in (%ux%u). use default interval = %d\n",
+                            fmt->frameinterval, fmt->width, fmt->height, frame->dwDefaultFrameInterval);
+            }
             fmt->frameinterval = frame->dwDefaultFrameInterval;
         }
 
@@ -1584,7 +1806,7 @@ static rt_err_t uvc_control(rt_device_t dev, int cmd, void *args)
 
         if (uvc_queue.streaming || video->is_opened) {
             USB_LOG_ERR("reqbufs while stream is running\n");
-            ret = -RT_EBUSY;
+            ret = -EBUSY;
             goto out;
         }
 
@@ -1595,7 +1817,7 @@ static rt_err_t uvc_control(rt_device_t dev, int cmd, void *args)
                    buffer_size, video->current_frame.dwMaxVideoFrameBufferSize, request->count);
         if (request->count > MAX_UVC_BUFFER) {
             USB_LOG_ERR("Too many buffer required: %s %d\n", __func__, __LINE__);
-            ret = -RT_EINVAL;
+            ret = -EINVAL;
             goto out;
         }
 
@@ -1617,7 +1839,7 @@ static rt_err_t uvc_control(rt_device_t dev, int cmd, void *args)
         if (vb_create_pool(&pool_id, request->count + 1, alloc_size,
                            RT_NULL, "uvc", VB_REMAP_MODE_CACHED) != 0) {
             USB_LOG_ERR("Can't create pool: %s %d\n", __func__, __LINE__);
-            ret = -RT_ENOMEM;
+            ret = -ENOMEM;
             goto release;
         }
         uvc_queue.buffer[0].pool_id = pool_id;
@@ -1625,7 +1847,7 @@ static rt_err_t uvc_control(rt_device_t dev, int cmd, void *args)
         uvc_queue.mem = rt_malloc_align(buffer_size * (request->count + 1), CONFIG_USB_ALIGN_SIZE);
         if (uvc_queue.mem == RT_NULL) {
             USB_LOG_ERR("Can't alloc mem: %s %d\n", __func__, __LINE__);
-            ret = -RT_ENOMEM;
+            ret = -ENOMEM;
             goto out;
         }
 #endif
@@ -1648,7 +1870,7 @@ static rt_err_t uvc_control(rt_device_t dev, int cmd, void *args)
                 vb_get_blk_by_size_and_pool_id(pool_id, alloc_size, VB_UID_V_VI);
             if (uvc_queue.buffer[i].handle == VB_INVALID_HANDLE) {
                 USB_LOG_ERR("Can't get buffer from pool: %s %d\n", __func__, __LINE__);
-                ret = -RT_ENOMEM;
+                ret = -ENOMEM;
                 goto release;
             }
             uvc_queue.buffer[i].blk_phys_addr =
@@ -1695,7 +1917,7 @@ release:
 
         if (query_buf->index >= uvc_queue.count) {
             USB_LOG_ERR("index over range: %s %d\n", __func__, __LINE__);
-            ret = -RT_EINVAL;
+            ret = -EINVAL;
             goto out;
         }
 
@@ -1732,7 +1954,7 @@ release:
 
         if ((i == uvc_queue.count) || (mmap->length != uvc_queue.buffer_size)) {
             USB_LOG_ERR("video buf mismatch: %s %d\n", __func__, __LINE__);
-            ret = -RT_ERROR;
+            ret = -EINVAL;
             goto out;
         }
 
@@ -1748,7 +1970,7 @@ release:
             addr = lwp_map_user_phy(lwp_self(), RT_NULL, pa, mmap->length, 0);
             if (addr == 0) {
                 USB_LOG_ERR("video mmap fail: %s %d\n", __func__, __LINE__);
-                ret = -RT_ERROR;
+                ret = -ENOMEM;
                 goto out;
             }
             mmap->addr = addr;
@@ -1774,14 +1996,14 @@ release:
 
         if (q_buf->index >= uvc_queue.count) {
             USB_LOG_ERR("index over range: %s %d\n", __func__, __LINE__);
-            ret = -RT_EINVAL;
+            ret = -EINVAL;
             goto out;
         }
 
         uvc_buf = &uvc_queue.buffer[q_buf->index];
         if (uvc_buf->state != VIDEOBUF_IDLE) {
             USB_LOG_ERR("mismatch state: %s %d\n", __func__, __LINE__);
-            ret = -RT_EINVAL;
+            ret = -EINVAL;
             goto out;
         }
 
@@ -1827,7 +2049,7 @@ release:
 
         if (rt_list_isempty(&uvc_queue.app_queue)) {
             USB_LOG_ERR("queue is empty: %s %d\n", __func__, __LINE__);
-            ret = -RT_EINVAL;
+            ret = -EINVAL;
             rt_hw_interrupt_enable(level);
             goto out;
         }
@@ -1844,7 +2066,7 @@ release:
         case VIDEOBUF_QUEUED:
         case VIDEOBUF_ACTIVE:
         default:
-            ret = -RT_EINVAL;
+            ret = -EINVAL;
             goto out;
         }
 
@@ -1926,13 +2148,13 @@ release:
     }
     case VIDIOC_STREAMON: {
         if (uvc_queue.streaming) {
-            ret = -RT_EBUSY;
+            ret = -EBUSY;
             break;
         }
         if ((uvc_queue.count <= 0) || (uvc_queue.buffer_size <= 0) ||
             rt_list_isempty(&uvc_queue.irq_queue)) {
             USB_LOG_ERR("stream on without prepared/qbuf buffers\n");
-            ret = -RT_EINVAL;
+            ret = -EINVAL;
             break;
         }
         ret = usbh_video_on(video);
@@ -1943,7 +2165,7 @@ release:
         break;
     default:
         USB_LOG_ERR("Unsupport cmd %s\n", __func__);
-        ret = -RT_EINVAL;
+        ret = -EINVAL;
     }
 
 out:
@@ -1964,14 +2186,27 @@ void usbh_video_run(struct usbh_video *video_class)
 {
     int ret;
     struct rt_device *device;
+    struct uvc_slot *slot;
     const char *dev_name = video_class->hport->config.intf[video_class->ctrl_intf].devname;
 
-    if (io_lock() != RT_EOK) {
-        USB_LOG_ERR("set disconnect flag fail in %s\n", __func__);
+    /*
+     * Mark the slot present, keeping its generation: an fd opened on the
+     * previous instance of this slot stays dead until it is closed.
+     */
+    io_lock_forever();
+    slot = uvc_slot_find(video_class);
+    if (slot == RT_NULL) {
+        slot = uvc_slot_find(RT_NULL);
+    }
+    if (slot == RT_NULL) {
+        io_unlock();
+        USB_LOG_ERR("no uvc slot for %s\n", dev_name);
         return;
     }
-    uvc_queue.disconnect = RT_FALSE;
+    slot->video = video_class;
+    slot->present = RT_TRUE;
     io_unlock();
+
     device = &(video_class->device);
     device->type = RT_Device_Class_Char;
     device->rx_indicate = RT_NULL;
@@ -1981,29 +2216,56 @@ void usbh_video_run(struct usbh_video *video_class)
     ret = rt_device_register(device, dev_name, RT_DEVICE_FLAG_RDWR);
     if (ret) {
         USB_LOG_ERR("%s register fail\n", dev_name);
+    } else {
+        LOG_I("UVC attached as /dev/%s: version %x.%02x, %u format(s)",
+              dev_name,
+              (video_class->bcdVDC >> 8) & 0xff,
+              video_class->bcdVDC & 0xff,
+              video_class->num_of_formats);
     }
 
+    /* Set after registering, which clears it; see uvc_open(). */
     device->fops = &uvc_fops;
 
     USB_LOG_DBG("register %s\n", dev_name);
 
 }
 
+/*
+ * Disconnect, from the hub thread. The open fd turns dead (-ENODEV, poll
+ * POLLERR | POLLHUP) and its stream is stopped here, under io_mutex so it
+ * cannot race close or STREAMOFF. After this returns nothing in this file
+ * reads *video_class again, so usbh_video_class_free() may clear it.
+ */
 void usbh_video_stop(struct usbh_video *video_class)
 {
-    if (io_lock() == RT_EOK) {
-        uvc_queue.disconnect = RT_TRUE;
-        io_unlock();
-    } else {
-        USB_LOG_ERR("set disconnect flag fail in %s\n", __func__);
+    struct uvc_slot *slot;
+    rt_bool_t open_here;
+
+    io_lock_forever();
+
+    /* An fd that is already dead belongs to an earlier instance of the slot. */
+    open_here = uvc_queue.video == video_class && uvc_fd_alive();
+
+    slot = uvc_slot_find(video_class);
+    if (slot != RT_NULL) {
+        slot->present = RT_FALSE;
+        slot->generation++;
     }
 
-    usbh_video_off(video_class);
+    if (open_here) {
+        usbh_video_off(video_class);
 
-    for (int i = 0; i < uvc_queue.count; i++) {
-        uvc_queue.buffer[i].state = VIDEOBUF_ERROR;
-        rt_wqueue_wakeup(&uvc_queue.buffer[i].wait_queue, 0);
+        /* Wake every poll()/select() waiter; they find the fd dead. */
+        for (int i = 0; i < uvc_queue.count; i++) {
+            uvc_queue.buffer[i].state = VIDEOBUF_ERROR;
+            rt_wqueue_wakeup_all(&uvc_queue.buffer[i].wait_queue, 0);
+        }
     }
+
+    io_unlock();
 
     rt_device_unregister(&video_class->device);
+    LOG_I("UVC detached from /dev/%s",
+          video_class->hport->config.intf[video_class->ctrl_intf].devname);
 }
