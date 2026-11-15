@@ -1266,7 +1266,7 @@ static rt_err_t aic_firmware_upload(struct aic8800_context *context,
     }
     if (result == RT_EOK)
     {
-        LOG_I("uploaded %s (%u bytes)", name, total);
+        LOG_D("uploaded %s (%u bytes)", name, total);
     }
     return result;
 }
@@ -1356,7 +1356,7 @@ static rt_err_t aic_firmware_read_patch_table(
         *table_length = 0;
         return -RT_EIO;
     }
-    LOG_I("loaded patch table %s (%u bytes)", path,
+    LOG_D("loaded patch table %s (%u bytes)", path,
           (unsigned int)*table_length);
     return RT_EOK;
 }
@@ -1587,7 +1587,7 @@ static rt_err_t aic_firmware_system_config_8800(
         return result;
     }
     sub_id = (rt_uint8_t)(value >> 4);
-    LOG_I("AIC8800 chip revision=0x%02x sub-revision=0x%02x",
+    LOG_D("AIC8800 chip revision=0x%02x sub-revision=0x%02x",
           *chip_id, sub_id);
 #ifdef AIC8800_WIFI_TRANSPORT_SDIO
     if (context->transport == AIC8800_TRANSPORT_SDIO)
@@ -1881,7 +1881,7 @@ static rt_err_t aic_firmware_config_patch_d80(
             return result;
         }
     }
-    LOG_I("firmware version=0x%08x config=0x%08x patch=0x%08x",
+    LOG_D("firmware version=0x%08x config=0x%08x patch=0x%08x",
           version, config_base, patch_buffer);
     result = aic_firmware_mem_write(
         context, patch_struct_address + AIC_PATCH_STRUCT_MAGIC_OFFSET,
@@ -2003,7 +2003,7 @@ static rt_err_t aic_firmware_system_config_d80(
     if (result == RT_EOK)
     {
         *chip_id = (rt_uint8_t)(value >> 16);
-        LOG_I("AIC8800D80 chip revision=0x%02x high=%u mcu=%u",
+        LOG_D("AIC8800D80 chip revision=0x%02x high=%u mcu=%u",
               *chip_id & (rt_uint8_t)~AIC_CHIP_ID_H_MASK,
               (*chip_id & AIC_CHIP_ID_H_MASK) == AIC_CHIP_ID_H_MASK,
               ((value >> 25) & 1U) == 0U);
@@ -2138,7 +2138,7 @@ static rt_err_t aic_firmware_system_config_d80x2(
         return result;
     }
     *mcu_variant = ((value >> 17) & 1U) == 0U;
-    LOG_I("AIC8800D80X2 chip revision=0x%02x mcu=%u",
+    LOG_D("AIC8800D80X2 chip revision=0x%02x mcu=%u",
           *chip_id, *mcu_variant);
     return aic_firmware_write_pairs(
         context, system_config,
@@ -2424,7 +2424,7 @@ static rt_err_t aic_firmware_probe_dc_revision(
     }
     context->chip_sub_id = (rt_uint8_t)value;
     context->chip_revision_valid = RT_TRUE;
-    LOG_I("DC/DW silicon: chip=0x%02x sub=%u mcu=%u%s",
+    LOG_D("DC/DW silicon: chip=0x%02x sub=%u mcu=%u%s",
           context->chip_id, context->chip_sub_id, context->chip_mcu_id,
           (context->chip_id & AIC_CHIP_ID_H_MASK) == AIC_CHIP_ID_H_MASK ?
           " H" : "");
@@ -2722,7 +2722,7 @@ static rt_err_t aic_firmware_dc_apply_patch_table(
         result = -RT_EIO;
         goto exit;
     }
-    LOG_I("loaded DC patch table %s (%u bytes)", path,
+    LOG_D("loaded DC patch table %s (%u bytes)", path,
           (unsigned int)table_length);
     result = aic_firmware_mem_block_write(
         context, describe_address, table, AIC_DC_PATCH_DESCRIBE_SIZE);

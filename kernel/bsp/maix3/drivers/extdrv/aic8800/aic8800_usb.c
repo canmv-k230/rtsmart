@@ -1910,7 +1910,7 @@ static rt_err_t aic8800_usb_bus_start(struct rt_wlan_offload_bus *bus)
         aic8800_usb_stop_tx(&context->tx_worker);
         return result;
     }
-    LOG_I("USB bus ready: %s RX ep=0x%02x/%u mps=%u TX ep=0x%02x/%u "
+    LOG_D("USB bus ready: %s RX ep=0x%02x/%u mps=%u TX ep=0x%02x/%u "
           "mps=%u buffer=%u queue=%u aggregate=%u/%u%s",
           aic8800_usb_speed_name(context->hport->speed),
           context->data_in->bEndpointAddress,

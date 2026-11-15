@@ -5984,7 +5984,7 @@ static rt_err_t aic_start_firmware_stack(struct aic8800_context *context)
               (unsigned int)response_length);
         return result == RT_EOK ? -RT_EIO : result;
     }
-    LOG_I("firmware stack started: 5GHz=%u vendor=0x%02x",
+    LOG_D("firmware stack started: 5GHz=%u vendor=0x%02x",
           stack_response.supports_5ghz, stack_response.vendor_info);
     context->firmware_supports_5ghz = stack_response.supports_5ghz != 0;
     context->firmware_capabilities_valid = RT_TRUE;
@@ -6022,7 +6022,7 @@ static void aic_log_runtime_version(struct aic8800_context *context)
         {
             version_length = response_length - 1U;
         }
-        LOG_I("runtime firmware: %.*s", (int)version_length,
+        LOG_D("runtime firmware: %.*s", (int)version_length,
               runtime_version.version);
     }
 }
@@ -9586,6 +9586,7 @@ MSH_CMD_EXPORT(aic8800_recover, restart AIC8800 USB radio or port for testing);
 #define AIC_THERMAL_THRESHOLD_HIGH_C   110
 #define AIC_THERMAL_THRESHOLD_MID_C    95
 #define AIC_THERMAL_THRESHOLD_LOW_C    85
+#define AIC_THERMAL_SDIO_THRESHOLD_C   80
 #define AIC_THERMAL_LOSS_HIGH_DB       10U
 #define AIC_THERMAL_LOSS_MID_DB        5U
 #define AIC_THERMAL_LOSS_LOW_DB        2U
@@ -9746,7 +9747,18 @@ void aic8800_core_thermal_poll(struct aic8800_context *context)
         context->thermal_valid = RT_TRUE;
         rt_hw_interrupt_enable(level);
     }
-    LOG_I("chip temperature: %d C", degree);
+    {
+        rt_int8_t threshold =
+            context->transport == AIC8800_TRANSPORT_SDIO ?
+                AIC_THERMAL_SDIO_THRESHOLD_C :
+                AIC_THERMAL_THRESHOLD_LOW_C;
+
+        if (degree > threshold)
+        {
+            LOG_W("chip temperature high: %d C (threshold %d C)",
+                  degree, threshold);
+        }
+    }
 #ifdef AIC8800_WIFI_THERMAL_CONTROL
     if (context->transport == AIC8800_TRANSPORT_USB)
     {

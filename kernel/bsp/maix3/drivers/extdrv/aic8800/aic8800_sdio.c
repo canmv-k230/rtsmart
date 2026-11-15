@@ -1654,7 +1654,7 @@ static rt_err_t aic8800_sdio_bus_start(struct rt_wlan_offload_bus *bus)
         return result;
     }
     rt_event_send(&context->sdio_event, AIC8800_SDIO_EVENT_RX);
-    LOG_I("SDIO bus started on function %u: clock=%u kHz width=%u "
+    LOG_D("SDIO bus started on function %u: clock=%u kHz width=%u "
           "timing=%u protocol=%s aggregate=%u wait=%u ms reserve=%u",
           context->sdio_function->num,
           (unsigned int)(context->sdio_card->host->io_cfg.clock / 1000U),
@@ -2255,7 +2255,7 @@ static rt_int32_t aic8800_sdio_probe(struct rt_mmcsd_card *card)
 
     /* Card discovery holds the mmcsd host lock while invoking probe.  Defer
      * function setup and firmware loading until after discovery releases it. */
-    LOG_I("queued AIC SDIO device %04x:%04x on function %u",
+    LOG_D("queued AIC SDIO device %04x:%04x on function %u",
           context->sdio_vendor_id, context->sdio_product_id, function->num);
     return RT_EOK;
 

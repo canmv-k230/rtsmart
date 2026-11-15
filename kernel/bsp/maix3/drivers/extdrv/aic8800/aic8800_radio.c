@@ -472,7 +472,7 @@ static void aic_radio_load_powerlimit(
     else
     {
         config->powerlimit_loaded = RT_TRUE;
-        LOG_I("loaded power limits: %s country=%s rows=%u", path,
+        LOG_D("loaded power limits: %s country=%s rows=%u", path,
               config->country_code, (unsigned int)parsed_lines);
     }
     (void)context;
@@ -1265,7 +1265,7 @@ rt_err_t aic8800_radio_load_config(struct aic8800_context *context)
     aic_radio_apply_loss(config);
     config->loaded = RT_TRUE;
     context->country = aic_radio_country_from_code(config->country_code);
-    LOG_I("loaded RF userconfig: %s country=%s (offset=%u adjust=%u xtal=%u)",
+    LOG_D("loaded RF userconfig: %s country=%s (offset=%u adjust=%u xtal=%u)",
           path, config->country_code, config->tx_power_offset_2x.enable,
           config->tx_power_adjust.enable,
           config->crystal_enabled);
@@ -1821,7 +1821,7 @@ static rt_err_t aic_radio_initialize(struct aic8800_context *context,
     }
     if (result == RT_EOK)
     {
-        LOG_I("%sRF initialized for product 0x%04x",
+        LOG_D("%sRF initialized for product 0x%04x",
               rf_test ? "test " : "", context->product_id);
     }
     return result;
@@ -2001,7 +2001,7 @@ void aic8800_radio_prepare(struct aic8800_context *context,
     request->dynamic_power_save = 0;
     request->antenna_diversity_enabled =
         (features & AIC_FW_CAP_ANT_DIV) != 0;
-    LOG_I("ME capabilities: feature-map=%s PHY=0x%08x HT40=1 VHT=%u HE=%u max-bw=%u MHz BFMEE=%u MU-RX=%u PS=%u DPSM=%u",
+    LOG_D("ME capabilities: feature-map=%s PHY=0x%08x HT40=1 VHT=%u HE=%u max-bw=%u MHz BFMEE=%u MU-RX=%u PS=%u DPSM=%u",
           context && context->firmware_feature_map_compact ? "compact" : "full",
           (unsigned int)(context ? context->firmware_phy_features : 0),
           (unsigned int)vht_supported, (unsigned int)he_supported,
