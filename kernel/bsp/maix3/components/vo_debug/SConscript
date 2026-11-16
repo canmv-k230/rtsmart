@@ -1,0 +1,10 @@
+# RT-Thread building script for component
+
+from building import *
+
+src     = Glob('*.c')
+group = DefineGroup('vo_debug', src, depend = ['RT_USING_VO_DEBUG'])
+
+objs = [group]
+
+Return('objs')

@@ -523,6 +523,16 @@ menu "Components Configuration"
         bool "Enable misc Device for CanMV"
         default n
 
+    config RT_USING_VO_DEBUG
+        bool "Enable VO debug shell command"
+        depends on RT_USING_MSH && RT_USING_POSIX && ARCH_MM_MMU
+        default n
+        help
+            Export vo_debug to inspect VO registers, toggle layer mixer
+            enable bits, and dump physical frame buffers to files. Supports
+            hardware video layers 1 through 3 and OSD layers 0 through 7.
+            Register changes bypass MPP state and may be overwritten by it.
+
     source "components/netutils/Kconfig"
 
 endmenu
