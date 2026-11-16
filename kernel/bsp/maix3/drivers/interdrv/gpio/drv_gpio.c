@@ -109,8 +109,21 @@ struct kd_gpio_irq_to_user_arg {
 };
 
 typedef struct _kd_gpio_irq {
+#ifdef RT_USING_SMP
+    struct rt_spinlock lock;
+#else
+    rt_uint32_t lock;
+#endif
     void (*hdr)(void* args);
     void* args;
+    rt_uint32_t in_flight;
+    rt_uint32_t notify_in_flight;
+    rt_bool_t detaching;
+#ifdef RT_USING_SMP
+    rt_uint8_t active_nest[RT_CPUS_NR];
+#else
+    rt_uint8_t active_nest[1];
+#endif
 
     struct kd_gpio_irq_to_user_arg  to_user;
     struct kd_gpio_irq_debounce_arg debounce;
@@ -129,7 +142,11 @@ typedef struct _kd_gpio_work {
     struct rt_work       work;
     struct rt_workqueue* queue;
 
-    rt_spinlock_t       lock;
+#ifdef RT_USING_SMP
+    struct rt_spinlock lock;
+#else
+    rt_uint32_t lock;
+#endif
     struct rt_list_node list;
 } kd_gpio_work_t;
 
@@ -146,6 +163,9 @@ typedef struct _kd_gpio_inst {
 
 static kd_gpio_inst_t _gpio_inst;
 
+/* The debounce worker tracks expired pins in a 64-bit mask. */
+typedef char kd_gpio_irq_mask_fits[(GPIO_IRQ_MAX_NUM <= 64) ? 1 : -1];
+
 #define GPIO_BANK_COUNT 3
 
 #ifdef RT_USING_SMP
@@ -154,7 +174,11 @@ static struct rt_spinlock g_gpio_bank_locks[GPIO_BANK_COUNT];
 static rt_uint32_t g_gpio_bank_locks[GPIO_BANK_COUNT];
 #endif
 
-static atomic_lock_t g_gpio_pin_state_locks[GPIO_MAX_NUM];
+#ifdef RT_USING_SMP
+static struct rt_spinlock g_gpio_pin_state_locks[GPIO_MAX_NUM];
+#else
+static rt_uint32_t g_gpio_pin_state_locks[GPIO_MAX_NUM];
+#endif
 
 static inline int kd_gpio_pin_bank(rt_base_t pin)
 {
@@ -186,14 +210,16 @@ static inline void kd_gpio_bank_unlock(rt_base_t pin, rt_base_t level)
 #endif
 }
 
-static inline void kd_gpio_pin_state_lock(rt_base_t pin)
+/* IRQ callbacks call kd_pin_read() and kd_pin_write(), so a thread holding
+ * the pin state lock must not be interrupted or preempted by them. */
+static inline rt_base_t kd_gpio_pin_state_lock(rt_base_t pin)
 {
-    atomic_lock_take(&g_gpio_pin_state_locks[pin]);
+    return rt_spin_lock_irqsave(&g_gpio_pin_state_locks[pin]);
 }
 
-static inline void kd_gpio_pin_state_unlock(rt_base_t pin)
+static inline void kd_gpio_pin_state_unlock(rt_base_t pin, rt_base_t level)
 {
-    atomic_lock_release(&g_gpio_pin_state_locks[pin]);
+    rt_spin_unlock_irqrestore(&g_gpio_pin_state_locks[pin], level);
 }
 
 rt_err_t kd_pin_mode_get(rt_base_t pin, rt_base_t* mode)
@@ -203,9 +229,9 @@ rt_err_t kd_pin_mode_get(rt_base_t pin, rt_base_t* mode)
         return -RT_EINVAL;
     }
 
-    kd_gpio_pin_state_lock(pin);
+    rt_base_t state_level = kd_gpio_pin_state_lock(pin);
     *mode = _gpio_inst.mode_table[pin].mode;
-    kd_gpio_pin_state_unlock(pin);
+    kd_gpio_pin_state_unlock(pin, state_level);
 
     return RT_EOK;
 }
@@ -286,7 +312,7 @@ rt_err_t kd_pin_mode(rt_base_t pin, rt_base_t mode)
     fpioa_iomux_cfg_t curr_cfg, new_cfg;
 
     /* Parameter validation */
-    if (pin >= GPIO_MAX_NUM) {
+    if (pin < 0 || pin >= GPIO_MAX_NUM) {
         LOG_E("Invalid GPIO pin %d (max %d)", pin, GPIO_MAX_NUM - 1);
         return -RT_EINVAL;
     }
@@ -362,10 +388,10 @@ rt_err_t kd_pin_mode(rt_base_t pin, rt_base_t mode)
     volatile uint32_t*  ddr      = &gpio->port[port_idx].ddr;
     kd_gpio_mode_t*     pin_mode = &_gpio_inst.mode_table[pin];
 
-    kd_gpio_pin_state_lock(pin);
+    rt_base_t state_level = kd_gpio_pin_state_lock(pin);
     if (new_cfg.u.value != curr_cfg.u.value) {
         if (0x00 != drv_fpioa_set_pin_cfg(pin, new_cfg.u.value)) {
-            kd_gpio_pin_state_unlock(pin);
+            kd_gpio_pin_state_unlock(pin, state_level);
             LOG_E("Failed to set pin configuration for pin %d", pin);
             return -RT_EINVAL;
         }
@@ -378,7 +404,7 @@ rt_err_t kd_pin_mode(rt_base_t pin, rt_base_t mode)
     pin_mode->mode  = mode;
     pin_mode->iomux = new_cfg.u.value;
     pin_mode->dir   = dir;
-    kd_gpio_pin_state_unlock(pin);
+    kd_gpio_pin_state_unlock(pin, state_level);
 
     return RT_EOK;
 }
@@ -386,7 +412,7 @@ rt_err_t kd_pin_mode(rt_base_t pin, rt_base_t mode)
 rt_err_t kd_pin_write(rt_base_t pin, rt_base_t value)
 {
     /* Parameter validation */
-    if (pin >= GPIO_MAX_NUM) {
+    if (pin < 0 || pin >= GPIO_MAX_NUM) {
         LOG_E("Invalid GPIO pin %d", pin);
         return -RT_EINVAL;
     }
@@ -397,7 +423,7 @@ rt_err_t kd_pin_write(rt_base_t pin, rt_base_t value)
     volatile uint32_t*  ddr      = &gpio->port[port_idx].ddr;
     volatile uint32_t*  dr       = &gpio->port[port_idx].dr;
 
-    kd_gpio_pin_state_lock(pin);
+    rt_base_t state_level = kd_gpio_pin_state_lock(pin);
     kd_gpio_mode_t* pin_mode = &_gpio_inst.mode_table[pin];
     uint32_t        mode     = pin_mode->mode;
     uint32_t        dir      = pin_mode->dir;
@@ -408,7 +434,7 @@ rt_err_t kd_pin_write(rt_base_t pin, rt_base_t value)
 
             iomux |= BIT(7); // oe = 1
             if (0x00 != drv_fpioa_set_pin_cfg(pin, iomux)) {
-                kd_gpio_pin_state_unlock(pin);
+                kd_gpio_pin_state_unlock(pin, state_level);
                 LOG_E("Failed to set pin configuration for pin %d", pin);
                 return -RT_EINVAL;
             }
@@ -420,7 +446,7 @@ rt_err_t kd_pin_write(rt_base_t pin, rt_base_t value)
             dir           = GPIO_OD_DIRECTION_OUTPUT;
         }
     } else if (0x00 == dir) {
-        kd_gpio_pin_state_unlock(pin);
+        kd_gpio_pin_state_unlock(pin, state_level);
         LOG_E("Pin %d is input mode, not write it", pin);
         return -RT_EINVAL;
     }
@@ -428,7 +454,7 @@ rt_err_t kd_pin_write(rt_base_t pin, rt_base_t value)
     rt_base_t level = kd_gpio_bank_lock(pin);
     kd_pin_write_reg_raw(dr, port_pin, value);
     kd_gpio_bank_unlock(pin, level);
-    kd_gpio_pin_state_unlock(pin);
+    kd_gpio_pin_state_unlock(pin, state_level);
 
     return RT_EOK;
 }
@@ -436,7 +462,7 @@ rt_err_t kd_pin_write(rt_base_t pin, rt_base_t value)
 rt_err_t kd_pin_read(rt_base_t pin)
 {
     /* Parameter validation */
-    if (pin >= GPIO_MAX_NUM) {
+    if (pin < 0 || pin >= GPIO_MAX_NUM) {
         LOG_E("Invalid GPIO pin %d", pin);
         return -RT_EINVAL;
     }
@@ -446,7 +472,7 @@ rt_err_t kd_pin_read(rt_base_t pin)
     uint8_t             port_pin = pin & 0x1F;
     volatile uint32_t*  ddr      = &gpio->port[port_idx].ddr;
 
-    kd_gpio_pin_state_lock(pin);
+    rt_base_t state_level = kd_gpio_pin_state_lock(pin);
     kd_gpio_mode_t* pin_mode = &_gpio_inst.mode_table[pin];
     uint32_t        mode     = pin_mode->mode;
     uint32_t        dir      = pin_mode->dir;
@@ -457,7 +483,7 @@ rt_err_t kd_pin_read(rt_base_t pin)
 
             iomux &= ~BIT(7); // oe = 0
             if (0x00 != drv_fpioa_set_pin_cfg(pin, iomux)) {
-                kd_gpio_pin_state_unlock(pin);
+                kd_gpio_pin_state_unlock(pin, state_level);
                 LOG_E("Failed to set pin configuration for pin %d", pin);
                 return -RT_EINVAL;
             }
@@ -470,7 +496,7 @@ rt_err_t kd_pin_read(rt_base_t pin)
     }
 
     uint32_t value = kd_pin_get_dr(pin);
-    kd_gpio_pin_state_unlock(pin);
+    kd_gpio_pin_state_unlock(pin, state_level);
 
     return value;
 }
@@ -491,23 +517,44 @@ static void kd_pin_irq_handler(int vector, void* param)
         return;
     }
 
-    // Read the interrupt status
+    kd_gpio_irq_t* irq = &_gpio_inst.irq_table[pin];
+    rt_base_t level = rt_spin_lock_irqsave(&irq->lock);
+    /* Status and EOI belong to the registration protected by this lock. */
     uint32_t status = read32(&gpio->intstatus);
     if (status & BIT(port_pin)) {
-        kd_gpio_irq_t* irq = &_gpio_inst.irq_table[pin];
-        if (!irq->hdr) {
-            LOG_E("No IRQ handler registered for pin %d", port_pin);
+        void (*hdr)(void* args) = irq->hdr;
+        void* args = irq->args;
+#ifdef RT_USING_SMP
+        int cpu = rt_hw_cpu_id();
+#else
+        int cpu = 0;
+#endif
+
+        /* Acknowledge the edge before running the callback. An edge that
+         * arrives during the callback then stays latched and raises a new
+         * interrupt. EOI under this lock also keeps it from clearing an edge
+         * that belongs to a replacement handler attached after detach.
+         * Level interrupts ignore EOI. */
+        kd_pin_write_reg(pin, &gpio->porta_eoi, port_pin, 1);
+
+        if (!hdr) {
+            rt_spin_unlock_irqrestore(&irq->lock, level);
             return;
         }
 
-        // Call the registered handler
-        if (_gpio_inst.irq_table[pin].hdr) {
-            _gpio_inst.irq_table[pin].hdr(_gpio_inst.irq_table[pin].args);
-        }
+        rt_uint8_t previous_nest = irq->active_nest[cpu];
+        irq->in_flight++;
+        irq->active_nest[cpu] = rt_interrupt_get_nest();
+        rt_spin_unlock_irqrestore(&irq->lock, level);
 
-        // Clear the interrupt status
-        kd_pin_write_reg(pin, &gpio->porta_eoi, port_pin, 1);
+        hdr(args);
+
+        level = rt_spin_lock_irqsave(&irq->lock);
+        RT_ASSERT(irq->in_flight > 0);
+        irq->active_nest[cpu] = previous_nest;
+        irq->in_flight--;
     }
+    rt_spin_unlock_irqrestore(&irq->lock, level);
 }
 
 rt_err_t kd_pin_attach_irq(rt_base_t pin, rt_uint32_t mode, void (*hdr)(void* args), void* args)
@@ -536,27 +583,39 @@ rt_err_t kd_pin_attach_irq(rt_base_t pin, rt_uint32_t mode, void (*hdr)(void* ar
         return -RT_EINVAL;
     }
 
-    rt_hw_interrupt_mask(IRQN_GPIO0_INTERRUPT + pin);
-
     kd_gpio_irq_t* irq = &_gpio_inst.irq_table[pin];
+    rt_base_t      level = rt_spin_lock_irqsave(&irq->lock);
     if (irq->hdr) {
+        rt_spin_unlock_irqrestore(&irq->lock, level);
         LOG_E("IRQ handler already attached for pin %d", pin);
         return -RT_EBUSY;
     }
 
-    irq->hdr  = hdr;
-    irq->args = args;
+    rt_base_t work_level = rt_spin_lock_irqsave(&_gpio_inst.debounce_work.lock);
+    rt_bool_t work_busy = irq->debounce.runing;
+    rt_spin_unlock_irqrestore(&_gpio_inst.debounce_work.lock, work_level);
+    work_level = rt_spin_lock_irqsave(&_gpio_inst.irq_to_user_work.lock);
+    work_busy = work_busy || irq->to_user.runing;
+    rt_spin_unlock_irqrestore(&_gpio_inst.irq_to_user_work.lock, work_level);
+    if (work_busy || irq->in_flight != 0 || irq->notify_in_flight != 0 || irq->detaching) {
+        rt_spin_unlock_irqrestore(&irq->lock, level);
+        LOG_E("IRQ callback or work is still active for pin %d", pin);
+        return -RT_EBUSY;
+    }
 
     rt_memset(&irq->to_user, 0, sizeof(struct kd_gpio_irq_to_user_arg));
     rt_memset(&irq->debounce, 0, sizeof(struct kd_gpio_irq_debounce_arg));
 
     volatile kd_gpio_t* gpio = _gpio_inst.reg[pin >= 32]; // Get the correct GPIO instance
     if (!gpio) {
+        rt_spin_unlock_irqrestore(&irq->lock, level);
         LOG_E("Invalid GPIO instance for pin %d", pin);
         return -RT_EINVAL;
     }
     // Disable interrupt during configuration
     kd_pin_write_reg(pin, &gpio->inten, port_pin, 0);
+    kd_pin_write_reg(pin, &gpio->intmask, port_pin, 1);
+    kd_pin_write_reg(pin, &gpio->porta_eoi, port_pin, 1);
 
     switch (mode) {
     case GPIO_PE_RISING: {
@@ -583,35 +642,134 @@ rt_err_t kd_pin_attach_irq(rt_base_t pin, rt_uint32_t mode, void (*hdr)(void* ar
         kd_pin_write_reg(pin, &gpio->int_bothedge, port_pin, 0); // Set to both edges
     } break;
     default:
+        rt_spin_unlock_irqrestore(&irq->lock, level);
         LOG_E("Unsupported IRQ mode %d for pin %d", mode, port_pin);
         return -RT_EINVAL;
     }
 
     rt_snprintf(intr_name, sizeof(intr_name), "pin%d", pin);
     rt_hw_interrupt_install(IRQN_GPIO0_INTERRUPT + pin, kd_pin_irq_handler, RT_NULL, intr_name);
+    irq->args = args;
+    irq->hdr  = hdr;
+    rt_spin_unlock_irqrestore(&irq->lock, level);
+
+    return RT_EOK;
+}
+
+static void kd_pin_detach_irq_locked(rt_base_t pin, kd_gpio_irq_t* irq)
+{
+    uint8_t port_pin = pin & 0x1F;
+    volatile kd_gpio_t* gpio = _gpio_inst.reg[pin >= 32];
+
+    /* Mask the peripheral rather than the PLIC. A callback may detach itself,
+     * and the PLIC ignores completion if its source was disabled in the ISR. */
+    if (gpio) {
+        kd_pin_write_reg(pin, &gpio->inten, port_pin, 0);
+        kd_pin_write_reg(pin, &gpio->intmask, port_pin, 1);
+    }
+    irq->hdr  = NULL;
+    irq->args = NULL;
+
+    /* Workers take the IRQ lock before claiming a list entry. Remove only
+     * queued entries; an already claimed signal is covered by notify_in_flight. */
+    rt_base_t work_level = rt_spin_lock_irqsave(&_gpio_inst.irq_to_user_work.lock);
+    if (irq->to_user.runing) {
+        rt_list_remove(&irq->to_user.list);
+        irq->to_user.runing = 0;
+    }
+    rt_spin_unlock_irqrestore(&_gpio_inst.irq_to_user_work.lock, work_level);
+    work_level = rt_spin_lock_irqsave(&_gpio_inst.debounce_work.lock);
+    if (irq->debounce.runing) {
+        rt_list_remove(&irq->debounce.list);
+        irq->debounce.runing = 0;
+    }
+    rt_spin_unlock_irqrestore(&_gpio_inst.debounce_work.lock, work_level);
+    rt_memset(&irq->to_user.cfg, 0, sizeof(irq->to_user.cfg));
+}
+
+static void kd_pin_irq_wait_tick(void)
+{
+    /* mdelay() is interruptible: a pending GPIO signal would make a higher
+     * priority detacher spin and starve the signal worker it is waiting for.
+     * delay_until() suspends uninterruptibly, including with a pending signal. */
+    rt_tick_t tick = rt_tick_get();
+    rt_thread_delay_until(&tick, 1);
+}
+
+static void kd_pin_irq_wait_idle(kd_gpio_irq_t* irq)
+{
+    while (1) {
+        rt_base_t level = rt_spin_lock_irqsave(&irq->lock);
+        rt_bool_t idle = irq->in_flight == 0 && irq->notify_in_flight == 0;
+        rt_spin_unlock_irqrestore(&irq->lock, level);
+        if (idle)
+            return;
+        kd_pin_irq_wait_tick();
+    }
+}
+
+static rt_err_t kd_pin_detach_irq_for_owner(rt_base_t pin, int pid)
+{
+    if (pin < 0 || pin >= GPIO_IRQ_MAX_NUM) {
+        LOG_E("Invalid GPIO pin %d", pin);
+        return -RT_EINVAL;
+    }
+    kd_gpio_irq_t* irq = &_gpio_inst.irq_table[pin];
+    rt_base_t      level = rt_spin_lock_irqsave(&irq->lock);
+    if (pid != 0 && irq->to_user.pid != pid) {
+        rt_spin_unlock_irqrestore(&irq->lock, level);
+        return RT_EOK;
+    }
+    rt_uint8_t     nest = rt_interrupt_get_nest();
+    if (irq->detaching) {
+        rt_spin_unlock_irqrestore(&irq->lock, level);
+        if (nest != 0)
+            return -RT_EBUSY;
+        /* Another thread owns teardown. Do not unpublish a replacement that
+         * may be attached after that thread finishes. */
+        while (1) {
+            level = rt_spin_lock_irqsave(&irq->lock);
+            rt_bool_t done = !irq->detaching;
+            rt_spin_unlock_irqrestore(&irq->lock, level);
+            if (done)
+                return RT_EOK;
+            kd_pin_irq_wait_tick();
+        }
+    }
+#ifdef RT_USING_SMP
+    int            cpu = rt_hw_cpu_id();
+#else
+    int            cpu = 0;
+#endif
+    rt_bool_t      self_detach = nest != 0 && irq->active_nest[cpu] == nest;
+
+    /* An unrelated ISR cannot sleep for a callback active on another CPU.
+     * Leave the pin published and let a thread retry the detach. */
+    if (nest != 0 && (irq->in_flight > (self_detach ? 1U : 0U) || irq->notify_in_flight != 0)) {
+        rt_spin_unlock_irqrestore(&irq->lock, level);
+        return -RT_EBUSY;
+    }
+
+    irq->detaching = nest == 0;
+    kd_pin_detach_irq_locked(pin, irq);
+    if (nest != 0) {
+        irq->to_user.pid = 0;
+        rt_spin_unlock_irqrestore(&irq->lock, level);
+        return RT_EOK;
+    }
+    rt_spin_unlock_irqrestore(&irq->lock, level);
+    kd_pin_irq_wait_idle(irq);
+    level = rt_spin_lock_irqsave(&irq->lock);
+    irq->to_user.pid = 0;
+    irq->detaching = RT_FALSE;
+    rt_spin_unlock_irqrestore(&irq->lock, level);
 
     return RT_EOK;
 }
 
 rt_err_t kd_pin_detach_irq(rt_base_t pin)
 {
-    uint8_t port_pin = pin & 0x1F;
-
-    if (pin < 0 || pin >= GPIO_IRQ_MAX_NUM) {
-        LOG_E("Invalid GPIO pin %d", pin);
-        return -RT_EINVAL;
-    }
-    kd_pin_irq_enable(pin, 0);
-
-    kd_gpio_irq_t* irq = &_gpio_inst.irq_table[pin];
-
-    irq->hdr  = NULL;
-    irq->args = NULL;
-
-    rt_memset(&irq->to_user, 0, sizeof(struct kd_gpio_irq_to_user_arg));
-    rt_memset(&irq->debounce, 0, sizeof(struct kd_gpio_irq_debounce_arg));
-
-    return RT_EOK;
+    return kd_pin_detach_irq_for_owner(pin, 0);
 }
 
 rt_err_t kd_pin_irq_enable(rt_base_t pin, rt_uint32_t enabled)
@@ -624,13 +782,16 @@ rt_err_t kd_pin_irq_enable(rt_base_t pin, rt_uint32_t enabled)
     }
 
     kd_gpio_irq_t* irq = &_gpio_inst.irq_table[pin];
+    rt_base_t      level = rt_spin_lock_irqsave(&irq->lock);
     if (!irq->hdr) {
+        rt_spin_unlock_irqrestore(&irq->lock, level);
         LOG_E("No IRQ handler registered for pin %d", pin);
         return -RT_EINVAL;
     }
 
     volatile kd_gpio_t* gpio = _gpio_inst.reg[pin >= 32]; // Get the correct GPIO instance
     if (!gpio) {
+        rt_spin_unlock_irqrestore(&irq->lock, level);
         LOG_E("Invalid GPIO instance for pin %d", pin);
         return -RT_EINVAL;
     }
@@ -642,12 +803,11 @@ rt_err_t kd_pin_irq_enable(rt_base_t pin, rt_uint32_t enabled)
         kd_pin_write_reg(pin, &gpio->inten, port_pin, 1); // Enable interrupt for the pin
         kd_pin_write_reg(pin, &gpio->intmask, port_pin, 0); // Unmask the interrupt
     } else {
-        rt_hw_interrupt_mask(IRQN_GPIO0_INTERRUPT + pin);
-
-        // Disable the interrupt
-        kd_pin_write_reg(pin, &gpio->inten, port_pin, 0); // Enable interrupt for the pin
+        /* Leave the PLIC source enabled so an ISR can still complete. */
+        kd_pin_write_reg(pin, &gpio->inten, port_pin, 0); // Disable interrupt for the pin
         kd_pin_write_reg(pin, &gpio->intmask, port_pin, 1); // Mask the interrupt
     }
+    rt_spin_unlock_irqrestore(&irq->lock, level);
 
     return RT_EOK;
 }
@@ -655,30 +815,40 @@ rt_err_t kd_pin_irq_enable(rt_base_t pin, rt_uint32_t enabled)
 /* irq handler for usrapps */
 static void kd_pin_irq_to_user_work(struct rt_work* work, void* work_data)
 {
-    rt_base_t level;
-
-    struct kd_gpio_irq_to_user_arg arg, *_arg = NULL;
-
     kd_gpio_work_t* gpio_work = (kd_gpio_work_t*)work_data;
     if (NULL == gpio_work) {
         LOG_E("Invalid work data\n");
         return;
     }
 
-    level = rt_spin_lock_irqsave(&gpio_work->lock);
-    while (!rt_list_isempty(&gpio_work->list)) {
-        int runging = 0;
-
-        _arg = rt_list_entry(gpio_work->list.next, struct kd_gpio_irq_to_user_arg, list);
-        rt_memcpy(&arg, _arg, sizeof(struct kd_gpio_irq_to_user_arg));
-
-        if ((0 < _arg->pid) && (_arg->runing)) {
-            runging = 1;
+    while (1) {
+        rt_base_t level = rt_spin_lock_irqsave(&gpio_work->lock);
+        if (rt_list_isempty(&gpio_work->list)) {
+            rt_spin_unlock_irqrestore(&gpio_work->lock, level);
+            return;
         }
-
+        struct kd_gpio_irq_to_user_arg* pending = rt_list_entry(gpio_work->list.next, struct kd_gpio_irq_to_user_arg, list);
         rt_spin_unlock_irqrestore(&gpio_work->lock, level);
 
-        if (runging) {
+        kd_gpio_irq_t* irq = rt_container_of(pending, kd_gpio_irq_t, to_user);
+        rt_base_t irq_level = rt_spin_lock_irqsave(&irq->lock);
+        level = rt_spin_lock_irqsave(&gpio_work->lock);
+        /* Detach may have canceled this entry while we acquired the IRQ lock. */
+        if (!pending->runing) {
+            rt_spin_unlock_irqrestore(&gpio_work->lock, level);
+            rt_spin_unlock_irqrestore(&irq->lock, irq_level);
+            continue;
+        }
+        struct kd_gpio_irq_to_user_arg arg = *pending;
+        pending->runing = 0;
+        rt_list_remove(&pending->list);
+        rt_bool_t deliver = irq->hdr != NULL && arg.pid > 0;
+        if (deliver)
+            irq->notify_in_flight++;
+        rt_spin_unlock_irqrestore(&gpio_work->lock, level);
+        rt_spin_unlock_irqrestore(&irq->lock, irq_level);
+
+        if (deliver) {
             siginfo_t info;
             rt_memset(&info, 0, sizeof(info));
 
@@ -686,60 +856,69 @@ static void kd_pin_irq_to_user_work(struct rt_work* work, void* work_data)
             info.si_ptr  = arg.cfg.sigval;
 
             lwp_kill_ext(arg.pid, arg.cfg.signo, &info);
+            irq_level = rt_spin_lock_irqsave(&irq->lock);
+            RT_ASSERT(irq->notify_in_flight > 0);
+            irq->notify_in_flight--;
+            rt_spin_unlock_irqrestore(&irq->lock, irq_level);
         }
-
-        level = rt_spin_lock_irqsave(&gpio_work->lock);
-
-        _arg->runing = 0;
-        rt_list_remove(&_arg->list);
     }
-    rt_spin_unlock_irqrestore(&gpio_work->lock, level);
 }
 
 static void kd_pin_irq_debounce_work(struct rt_work* work, void* work_data)
 {
-    rt_base_t level;
-
-    struct kd_gpio_irq_debounce_arg arg, *_arg = NULL;
-
     kd_gpio_work_t* gpio_work = (kd_gpio_work_t*)work_data;
     if (NULL == gpio_work) {
         LOG_E("Invalid work data\n");
         return;
     }
 
-    level = rt_spin_lock_irqsave(&gpio_work->lock);
-    while (!rt_list_isempty(&gpio_work->list)) {
-        int runing = 0;
-
-        _arg = rt_list_entry(gpio_work->list.next, struct kd_gpio_irq_debounce_arg, list);
-        rt_memcpy(&arg, _arg, sizeof(struct kd_gpio_irq_debounce_arg));
-
-        runing = _arg->runing;
-
+    while (1) {
+        /* Collect every expired entry, not just the list head: new entries
+         * are inserted at the head and may have a later deadline. */
+        rt_uint64_t candidates = 0;
+        rt_uint64_t now        = cpu_ticks_ms();
+        rt_base_t   level      = rt_spin_lock_irqsave(&gpio_work->lock);
+        if (rt_list_isempty(&gpio_work->list)) {
+            rt_spin_unlock_irqrestore(&gpio_work->lock, level);
+            return;
+        }
+        for (struct rt_list_node* node = gpio_work->list.next; node != &gpio_work->list; node = node->next) {
+            struct kd_gpio_irq_debounce_arg* pending = rt_list_entry(node, struct kd_gpio_irq_debounce_arg, list);
+            if (now > pending->tmo_ticks_ms) {
+                rt_size_t index = rt_container_of(pending, kd_gpio_irq_t, debounce) - _gpio_inst.irq_table;
+                candidates |= (rt_uint64_t)1 << index;
+            }
+        }
         rt_spin_unlock_irqrestore(&gpio_work->lock, level);
 
-        int         del_node  = 0;
-        rt_uint64_t ticks_now = cpu_ticks_ms();
-
-        if (runing && (ticks_now > arg.tmo_ticks_ms)) {
-            rt_uint16_t pin = arg.pin;
-
-            volatile kd_gpio_t* gpio = _gpio_inst.reg[pin >= 32]; // Get the correct GPIO instance
-            kd_pin_write_reg(pin, &gpio->intmask, pin & 0x1F, 0); // Unmask the interrupt
-
-            del_node = 1;
-        } else {
+        if (!candidates) {
             rt_thread_mdelay(1);
+            continue;
         }
 
-        level = rt_spin_lock_irqsave(&gpio_work->lock);
-        if (del_node) {
-            _arg->runing = 0;
-            rt_list_remove(&_arg->list);
+        /* Lock order is pin IRQ lock, then work list lock. Recheck each
+         * candidate because detach may have canceled it meanwhile. */
+        for (rt_size_t index = 0; index < GPIO_IRQ_MAX_NUM; index++) {
+            if (!(candidates & ((rt_uint64_t)1 << index)))
+                continue;
+
+            kd_gpio_irq_t*                   irq     = &_gpio_inst.irq_table[index];
+            struct kd_gpio_irq_debounce_arg* pending = &irq->debounce;
+            rt_base_t                        irq_level = rt_spin_lock_irqsave(&irq->lock);
+            level = rt_spin_lock_irqsave(&gpio_work->lock);
+            if (pending->runing && cpu_ticks_ms() > pending->tmo_ticks_ms) {
+                rt_uint16_t pin = pending->pin;
+                pending->runing = 0;
+                rt_list_remove(&pending->list);
+                if (irq->hdr) {
+                    volatile kd_gpio_t* gpio = _gpio_inst.reg[pin >= 32];
+                    kd_pin_write_reg(pin, &gpio->intmask, pin & 0x1F, 0);
+                }
+            }
+            rt_spin_unlock_irqrestore(&gpio_work->lock, level);
+            rt_spin_unlock_irqrestore(&irq->lock, irq_level);
         }
     }
-    rt_spin_unlock_irqrestore(&gpio_work->lock, level);
 }
 
 static void kd_pin_irq_to_user_handler(void* arg)
@@ -753,17 +932,24 @@ static void kd_pin_irq_to_user_handler(void* arg)
     }
 
     kd_gpio_irq_t* irq  = &_gpio_inst.irq_table[pin];
-    rt_uint16_t    mode = irq->to_user.cfg.mode;
+    rt_base_t irq_level = rt_spin_lock_irqsave(&irq->lock);
+    if (irq->hdr != kd_pin_irq_to_user_handler) {
+        rt_spin_unlock_irqrestore(&irq->lock, irq_level);
+        return;
+    }
+    rt_uint16_t mode = irq->to_user.cfg.mode;
 
     if ((GPIO_PE_HIGH == mode) || (GPIO_PE_LOW == mode)) {
         volatile kd_gpio_t* gpio = _gpio_inst.reg[pin >= 32]; // Get the correct GPIO instance
         if (!gpio) {
+            rt_spin_unlock_irqrestore(&irq->lock, irq_level);
             LOG_E("Invalid GPIO instance for pin %d", pin);
             return;
         }
         kd_pin_write_reg(pin, &gpio->intmask, port_pin, 1); // Mask the interrupt
 
         struct kd_gpio_irq_debounce_arg* debounce = &irq->debounce;
+        rt_base_t level = rt_spin_lock_irqsave(&_gpio_inst.debounce_work.lock);
         if (0x00 == debounce->runing) {
             debounce->runing = 1;
             debounce->pin    = pin;
@@ -774,15 +960,19 @@ static void kd_pin_irq_to_user_handler(void* arg)
             rt_list_insert_after(&_gpio_inst.debounce_work.list, &debounce->list);
             rt_workqueue_submit_work(_gpio_inst.debounce_work.queue, &_gpio_inst.debounce_work.work, 1);
         }
+        rt_spin_unlock_irqrestore(&_gpio_inst.debounce_work.lock, level);
     }
 
     struct kd_gpio_irq_to_user_arg* to_user = &irq->to_user;
+    rt_base_t level = rt_spin_lock_irqsave(&_gpio_inst.irq_to_user_work.lock);
     if (0x00 == to_user->runing) {
         to_user->runing = 1;
 
         rt_list_insert_after(&_gpio_inst.irq_to_user_work.list, &to_user->list);
         rt_workqueue_submit_work(_gpio_inst.irq_to_user_work.queue, &_gpio_inst.irq_to_user_work.work, 0);
     }
+    rt_spin_unlock_irqrestore(&_gpio_inst.irq_to_user_work.lock, level);
+    rt_spin_unlock_irqrestore(&irq->lock, irq_level);
 }
 
 /* Wrap to rt-thread device */
@@ -795,11 +985,7 @@ static rt_err_t kd_pin_close_wrap(rt_device_t dev)
     if (0x00 != pid) {
         /* close from lwp process */
         for (int i = 0; i < GPIO_IRQ_MAX_NUM; i++) {
-            kd_gpio_irq_t* irq = &_gpio_inst.irq_table[i];
-
-            if (irq->to_user.pid == pid) {
-                kd_pin_detach_irq(i);
-            }
+            kd_pin_detach_irq_for_owner(i, pid);
         }
     }
 
@@ -938,8 +1124,14 @@ static rt_err_t kd_pin_control_wrap(rt_device_t dev, int cmd, void* args)
             return -RT_ERROR;
         }
 
+        rt_base_t level = rt_spin_lock_irqsave(&irq->lock);
+        if (irq->hdr != hdr || irq->args != (void*)(long)pin) {
+            rt_spin_unlock_irqrestore(&irq->lock, level);
+            return -RT_ERROR;
+        }
         irq->to_user.pid = pid;
         rt_memcpy(&irq->to_user.cfg, &irq_cfg, sizeof(irq->to_user.cfg));
+        rt_spin_unlock_irqrestore(&irq->lock, level);
     } break;
     case KD_GPIO_IOCTL_GET_IRQ: {
         gpio_irqcfg_t irq_cfg;
@@ -956,11 +1148,15 @@ static rt_err_t kd_pin_control_wrap(rt_device_t dev, int cmd, void* args)
             return -RT_EINVAL;
         }
         kd_gpio_irq_t* irq = &_gpio_inst.irq_table[pin];
+        gpio_irqcfg_t current;
+        rt_base_t level = rt_spin_lock_irqsave(&irq->lock);
+        rt_memcpy(&current, &irq->to_user.cfg, sizeof(current));
+        rt_spin_unlock_irqrestore(&irq->lock, level);
 
         if (0x00 != pid) {
-            lwp_put_to_user(args, &irq->to_user.cfg, sizeof(irq_cfg));
+            lwp_put_to_user(args, &current, sizeof(current));
         } else {
-            rt_memcpy(args, &irq->to_user.cfg, sizeof(irq_cfg));
+            rt_memcpy(args, &current, sizeof(current));
         }
     } break;
     case KD_GPIO_IOCTL_CTRL_IRQ: {
@@ -981,7 +1177,7 @@ static rt_err_t kd_pin_control_wrap(rt_device_t dev, int cmd, void* args)
         int detach = cfg.value & (1 << 7);
 
         if ((0x00 == enable) && detach) {
-            if (RT_EOK != kd_pin_detach_irq(pin)) {
+            if (RT_EOK != kd_pin_detach_irq_for_owner(pin, pid)) {
                 LOG_E("control pin%d detach irq failed\n", pin);
                 return -RT_ERROR;
             }
@@ -1046,14 +1242,19 @@ int kd_pin_init(void)
 #endif
 
     for (int i = 0; i < GPIO_MAX_NUM; i++) {
-        atoic_lock_init(&g_gpio_pin_state_locks[i]);
+        rt_spin_lock_init(&g_gpio_pin_state_locks[i]);
     }
 
     for (int i = 0; i < GPIO_IRQ_MAX_NUM; i++) {
         kd_gpio_irq_t* irq = &_gpio_inst.irq_table[i];
 
+        rt_spin_lock_init(&irq->lock);
         irq->hdr  = NULL;
         irq->args = NULL;
+        irq->in_flight = 0;
+        irq->notify_in_flight = 0;
+        irq->detaching = RT_FALSE;
+        rt_memset(irq->active_nest, 0, sizeof(irq->active_nest));
         rt_memset(&irq->to_user, 0, sizeof(struct kd_gpio_irq_to_user_arg));
         rt_memset(&irq->debounce, 0, sizeof(struct kd_gpio_irq_debounce_arg));
 
@@ -1066,7 +1267,7 @@ int kd_pin_init(void)
         goto _error1;
     }
     rt_work_init(&_gpio_inst.debounce_work.work, kd_pin_irq_debounce_work, &_gpio_inst.debounce_work);
-    rt_spin_lock_init(_gpio_inst.debounce_work.lock);
+    rt_spin_lock_init(&_gpio_inst.debounce_work.lock);
     rt_list_init(&_gpio_inst.debounce_work.list);
 
     _gpio_inst.irq_to_user_work.queue = rt_workqueue_create("gpio_irq_to_user", 20480, RT_SYSTEM_WORKQUEUE_PRIORITY - 1);
@@ -1075,7 +1276,7 @@ int kd_pin_init(void)
         goto _error2;
     }
     rt_work_init(&_gpio_inst.irq_to_user_work.work, kd_pin_irq_to_user_work, &_gpio_inst.irq_to_user_work);
-    rt_spin_lock_init(_gpio_inst.irq_to_user_work.lock);
+    rt_spin_lock_init(&_gpio_inst.irq_to_user_work.lock);
     rt_list_init(&_gpio_inst.irq_to_user_work.list);
 
     device = &_gpio_inst.dev;

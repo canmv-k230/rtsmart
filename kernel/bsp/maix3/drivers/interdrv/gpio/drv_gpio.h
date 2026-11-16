@@ -71,7 +71,30 @@ typedef struct {
 
 int kd_pin_init(void);
 
+/*
+ * Attach hdr to pin, leaving the interrupt disabled until kd_pin_irq_enable().
+ * hdr runs in interrupt context. It may call kd_pin_read(), kd_pin_write() and
+ * kd_pin_mode() on any pin, and kd_pin_irq_enable() and kd_pin_detach_irq()
+ * on its own pin.
+ *
+ * Returns -RT_EBUSY if a handler is attached, or if a previous registration
+ * is still being torn down: its callback is running, a userspace signal is
+ * being delivered, or another thread is detaching. A callback that detaches
+ * its own pin therefore cannot re-attach it before returning; reconfigure the
+ * edge from a thread or work item instead.
+ */
 rt_err_t kd_pin_attach_irq(rt_base_t pin, rt_uint32_t mode, void (*hdr)(void* args), void* args);
+
+/*
+ * Detach the handler from pin. Call it from a thread: it then waits until any
+ * running callback and signal delivery have finished, so the old args may be
+ * freed once it returns.
+ *
+ * A callback may detach its own pin from interrupt context; that call does not
+ * wait. Any other interrupt-context call returns -RT_EBUSY, and leaves the
+ * handler attached, while another callback or signal delivery for the pin is
+ * active.
+ */
 rt_err_t kd_pin_detach_irq(rt_base_t pin);
 
 rt_err_t kd_pin_irq_enable(rt_base_t pin, rt_uint32_t enabled);
