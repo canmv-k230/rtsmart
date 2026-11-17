@@ -627,6 +627,101 @@ static struct usbh_video_format *uvc_find_format(struct usbh_video *video,
     return RT_NULL;
 }
 
+/* Callers see sizes and intervals; frame descriptors are an implementation
+ * detail. A camera may describe one size with several descriptors (e.g. one
+ * per default rate), and some descriptor slots may be unusable. ENUM_FRAME
+ * lists each usable size once, ENUM_INTERVAL lists the intervals of all
+ * descriptors of a size once each, and S_FMT picks the first descriptor of
+ * the size that supports the requested interval. */
+
+static bool uvc_frame_has_size(const struct usbh_video_frame *frame,
+                               uint32_t width, uint32_t height)
+{
+    return usbh_video_frame_usable(frame) &&
+           frame->wWidth == width && frame->wHeight == height;
+}
+
+/* First usable descriptor of this size, or RT_NULL. */
+static struct usbh_video_frame *uvc_find_frame(struct usbh_video_format *format,
+                                               uint32_t width, uint32_t height)
+{
+    for (int i = 0; i < format->num_of_frames; i++) {
+        if (uvc_frame_has_size(&format->frame[i], width, height)) {
+            return &format->frame[i];
+        }
+    }
+
+    return RT_NULL;
+}
+
+/* Intervals one descriptor lists. A continuous range lists only its default;
+ * S_FMT still accepts the whole range. */
+static int uvc_frame_interval_count(const struct usbh_video_frame *frame)
+{
+    if (frame->bFrameIntervalType == 0) {
+        return 1;
+    }
+    return frame->bFrameIntervalType < MAX_INTERVAL_NUM ? frame->bFrameIntervalType
+                                                         : MAX_INTERVAL_NUM;
+}
+
+static uint32_t uvc_frame_interval(const struct usbh_video_frame *frame, int index)
+{
+    return frame->bFrameIntervalType ? frame->dwFrameInterval[index]
+                                     : frame->dwDefaultFrameInterval;
+}
+
+/* Whether ENUM_INTERVAL already listed this interval for the size before
+ * reaching entry interval_index of descriptor frame_index. */
+static bool uvc_interval_listed_before(struct usbh_video_format *format, int frame_index,
+                                       int interval_index, uint32_t interval)
+{
+    const struct usbh_video_frame *frame = &format->frame[frame_index];
+
+    for (int i = 0; i <= frame_index; i++) {
+        const struct usbh_video_frame *other = &format->frame[i];
+        int count;
+
+        if (!uvc_frame_has_size(other, frame->wWidth, frame->wHeight)) {
+            continue;
+        }
+        count = (i == frame_index) ? interval_index : uvc_frame_interval_count(other);
+        for (int j = 0; j < count; j++) {
+            if (uvc_frame_interval(other, j) == interval) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+static bool uvc_frame_supports_interval(const struct usbh_video_frame *frame, uint32_t interval)
+{
+    if (interval == 0) {
+        return false;
+    }
+    /* The default is always valid, even past a truncated discrete list. */
+    if (interval == frame->dwDefaultFrameInterval) {
+        return true;
+    }
+    if (frame->bFrameIntervalType) {
+        for (int i = 0; i < uvc_frame_interval_count(frame); i++) {
+            if (frame->dwFrameInterval[i] == interval) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /* Continuous: dwFrameInterval[] holds min, max and step. */
+    return frame->dwFrameInterval[0] != 0 &&
+           interval >= frame->dwFrameInterval[0] &&
+           interval <= frame->dwFrameInterval[1] &&
+           (frame->dwFrameInterval[2] == 0 ||
+            (interval - frame->dwFrameInterval[0]) % frame->dwFrameInterval[2] == 0);
+}
+
 static k_pixel_format uvc_fourcc_to_kpixel(uint32_t fourcc)
 {
     switch (fourcc) {
@@ -1623,6 +1718,8 @@ static rt_err_t uvc_control(rt_device_t dev, int cmd, void *args)
         struct uvc_framedesc local_frame;
         struct uvc_framedesc *frame_desc;
         struct usbh_video_format *format = NULL;
+        struct usbh_video_frame *frame = NULL;
+        uint32_t index = 0;
 
         if (lwp_self() == NULL) {
             frame_desc = (struct uvc_framedesc *)args;
@@ -1639,14 +1736,28 @@ static rt_err_t uvc_control(rt_device_t dev, int cmd, void *args)
             goto out;
         }
 
-        if (frame_desc->index >= format->num_of_frames) {
+        /* Keep USB frame indexes in the descriptor table, but list each
+         * usable size once, without the holes of unusable descriptors. */
+        for (int i = 0; i < format->num_of_frames; i++) {
+            struct usbh_video_frame *candidate = &format->frame[i];
+
+            if (!usbh_video_frame_usable(candidate) ||
+                uvc_find_frame(format, candidate->wWidth, candidate->wHeight) != candidate) {
+                continue;
+            }
+            if (index++ == frame_desc->index) {
+                frame = candidate;
+                break;
+            }
+        }
+        if (frame == NULL) {
             ret = -EINVAL;
             goto out;
         }
 
-        frame_desc->width = format->frame[frame_desc->index].wWidth;
-        frame_desc->height = format->frame[frame_desc->index].wHeight;
-        frame_desc->defaultframeinterval = format->frame[frame_desc->index].dwDefaultFrameInterval;
+        frame_desc->width = frame->wWidth;
+        frame_desc->height = frame->wHeight;
+        frame_desc->defaultframeinterval = frame->dwDefaultFrameInterval;
         frame_desc->fourcc = format->fourcc;
 
         if (lwp_self() != NULL) {
@@ -1656,7 +1767,6 @@ static rt_err_t uvc_control(rt_device_t dev, int cmd, void *args)
         break;
     }
     case VIDIOC_ENUM_INTERVAL: {
-        int i;
         struct uvc_fpsdesc local_fps;
         struct uvc_fpsdesc *fps_desc;
         struct usbh_video_format *format = NULL;
@@ -1677,31 +1787,40 @@ static rt_err_t uvc_control(rt_device_t dev, int cmd, void *args)
             goto out;
         }
 
-        for (i = 0; i < format->num_of_frames; i++) {
-            if ((fps_desc->width == format->frame[i].wWidth) &&
-                (fps_desc->height == format->frame[i].wHeight))
-                frame = &format->frame[i];
-        }
-
-        if (frame == NULL) {
+        if (uvc_find_frame(format, fps_desc->width, fps_desc->height) == RT_NULL) {
             USB_LOG_ERR("unmatch frame size: %ux%u\n",
                         fps_desc->width, fps_desc->height);
             ret = -EINVAL;
             goto out;
         }
 
-        if (frame->bFrameIntervalType) {
-            if (fps_desc->index >= frame->bFrameIntervalType) {
-                ret = -EINVAL;
-                goto out;
+        /* Never list zero; EINVAL past the last entry ends the caller's loop. */
+        uint32_t listed = 0;
+        bool found = false;
+
+        for (int i = 0; i < format->num_of_frames && !found; i++) {
+            frame = &format->frame[i];
+            if (!uvc_frame_has_size(frame, fps_desc->width, fps_desc->height)) {
+                continue;
             }
+            for (int j = 0; j < uvc_frame_interval_count(frame); j++) {
+                uint32_t interval = uvc_frame_interval(frame, j);
 
-            fps_desc->frameinterval = frame->dwFrameInterval[fps_desc->index];
-            fps_desc->fourcc = format->fourcc;
-
-        } else {
-            USB_LOG_ERR("have no interval field ?: %s %d\n", __func__, __LINE__);
+                if (interval == 0 || uvc_interval_listed_before(format, i, j, interval)) {
+                    continue;
+                }
+                if (listed++ == fps_desc->index) {
+                    fps_desc->frameinterval = interval;
+                    found = true;
+                    break;
+                }
+            }
         }
+        if (!found) {
+            ret = -EINVAL;
+            goto out;
+        }
+        fps_desc->fourcc = format->fourcc;
 
         if (lwp_self() != NULL) {
             lwp_put_to_user(args, fps_desc, sizeof(*fps_desc));
@@ -1743,6 +1862,9 @@ static rt_err_t uvc_control(rt_device_t dev, int cmd, void *args)
             uint16_t w = uvc_format->frame[i].wWidth;
             uint16_t h = uvc_format->frame[i].wHeight;
 
+            if (!usbh_video_frame_usable(&uvc_format->frame[i])) {
+                continue;
+            }
             d = min(w, rw) * min(h, rh);
             d = w*h + rw*rh - 2*d;
             if (d < maxd) {
@@ -1760,17 +1882,25 @@ static rt_err_t uvc_control(rt_device_t dev, int cmd, void *args)
             goto out;
         }
 
-        for (i = 0; i < frame->bFrameIntervalType; i++) {
-            if (fmt->frameinterval == frame->dwFrameInterval[i])
+        /* Several descriptors may share this size: use the first that
+         * supports the requested interval. */
+        for (i = 0; i < uvc_format->num_of_frames; i++) {
+            struct usbh_video_frame *candidate = &uvc_format->frame[i];
+
+            if (uvc_frame_has_size(candidate, frame->wWidth, frame->wHeight) &&
+                uvc_frame_supports_interval(candidate, fmt->frameinterval)) {
+                frame = candidate;
                 break;
+            }
         }
 
-        if (i >= frame->bFrameIntervalType) {
+        if (!uvc_frame_supports_interval(frame, fmt->frameinterval)) {
             /* 0 asks for the default interval: not an error. */
             if (fmt->frameinterval != 0) {
                 USB_LOG_ERR("Unsupported interval %d in (%ux%u). use default interval = %d\n",
                             fmt->frameinterval, fmt->width, fmt->height, frame->dwDefaultFrameInterval);
             }
+            /* Never zero: only usable frames are selected. */
             fmt->frameinterval = frame->dwDefaultFrameInterval;
         }
 
@@ -1784,6 +1914,8 @@ static rt_err_t uvc_control(rt_device_t dev, int cmd, void *args)
         video->current_frame.wHeight = frame->wHeight;
         video->current_frame.dwRequestFrameInterval = fmt->frameinterval;
         video->current_frame.dwMaxVideoFrameBufferSize = frame->dwMaxVideoFrameBufferSize;
+        video->current_frame.bFormatIndex = uvc_format - video->format + 1;
+        video->current_frame.bFrameIndex = frame - uvc_format->frame + 1;
 
         if (lwp_self() != NULL) {
             lwp_put_to_user(args, fmt, sizeof(*fmt));

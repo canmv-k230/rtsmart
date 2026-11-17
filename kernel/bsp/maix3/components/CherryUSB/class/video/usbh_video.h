@@ -34,6 +34,13 @@ struct usbh_video_frame {
     uint32_t dwMaxVideoFrameBufferSize;
 };
 
+/* Missing or malformed frame descriptors leave slots that callers must never
+ * enumerate, select or probe. */
+static inline bool usbh_video_frame_usable(const struct usbh_video_frame *frame)
+{
+    return frame->wWidth && frame->wHeight && frame->dwDefaultFrameInterval;
+}
+
 struct usbh_video_format {
     struct usbh_video_frame frame[MAX_FRAME_NUM];
     uint8_t format_type;
@@ -62,6 +69,10 @@ struct request_frame {
     uint16_t wHeight;
     uint32_t dwRequestFrameInterval;
     uint32_t dwMaxVideoFrameBufferSize;
+    /* USB descriptor indexes chosen by S_FMT (1-based, 0 = none). Opening
+     * probes exactly this frame instead of searching by size again. */
+    uint8_t bFormatIndex;
+    uint8_t bFrameIndex;
 };
 
 struct usbh_video {

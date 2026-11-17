@@ -239,6 +239,9 @@ static inline __attribute__((always_inline)) rt_err_t _usbd_video_ioctl_create_p
         goto _exit;
     }
 
+    /* Let error cleanup release the pool and each block acquired so far. */
+    inst->buffer_pool_id = pool_id;
+
     inst->frames = rt_malloc(sizeof(struct usbd_video_frame_t) * cfg.buffer_count);
     if (!inst->frames) {
         LOG_E("Can't malloc buffer");
@@ -253,8 +256,6 @@ static inline __attribute__((always_inline)) rt_err_t _usbd_video_ioctl_create_p
         if (VB_INVALID_HANDLE == (frame->handle = vb_get_blk_by_size_and_pool_id(pool_id, pool_blk_size, VB_UID_V_VI))) {
             LOG_E("No blk");
 
-            rt_free(frame);
-
             ret = RT_ENOMEM;
             goto _error;
         }
@@ -268,11 +269,10 @@ static inline __attribute__((always_inline)) rt_err_t _usbd_video_ioctl_create_p
 
         rt_list_init(&frame->list);
         rt_list_insert_after(&inst->free_list, &frame->list);
+        inst->buffer_cnt = i + 1;
     }
 
-    inst->buffer_cnt     = cfg.buffer_count;
     inst->buffer_size    = cfg.buffer_size;
-    inst->buffer_pool_id = pool_id;
 
     rt_mutex_release(&inst->mutex);
 
