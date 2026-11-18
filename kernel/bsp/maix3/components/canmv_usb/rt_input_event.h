@@ -187,19 +187,20 @@ struct rt_input_dev
     struct rt_device parent;
     struct rt_input_rx_fifo *rx_fifo;
     rt_size_t rx_bufsz;
+    rt_uint16_t reader_count;
     int id;
     rt_bool_t connected;
     struct rt_input_info info;
 };
 
-rt_err_t rt_input_dev_register(struct rt_input_dev *input);
-rt_err_t rt_input_dev_reconnect(struct rt_input_dev *input);
+rt_err_t rt_input_dev_register(struct rt_input_dev *input, const struct rt_input_info *info);
+rt_err_t rt_input_dev_reconnect(struct rt_input_dev *input, const struct rt_input_info *info);
 rt_err_t rt_input_dev_disconnect(struct rt_input_dev *input);
-void rt_input_dev_unregister(struct rt_input_dev *input);
+/* Stop the producer before unregistering. On -RT_EBUSY the device is unchanged;
+ * disconnect it to stop new readers, then retry after the last close. */
+rt_err_t rt_input_dev_unregister(struct rt_input_dev *input);
 rt_err_t rt_input_report(struct rt_input_dev *input, rt_uint16_t type, rt_uint16_t code, rt_int32_t value);
 rt_err_t rt_input_sync(struct rt_input_dev *input);
-void rt_input_set_name(struct rt_input_dev *input, const char *name);
-void rt_input_set_kind(struct rt_input_dev *input, rt_uint32_t kind);
-void rt_input_set_capability(struct rt_input_dev *input, rt_uint16_t type, rt_uint16_t code);
+void rt_input_set_capability(struct rt_input_info *info, rt_uint16_t type, rt_uint16_t code);
 
 #endif

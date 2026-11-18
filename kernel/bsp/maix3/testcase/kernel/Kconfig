@@ -4,6 +4,11 @@ menuconfig ENABLE_K230_UTEST
     select RT_USING_UTEST
 
     if ENABLE_K230_UTEST
+        config UTEST_INPUT_EVENT_TC
+            bool "USB input event lifecycle test"
+            default n
+            depends on CHERRY_USB_HOST_ENABLE_CLASS_HID && RT_USING_POSIX
+
         config UTEST_MEMHEAP_TC
             bool "memheap stability test"
             default n

@@ -71,7 +71,6 @@ static void hid_prepare_device(struct hid_device *hid)
     hid->last_buttons = 0;
     rt_memset(hid->last_report, 0, sizeof(hid->last_report));
     rt_memset(&hid->report_map, 0, sizeof(hid->report_map));
-    rt_memset(&hid->input.info, 0, sizeof(hid->input.info));
 }
 
 static rt_uint16_t hid_button_code(rt_uint8_t index)
@@ -375,35 +374,34 @@ static void hid_cleanup_device(struct hid_device *hid)
 
 static int hid_start_device(struct hid_device *hid, rt_uint8_t *buffer, usbh_complete_callback_t callback)
 {
+    struct rt_input_info info = {0};
     int ret;
 
-    rt_memset(&hid->input.info, 0, sizeof(hid->input.info));
-
     if (hid->type == HID_DEV_KEYBOARD) {
-        rt_input_set_name(&hid->input, "usb-hid-keyboard");
-        rt_input_set_kind(&hid->input, RT_INPUT_KIND_KEYBOARD);
-        rt_input_set_capability(&hid->input, EV_KEY, KEY_A);
-        rt_input_set_capability(&hid->input, EV_KEY, KEY_ENTER);
+        rt_strncpy(info.name, "usb-hid-keyboard", sizeof(info.name));
+        info.kind = RT_INPUT_KIND_KEYBOARD;
+        rt_input_set_capability(&info, EV_KEY, KEY_A);
+        rt_input_set_capability(&info, EV_KEY, KEY_ENTER);
     } else if (hid->type == HID_DEV_TOUCH) {
-        rt_input_set_name(&hid->input, "usb-hid-touch");
-        rt_input_set_kind(&hid->input, RT_INPUT_KIND_TOUCH);
-        rt_input_set_capability(&hid->input, EV_KEY, BTN_TOUCH);
-        rt_input_set_capability(&hid->input, EV_ABS, ABS_X);
-        rt_input_set_capability(&hid->input, EV_ABS, ABS_Y);
-        rt_input_set_capability(&hid->input, EV_ABS, ABS_PRESSURE);
+        rt_strncpy(info.name, "usb-hid-touch", sizeof(info.name));
+        info.kind = RT_INPUT_KIND_TOUCH;
+        rt_input_set_capability(&info, EV_KEY, BTN_TOUCH);
+        rt_input_set_capability(&info, EV_ABS, ABS_X);
+        rt_input_set_capability(&info, EV_ABS, ABS_Y);
+        rt_input_set_capability(&info, EV_ABS, ABS_PRESSURE);
     } else {
-        rt_input_set_name(&hid->input, "usb-hid-mouse");
-        rt_input_set_kind(&hid->input, RT_INPUT_KIND_MOUSE);
-        rt_input_set_capability(&hid->input, EV_KEY, BTN_LEFT);
-        rt_input_set_capability(&hid->input, EV_REL, REL_X);
-        rt_input_set_capability(&hid->input, EV_REL, REL_Y);
-        rt_input_set_capability(&hid->input, EV_REL, REL_WHEEL);
+        rt_strncpy(info.name, "usb-hid-mouse", sizeof(info.name));
+        info.kind = RT_INPUT_KIND_MOUSE;
+        rt_input_set_capability(&info, EV_KEY, BTN_LEFT);
+        rt_input_set_capability(&info, EV_REL, REL_X);
+        rt_input_set_capability(&info, EV_REL, REL_Y);
+        rt_input_set_capability(&info, EV_REL, REL_WHEEL);
     }
 
     if (hid->registered) {
-        ret = rt_input_dev_reconnect(&hid->input);
+        ret = rt_input_dev_reconnect(&hid->input, &info);
     } else {
-        ret = rt_input_dev_register(&hid->input);
+        ret = rt_input_dev_register(&hid->input, &info);
         if (ret == RT_EOK)
             hid->registered = RT_TRUE;
     }

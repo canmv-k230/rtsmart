@@ -5,6 +5,10 @@ cwd     = GetCurrentDir()
 src     = []
 CPPPATH = [cwd]
 
+if GetDepend(['UTEST_INPUT_EVENT_TC']):
+    src += ['input_event_tc.c']
+    CPPPATH += [cwd + '/../../components/canmv_usb']
+
 if GetDepend(['UTEST_MEMHEAP_TC']):
     src += ['memheap_tc.c']
 
