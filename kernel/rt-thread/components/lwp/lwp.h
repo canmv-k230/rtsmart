@@ -131,7 +131,16 @@ struct rt_lwp
     uint64_t generation;
     unsigned int asid;
 #endif
+    /* FD_CLOEXEC of each fdt slot (dfs.c). Last: appending moves no field
+     * that separately built code (prebuilt MPP libraries) reads. */
+    uint32_t fd_cloexec[DFS_FD_CLOEXEC_WORDS];
+    uintptr_t alarm_timer;
+    int alarm_timer_created;
 };
+
+void lwp_alarm_cleanup(struct rt_lwp *lwp);
+int lwp_take_console_echoed_input(void);
+void lwp_restore_console_termios(void);
 
 struct rt_lwp *lwp_self(void);
 

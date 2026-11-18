@@ -133,6 +133,57 @@ int dfs_device_fs_close(struct dfs_fd *file)
     return -EIO;
 }
 
+/*
+ * rt_device_open() returns RT-Thread codes (rtdef.h). RT_ERROR..RT_EINVAL
+ * are 1..10, numbers that POSIX gives to other errors (-RT_ENOMEM is -EIO,
+ * -RT_EBUSY is -E2BIG), so they are translated rather than passed on. A
+ * negative code past that range is a POSIX errno from a driver that already
+ * speaks it, such as -ENODEV.
+ */
+static int devfs_rt_errno(rt_err_t result, rt_bool_t opened)
+{
+    switch (result)
+    {
+    case RT_EOK:
+        return 0;
+    case -RT_ENOSYS:
+        /* From the open op this means there was nothing to do, and
+         * rt_device_open() counted the device as opened. From init it is a
+         * failure that takes no reference. */
+        return opened ? 0 : -ENODEV;
+    case -RT_ERROR:
+    case -RT_EIO:
+        return -EIO;
+    case -RT_ETIMEOUT:
+        return -ETIMEDOUT;
+    case -RT_EFULL:
+        return -ENOSPC;
+    case -RT_EEMPTY:
+        return -ENODATA;
+    case -RT_ENOMEM:
+        return -ENOMEM;
+    case -RT_EBUSY:
+        return -EBUSY;
+    case -RT_EINTR:
+        return -EINTR;
+    case -RT_EINVAL:
+        return -EINVAL;
+    default:
+        /* A positive code is a failure too: the device was not opened. */
+        return result < 0 ? dfs_open_errno((int)result) : -EIO;
+    }
+}
+
+int devfs_device_open(rt_device_t device, rt_uint16_t oflag)
+{
+    /* Whether rt_device_open() took a reference. RT_DEVICE_FLAG_ACTIVATED
+     * would not do: a close can clear it (hwtimer does). */
+    rt_uint8_t refs = device->ref_count;
+    rt_err_t result = rt_device_open(device, oflag);
+
+    return devfs_rt_errno(result, device->ref_count != refs);
+}
+
 int dfs_device_fs_open(struct dfs_fd *file)
 {
     rt_err_t result;
@@ -210,6 +261,9 @@ int dfs_device_fs_open(struct dfs_fd *file)
         return -ENODEV;
     }
 
+    /* A driver without an open callback cannot be opened: later opens of
+     * the path would call it through the fnode. */
+    result = -EIO;
 #ifdef RT_USING_POSIX
     if (device->fops)
     {
@@ -217,22 +271,24 @@ int dfs_device_fs_open(struct dfs_fd *file)
         file->fnode->fops = device->fops;
         file->fnode->data = (void *)device;
 
-        /* use fops */
+        /* Later opens of this path call fops->open from dfs_file_open(),
+         * which applies the same rules. */
         if (file->fnode->fops->open)
         {
             result = file->fnode->fops->open(file);
-            if (result == RT_EOK || result == -RT_ENOSYS)
+            if (result >= 0)
             {
                 file->fnode->type = FT_DEVICE;
                 return 0;
             }
+            result = dfs_open_errno(result);
         }
     }
     else
 #endif
     {
-        result = rt_device_open(device, RT_DEVICE_OFLAG_RDWR);
-        if (result == RT_EOK || result == -RT_ENOSYS)
+        result = devfs_device_open(device, RT_DEVICE_OFLAG_RDWR);
+        if (result == 0)
         {
             file->fnode->data = device;
             file->fnode->type = FT_DEVICE;
@@ -242,7 +298,7 @@ int dfs_device_fs_open(struct dfs_fd *file)
 
     file->fnode->data = RT_NULL;
     /* open device failed. */
-    return -EIO;
+    return result;
 }
 
 int dfs_device_fs_lseek(struct dfs_fd *file, off_t offset)
@@ -324,6 +380,7 @@ int dfs_device_fs_stat(struct dfs_filesystem *fs, const char *path, struct stat 
 int dfs_device_fs_getdents(struct dfs_fd *file, struct dirent *dirp, uint32_t count)
 {
     rt_uint32_t index;
+    rt_uint32_t start;
     rt_object_t object;
     struct dirent *d;
     struct device_dirent *root_dirent;
@@ -336,26 +393,44 @@ int dfs_device_fs_getdents(struct dfs_fd *file, struct dirent *dirp, uint32_t co
     if (count == 0)
         return -EINVAL;
 
-    for (index = 0; index < count && index + root_dirent->read_index < root_dirent->device_count; 
+    /* Position in this open file, in sizeof(struct dirent) units as every
+     * filesystem here (lseek()/seekdir() to a getdents d_off). read_index was
+     * shared by every open of /dev and ignored lseek(), so rewinddir() and
+     * concurrent listings went wrong. */
+    start = (rt_uint32_t)(file->pos / sizeof(struct dirent));
+    for (index = 0; index < count && index + start < root_dirent->device_count;
         index ++)
     {
-        object = (rt_object_t)root_dirent->devices[root_dirent->read_index + index];
+        object = (rt_object_t)root_dirent->devices[start + index];
 
         d = dirp + index;
-        if ((((rt_device_t)object)->type) == RT_Device_Class_Bus)
+        /* As devfs stat() of the entry (DT_REG made every device look
+         * like a regular file). */
+        switch (((rt_device_t)object)->type)
         {
+        case RT_Device_Class_Bus:
             d->d_type = DT_DIR;
-        }
-        else
-        {
+            break;
+        case RT_Device_Class_Block:
+            d->d_type = DT_BLK;
+            break;
+        case RT_Device_Class_Pipe:
+            d->d_type = DT_FIFO;
+            break;
+        case RT_Device_Class_Char:
+            d->d_type = DT_CHR;
+            break;
+        default:
             d->d_type = DT_REG;
+            break;
         }
         d->d_namlen = RT_NAME_MAX;
         d->d_reclen = (rt_uint16_t)sizeof(struct dirent);
         rt_strncpy(d->d_name, object->name, RT_NAME_MAX);
     }
 
-    root_dirent->read_index += index;
+    file->pos += index * sizeof(struct dirent);
+    root_dirent->read_index = start + index;
 
     return index * sizeof(struct dirent);
 }

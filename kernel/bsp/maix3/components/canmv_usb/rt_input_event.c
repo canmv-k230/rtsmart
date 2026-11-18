@@ -7,7 +7,12 @@
 #include <dfs_file.h>
 #include <dfs_posix.h>
 #include <fcntl.h>
-#include <poll.h>
+/* The DFS poll bits these fops report (musl's <poll.h> has other values:
+ * its POLLOUT is DFS's POLLERR). */
+#include <dfs_poll.h>
+#if POLLOUT != 0x02 || POLLERR != 0x04 || POLLHUP != 0x08
+#error "poll bits must be DFS's (dfs_poll.h), not musl's"
+#endif
 #endif
 
 #include "rt_input_event.h"

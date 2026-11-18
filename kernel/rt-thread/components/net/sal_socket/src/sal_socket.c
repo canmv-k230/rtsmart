@@ -1304,6 +1304,17 @@ __exit:
     return ret;
 }
 
+/* -1 with errno set to why. The errno is set after socket_delete(): taking a
+ * lock resets the thread's error. socket() used to report ENOMEM for every
+ * failure. */
+static int sal_socket_fail(int socket, int err)
+{
+    if (socket >= 0)
+        socket_delete(socket);
+    rt_set_errno(err);
+    return -1;
+}
+
 int sal_socket(int domain, int type, int protocol)
 {
     int retval;
@@ -1315,15 +1326,14 @@ int sal_socket(int domain, int type, int protocol)
     socket = socket_new();
     if (socket < 0)
     {
-        return -1;
+        return sal_socket_fail(-1, -ENFILE);
     }
 
     /* get sal socket object by socket descriptor */
     sock = sal_get_socket(socket);
     if (sock == RT_NULL)
     {
-        socket_delete(socket);
-        return -1;
+        return sal_socket_fail(socket, -ENOMEM);
     }
 
     /* Initialize sal socket object */
@@ -1331,12 +1341,16 @@ int sal_socket(int domain, int type, int protocol)
     if (retval < 0)
     {
         LOG_E("SAL socket protocol family input failed, return error %d.", retval);
-        socket_delete(socket);
-        return -1;
+        return sal_socket_fail(socket, -EAFNOSUPPORT);
     }
 
-    /* valid the network interface socket opreation */
-    SAL_SOCKETOPS_VALID(sock, pf, socket);
+    /* valid the network interface socket opreation (SAL_SOCKETOPS_VALID
+     * returned without freeing the socket) */
+    pf = sock->pf;
+    if (pf == RT_NULL || pf->skt_ops == RT_NULL || pf->skt_ops->socket == RT_NULL)
+    {
+        return sal_socket_fail(socket, -EAFNOSUPPORT);
+    }
 
     proto_socket = pf->skt_ops->socket(domain, type, protocol);
     if (proto_socket >= 0)
@@ -1347,16 +1361,19 @@ int sal_socket(int domain, int type, int protocol)
             sock->user_data_tls = proto_tls->ops->socket(socket);
             if (sock->user_data_tls == RT_NULL)
             {
-                socket_delete(socket);
-                return -1;
+                /* The stack's socket too: it leaked. */
+                if (pf->skt_ops->closesocket)
+                    pf->skt_ops->closesocket(proto_socket);
+                return sal_socket_fail(socket, -ENOMEM);
             }
         }
 #endif
         sock->user_data = (void *)(size_t)proto_socket;
         return sock->socket;
     }
-    socket_delete(socket);
-    return -1;
+    /* The protocol stack (lwIP) set errno. */
+    retval = rt_get_errno();
+    return sal_socket_fail(socket, retval ? retval : -ENOMEM);
 }
 
 int sal_closesocket_ex(int socket, rt_bool_t *closed)

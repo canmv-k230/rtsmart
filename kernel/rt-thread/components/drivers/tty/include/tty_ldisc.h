@@ -35,6 +35,7 @@ struct tty_ldisc_ops
     int (*poll)     (struct dfs_fd *fd, struct rt_pollreq *req);
     void (*set_termios) (struct tty_struct *tty, struct termios *old);
     int (*receive_buf) (struct tty_struct *tty,char *cp, int count);
+    int (*receive_room) (struct tty_struct *tty);
 
     int refcount;
 };
@@ -49,7 +50,7 @@ struct tty_ldisc
 
 int tty_register_ldisc(int disc, struct tty_ldisc_ops *new_ldisc);
 void tty_ldisc_kill(struct tty_struct *tty);
-void tty_ldisc_init(struct tty_struct *tty);
+int tty_ldisc_init(struct tty_struct *tty);
 void tty_ldisc_release(struct tty_struct *tty);
 void n_tty_init(void);
 

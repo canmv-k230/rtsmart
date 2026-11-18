@@ -903,6 +903,7 @@ int lwp_channel_open(int fdt_type, const char *name, int flags)
     int fd;
     rt_channel_t ch = RT_NULL;
     struct dfs_fd *d;
+    struct dfs_fnode *fnode;
 
     fd = _chfd_alloc(fdt_type);     /* allocate an IPC channel descriptor */
     if (fd == -1)
@@ -910,8 +911,10 @@ int lwp_channel_open(int fdt_type, const char *name, int flags)
         goto quit;
     }
     d = lwp_fd_get(fdt_type, fd);
-    d->fnode = (struct dfs_fnode *)rt_malloc(sizeof(struct dfs_fnode));
-    if (!d->fnode)
+    /* Built aside and published whole once the channel is open: the slot is
+     * in the table already, and the open may sleep. */
+    fnode = (struct dfs_fnode *)rt_malloc(sizeof(struct dfs_fnode));
+    if (!fnode)
     {
         _chfd_free(fd, fdt_type);
         fd = -1;
@@ -921,25 +924,29 @@ int lwp_channel_open(int fdt_type, const char *name, int flags)
     ch = rt_raw_channel_open(name, flags);
     if (ch)
     {
-        rt_memset(d->fnode, 0, sizeof(struct dfs_fnode));
-        rt_list_init(&d->fnode->list);
-        d->fnode->type = FT_USER;
-        d->fnode->path = NULL;
-        d->fnode->fullpath = NULL;
+        rt_memset(fnode, 0, sizeof(struct dfs_fnode));
+        rt_list_init(&fnode->list);
+        fnode->type = FT_USER;
+        fnode->path = NULL;
+        fnode->fullpath = NULL;
 
-        d->fnode->fops = &channel_fops;
+        fnode->fops = &channel_fops;
 
-        d->flags = O_RDWR; /* set flags as read and write */
-        d->fnode->size = 0;
-        d->pos = 0;
-        d->fnode->ref_count = 1;
+        fnode->size = 0;
+        fnode->ref_count = 1;
 
         /* set socket to the data of dfs_fd */
-        d->fnode->data = (void *)ch;
+        fnode->data = (void *)ch;
+
+        dfs_fd_lock();
+        d->flags = O_RDWR; /* set flags as read and write */
+        d->pos = 0;
+        d->fnode = fnode;
+        dfs_fd_unlock();
     }
     else
     {
-        rt_free(d->fnode);
+        rt_free(fnode);
         _chfd_free(fd, fdt_type);
         fd = -1;
     }
@@ -970,28 +977,34 @@ rt_err_t lwp_channel_close(int fdt_type, int fd)
     rt_channel_t ch;
     struct dfs_fd *d;
     struct dfs_fnode *fnode;
+    rt_bool_t last;
 
+    /* Looked up, checked, decided and released under the descriptor lock
+     * (recursive): nobody's close(), dup2() or I/O pin can change or free
+     * the descriptor in between. The last reference frees the descriptor
+     * and its fnode (fd_free()), which this used to read and free again
+     * afterwards. Another reference (a dup) closes the channel through
+     * channel_fops_close() when it goes. */
+    dfs_fd_lock();
     d = lwp_fd_get(fdt_type, fd);
-    if (!d)
+    fnode = d ? d->fnode : RT_NULL;
+    /* Channels only: a socket's or a file's data is no channel. */
+    if (!fnode || fnode->fops != &channel_fops)
     {
+        dfs_fd_unlock();
         return -RT_EIO;
     }
-
-    fnode = d->fnode;
-    if (!fnode)
-    {
-        return -RT_EIO;
-    }
-
-    ch = fd_2_channel(fdt_type, fd);
+    ch = (rt_channel_t)fnode->data;
     if (!ch)
     {
+        dfs_fd_unlock();
         return -RT_EIO;
     }
+    last = d->ref_count == 1;
     _chfd_free(fd, fdt_type);
-    if (fnode->ref_count == 1)
+    dfs_fd_unlock();
+    if (last)
     {
-        rt_free(fnode);
         return rt_raw_channel_close(ch);
     }
 

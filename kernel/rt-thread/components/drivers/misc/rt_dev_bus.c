@@ -21,7 +21,9 @@
 #if defined(RT_USING_POSIX)
 #include <unistd.h>
 #include <fcntl.h>
-#include <poll.h>
+/* The DFS poll bits these fops report (musl's <poll.h> has other values:
+ * its POLLOUT is DFS's POLLERR). */
+#include <dfs_poll.h>
 #include <sys/ioctl.h>
 #include <dfs_file.h>
 

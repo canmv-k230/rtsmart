@@ -16,6 +16,7 @@
 #include <rthw.h>
 #include <board.h>
 #include <stddef.h>
+#include <sys/time.h>
 
 #include <lwp.h>
 #include "tick.h"
@@ -767,9 +768,15 @@ int sys_open(const char *name, int flag, ...)
 
     lwp_get_from_user(kname, (void *)name, len + 1);
     ret = open(kname, flag, 0);
+    /* Read errno before kmem_put(): freeing can wait for the heap lock,
+     * and taking a lock resets the thread's error. */
+    if (ret < 0)
+        ret = GET_ERRNO();
+    else if (flag & O_CLOEXEC)
+        fd_set_cloexec(ret, 1);
 
     kmem_put(kname);
-    return (ret < 0 ? GET_ERRNO() : ret);
+    return ret;
 #else
     if (!lwp_user_accessable((void *)name, 1))
     {
@@ -788,9 +795,84 @@ int sys_close(int fd)
 }
 
 /* syscall: "ioctl" ret: "int" args: "int" "u_long" "..." */
+/* Bytes a terminal (or FIONREAD/FIONBIO) ioctl reads or writes through its
+ * pointer argument; 0 for requests passed through unchecked. The tty code
+ * uses the pointer directly, so a bad one from user space faulted the
+ * kernel. */
+static size_t sys_ioctl_arg_size(int fd, unsigned long cmd)
+{
+    /* Record locks are handled in sys_ioctl() itself. */
+    if ((cmd & DFS_FCNTL_TAG_MASK) == DFS_FCNTL_TAG)
+        return 0;
+
+    switch (cmd)
+    {
+    case TCGETS:
+    case TCSETS:
+    case TCSETSW:
+    case TCSETSF:
+        return sizeof(struct termios);
+    case TIOCGWINSZ:
+    case TIOCSWINSZ:
+        return sizeof(struct winsize);
+    case TIOCGPGRP:
+    case TIOCSPGRP:
+    case TIOCGSID:
+    case TIOCGPTN:
+    case TIOCSPTLCK:
+    case TIOCGPTLCK:
+    case FIONREAD:
+    case FIONBIO:
+        return sizeof(int);
+    default:
+        return 0;
+    }
+}
+
 int sys_ioctl(int fd, unsigned long cmd, void* data)
 {
-    int ret = ioctl(fd, cmd, data);
+    int ret;
+    int tagged = (cmd & DFS_FCNTL_TAG_MASK) == DFS_FCNTL_TAG;
+    unsigned long c = tagged ? (cmd & ~(unsigned long)DFS_FCNTL_TAG_MASK) : cmd;
+
+    /* Record locks: decided and run on one pinned descriptor, so another
+     * thread's dup2()/close() cannot turn a driver's command into a lock on
+     * an unchecked pointer between the check and the call. The struct
+     * flock is copied in and out. Untagged on a driver file: the driver's
+     * own ioctl command. */
+    if (c == F_GETLK || c == F_SETLK || c == F_SETLKW)
+    {
+        struct dfs_fd *d = fd_get_ref(fd);
+
+        if (!d)
+            return -EBADF;
+        if (!tagged && dfs_fd_is_driver_file(d))
+            ret = dfs_file_ioctl(d, (int)c, data);
+        else
+        {
+            struct flock kfl;
+
+            if (!lwp_user_accessable(data, sizeof(kfl)))
+                ret = -EFAULT;
+            else
+            {
+                lwp_get_from_user(&kfl, data, sizeof(kfl));
+                ret = dfs_fd_lock_cmd(fd, d, (int)c, &kfl);
+                if (ret == 0 && c == F_GETLK &&
+                    lwp_put_to_user(data, &kfl, sizeof(kfl)) != sizeof(kfl))
+                    ret = -EFAULT;
+            }
+        }
+        fd_put(d);
+        return ret;
+    }
+#ifdef RT_USING_USERSPACE
+    size_t size = sys_ioctl_arg_size(fd, cmd);
+
+    if (size && !lwp_user_accessable(data, size))
+        return -EFAULT;
+#endif
+    ret = ioctl(fd, cmd, data);
     return (ret < 0 ? GET_ERRNO() : ret);
 }
 
@@ -943,15 +1025,24 @@ int sys_poll(struct pollfd *fds, nfds_t nfds, int timeout)
     for (i = 0; i < nfds; i++)
     {
         musl2dfs_events(&kfds[i].events);
+        kfds[i].revents = 0;
     }
     ret = poll(kfds, nfds, timeout);
-    if (ret > 0)
+    if (ret >= 0)
     {
+        /* Write back only revents: the converted events went back to user
+         * space too, so a reused array lost POLLOUT (DFS 0x2 reads as
+         * POLLPRI). Report what was asked for, and the conditions that are
+         * always reported; revents of a timeout are 0. */
         for (i = 0; i < nfds; i++)
         {
+            struct pollfd orig;
+
+            lwp_get_from_user(&orig, &fds[i], sizeof(orig));
             dfs2musl_events(&kfds[i].revents);
+            kfds[i].revents &= orig.events | INTF_POLLERR | INTF_POLLHUP | INTF_POLLNVAL;
+            lwp_put_to_user(&fds[i].revents, &kfds[i].revents, sizeof(kfds[i].revents));
         }
-        lwp_put_to_user(fds, kfds, nfds * sizeof *kfds);
     }
 
     kmem_put(kfds);
@@ -988,6 +1079,7 @@ int sys_select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, s
     fd_set *kreadfds = RT_NULL, *kwritefds = RT_NULL, *kexceptfds = RT_NULL;
     struct timeval ktimeout;
     struct timeval *ptimeout = RT_NULL;
+    rt_tick_t start_tick;
 
     if (nfds < 0 || nfds > FD_SETSIZE)
     {
@@ -1012,13 +1104,13 @@ int sys_select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, s
     {
         if (!lwp_user_accessable((void *)readfds, sizeof *readfds))
         {
-            SET_ERRNO(EFAULT);
+            ret = -EFAULT;
             goto quit;
         }
         kreadfds = (fd_set *)kmem_get(sizeof *kreadfds);
         if (!kreadfds)
         {
-            SET_ERRNO(ENOMEM);
+            ret = -ENOMEM;
             goto quit;
         }
         lwp_get_from_user(kreadfds, readfds, sizeof *kreadfds);
@@ -1027,13 +1119,13 @@ int sys_select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, s
     {
         if (!lwp_user_accessable((void *)writefds, sizeof *writefds))
         {
-            SET_ERRNO(EFAULT);
+            ret = -EFAULT;
             goto quit;
         }
         kwritefds = (fd_set *)kmem_get(sizeof *kwritefds);
         if (!kwritefds)
         {
-            SET_ERRNO(ENOMEM);
+            ret = -ENOMEM;
             goto quit;
         }
         lwp_get_from_user(kwritefds, writefds, sizeof *kwritefds);
@@ -1042,19 +1134,36 @@ int sys_select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, s
     {
         if (!lwp_user_accessable((void *)exceptfds, sizeof *exceptfds))
         {
-            SET_ERRNO(EFAULT);
+            ret = -EFAULT;
             goto quit;
         }
         kexceptfds = (fd_set *)kmem_get(sizeof *kexceptfds);
         if (!kexceptfds)
         {
-            SET_ERRNO(EINVAL);
+            ret = -EINVAL;
             goto quit;
         }
         lwp_get_from_user(kexceptfds, exceptfds, sizeof *kexceptfds);
     }
 
+    start_tick = rt_tick_get();
     ret = select(nfds, kreadfds, kwritefds, kexceptfds, ptimeout);
+    /* Read errno before copying out and freeing: either can take a lock,
+     * which resets the thread's error. Errors above are set in ret. */
+    if (ret < 0)
+        ret = GET_ERRNO();
+    if (ptimeout && (ret >= 0 || ret == -EINTR))
+    {
+        /* As Linux: the time not slept, so a caller looping on select()
+         * keeps its overall deadline. */
+        rt_uint64_t spent_us = (rt_uint64_t)(rt_tick_get() - start_tick) * 1000000 / RT_TICK_PER_SECOND;
+        rt_uint64_t left_us = (rt_uint64_t)ktimeout.tv_sec * 1000000 + ktimeout.tv_usec;
+
+        left_us = (ret == 0 || spent_us >= left_us) ? 0 : left_us - spent_us;
+        ktimeout.tv_sec = left_us / 1000000;
+        ktimeout.tv_usec = left_us % 1000000;
+        lwp_put_to_user(timeout, &ktimeout, sizeof ktimeout);
+    }
     if (kreadfds)
     {
         lwp_put_to_user(readfds, kreadfds, sizeof *kreadfds);
@@ -1080,7 +1189,7 @@ quit:
     {
         kmem_put(kexceptfds);
     }
-    return (ret < 0 ? GET_ERRNO() : ret);
+    return ret;
 #else
     int ret;
 
@@ -1129,9 +1238,11 @@ int sys_unlink(const char *pathname)
 
     lwp_get_from_user(kname, (void *)pathname, len + 1);
     ret = unlink(kname);
+    if (ret < 0)
+        ret = GET_ERRNO(); /* before kmem_put(), see sys_open() */
 
     kmem_put(kname);
-    return (ret < 0 ? GET_ERRNO() : ret);
+    return ret;
 #else
     int ret = 0;
     ret = unlink(pathname);
@@ -1239,6 +1350,132 @@ int sys_kill(int pid, int sig)
 int sys_getpid(void)
 {
     return lwp_getpid();
+}
+
+/* Keep additions at the end of func_table: existing user binaries retain
+ * their syscall numbers. PID lookup and group changes share the lifetime
+ * lock used by tty foreground and process teardown. */
+int sys_getppid(void)
+{
+    rt_base_t level = rt_hw_interrupt_disable();
+    struct rt_lwp *self = lwp_self();
+    int pid = self && self->parent ? self->parent->pid : 0;
+    rt_hw_interrupt_enable(level);
+    return pid;
+}
+
+int sys_getpgid(int pid)
+{
+    rt_base_t level = rt_hw_interrupt_disable();
+    struct rt_lwp *p = pid ? lwp_from_pid(pid) : lwp_self();
+    int ret = p && !p->finish ? p->__pgrp : -ESRCH;
+    rt_hw_interrupt_enable(level);
+    return ret;
+}
+
+int sys_getsid(int pid)
+{
+    rt_base_t level = rt_hw_interrupt_disable();
+    struct rt_lwp *p = pid ? lwp_from_pid(pid) : lwp_self();
+    int ret = p && !p->finish ? p->session : -ESRCH;
+    rt_hw_interrupt_enable(level);
+    return ret;
+}
+
+int sys_setpgid(int pid, int pgid)
+{
+    struct rt_lwp *self = lwp_self(), *p, *group;
+    rt_base_t level;
+    int ret = 0;
+
+    if (pid < 0 || pgid < 0)
+        return -EINVAL;
+    level = rt_hw_interrupt_disable();
+    p = pid ? lwp_from_pid(pid) : self;
+    if (!p || p->finish || (p != self && p->parent != self))
+        ret = -ESRCH;
+    else if (p->session != self->session || p->leader)
+        ret = -EPERM;
+    else
+    {
+        if (!pgid)
+            pgid = p->pid;
+        group = pgid == p->pid ? p : lwp_from_pid(pgid);
+        if (!group || group->finish || group->session != p->session ||
+            (group != p && group->__pgrp != pgid))
+            ret = -EPERM;
+        else
+            p->__pgrp = pgid;
+    }
+    rt_hw_interrupt_enable(level);
+    return ret;
+}
+
+int sys_ftruncate(int fd, off_t length)
+{
+    int ret = ftruncate(fd, length);
+    return ret < 0 ? GET_ERRNO() : ret;
+}
+
+static struct rt_mutex alarm_mutex;
+static int lwp_alarm_init(void)
+{
+    return rt_mutex_init(&alarm_mutex, "lwp-alarm", RT_IPC_FLAG_PRIO);
+}
+INIT_PREV_EXPORT(lwp_alarm_init);
+
+void lwp_alarm_cleanup(struct rt_lwp *lwp)
+{
+    rt_mutex_take(&alarm_mutex, RT_WAITING_FOREVER);
+    if (lwp->alarm_timer_created)
+    {
+        timer_delete((timer_t)lwp->alarm_timer);
+        lwp->alarm_timer_created = 0;
+    }
+    rt_mutex_release(&alarm_mutex);
+}
+
+/* ITIMER_REAL is process-owned: fork starts disarmed and exit deletes it.
+ * Use the existing POSIX timer backend, whose callback delivers SIGALRM. */
+struct lwp_itimerval { struct timeval it_interval, it_value; };
+
+int sys_setitimer(int which, const struct lwp_itimerval *value, struct lwp_itimerval *old)
+{
+    struct rt_lwp *self = lwp_self();
+    struct lwp_itimerval v, ov = {0};
+    struct itimerspec spec = {0}, previous = {0};
+    int ret = 0;
+    if (which != 0) return -EOPNOTSUPP; /* ITIMER_REAL */
+    if (!lwp_user_accessable((void *)value, sizeof(v)) ||
+        (old && !lwp_user_accessable(old, sizeof(ov)))) return -EFAULT;
+    lwp_get_from_user(&v, (void *)value, sizeof(v));
+    if (v.it_value.tv_sec < 0 || v.it_interval.tv_sec < 0 ||
+        v.it_value.tv_usec < 0 || v.it_value.tv_usec >= 1000000 ||
+        v.it_interval.tv_usec < 0 || v.it_interval.tv_usec >= 1000000) return -EINVAL;
+    spec.it_value.tv_sec = v.it_value.tv_sec;
+    spec.it_value.tv_nsec = v.it_value.tv_usec * 1000;
+    spec.it_interval.tv_sec = v.it_interval.tv_sec;
+    spec.it_interval.tv_nsec = v.it_interval.tv_usec * 1000;
+    rt_mutex_take(&alarm_mutex, RT_WAITING_FOREVER);
+    if (!self->alarm_timer_created && (spec.it_value.tv_sec || spec.it_value.tv_nsec))
+    {
+        struct sigevent event = {0};
+        timer_t id;
+        event.sigev_notify = SIGEV_SIGNAL;
+        event.sigev_signo = SIGALRM;
+        ret = timer_create(CLOCK_MONOTONIC, &event, &id);
+        if (!ret) { self->alarm_timer = (uintptr_t)id; self->alarm_timer_created = 1; }
+    }
+    if (!ret && self->alarm_timer_created)
+        ret = timer_settime((timer_t)self->alarm_timer, 0, &spec, &previous);
+    if (ret < 0) ret = GET_ERRNO();
+    rt_mutex_release(&alarm_mutex);
+    ov.it_value.tv_sec = previous.it_value.tv_sec;
+    ov.it_value.tv_usec = previous.it_value.tv_nsec / 1000;
+    ov.it_interval.tv_sec = previous.it_interval.tv_sec;
+    ov.it_interval.tv_usec = previous.it_interval.tv_nsec / 1000;
+    if (!ret && old) lwp_put_to_user(old, &ov, sizeof(ov));
+    return ret;
 }
 
 /* syscall: "getpriority" ret: "int" args: "int" "id_t" */
@@ -1870,7 +2107,9 @@ static void lwp_struct_copy(struct rt_lwp *dst, struct rt_lwp *src)
     dst->session = src->session;
     dst->tty_old_pgrp = 0;
     dst->__pgrp = src->__pgrp;
-    dst->tty = src->tty;
+    /* Fork attaches the child under the PTY release interrupt lock after all
+     * fallible process/thread allocation has completed. */
+    dst->tty = RT_NULL;
     rt_memcpy(dst->cmd, src->cmd, sizeof(dst->cmd));
 
     dst->sa_flags = src->sa_flags;
@@ -1895,11 +2134,16 @@ static int lwp_copy_files(struct rt_lwp *dst, struct rt_lwp *src)
         dst_fdt->maxfd = src_fdt->maxfd;
 
         dfs_fd_lock();
+        /* fork() keeps FD_CLOEXEC; a slot skipped below has its bit cleared
+         * when it is next assigned. */
+        rt_memcpy(dst->fd_cloexec, src->fd_cloexec, sizeof(dst->fd_cloexec));
         /* dup files */
         for (i = 0; i < src_fdt->maxfd; i++)
         {
             d_s = fdt_fd_get(src_fdt, i);
-            if (d_s)
+            /* No fnode yet: another thread's fd_new() slot whose open or
+             * socket setup has not started. The child must not share it. */
+            if (d_s && d_s->fnode)
             {
                 dst_fdt->fds[i] = d_s;
                 d_s->ref_count++;
@@ -1973,6 +2217,7 @@ int _sys_fork(void)
             self_thread->init_tick);
     if (!thread)
     {
+        SET_ERRNO(ENOMEM);
         goto fail;
     }
 
@@ -1995,6 +2240,15 @@ int _sys_fork(void)
     self_lwp->first_child = lwp;
     lwp->parent = self_lwp;
 
+    /* Publish the terminal only after the child has a signalable thread. Pair
+     * release uses this same interrupt lock and can clear both pointers.
+     * As POSIX: fork() shares the terminal and leaves its foreground alone.
+     * The child is in the parent's process group, so it gets ^C with it
+     * (__isig() signals the foreground group). Giving every forked child the
+     * foreground let a background job's children take ^C from the foreground
+     * job. */
+    lwp->tty = self_lwp->tty;
+
     rt_hw_interrupt_enable(level);
 
     /* copy origin stack */
@@ -2012,28 +2266,15 @@ int _sys_fork(void)
             (void *)((char *)thread->stack_addr + thread->stack_size),
             user_stack, &thread->sp);
     /* new thread never reach there */
-    level = rt_hw_interrupt_disable();
-    if (lwp->tty != RT_NULL)
-    {
-        int ret;
-        struct rt_lwp *old_lwp;
-
-        old_lwp = lwp->tty->foreground;
-        rt_spin_lock(&lwp->tty->spinlock);
-        ret = tty_push(&lwp->tty->head, old_lwp);
-        rt_spin_unlock(&lwp->tty->spinlock);
-        if (ret < 0)
-        {
-            LOG_E("malloc fail!\n");
-            goto fail;
-        }
-
-        lwp->tty->foreground = lwp;
-    }
-    rt_hw_interrupt_enable(level);
     rt_thread_startup(thread);
     return lwp_to_pid(lwp);
 fail:
+    if (thread != RT_NULL)
+    {
+        thread->cleanup = RT_NULL;
+        thread->lwp = RT_NULL;
+        rt_thread_delete(thread);
+    }
     if (tid != 0)
     {
         lwp_tid_put(tid);
@@ -2600,6 +2841,11 @@ int sys_execve(const char *path, char *const argv[], char *const envp[])
         /* clear all user objects */
         lwp_user_object_clear(lwp);
 
+        /* The new image is loaded: close FD_CLOEXEC descriptors (O_CLOEXEC,
+         * fcntl(F_SETFD)) here, before the interrupt-locked swap below; a
+         * backend close may sleep. */
+        fdt_close_on_exec(&lwp->fdt);
+
         /* find last \ or / */
         while (1)
         {
@@ -2642,8 +2888,6 @@ int sys_execve(const char *path, char *const argv[], char *const envp[])
         rt_memset(&lwp->signal_mask, 0, sizeof(lwp->signal_mask));
         rt_memset(&lwp->signal_mask_bak, 0, sizeof(lwp->signal_mask_bak));
         rt_memset(lwp->signal_handler, 0, sizeof(lwp->signal_handler));
-
-        /* to do: clsoe files with flag CLOEXEC */
 
         lwp_mmu_switch(thread);
 
@@ -2821,6 +3065,8 @@ int sys_stat(const char *file, struct stat *buf)
     copy_path[copy_len] = '\0';
 
     ret = stat(copy_path, &statbuff);
+    if (ret < 0)
+        ret = GET_ERRNO(); /* before rt_free(), see sys_open() */
     rt_free(copy_path);
 
     if (ret == 0)
@@ -2828,7 +3074,7 @@ int sys_stat(const char *file, struct stat *buf)
         lwp_put_to_user(buf, &statbuff, sizeof statbuff);
     }
 
-    return (ret < 0 ? GET_ERRNO() : ret);
+    return ret;
 }
 
 int sys_notimpl(void)
@@ -3128,6 +3374,8 @@ int sys_getsockopt(int socket, int level, int optname, void *optval, socklen_t *
     koptlen = user_optlen;
     convert_sockopt(&level, &optname);
     ret = getsockopt(socket, level, optname, koptval, &koptlen);
+    if (ret < 0)
+        ret = GET_ERRNO(); /* before rt_free(), see sys_open() */
     if (ret == 0)
     {
         socklen_t copy_len = koptlen < user_optlen ? koptlen : user_optlen;
@@ -3141,7 +3389,7 @@ int sys_getsockopt(int socket, int level, int optname, void *optval, socklen_t *
     }
     rt_free(koptval);
 
-    return (ret < 0 ? GET_ERRNO() : ret);
+    return ret;
 }
 
 int sys_setsockopt(int socket, int level, int optname, const void *optval, socklen_t optlen)
@@ -3175,9 +3423,11 @@ int sys_setsockopt(int socket, int level, int optname, const void *optval, sockl
 
     convert_sockopt(&level, &optname);
     ret = setsockopt(socket, level, optname, koptval, optlen);
+    if (ret < 0)
+        ret = GET_ERRNO(); /* before rt_free(), see sys_open() */
     rt_free(koptval);
 
-    return (ret < 0 ? GET_ERRNO() : ret);
+    return ret;
 }
 
 int sys_connect(int socket, const struct musl_sockaddr *name, socklen_t namelen)
@@ -3315,6 +3565,8 @@ int sys_recvfrom(int socket, void *mem, size_t len, int flags,
     {
         ret = recvfrom(socket, kmem, len, flgs, NULL, NULL);
     }
+    if (ret < 0)
+        ret = GET_ERRNO(); /* before kmem_put(), see sys_open() */
 
     if (ret > 0)
     {
@@ -3322,7 +3574,7 @@ int sys_recvfrom(int socket, void *mem, size_t len, int flags,
     }
 
     kmem_put(kmem);
-    return (ret < 0 ? GET_ERRNO() : ret);
+    return ret;
 #else
     int ret = -1;
     if (from)
@@ -3391,9 +3643,11 @@ int sys_sendto(int socket, const void *dataptr, size_t size, int flags,
     {
         ret = sendto(socket, kmem, size, flgs, NULL, tolen);
     }
+    if (ret < 0)
+        ret = GET_ERRNO(); /* before kmem_put(), see sys_open() */
 
     kmem_put(kmem);
-    return (ret < 0 ? GET_ERRNO() : ret);
+    return ret;
 #else
     int ret;
     if (to)
@@ -4411,30 +4665,45 @@ __exit:
 }
 #endif
 
+/* The length with the terminator, or a negative errno: musl's getcwd()
+ * reads 0 as ENOENT, and a too-small buffer is ERANGE. */
 char *sys_getcwd(char *buf, size_t size)
 {
-    size_t result_size;
+    size_t len;
+    char *tbuf;
 
+    if (size == 0)
+    {
+        return (char *)(rt_base_t)-EINVAL;
+    }
     if (!lwp_user_accessable((void *)buf, size))
     {
-        return RT_NULL;
+        return (char *)(rt_base_t)-EFAULT;
     }
 
-    char *tbuf = rt_malloc(size);
-    if(!tbuf) {
-        return RT_NULL;
+    tbuf = rt_malloc(size);
+    if (!tbuf)
+    {
+        return (char *)(rt_base_t)-ENOMEM;
     }
 
-    getcwd(tbuf, size);
-    result_size = strlen(tbuf);
+    if (!getcwd(tbuf, size))
+    {
+        int err = rt_get_errno();
 
-    if(size != lwp_put_to_user(buf, tbuf, size)) {
-        result_size = 0;
+        rt_free(tbuf);
+        return (char *)(rt_base_t)(err < 0 ? err : -ERANGE);
+    }
+    len = strlen(tbuf) + 1;
+    if (lwp_put_to_user(buf, tbuf, len) != len)
+    {
+        rt_free(tbuf);
+        return (char *)(rt_base_t)-EFAULT;
     }
 
     rt_free(tbuf);
 
-    return (char *)result_size;
+    return (char *)len;
 }
 
 int sys_chdir(const char *path)
@@ -4483,10 +4752,10 @@ int sys_rmdir(const char *path)
     {
         return -EFAULT;
     }
-    err = unlink(path);
+    err = rmdir(path);
     return (err < 0 ? GET_ERRNO() : err);
 #else
-    int ret = unlink(path);
+    int ret = rmdir(path);
     return (ret < 0 ? GET_ERRNO() : ret);
 #endif
 }
@@ -4508,9 +4777,12 @@ int sys_getdents(int fd, struct libc_dirent *dirp, size_t nbytes)
     size_t cnt = (nbytes / sizeof(struct libc_dirent));
     size_t rtt_nbytes = 0;
     struct dirent *rtt_dirp;
+    off_t base;
 
 #ifdef RT_USING_USERSPACE
-    if (!lwp_user_accessable((void *)dirp, sizeof(struct libc_dirent)))
+    /* Every entry below is written straight to user memory: check all of
+     * them, not only the first. */
+    if (!lwp_user_accessable((void *)dirp, (cnt ? cnt : 1) * sizeof(struct libc_dirent)))
     {
         return -EFAULT;
     }
@@ -4526,16 +4798,28 @@ int sys_getdents(int fd, struct libc_dirent *dirp, size_t nbytes)
     {
         return -ENOMEM;
     }
-    dfs_fd = fd_get(fd);
+    /* Pinned: a close from another thread may run meanwhile. */
+    dfs_fd = fd_get_ref(fd);
+    if (!dfs_fd)
+    {
+        rt_free(rtt_dirp);
+        return -EBADF;
+    }
+    base = dfs_fd->pos;
     ret = dfs_file_getdents(dfs_fd, rtt_dirp, rtt_nbytes);
+    fd_put(dfs_fd);
     if (ret > 0)
     {
         size_t i = 0;
         cnt = ret / sizeof(struct dirent);
         for (i = 0; i < cnt; i++)
         {
+            /* 0, as stat() reports st_ino. */
             dirp[i].d_ino = 0;
-            dirp[i].d_off = i*sizeof(struct libc_dirent);
+            /* Where the next entry starts: musl's telldir()/seekdir() hand
+             * this to lseek(). Every filesystem here counts directory
+             * positions in sizeof(struct dirent) (kernel) units. */
+            dirp[i].d_off = base + (off_t)(i + 1) * sizeof(struct dirent);
             dirp[i].d_type = rtt_dirp[i].d_type;
             dirp[i].d_reclen = sizeof(struct libc_dirent);
             strcpy(dirp[i].d_name, rtt_dirp[i].d_name);
@@ -4543,7 +4827,8 @@ int sys_getdents(int fd, struct libc_dirent *dirp, size_t nbytes)
         ret = cnt * sizeof(struct libc_dirent);
     }
     rt_free(rtt_dirp);
-    return (ret < 0 ? GET_ERRNO() : ret);
+    /* dfs_file_getdents() returns a negative errno itself. */
+    return ret;
 }
 
 rt_err_t sys_get_errno(void)
@@ -4613,13 +4898,15 @@ int sys_access(const char *filename, int mode)
     {
         lwp_get_from_user(kname, (void *)filename, len + 1);
         ret = access(kname, mode);
+        if (ret < 0)
+            ret = GET_ERRNO(); /* before kmem_put(), see sys_open() */
         kmem_put(kname);
     }
+    return ret;
 #else
     ret = access(filename, mode);
-#endif
-
     return (ret < 0 ? GET_ERRNO() : ret);
+#endif
 }
 
 int sys_pipe(int fd[2])
@@ -4653,15 +4940,18 @@ int sys_clock_settime(clockid_t clk, const struct timespec *ts)
 
     lwp_get_from_user(kts, (void *)ts, size);
     ret = clock_settime(clk, kts);
+    if (ret < 0)
+        ret = GET_ERRNO(); /* before kmem_put(), see sys_open() */
     kmem_put(kts);
+    return ret;
 #else
     if (!lwp_user_accessable((void *)ts, sizeof(struct timespec)))
     {
         return -EFAULT;
     }
     ret = clock_settime(clk, ts);
-#endif
     return (ret < 0 ? GET_ERRNO() : ret);
+#endif
 }
 
 int sys_clock_gettime(clockid_t clk, struct timespec *ts)
@@ -4683,18 +4973,21 @@ int sys_clock_gettime(clockid_t clk, struct timespec *ts)
     }
 
     ret = clock_gettime(clk, kts);
-    if (ret != -1)
+    if (ret < 0)
+        ret = GET_ERRNO(); /* before copying out and kmem_put(), see sys_open() */
+    else
         lwp_put_to_user(ts, kts, size);
 
     kmem_put(kts);
+    return ret;
 #else
     if (!lwp_user_accessable((void *)ts, sizeof(struct timespec)))
     {
         return -EFAULT;
     }
     ret = clock_gettime(clk, ts);
-#endif
     return (ret < 0 ? GET_ERRNO() : ret);
+#endif
 }
 
 int sys_clock_nanosleep(clockid_t clk, int flags, const struct timespec *rqtp, struct timespec *rmtp)
@@ -4835,9 +5128,7 @@ int sys_setrlimit(unsigned int resource, struct rlimit *rlim)
 
 int sys_setsid(void)
 {
-    int ret = 0;
-    ret = setsid();
-    return (ret < 0 ? GET_ERRNO() : ret);
+    return setsid(); /* kernel helper already returns -errno */
 }
 
 int sys_getrandom(void *buf, size_t buflen, unsigned int flags)
@@ -4922,7 +5213,7 @@ ssize_t sys_readlink(char* path, char *buf, size_t bufsz)
 
     if (!lwp_user_accessable(buf, bufsz))
     {
-        return -EINVAL;
+        return -EFAULT;
     }
 
     copy_path = (char*)rt_malloc(len + 1);
@@ -4944,24 +5235,33 @@ ssize_t sys_readlink(char* path, char *buf, size_t bufsz)
         return -EINVAL;
     }
 
-    d = fd_get(fd);
+    /* Pinned: another thread's close() may run meanwhile. */
+    d = fd_get_ref(fd);
     if (!d)
     {
         return -EBADF;
     }
 
-    if (!d->fnode)
     {
-        return -EBADF;
-    }
+        /* Sockets and channels have no path (fullpath NULL): strlen() of
+         * it faulted the kernel. Name them as Linux does. */
+        char anon[32];
+        const char *name = d->fnode->fullpath;
 
-    copy_len = strlen(d->fnode->fullpath);
-    if (copy_len > bufsz)
-    {
-        copy_len = bufsz;
+        if (!name)
+        {
+            rt_snprintf(anon, sizeof(anon),
+                        d->fnode->type == FT_SOCKET ? "socket:[%d]" : "anon_inode:[%d]", fd);
+            name = anon;
+        }
+        copy_len = strlen(name);
+        if (copy_len > bufsz)
+        {
+            copy_len = bufsz;
+        }
+        bufsz = lwp_put_to_user(buf, (void *)name, copy_len);
     }
-
-    bufsz = lwp_put_to_user(buf, d->fnode->fullpath, copy_len);
+    fd_put(d);
 
     return bufsz;
 }
@@ -5116,9 +5416,7 @@ int sys_sched_yield(void)
 int sys_fsync(int fd)
 {
     int res = fsync(fd);
-    if (res < 0)
-        res = rt_get_errno();
-    return res;
+    return res < 0 ? GET_ERRNO() : 0;
 }
 
 int sys_statfs(const char* path, struct statfs* buf)
@@ -5171,9 +5469,11 @@ int sys_statfs(const char* path, struct statfs* buf)
     kpath[k_len] = '\0';
 
     ret = statfs(kpath, &kbuf);
+    if (ret < 0)
+        err = GET_ERRNO(); /* before kmem_put(), see sys_open() */
     kmem_put(kpath);
     if (ret < 0) {
-        return -GET_ERRNO();
+        return err; /* GET_ERRNO() is already negative */
     }
 
     memset(&_ustatfs, 0, sizeof(_ustatfs));
@@ -5406,6 +5706,12 @@ const static void* func_table[] =
     SYSCALL_SIGN(sys_statfs),
 
     SYSCALL_SIGN(sys_sched_yield), /* 165 */
+    SYSCALL_SIGN(sys_getppid),
+    SYSCALL_SIGN(sys_getpgid),
+    SYSCALL_SIGN(sys_setpgid),
+    SYSCALL_SIGN(sys_getsid),
+    SYSCALL_SIGN(sys_ftruncate), /* 170 */
+    SYSCALL_SIGN(sys_setitimer),
 };
 
 const void *lwp_get_sys_api(rt_uint32_t number)

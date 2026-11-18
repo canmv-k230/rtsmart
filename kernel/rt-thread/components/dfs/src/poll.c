@@ -109,6 +109,11 @@ static int poll_wait_timeout(struct rt_poll_table *pt, int msec)
     thread = pt->polling_thread;
 
     timeout = rt_tick_from_millisecond(msec);
+    /* rt_timer_start() asserts a timeout below RT_TICK_MAX / 2: a user
+     * poll(INT_MAX) or select(tv_sec = INT_MAX) panicked the kernel. Those
+     * are 24.8 days or more; wait forever instead. */
+    if (timeout >= (rt_int32_t)(RT_TICK_MAX / 2))
+        timeout = RT_WAITING_FOREVER;
 
     level = rt_hw_interrupt_disable();
 

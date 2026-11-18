@@ -71,42 +71,41 @@ struct termios {
 #define IMAXBEL 0020000
 #define IUTF8   0040000
 
-/* c_oflag bits */
+/* c_oflag bits: the user-space ABI, as in musl's (and Linux's) asm-generic
+ * termios. Userapps set these through musl; any other value here makes the
+ * kernel misread them (ONLCR and OLCUC were swapped, the delay masks and
+ * XTABS differed, so tab expansion could never match). */
 #define OPOST  0000001
-#define ONLCR  0000002
-#define OLCUC  0000004
-
+#define OLCUC  0000002
+#define ONLCR  0000004
 #define OCRNL  0000010
 #define ONOCR  0000020
 #define ONLRET 0000040
-
-#define OFILL   00000100
-#define OFDEL   00000200
-#define NLDLY   00001400
-#define   NL0   00000000
-#define   NL1   00000400
-#define   NL2   00001000
-#define   NL3   00001400
-#define TABDLY  00006000
-#define   TAB0  00000000
-#define   TAB1  00002000
-#define   TAB2  00004000
-#define   TAB3  00006000
-#define CRDLY   00030000
-#define   KCR0  00000000
-#define   KCR1  00010000
-#define   KCR2  00020000
-#define   KCR3  00030000
-#define FFDLY   00040000
-#define   FF0   00000000
-#define   FF1   00040000
-#define BSDLY   00100000
-#define   BS0   00000000
-#define   BS1   00100000
-#define VTDLY   00200000
-#define   VT0   00000000
-#define   VT1   00200000
-#define XTABS   01000000
+#define OFILL  0000100
+#define OFDEL  0000200
+#define NLDLY  0000400
+#define   NL0  0000000
+#define   NL1  0000400
+#define CRDLY  0003000
+#define   KCR0 0000000
+#define   KCR1 0001000
+#define   KCR2 0002000
+#define   KCR3 0003000
+#define TABDLY 0014000
+#define   TAB0 0000000
+#define   TAB1 0004000
+#define   TAB2 0010000
+#define   TAB3 0014000
+#define BSDLY  0020000
+#define   BS0  0000000
+#define   BS1  0020000
+#define FFDLY  0100000
+#define   FF0  0000000
+#define   FF1  0100000
+#define VTDLY  0040000
+#define   VT0  0000000
+#define   VT1  0040000
+#define XTABS  0014000
 
 /* c_cflag bit meaning */
 #define B0       0000000

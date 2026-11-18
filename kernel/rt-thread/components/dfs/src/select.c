@@ -104,7 +104,11 @@ int select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, struc
     /* Convert the timeout to milliseconds */
     if (timeout)
     {
-        msec = timeout->tv_sec * 1000 + timeout->tv_usec / 1000;
+        /* Rounded up, not down: a timeout under 1 ms became 0, a poll,
+         * and callers spun. Clamped, not overflowed. */
+        long long ms = (long long)timeout->tv_sec * 1000 + (timeout->tv_usec + 999) / 1000;
+
+        msec = ms > 0x7fffffff ? 0x7fffffff : (int)ms;
     }
     else
     {

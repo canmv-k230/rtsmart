@@ -172,6 +172,27 @@ int dfs_tmpfs_ioctl(struct dfs_fd *file, int cmd, void *args)
 
     switch (cmd)
     {
+    case RT_FIOFTRUNCATE:
+    {
+        off_t length;
+        rt_uint8_t *data = RT_NULL;
+        if (!args || d_file->type != TMPFS_TYPE_FILE) return -EINVAL;
+        if ((file->flags & O_ACCMODE) == O_RDONLY) return -EBADF;
+        length = *(off_t *)args;
+        if (length < 0 || (off_t)(rt_size_t)length != length) return -EINVAL;
+        if (length)
+        {
+            data = rt_realloc(d_file->data, (rt_size_t)length);
+            if (!data) return -ENOSPC;
+            if ((rt_size_t)length > d_file->size)
+                rt_memset(data + d_file->size, 0, (rt_size_t)length - d_file->size);
+        }
+        else rt_free(d_file->data);
+        superblock->df_size = superblock->df_size - d_file->size + length;
+        d_file->data = data;
+        d_file->size = file->fnode->size = length;
+        return 0;
+    }
 #ifdef RT_USING_LWP
     case RT_FIOMMAP2: 
     {
@@ -268,6 +289,7 @@ int dfs_tmpfs_read(struct dfs_fd *file, void *buf, size_t count)
     d_file = (struct tmpfs_file *)file->fnode->data;
     RT_ASSERT(d_file != NULL);
 
+    if (file->pos >= (off_t)file->fnode->size) return 0;
     if (count < file->fnode->size - file->pos)
         length = count;
     else
@@ -294,18 +316,24 @@ int dfs_tmpfs_write(struct dfs_fd *fd, const void *buf, size_t count)
     superblock = d_file->sb;
     RT_ASSERT(superblock != NULL);
 
+    /* O_APPEND: every write goes to the end, not only the first. */
+    if (fd->flags & O_APPEND)
+        fd->pos = d_file->size;
+
     if (count + fd->pos > fd->fnode->size)
     {
         rt_uint8_t *ptr;
         ptr = rt_realloc(d_file->data, fd->pos + count);
         if (ptr == NULL)
         {
-            rt_set_errno(-ENOMEM);
-            return 0;
+            /* An error, not 0 bytes: stdio retries a 0-byte write forever. */
+            return -ENOSPC;
         }
 
         superblock->df_size += (fd->pos - d_file->size + count);
         /* update d_file and file size */
+        if (fd->pos > (off_t)d_file->size)
+            rt_memset(ptr + d_file->size, 0, fd->pos - d_file->size);
         d_file->data = ptr;
         d_file->size = fd->pos + count;
         fd->fnode->size = d_file->size;
@@ -323,7 +351,13 @@ int dfs_tmpfs_write(struct dfs_fd *fd, const void *buf, size_t count)
 
 int dfs_tmpfs_lseek(struct dfs_fd *file, off_t offset)
 {
-    if (offset <= (off_t)file->fnode->size)
+    /* A directory's position is an entry offset (getdents d_off). */
+    if (file->fnode->type == FT_DIRECTORY)
+    {
+        file->pos = offset;
+        return (int)file->pos;
+    }
+    if (offset >= 0)
     {
         file->pos = offset;
 
@@ -359,12 +393,17 @@ int dfs_tmpfs_open(struct dfs_fd *file)
     RT_ASSERT(file->fnode->ref_count > 0);
     if (file->fnode->ref_count > 1)
     {
-        if (file->fnode->type == FT_DIRECTORY
-                && !(file->flags & O_DIRECTORY))
+        /* The path exists (it is open). */
+        if ((file->flags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL))
+            return -EEXIST;
+        if (file->fnode->type == FT_DIRECTORY)
         {
-            return -ENOENT;
+            if ((file->flags & O_ACCMODE) != O_RDONLY)
+                return -EISDIR;
         }
-        file->pos = 0;
+        else if (file->flags & O_DIRECTORY)
+            return -ENOTDIR;
+        file->pos = (file->flags & O_APPEND) ? file->fnode->size : 0;
         return 0;
     }
 
@@ -377,6 +416,12 @@ int dfs_tmpfs_open(struct dfs_fd *file)
     d_file = dfs_tmpfs_lookup(superblock, file->fnode->path, &size);
     if (d_file == NULL && !(file->flags & O_CREAT))
         return -ENOENT;
+
+    /* O_CREAT|O_EXCL fails on an existing path; so does mkdir()
+     * (O_CREAT|O_DIRECTORY, which open() itself never passes). */
+    if (d_file != NULL && (file->flags & O_CREAT) &&
+        (file->flags & (O_EXCL | O_DIRECTORY)))
+        return -EEXIST;
 
     /* Creates a new file. */
     if (file->flags & O_CREAT)
@@ -397,8 +442,6 @@ int dfs_tmpfs_open(struct dfs_fd *file)
             if (d_file == NULL) {
                 return -ENOMEM;
             }
-            superblock->df_size += sizeof(struct tmpfs_file);
-
             strncpy(d_file->name, file_name, TMPFS_NAME_MAX);
 
             rt_list_init(&(d_file->subdirs));
@@ -412,7 +455,10 @@ int dfs_tmpfs_open(struct dfs_fd *file)
             else {
                 d_file->type = TMPFS_TYPE_FILE;
             }
+            /* With the list change: first opens of different paths run
+             * at the same time now (dfs_file.c). */
             rt_hw_spin_lock(lock);
+            superblock->df_size += sizeof(struct tmpfs_file);
             rt_list_insert_after(&(p_file->subdirs), &(d_file->sibling));
             rt_hw_spin_unlock(lock);
         }
@@ -420,8 +466,10 @@ int dfs_tmpfs_open(struct dfs_fd *file)
     /* Creates a new file.
         * If the file is existing, it is truncated and overwritten.
         */
-    if (file->flags & O_TRUNC)
+    if ((file->flags & O_TRUNC) && d_file->type == TMPFS_TYPE_FILE &&
+        (file->flags & O_ACCMODE) != O_RDONLY)
     {
+        superblock->df_size -= d_file->size;
         d_file->size = 0;
         if (d_file->data != NULL)
         {
@@ -431,21 +479,21 @@ int dfs_tmpfs_open(struct dfs_fd *file)
         }
     }
 
-    /* fill file */
+    /* fill file. A directory opens read-only without O_DIRECTORY too, as
+     * POSIX has it; the errors were ENOMEM. */
     if (d_file->type == TMPFS_TYPE_DIR)
     {
-        if (file->flags & O_DIRECTORY)
-            file->fnode->type = FT_DIRECTORY;
-        else
-            return -ENOMEM;
+        if ((file->flags & O_ACCMODE) != O_RDONLY)
+            return -EISDIR;
+        file->fnode->type = FT_DIRECTORY;
     }
     else
     {
         if (file->flags & O_DIRECTORY)
         {
-            return -ENOMEM;
+            return -ENOTDIR;
         }
-        file->fnode->type = FT_DEVICE;
+        file->fnode->type = FT_REGULAR;
     }
 
     file->fnode->data = d_file;
@@ -511,30 +559,27 @@ int dfs_tmpfs_getdents(struct dfs_fd *file,
     if (count == 0)
         return -EINVAL;
 
-    end = file->pos + count;
+    /* file->pos counts sizeof(struct dirent) per entry, as on the other
+     * filesystems: lseek()/seekdir() take a getdents d_off. */
+    end = (rt_size_t)(file->pos / sizeof(struct dirent)) + count;
     index = 0;
     count = 0;
 
     rt_list_for_each(list, &d_file->subdirs)
     {
         n_file = rt_list_entry(list, struct tmpfs_file, sibling);
-        if (index >= (rt_size_t)file->pos)
+        if (index >= (rt_size_t)(file->pos / sizeof(struct dirent)))
         {
             d = dirp + count;
-            if (d_file->type == TMPFS_TYPE_FILE)
-            {
-                d->d_type = DT_REG;
-            }
-            if (d_file->type == TMPFS_TYPE_DIR)
-            {
-                d->d_type = DT_DIR;
-            }
+            /* The entry's type: this read the listed directory's, so every
+             * entry of /tmp, /etc and /dev/shm read as DT_DIR. */
+            d->d_type = n_file->type == TMPFS_TYPE_DIR ? DT_DIR : DT_REG;
             d->d_namlen = RT_NAME_MAX;
             d->d_reclen = (rt_uint16_t)sizeof(struct dirent);
             rt_strncpy(d->d_name, n_file->name, TMPFS_NAME_MAX);
 
             count += 1;
-            file->pos += 1;
+            file->pos += sizeof(struct dirent);
         }
         index += 1;
         if (index >= end)

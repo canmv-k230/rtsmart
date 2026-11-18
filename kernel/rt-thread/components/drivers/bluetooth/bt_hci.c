@@ -6,6 +6,7 @@
 #ifdef RT_USING_POSIX
 #include <dfs_poll.h>
 #include <dfs_posix.h>
+#include <devfs.h>
 #endif
 
 static rt_uint16_t bt_hci_get_le16(const rt_uint8_t *data)
@@ -171,17 +172,18 @@ static int bt_hci_fops_open(struct dfs_fd *fd)
         flags = RT_DEVICE_FLAG_RDWR | RT_DEVICE_FLAG_INT_RX;
         break;
     default:
-        return -RT_EINVAL;
+        return -EINVAL;
     }
 
-    if ((fd->flags & O_ACCMODE) != O_WRONLY)
+    /* 0 or a POSIX errno: rt_device_open() speaks RT_E*. */
+    result = devfs_device_open(device, flags);
+    /* Hook up only once this call has opened the device. The device is
+     * standalone, so a refused open (EBUSY) means another file has it, and
+     * that file's hook must stay. Data arriving before the hook is set sits
+     * in the ring, which poll checks. */
+    if (result == 0 && (fd->flags & O_ACCMODE) != O_WRONLY)
     {
         rt_device_set_rx_indicate(device, bt_hci_fops_rx_indicate);
-    }
-    result = rt_device_open(device, flags);
-    if (result != RT_EOK)
-    {
-        rt_device_set_rx_indicate(device, RT_NULL);
     }
     return result;
 }

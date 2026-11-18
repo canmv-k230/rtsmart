@@ -49,6 +49,11 @@
 
 #define DFS_FS_FLAG_DEFAULT     0x00    /* default flag */
 #define DFS_FS_FLAG_FULLPATH    0x01    /* set full path to underlaying file system */
+/* The filesystem's lseek returns 0 and leaves the new position in fd->pos:
+ * an int return cannot hold a position past 2 GiB (FAT files go to 4 GiB).
+ * A flag here, not a new dfs_file_ops member, keeps driver ops (prebuilt MPP
+ * libraries) unchanged. */
+#define DFS_FS_FLAG_LSEEK_POS   0x02
 
 /* File types */
 #define FT_REGULAR               0   /* regular file */
@@ -64,6 +69,10 @@
 #define DFS_F_ERR               0x08000000
 #define DFS_F_CLOSE_TERMINAL    0x20000000 /* close consumed private state */
 #define DFS_F_CLOSING           0x40000000 /* final backend close in progress */
+#define DFS_F_OPENING           0x80000000 /* dfs_file_open() in progress */
+/* DFS's own bits of dfs_fd.flags, above every O_* flag (O_TMPFILE is
+ * 0x410000): never taken from user open flags. */
+#define DFS_F_INTERNAL_MASK     0xFF000000
 
 #ifdef __cplusplus
 extern "C" {
@@ -99,6 +108,20 @@ struct dfs_fdtable
     struct dfs_fd **fds;
 };
 
+/* FD_CLOEXEC, per descriptor slot as POSIX has it (dup() and dup2() of a
+ * close-on-exec descriptor give one without it). Kept outside struct
+ * dfs_fdtable (at the end of struct rt_lwp) so that neither struct moves a
+ * field that separately built code reads. Guarded by the descriptor lock. */
+#define DFS_FD_CLOEXEC_WORDS ((DFS_FD_MAX + 31) / 32)
+
+/* musl's fcntl() and ioctl() reach the kernel as the same system call, so a
+ * device's ioctl commands 0, 1, 2 (ADC enable/disable, I2C slave buffer size
+ * and address, ...) cannot be told from F_DUPFD, F_GETFD, F_SETFD. User space
+ * that means fcntl (k230_syscalls' fcntl()) adds this tag to the command; an
+ * untagged one on a device file goes to the driver. User-space ABI. */
+#define DFS_FCNTL_TAG           0x46430000
+#define DFS_FCNTL_TAG_MASK      0xffff0000
+
 /* Initialization of dfs */
 int dfs_init(void);
 
@@ -121,6 +144,10 @@ void fdt_fd_release(struct dfs_fdtable* fdt, int fd);
 int fd_new(void);
 /* Attach a live source descriptor to an empty destination slot. */
 int fd_associate(struct dfs_fdtable *fdt, int fd, struct dfs_fd *file);
+int fd_get_cloexec(int fd);
+int fd_set_cloexec(int fd, int on);
+int fd_dup_from(int oldfd, int minfd, int cloexec);
+void fdt_close_on_exec(struct dfs_fdtable *fdt);
 /* Borrowed lookup; the caller must prevent concurrent close. */
 struct dfs_fd *fd_get(int fd);
 /* Pin through a blocking operation; pair with fd_put(), not fd_release(). */

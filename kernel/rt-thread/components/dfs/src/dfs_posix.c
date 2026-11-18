@@ -183,7 +183,7 @@ RTM_EXPORT(write);
  */
 off_t lseek(int fd, off_t offset, int whence)
 {
-    int result;
+    off_t result;
     struct dfs_fd *d;
 
     d = fd_get_ref(fd);
@@ -230,7 +230,8 @@ off_t lseek(int fd, off_t offset, int whence)
         return -1;
     }
 
-    return offset;
+    /* Where the backend put it (it may clamp). */
+    return result;
 }
 RTM_EXPORT(lseek);
 
@@ -331,19 +332,44 @@ int fstat(int fildes, struct stat *buf)
         return -1;
     }
 
-    /* it's the root directory */
-    buf->st_dev = 0;
-
-    buf->st_mode = S_IFREG | S_IRUSR | S_IRGRP | S_IROTH |
-                   S_IWUSR | S_IWGRP | S_IWOTH;
-    if (d->fnode->type == FT_DIRECTORY)
+    /* Unset fields used to be left as they were (kernel stack, for
+     * sys_fstat()); st_dev/st_ino stay 0 as stat() reports them. */
+    rt_memset(buf, 0, sizeof(*buf));
+    /* 0 once unlinked while open (dfs_file_unlink()). */
+    buf->st_nlink = (d->fnode->flags & DFS_FNODE_F_UNLINKED) ? 0 : 1;
+    buf->st_mode = S_IRUSR | S_IRGRP | S_IROTH | S_IWUSR | S_IWGRP | S_IWOTH;
+    switch (d->fnode->type)
     {
-        buf->st_mode &= ~S_IFREG;
+    case FT_DIRECTORY:
         buf->st_mode |= S_IFDIR | S_IXUSR | S_IXGRP | S_IXOTH;
+        break;
+    case FT_SOCKET:
+        buf->st_mode |= S_IFSOCK;
+        break;
+    case FT_DEVICE:
+        /* As devfs stat() of the path. Other filesystems (procfs) mark
+         * files FT_DEVICE without an rt_device behind them. */
+        if (d->fnode->fs && d->fnode->fs->ops &&
+            rt_strcmp(d->fnode->fs->ops->name, "devfs") == 0 && d->fnode->data)
+        {
+            rt_device_t dev = (rt_device_t)d->fnode->data;
+
+            if (dev->type == RT_Device_Class_Block)
+                buf->st_mode |= S_IFBLK;
+            else if (dev->type == RT_Device_Class_Pipe)
+                buf->st_mode |= S_IFIFO;
+            else
+                buf->st_mode |= S_IFCHR;
+        }
+        else
+            buf->st_mode |= S_IFREG;
+        break;
+    default:
+        buf->st_mode |= S_IFREG;
+        break;
     }
 
     buf->st_size    = d->fnode->size;
-    buf->st_mtime   = 0;
     fd_put(d);
 
     return RT_EOK;
@@ -376,8 +402,17 @@ int fsync(int fildes)
 
     ret = dfs_file_flush(d);
     fd_put(d);
+    /* As every other call here: -1 and errno (sys_fsync() read a stale
+     * errno for the backend's error). Nothing to flush is not an error. */
+    if (ret == -ENOSYS)
+        ret = 0;
+    if (ret < 0)
+    {
+        rt_set_errno(ret);
+        return -1;
+    }
 
-    return ret;
+    return 0;
 }
 RTM_EXPORT(fsync);
 
@@ -393,22 +428,123 @@ RTM_EXPORT(fsync);
  * @return 0 on successful completion. Otherwise, -1 shall be returned and errno
  * set to indicate the error.
  */
+/* A driver's file: devfs devices, and procfs entries with their own ops.
+ * Their ioctl commands share numbers with untagged fcntl commands. tmpfs
+ * marks its regular files FT_DEVICE too (for mmap); those are not. */
+/* A record-lock command on @d, the descriptor @fildes named. After taking a
+ * lock, check @fildes still names @d: a close() from another thread while
+ * this waited (F_SETLKW) would otherwise leave a lock that no descriptor
+ * releases. As Linux, drop the process's locks on the file and fail. */
+int dfs_fd_lock_cmd(int fildes, struct dfs_fd *d, int cmd, struct flock *fl)
+{
+    int ret = dfs_file_lock(d, cmd, fl);
+
+    if (ret == 0 && cmd != F_GETLK && fl->l_type != F_UNLCK && fd_get(fildes) != d)
+    {
+        dfs_file_lock_release(d->fnode, dfs_file_lock_owner());
+        ret = -EBADF;
+    }
+    return ret;
+}
+
+int dfs_fd_is_driver_file(struct dfs_fd *d)
+{
+    return d && d->fnode && d->fnode->type == FT_DEVICE && d->fnode->fs && d->fnode->fs->ops &&
+           (rt_strcmp(d->fnode->fs->ops->name, "devfs") == 0 ||
+            rt_strcmp(d->fnode->fs->ops->name, "procfs") == 0);
+}
+
 int fcntl(int fildes, int cmd, ...)
 {
     int ret = -1;
     struct dfs_fd *d;
+    void *arg;
+    va_list ap;
+
+    va_start(ap, cmd);
+    arg = va_arg(ap, void *);
+    va_end(ap);
+
+    /* Descriptor-slot commands. musl's fcntl() and ioctl() share one system
+     * call: a tagged command (DFS_FCNTL_TAG) is always fcntl. An untagged
+     * 0, 1, 2 or 1030 is fcntl too, except on a device file, where it is the
+     * driver's ioctl command, as it always was. */
+    int handled = 1;
+    int tagged = ((unsigned int)cmd & DFS_FCNTL_TAG_MASK) == DFS_FCNTL_TAG;
+
+    if (tagged)
+        cmd &= ~DFS_FCNTL_TAG_MASK;
+    else if (cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC || cmd == F_GETFD || cmd == F_SETFD ||
+             cmd == F_GETLK || cmd == F_SETLK || cmd == F_SETLKW)
+    {
+        d = fd_get_ref(fildes);
+        if (d && dfs_fd_is_driver_file(d))
+        {
+            ret = dfs_file_ioctl(d, cmd, arg);
+            fd_put(d);
+            if (ret < 0)
+            {
+                rt_set_errno(ret);
+                ret = -1;
+            }
+            return ret;
+        }
+        fd_put(d);
+    }
+
+    switch (cmd)
+    {
+    case F_DUPFD:
+    case F_DUPFD_CLOEXEC:
+        ret = fd_dup_from(fildes, (int)(rt_base_t)arg, cmd == F_DUPFD_CLOEXEC);
+        break;
+    case F_GETFD:
+        ret = fd_get_cloexec(fildes);
+        if (ret > 0)
+            ret = FD_CLOEXEC;
+        break;
+    case F_SETFD:
+        ret = fd_set_cloexec(fildes, ((int)(rt_base_t)arg & FD_CLOEXEC) != 0);
+        break;
+    case F_GETLK:
+    case F_SETLK:
+    case F_SETLKW:
+        /* Record locks are DFS's own (dfs_file_lock()); the backends' answer
+         * was a fake success (FAT) or ENOSYS. @arg was checked for user
+         * access by sys_ioctl(). */
+        d = fd_get_ref(fildes);
+        if (!d)
+            ret = -EBADF;
+        else if (!arg)
+            ret = -EFAULT;
+        else
+        {
+            struct flock kfl = *(struct flock *)arg;
+
+            ret = dfs_fd_lock_cmd(fildes, d, cmd, &kfl);
+            if (ret == 0 && cmd == F_GETLK)
+                *(struct flock *)arg = kfl;
+        }
+        fd_put(d);
+        break;
+    default:
+        handled = 0;
+        break;
+    }
+    if (handled)
+    {
+        if (ret < 0)
+        {
+            rt_set_errno(ret);
+            ret = -1;
+        }
+        return ret;
+    }
 
     /* get the fd */
     d = fd_get_ref(fildes);
     if (d)
     {
-        void *arg;
-        va_list ap;
-
-        va_start(ap, cmd);
-        arg = va_arg(ap, void *);
-        va_end(ap);
-
         ret = dfs_file_ioctl(d, cmd, arg);
         fd_put(d);
     }
@@ -574,8 +710,14 @@ FINSH_FUNCTION_EXPORT(mkdir, create a directory);
 int rmdir(const char *pathname)
 {
     int result;
+    struct stat st;
 
-    result = dfs_file_unlink(pathname);
+    /* dfs_file_unlink() removes files too: rmdir() must not. */
+    result = dfs_file_stat(pathname, &st);
+    if (result == 0 && !S_ISDIR(st.st_mode))
+        result = -ENOTDIR;
+    if (result == 0)
+        result = dfs_file_unlink(pathname);
     if (result < 0)
     {
         rt_set_errno(result);
@@ -887,10 +1029,23 @@ FINSH_FUNCTION_EXPORT_ALIAS(chdir, cd, change current working directory);
 int access(const char *path, int amode)
 {
     struct stat sb;
+
+    if (amode & ~(R_OK | W_OK | X_OK))
+    {
+        rt_set_errno(-EINVAL);
+        return -1;
+    }
     if (stat(path, &sb) < 0)
         return -1; /* already sets errno */
 
-    /* ignore R_OK,W_OK,X_OK condition */
+    /* W_OK from the mode stat() reports (FAT's read-only attribute clears
+     * the write bits). Everything is readable. X_OK is not checked: FAT and
+     * tmpfs files carry no execute bits, yet any file can be executed. */
+    if ((amode & W_OK) && !(sb.st_mode & (S_IWUSR | S_IWGRP | S_IWOTH)))
+    {
+        rt_set_errno(-EACCES);
+        return -1;
+    }
     return 0;
 }
 /**
@@ -941,10 +1096,19 @@ char *getcwd(char *buf, size_t size)
     dir_buf = &working_directory[0];
 #endif
 
-    /* copy to buf parameter */
+    /* copy to buf parameter: whole and terminated, or ERANGE (strncpy left
+     * a too-long path unterminated) */
     if (buf)
     {
-        rt_strncpy(buf, dir_buf, size);
+        size_t len = rt_strlen(dir_buf);
+
+        if (len + 1 > size)
+        {
+            dfs_unlock();
+            rt_set_errno(-ERANGE);
+            return RT_NULL;
+        }
+        rt_memcpy(buf, dir_buf, len + 1);
     }
 
     dfs_unlock();

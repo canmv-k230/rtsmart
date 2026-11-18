@@ -120,6 +120,7 @@ int dfs_proc_fs_open(struct dfs_fd *file)
         return -ENODEV;
     }
 
+    result = -EIO;
 #ifdef RT_USING_POSIX
     if (entry->fops)
     {
@@ -127,20 +128,23 @@ int dfs_proc_fs_open(struct dfs_fd *file)
         file->fnode->fops = entry->fops;
         file->fnode->data = (void *)entry;
 
+        /* POSIX, as for devfs: later opens of this path call fops->open
+         * from dfs_file_open(). */
         if (file->fnode->fops->open)
         {
             result = file->fnode->fops->open(file);
-            if (result == RT_EOK || result == -RT_ENOSYS)
+            if (result >= 0)
             {
                 file->fnode->type = FT_DEVICE;
                 return 0;
             }
+            result = dfs_open_errno(result);
         }
     }
 #endif
 
     file->fnode->data = RT_NULL;
-    return -EIO;
+    return result;
 }
 
 int dfs_proc_fs_stat(struct dfs_filesystem *fs, const char *path, struct stat *st)
@@ -183,6 +187,7 @@ int dfs_proc_fs_stat(struct dfs_filesystem *fs, const char *path, struct stat *s
 int dfs_proc_fs_getdents(struct dfs_fd *file, struct dirent *dirp, uint32_t count)
 {
     rt_uint32_t index;
+    rt_uint32_t start;
     rt_object_t object;
     struct dirent *d;
     struct proc_dirent *root_dirent;
@@ -195,10 +200,13 @@ int dfs_proc_fs_getdents(struct dfs_fd *file, struct dirent *dirp, uint32_t coun
     if (count == 0)
         return -EINVAL;
 
-    for (index = 0; index < count && index + root_dirent->read_index < root_dirent->device_count; 
+    /* Per open file, in sizeof(struct dirent) units (lseek()/seekdir() to a
+     * getdents d_off); read_index was shared by every open of /proc. */
+    start = (rt_uint32_t)(file->pos / sizeof(struct dirent));
+    for (index = 0; index < count && index + start < root_dirent->device_count;
         index ++)
     {
-        object = (rt_object_t)root_dirent->entrys[root_dirent->read_index + index];
+        object = (rt_object_t)root_dirent->entrys[start + index];
 
         d = dirp + index;
         d->d_type = DT_REG;
@@ -207,10 +215,21 @@ int dfs_proc_fs_getdents(struct dfs_fd *file, struct dirent *dirp, uint32_t coun
         rt_strncpy(d->d_name, object->name, RT_NAME_MAX);
     }
 
-    root_dirent->read_index += index;
+    file->pos += index * sizeof(struct dirent);
+    root_dirent->read_index = start + index;
 
     return index * sizeof(struct dirent);
-    return 0;
+}
+
+/* Directories only (entries open with their own ops): rewinddir()/seekdir(). */
+static int dfs_proc_fs_lseek(struct dfs_fd *file, off_t offset)
+{
+    if (file->fnode->type != FT_DIRECTORY)
+        return -ESPIPE;
+    if (offset < 0)
+        return -EINVAL;
+    file->pos = offset;
+    return (int)offset;
 }
 
 static const struct dfs_file_ops _proc_fops =
@@ -221,7 +240,7 @@ static const struct dfs_file_ops _proc_fops =
     RT_NULL,                    /* read */
     RT_NULL,                    /* write */
     RT_NULL,                    /* flush */
-    RT_NULL,                    /* lseek */
+    dfs_proc_fs_lseek,          /* lseek */
     dfs_proc_fs_getdents,
     RT_NULL,
 };

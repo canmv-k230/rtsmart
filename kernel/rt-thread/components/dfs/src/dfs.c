@@ -215,6 +215,49 @@ static int fd_slot_alloc(struct dfs_fdtable *fdt, int startfd)
     return idx;
 }
 
+/* The lowest slot a new descriptor may take. POSIX hands out the lowest free
+ * one, so a process that closes 0 and opens a file gets 0 back (redirecting
+ * stdin); slots below DFS_STDIO_OFFSET were never reused. The kernel's own
+ * table keeps them for its console. */
+static int fd_lowest_slot(struct dfs_fdtable *fdt)
+{
+    return fdt == &_fdtab ? DFS_STDIO_OFFSET : 0;
+}
+
+/* The FD_CLOEXEC bits of @fdt: a process's own, or the kernel table's. */
+static uint32_t _fdtab_cloexec[DFS_FD_CLOEXEC_WORDS];
+
+static uint32_t *fd_cloexec_bits(struct dfs_fdtable *fdt)
+{
+#ifdef RT_USING_LWP
+    if (fdt != &_fdtab)
+        return rt_container_of(fdt, struct rt_lwp, fdt)->fd_cloexec;
+#endif
+    return _fdtab_cloexec;
+}
+
+/* Caller holds fdlock. */
+static void fd_cloexec_set_locked(struct dfs_fdtable *fdt, int fd, int on)
+{
+    uint32_t bit = 1u << (fd & 31);
+    uint32_t *bits;
+
+    if (fd < 0 || fd >= DFS_FD_MAX)
+        return;
+    bits = fd_cloexec_bits(fdt);
+    if (on)
+        bits[fd >> 5] |= bit;
+    else
+        bits[fd >> 5] &= ~bit;
+}
+
+static int fd_cloexec_get_locked(struct dfs_fdtable *fdt, int fd)
+{
+    if (fd < 0 || fd >= DFS_FD_MAX)
+        return 0;
+    return (fd_cloexec_bits(fdt)[fd >> 5] >> (fd & 31)) & 1;
+}
+
 static int fd_alloc(struct dfs_fdtable *fdt, int startfd)
 {
     int idx;
@@ -236,6 +279,7 @@ static int fd_alloc(struct dfs_fdtable *fdt, int startfd)
     fd->magic = DFS_FD_MAGIC;
     fd->fnode = NULL;
     fdt->fds[idx] = fd;
+    fd_cloexec_set_locked(fdt, idx, 0);
 
     return idx;
 }
@@ -258,7 +302,7 @@ int fdt_fd_new(struct dfs_fdtable *fdt)
     dfs_fd_lock();
 
     /* find an empty fd entry */
-    idx = fd_alloc(fdt, DFS_STDIO_OFFSET);
+    idx = fd_alloc(fdt, fd_lowest_slot(fdt));
 
     /* can't find an empty fd entry */
     if (idx < 0)
@@ -302,7 +346,7 @@ static struct dfs_fd *fdt_fd_get_locked(struct dfs_fdtable *fdt, int fd)
 
     /* check dfs_fd valid or not */
     if ((d == NULL) || (d->magic != DFS_FD_MAGIC) ||
-        (d->flags & DFS_F_CLOSING))
+        (d->flags & (DFS_F_CLOSING | DFS_F_OPENING)))
     {
         return NULL;
     }
@@ -347,7 +391,11 @@ struct dfs_fd *fd_get_ref(int fd)
     return d;
 }
 
-/* Caller holds fdlock and has removed the last reference. */
+/* Caller holds fdlock and has removed the last reference. A closed
+ * descriptor has no fnode any more: dfs_file_close() dropped its reference.
+ * One released without a close (a socket or channel whose setup failed)
+ * still owns its fnode, which is not hashed; fdt_fd_release() queues a
+ * hashed one for a close instead. */
 static void fd_free(struct dfs_fd *d)
 {
     struct dfs_fnode *fnode = d->fnode;
@@ -365,7 +413,17 @@ static void fd_free(struct dfs_fd *d)
  * failures, including interrupted socket draining, are logged and retained
  * for a later allocation/close to retry; they cannot change that earlier
  * close result. Preserve the current operation's errno in either case. */
+static void fd_put_common(struct dfs_fd *d, rt_bool_t retry);
+
 void fd_put(struct dfs_fd *d)
+{
+    fd_put_common(d, RT_FALSE);
+}
+
+/* @retry: a queued close, retried from fd_new() or close(). It must not wait
+ * for a busy path: that would stall an open or close of an unrelated path,
+ * or wait for the caller's own open of the same path. It is requeued. */
+static void fd_put_common(struct dfs_fd *d, rt_bool_t retry)
 {
     /* Taking fdlock resets thread->error; releasing a reference must preserve
      * the preceding file or socket operation's errno on every path. */
@@ -388,10 +446,20 @@ void fd_put(struct dfs_fd *d)
     /* No table entry or other operation owns this descriptor now. Keep its
      * final reference until the backend has consumed the private state. */
     dfs_fd_unlock();
-    result = dfs_file_close(d);
+    /* Already closed through another reference (closedir(), mkdir()):
+     * nothing to retry. */
+    if (!d->fnode)
+        result = 0;
+    else if (retry)
+        result = dfs_file_close_nowait(d);
+    else
+        result = dfs_file_close(d);
     if (result < 0 && !(d->flags & DFS_F_CLOSE_TERMINAL))
     {
-        LOG_E("deferred file close failed: %d", result);
+        if (retry && result == -EBUSY)
+            LOG_D("deferred file close postponed: path busy");
+        else
+            LOG_E("deferred file close failed: %d", result);
         /* The backend still owns private state, and fnode is still hashed.
          * Retain the final reference until a later allocation or close retries it;
          * freeing either object here would leave a dangling cache entry. */
@@ -427,21 +495,32 @@ static void fd_retry_failed_closes(void)
     failed_closes = RT_NULL;
     dfs_fd_unlock();
 
-    /* One attempt per retained descriptor. A failed retry is requeued by
-     * fd_put(), never retried in this pass. Backends may themselves open a
-     * file; retrying_closes prevents recursion and concurrent drainers. */
+    /* One attempt per retained descriptor. A failed retry, or one whose path
+     * is busy, is requeued by fd_put_common(), never retried in this pass.
+     * Backends may themselves open a file; retrying_closes prevents
+     * recursion and concurrent drainers. */
     while (pending)
     {
         struct dfs_fd *next = pending->close_next;
 
         pending->close_next = RT_NULL;
-        fd_put(pending);
+        fd_put_common(pending, RT_TRUE);
         pending = next;
     }
     dfs_fd_lock();
     retrying_closes = RT_FALSE;
     dfs_fd_unlock();
     rt_set_errno(saved_errno);
+}
+
+/* POSIX: a process loses its record locks on a file when it closes any of
+ * its descriptors of it, even one of several. Called once the slot is gone
+ * (or CLOSING): a lock acquired concurrently re-checks its descriptor
+ * afterwards (dfs_fd_lock_cmd()), so none can survive the close. */
+static void fd_drop_locks(struct dfs_fd *d)
+{
+    if (d && d->fnode && d->fnode->locks)
+        dfs_file_lock_release(d->fnode, dfs_file_lock_owner());
 }
 
 int fdt_fd_close(struct dfs_fdtable *fdt, int fd, int type)
@@ -471,14 +550,17 @@ int fdt_fd_close(struct dfs_fdtable *fdt, int fd, int type)
          * pins keep the backend alive. A later fd_put() may fail to close
          * it (e.g. EINTR while draining sends) and queue a logged retry. */
         fdt->fds[fd] = RT_NULL;
-        d->ref_count--;
+        /* The table's reference becomes a pin for dropping the locks. */
         dfs_fd_unlock();
+        fd_drop_locks(d);
+        fd_put(d);
         return 0;
     }
     /* Reserve the slot while a retryable close is in progress. New lookups
      * reject it, and no global descriptor lock spans a backend operation. */
     d->flags |= DFS_F_CLOSING;
     dfs_fd_unlock();
+    fd_drop_locks(d);
     result = dfs_file_close(d);
     dfs_fd_lock();
     if (result >= 0 || (d->flags & DFS_F_CLOSE_TERMINAL))
@@ -530,7 +612,22 @@ void fdt_fd_release(struct dfs_fdtable* fdt, int fd)
     /* clear this fd entry */
     if (fd_slot->ref_count == 0)
     {
-        fd_free(fd_slot);
+        if (fd_slot->fnode && fd_slot->fnode->fullpath)
+        {
+            /* Released before its close finished (closedir(), mkdir() and
+             * opendir() after a retryable close failure): the backend keeps
+             * private state and the fnode is hashed. Freeing the fnode here
+             * left the hash pointing at freed memory. Retry the close later,
+             * as fd_put() does. */
+            fd_slot->ref_count = 1;
+            fd_slot->flags |= DFS_F_CLOSING;
+            fd_slot->close_next = failed_closes;
+            failed_closes = fd_slot;
+        }
+        else
+        {
+            fd_free(fd_slot);
+        }
     }
     dfs_fd_unlock();
 }
@@ -543,40 +640,56 @@ void fd_release(int fd)
     fdt_fd_release(fdt, fd);
 }
 
-int sys_dup(int oldfd)
+/* Caller holds fdlock. A descriptor that is being set up (no fnode yet, or
+ * its open running) or closed: not to be duplicated, replaced or shared. */
+static rt_bool_t fd_unsettled_locked(struct dfs_fd *d)
 {
-    int newfd = -1;
+    return !d->fnode || (d->flags & (DFS_F_CLOSING | DFS_F_OPENING));
+}
+
+/* dup() and fcntl(F_DUPFD[_CLOEXEC]): the lowest free slot >= @minfd (and
+ * >= fd_lowest_slot()). Returns the new slot or a
+ * negative errno for user space. */
+int fd_dup_from(int oldfd, int minfd, int cloexec)
+{
+    int newfd;
     struct dfs_fdtable *fdt = NULL;
 
+    if (minfd < 0 || minfd >= DFS_FD_MAX)
+        return -EINVAL;
     dfs_fd_lock();
-    /* check old fd */
     fdt = dfs_fdtable_get();
-    if ((oldfd < 0) || (oldfd >= fdt->maxfd))
+    if ((oldfd < 0) || (oldfd >= fdt->maxfd) ||
+        !fdt->fds[oldfd] || fd_unsettled_locked(fdt->fds[oldfd]))
     {
-        goto exit;
+        dfs_fd_unlock();
+        return -EBADF;
     }
-    if (!fdt->fds[oldfd] || (fdt->fds[oldfd]->flags & DFS_F_CLOSING))
+    newfd = fd_slot_alloc(fdt, minfd > fd_lowest_slot(fdt) ? minfd : fd_lowest_slot(fdt));
+    if (newfd < 0)
     {
-        goto exit;
+        dfs_fd_unlock();
+        return -EMFILE;
     }
-    /* get a new fd */
-    newfd = fd_slot_alloc(fdt, DFS_STDIO_OFFSET);
-    if (newfd >= 0)
-    {
-        fdt->fds[newfd] = fdt->fds[oldfd];
-        /* inc ref_count */
-        fdt->fds[newfd]->ref_count++;
-    }
-exit:
+    fdt->fds[newfd] = fdt->fds[oldfd];
+    /* inc ref_count */
+    fdt->fds[newfd]->ref_count++;
+    fd_cloexec_set_locked(fdt, newfd, cloexec);
     dfs_fd_unlock();
     return newfd;
+}
+
+int sys_dup(int oldfd)
+{
+    return fd_dup_from(oldfd, 0, 0);
 }
 
 int sys_dup2(int oldfd, int newfd)
 {
     struct dfs_fdtable *fdt = NULL;
     struct dfs_fd *replaced = RT_NULL;
-    int retfd = -1;
+    /* Negative errnos for user space; it used to see -1 (EPERM). */
+    int retfd = -EBADF;
 
     dfs_fd_lock();
     /* check old fd */
@@ -585,11 +698,11 @@ int sys_dup2(int oldfd, int newfd)
     {
         goto exit;
     }
-    if (!fdt->fds[oldfd] || (fdt->fds[oldfd]->flags & DFS_F_CLOSING))
+    if (!fdt->fds[oldfd] || fd_unsettled_locked(fdt->fds[oldfd]))
     {
         goto exit;
     }
-    if (newfd < 0)
+    if (newfd < 0 || newfd >= DFS_FD_MAX)
     {
         goto exit;
     }
@@ -598,6 +711,7 @@ int sys_dup2(int oldfd, int newfd)
         newfd = fd_slot_expand(fdt, newfd);
         if (newfd < 0)
         {
+            retfd = -EMFILE;
             goto exit;
         }
     }
@@ -610,19 +724,31 @@ int sys_dup2(int oldfd, int newfd)
 
     if (fdt->fds[newfd])
     {
-        if (fdt->fds[newfd]->flags & DFS_F_CLOSING)
+        /* Not a slot another thread is still opening (or closing): its
+         * open would go on with a descriptor freed under it. */
+        if (fd_unsettled_locked(fdt->fds[newfd]))
+        {
+            /* Not EBUSY (Linux's answer): musl's dup2() retries that in a
+             * loop, which on this priority scheduler can starve the very
+             * thread that would finish the open or close. */
+            retfd = -EAGAIN;
             goto exit;
+        }
         replaced = fdt->fds[newfd];
     }
 
     fdt->fds[newfd] = fdt->fds[oldfd];
     /* inc ref_count */
     fdt->fds[newfd]->ref_count++;
+    fd_cloexec_set_locked(fdt, newfd, 0);
     retfd = newfd;
 exit:
     dfs_fd_unlock();
     /* dup2 atomically replaces the slot, then releases the old ownership.
-     * A writer holding a reference continues on the original descriptor. */
+     * A writer holding a reference continues on the original descriptor.
+     * Replacing a descriptor closes it: its file's record locks go. */
+    if (replaced && replaced->fnode && replaced->fnode->locks)
+        dfs_file_lock_release(replaced->fnode, dfs_file_lock_owner());
     fd_put(replaced);
     return retfd;
 }
@@ -684,17 +810,89 @@ int fd_associate(struct dfs_fdtable *fdt, int fd, struct dfs_fd *file)
      * descriptor, possibly shared with another table: do not add a reference
      * while its backend close is in progress or queued for retry. An occupied
      * destination is rejected regardless of that destination's flags. */
-    if (fdt->fds[fd] || (file->flags & DFS_F_CLOSING))
+    if (fdt->fds[fd] || fd_unsettled_locked(file))
     {
         goto exit;
     }
     /* inc ref_count */
     file->ref_count++;
     fdt->fds[fd] = file;
+    fd_cloexec_set_locked(fdt, fd, 0);
     retfd = fd;
 exit:
     dfs_fd_unlock();
     return retfd;
+}
+
+/* fcntl(F_GETFD): whether @fd closes on exec, or -EBADF. */
+int fd_get_cloexec(int fd)
+{
+    struct dfs_fdtable *fdt;
+    int ret;
+
+    dfs_fd_lock();
+    fdt = dfs_fdtable_get();
+    if (!fdt_fd_get_locked(fdt, fd))
+        ret = -EBADF;
+    else
+        ret = fd_cloexec_get_locked(fdt, fd);
+    dfs_fd_unlock();
+    return ret;
+}
+
+/* fcntl(F_SETFD), and open(O_CLOEXEC). */
+int fd_set_cloexec(int fd, int on)
+{
+    struct dfs_fdtable *fdt;
+    int ret = 0;
+
+    dfs_fd_lock();
+    fdt = dfs_fdtable_get();
+    if (fd < 0 || fd >= (int)fdt->maxfd || !fdt->fds[fd])
+        ret = -EBADF;
+    else
+        fd_cloexec_set_locked(fdt, fd, on);
+    dfs_fd_unlock();
+    return ret;
+}
+
+/* execve(): close every close-on-exec descriptor of @fdt.
+ * The caller must exclude concurrent users of this table: sys_execve()
+ * rejects a multithreaded process. Slots are closed one at a time, with the
+ * table lock released around backend close callbacks, which may sleep. */
+void fdt_close_on_exec(struct dfs_fdtable *fdt)
+{
+    int fd;
+
+    for (fd = 0; fd < DFS_FD_MAX; fd++)
+    {
+        int close_it;
+
+        dfs_fd_lock();
+        close_it = fd < (int)fdt->maxfd && fdt->fds[fd] &&
+                   fd_cloexec_get_locked(fdt, fd);
+        if (close_it)
+            fd_cloexec_set_locked(fdt, fd, 0);
+        dfs_fd_unlock();
+        if (close_it && fdt_fd_close(fdt, fd, -1) < 0)
+        {
+            /* A failed close kept the slot and its only reference (the
+             * backend may retry). Take it out of the table and hand that
+             * reference to fd_put(), which retries the close and queues it
+             * again on failure; fdt_fd_release() would have freed a socket's
+             * fnode without closing it. */
+            struct dfs_fd *d = RT_NULL;
+
+            dfs_fd_lock();
+            if (fd < (int)fdt->maxfd)
+            {
+                d = fdt->fds[fd];
+                fdt->fds[fd] = RT_NULL;
+            }
+            dfs_fd_unlock();
+            fd_put(d);
+        }
+    }
 }
 
 void fd_init(struct dfs_fd *fd)
@@ -939,7 +1137,7 @@ int list_fd(void)
     {
         struct dfs_fd *fd = fd_table->fds[index];
 
-        if (fd && fd->fnode->fops)
+        if (fd && fd->fnode && fd->fnode->fops)
         {
             rt_kprintf("%2d ", index);
             if (fd->fnode->type == FT_DIRECTORY)    rt_kprintf("%-7.7s ", "dir");
@@ -994,7 +1192,7 @@ static int lsofp(int pid)
     {
         struct dfs_fd *fd = fd_table->fds[index];
 
-        if (fd && fd->fnode->fops)
+        if (fd && fd->fnode && fd->fnode->fops)
         {
             if(pid == (-1))
             {

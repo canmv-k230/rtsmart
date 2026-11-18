@@ -31,9 +31,40 @@ static int socket_result(struct dfs_fd *file, int result)
     return result;
 }
 
+/* A socket descriptor's fnode, complete before anyone can see it. */
+static struct dfs_fnode *socket_fnode_new(int socket)
+{
+    struct dfs_fnode *fnode = rt_calloc(1, sizeof(struct dfs_fnode));
+
+    if (!fnode)
+        return RT_NULL;
+    rt_list_init(&fnode->list);
+    fnode->type = FT_SOCKET;
+    fnode->path = NULL;
+    fnode->fullpath = NULL;
+    fnode->ref_count = 1;
+    fnode->fops = dfs_net_get_fops();
+    fnode->size = 0;
+    /* set socket to the data of dfs_fd */
+    fnode->data = (void *)(size_t)socket;
+    return fnode;
+}
+
+/* fd_new()'s slot has no fnode until here, so other threads' close(),
+ * dup(), dup2() and fork() skip it (fd_unsettled_locked()). */
+static void socket_fd_publish(struct dfs_fd *d, struct dfs_fnode *fnode)
+{
+    dfs_fd_lock();
+    d->flags = O_RDWR; /* set flags as read and write */
+    d->pos = 0;
+    d->fnode = fnode;
+    dfs_fd_unlock();
+}
+
 int accept(int s, struct sockaddr *addr, socklen_t *addrlen)
 {
     int new_socket = -1;
+    struct dfs_fnode *fnode;
     SOCKET_GET(s);
 
     new_socket = sal_accept(socket, addr, addrlen);
@@ -54,32 +85,13 @@ int accept(int s, struct sockaddr *addr, socklen_t *addrlen)
         }
 
         d = fd_get(fd);
-        if(d)
+        /* Built aside and published whole: the slot is in the table
+         * already, and close(), dup2() or fork() from another thread must
+         * not find a half-built fnode (fops NULL). */
+        fnode = d ? socket_fnode_new(new_socket) : RT_NULL;
+        if (fnode)
         {
-            /* this is a socket fd */
-            d->fnode = (struct dfs_fnode *)rt_calloc(1, sizeof(struct dfs_fnode));
-            if (!d->fnode)
-            {
-                /* release fd */
-                fd_release(fd);
-                sal_closesocket(new_socket);
-                rt_set_errno(-ENOMEM);
-                return -1;
-            }
-            rt_list_init(&d->fnode->list);
-
-            d->fnode->type = FT_SOCKET;
-            d->fnode->path = NULL;
-            d->fnode->fullpath = NULL;
-            d->fnode->ref_count = 1;
-            d->fnode->fops = dfs_net_get_fops();
-            d->flags = O_RDWR; /* set flags as read and write */
-            d->fnode->size = 0;
-            d->pos = 0;
-
-            /* set socket to the data of dfs_fd */
-            d->fnode->data = (void *)(size_t)new_socket;
-
+            socket_fd_publish(d, fnode);
             return fd;
         }
 
@@ -220,6 +232,7 @@ int socket(int domain, int type, int protocol)
     int fd;
     int socket;
     struct dfs_fd *d;
+    struct dfs_fnode *fnode;
 
     /* allocate a fd */
     fd = fd_new();
@@ -236,16 +249,6 @@ int socket(int domain, int type, int protocol)
         rt_set_errno(-ENOMEM);
         return -1;
     }
-    d->fnode = (struct dfs_fnode *)rt_calloc(1, sizeof(struct dfs_fnode));
-    if (!d->fnode)
-    {
-        /* release fd */
-        fd_release(fd);
-        rt_set_errno(-ENOMEM);
-        return -1;
-    }
-    /* fd_release() also owns this fnode if sal_socket() fails. */
-    d->fnode->ref_count = 1;
 
 #ifdef SAL_USING_AF_UNIX
     if (domain == AF_UNIX)
@@ -254,31 +257,30 @@ int socket(int domain, int type, int protocol)
     }
 #endif /* SAL_USING_AF_UNIX */
 
-    /* create socket  and then put it to the dfs_fd */
+    /* create socket and then put it to the dfs_fd. The fnode is built aside
+     * and published whole once the socket exists: sal_socket() may sleep
+     * with the slot already in the table, and close(), dup2() or fork()
+     * from another thread must not find a half-built fnode (fops NULL). */
     socket = sal_socket(domain, type, protocol);
-    if (socket >= 0)
+    if (socket < 0)
     {
-        rt_list_init(&d->fnode->list);
-        /* this is a socket fd */
-        d->fnode->type = FT_SOCKET;
-        d->fnode->path = NULL;
-        d->fnode->fullpath = NULL;
-        d->fnode->fops = dfs_net_get_fops();
+        /* sal_socket() set errno; fd_release() takes a lock, which resets
+         * it. */
+        int err = rt_get_errno();
 
-        d->flags = O_RDWR; /* set flags as read and write */
-        d->fnode->size = 0;
-        d->pos = 0;
-
-        /* set socket to the data of dfs_fd */
-        d->fnode->data = (void *)(size_t)socket;
-    }
-    else
-    {
-        /* release fd */
         fd_release(fd);
+        rt_set_errno(err ? err : -ENOMEM);
+        return -1;
+    }
+    fnode = socket_fnode_new(socket);
+    if (!fnode)
+    {
+        fd_release(fd);
+        sal_closesocket(socket);
         rt_set_errno(-ENOMEM);
         return -1;
     }
+    socket_fd_publish(d, fnode);
 
     return fd;
 }

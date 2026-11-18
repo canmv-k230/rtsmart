@@ -53,7 +53,7 @@ static struct tty_ldisc *tty_ldisc_get(struct tty_struct *tty, int disc)
     ld = rt_malloc(sizeof(struct tty_ldisc));
     if (ld == RT_NULL)
     {
-        ldops->refcount--;
+        put_ldops(ldops);
         return RT_NULL;
     }
 
@@ -173,9 +173,11 @@ void tty_ldisc_release(struct tty_struct *tty)
  *  the tty structure is not completely set up when this call is made.
  */
 
-void tty_ldisc_init(struct tty_struct *tty)
+int tty_ldisc_init(struct tty_struct *tty)
 {
     struct tty_ldisc *ld = tty_ldisc_get(tty, N_TTY);
-    RT_ASSERT(ld != RT_NULL);
+    if (ld == RT_NULL)
+        return -ENOMEM;
     tty->ldisc = ld;
+    return 0;
 }

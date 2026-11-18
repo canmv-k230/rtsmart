@@ -160,7 +160,7 @@ static void reset_buffer_flags(struct n_tty_data *ldata)
     ldata->line_start = 0;
 
     ldata->erasing = 0;
-    rt_memset(ldata->read_flags, 0, RT_TTY_BUF);
+    rt_memset(ldata->read_flags, 0, sizeof(ldata->read_flags));
     ldata->push = 0;
 }
 
@@ -523,6 +523,35 @@ static void eraser(unsigned char c, struct tty_struct *tty)
  *  Locking: ctrl_lock
  */
 
+/* ^C/^\: every live process of the terminal's foreground process group,
+ * as POSIX. A forked child shares its parent's group and terminal (fork()
+ * leaves the foreground alone). The foreground process itself is always
+ * signalled, even when the recorded group is unset. Caller holds the
+ * interrupt lock. */
+static void tty_kill_foreground_group(struct tty_struct *tty, struct rt_lwp *fg, int sig)
+{
+    struct lwp_avl_struct *pids = lwp_get_pid_ary();
+    int fg_done = 0;
+    int i;
+
+    if (tty->pgrp > 0)
+    {
+        for (i = 0; i < RT_LWP_MAX_NR; i++)
+        {
+            struct rt_lwp *l = pids[i].data;
+
+            if (l && !l->finish && l->tty == tty && l->__pgrp == tty->pgrp)
+            {
+                lwp_kill(lwp_to_pid(l), sig);
+                if (l == fg)
+                    fg_done = 1;
+            }
+        }
+    }
+    if (!fg_done)
+        lwp_kill(lwp_to_pid(fg), sig);
+}
+
 static void __isig(int sig, struct tty_struct *tty)
 {
     struct rt_lwp *lwp = tty->foreground;
@@ -548,11 +577,12 @@ static void __isig(int sig, struct tty_struct *tty)
             }
             tty_sigaddset(&lwp->signal_mask, SIGTTOU);
             old_lwp = tty_pop(&tty->head, RT_NULL);
-            tty->foreground = old_lwp;  
+            tty->foreground = old_lwp;
+            tty->pgrp = old_lwp ? old_lwp->__pgrp : -1;
         }
         else
         {
-            lwp_kill(lwp_to_pid(lwp), sig);
+            tty_kill_foreground_group(tty, lwp, sig);
         }
     }
 }
@@ -602,83 +632,155 @@ static void isig(int sig, struct tty_struct *tty)
  *       the column state and space left in the buffer
  */
 
-static int do_output_char(unsigned char c, struct tty_struct *tty)
+static ssize_t n_tty_device_write(struct tty_struct *tty, const void *buf, size_t count)
+{
+    rt_size_t written;
+    rt_base_t level;
+    int hungup;
+
+    if (tty->type == TTY_DRIVER_TYPE_PTY)
+    {
+        level = rt_hw_interrupt_disable();
+        hungup = tty->pty_hungup;
+        rt_hw_interrupt_enable(level);
+        if (hungup)
+            return -EIO;
+    }
+    written = rt_device_write((rt_device_t)tty, -1, buf, count);
+    if (tty->type == TTY_DRIVER_TYPE_PTY && count && written == 0)
+    {
+        level = rt_hw_interrupt_disable();
+        hungup = tty->pty_hungup;
+        rt_hw_interrupt_enable(level);
+        if (hungup)
+            return -EIO;
+    }
+    return (ssize_t)written;
+}
+
+static ssize_t n_tty_device_write_exact(struct tty_struct *tty,
+                                        const void *buf, size_t count,
+                                        size_t *room_needed)
+{
+    ssize_t written;
+
+    if (tty->type == TTY_DRIVER_TYPE_PTY)
+    {
+        written = pty_write_exact(tty, buf, count);
+        if (written == -EAGAIN && room_needed)
+            *room_needed = count;
+        return written;
+    }
+    /* Serial/console drivers historically consume the source character even
+     * when their low-level putc path reports a short write. PTY output needs
+     * stronger all-or-nothing semantics because it has observable flow control. */
+    n_tty_device_write(tty, buf, count);
+    return count;
+}
+
+/* RT-Thread wait codes are not POSIX errnos (-RT_EINTR == -9 == -EBADF).
+ * An interruptible wait with no timeout only fails when a signal arrives. */
+static int n_tty_wait_interruptible(struct rt_wqueue *wq)
+{
+    return rt_wqueue_wait_interruptible(wq, 0, RT_WAITING_FOREVER) ? -EINTR : 0;
+}
+
+static int n_tty_wait_for_output(struct tty_struct *tty, size_t room_needed)
+{
+    struct tty_struct *to = tty->other_struct;
+    rt_base_t level = rt_hw_interrupt_disable();
+    int ret;
+
+    if (tty->pty_hungup)
+        ret = -EIO;
+    else if (to->ldisc->ops->receive_room &&
+             to->ldisc->ops->receive_room(to) >= (int)room_needed)
+        ret = 0;
+    else
+        ret = n_tty_wait_interruptible(&tty->write_wait_queue);
+    rt_hw_interrupt_enable(level);
+    return ret;
+}
+
+static int do_output_char(unsigned char c, struct tty_struct *tty,
+                          size_t *room_needed)
 {
     struct n_tty_data *ldata = tty->disc_data;
-    int spaces = 0;
-    char *ch = RT_NULL;
+    unsigned int column = ldata->column;
+    unsigned int canon_column = ldata->canon_column;
+    char output[8];
+    size_t output_len = 1;
+    ssize_t written;
+
+    output[0] = c;
 
     switch (c)
     {
     case '\n':
         if (O_ONLRET(tty))
         {
-            ldata->column = 0;
+            column = 0;
         }
 
         if (O_ONLCR(tty))
         {
-            ldata->canon_column = ldata->column = 0;
-            ch = "\r\n";
-            rt_device_write((rt_device_t)tty, -1, ch, 2);
-            return 2;
+            canon_column = column = 0;
+            output[0] = '\r';
+            output[1] = '\n';
+            output_len = 2;
         }
-        ldata->canon_column = ldata->column;
+        else
+            canon_column = column;
         break;
     case '\r':
-        if (O_ONOCR(tty) && ldata->column == 0)
+        if (O_ONOCR(tty) && column == 0)
         {
             return 0;
         }
 
         if (O_OCRNL(tty))
         {
-            c = '\n';
+            output[0] = '\n';
             if (O_ONLRET(tty))
             {
-                ldata->canon_column = ldata->column = 0;
+                canon_column = column = 0;
             }
             break;
         }
-        ldata->canon_column = ldata->column = 0;
+        canon_column = column = 0;
         break;
     case '\t':
-        spaces = 8 - (ldata->column & 7);
+        output_len = 8 - (column & 7);
+        column += output_len;
         if (O_TABDLY(tty) == XTABS)
-        {
-            ldata->column += spaces;
-            ch = "        ";
-            rt_device_write((rt_device_t)tty, -1, &ch, spaces);
-            return spaces;
-        }
-        ldata->column += spaces;
+            rt_memset(output, ' ', output_len);
+        else
+            output_len = 1;
         break;
     case '\b':
-        if (ldata->column > 0)
-        {
-            ldata->column--;
-        }
-        ch = "\b \b";
-        rt_device_write((rt_device_t)tty, -1, ch, strlen(ch));
-        return 1;
+        if (column > 0)
+            column--;
+        rt_memcpy(output, "\b \b", 3);
+        output_len = 3;
+        break;
     default:
         if (!iscntrl(c))
         {
             if (O_OLCUC(tty))
-            {
-                c = toupper(c);
-            }
+                output[0] = toupper(c);
 
             if (!is_continuation(c, tty))
-            {
-                ldata->column++;
-            }
+                column++;
         }
         break;
     }
 
-    rt_device_write((rt_device_t)tty, -1, &c, 1);
-    return 1;
+    written = n_tty_device_write_exact(tty, output, output_len, room_needed);
+    if (written < 0)
+        return written;
+    ldata->column = column;
+    ldata->canon_column = canon_column;
+    return written;
 }
 
 /**
@@ -695,14 +797,15 @@ static int do_output_char(unsigned char c, struct tty_struct *tty)
  *        tty layer write lock)
  */
 
-static int process_output(unsigned char c, struct tty_struct *tty)
+static int process_output(unsigned char c, struct tty_struct *tty,
+                          size_t *room_needed)
 {
     int retval = 0;
 
-    retval = do_output_char(c, tty);
+    retval = do_output_char(c, tty, room_needed);
     if (retval < 0)
     {
-        return -1;
+        return retval;
     }
     else
     {
@@ -733,9 +836,11 @@ static ssize_t process_output_block(struct tty_struct *tty,
                     const char *buf, unsigned int nr)
 {
     struct n_tty_data *ldata = tty->disc_data;
-    int i = 0;
+    int i = 0, accepted;
     ssize_t size = 0;
     const char *cp = RT_NULL;
+    unsigned int column = ldata->column;
+    unsigned int canon_column;
 
     for (i = 0, cp = buf; i < nr; i++, cp++)
     {
@@ -745,18 +850,15 @@ static ssize_t process_output_block(struct tty_struct *tty,
         {
         case '\n':
             if (O_ONLRET(tty))
-            {
-                ldata->column = 0;
-            }
+                column = 0;
 
             if (O_ONLCR(tty))
             {
                 goto break_out;
             }
-            ldata->canon_column = ldata->column;
             break;
         case '\r':
-            if (O_ONOCR(tty) && ldata->column == 0)
+            if (O_ONOCR(tty) && column == 0)
             {
                 goto break_out;
             }
@@ -766,15 +868,13 @@ static ssize_t process_output_block(struct tty_struct *tty,
                 goto break_out;
             }
 
-            ldata->canon_column = ldata->column = 0;
+            column = 0;
             break;
         case '\t':
             goto break_out;
         case '\b':
-            if (ldata->column > 0)
-            {
-                ldata->column--;
-            }
+            if (column > 0)
+                column--;
             break;
         default:
             if (!iscntrl(c))
@@ -786,25 +886,53 @@ static ssize_t process_output_block(struct tty_struct *tty,
 
                 if (!is_continuation(c, tty))
                 {
-                    ldata->column++;
+                    column++;
                 }
             }
             break;
         }
     }
 break_out:
-    size = rt_device_write((rt_device_t)tty, -1, buf, i);
+    size = n_tty_device_write(tty, buf, i);
+    if (size <= 0)
+        return size;
+
+    column = ldata->column;
+    canon_column = ldata->canon_column;
+    for (accepted = 0; accepted < size; accepted++)
+    {
+        unsigned char c = buf[accepted];
+
+        if (c == '\n')
+        {
+            if (O_ONLRET(tty))
+                column = 0;
+            canon_column = column;
+        }
+        else if (c == '\r')
+            canon_column = column = 0;
+        else if (c == '\b')
+        {
+            if (column > 0)
+                column--;
+        }
+        else if (!iscntrl(c) && !is_continuation(c, tty))
+            column++;
+    }
+    ldata->column = column;
+    ldata->canon_column = canon_column;
     return size;
 }
 
-static size_t __process_echoes(struct tty_struct *tty)
+static int __process_echoes(struct tty_struct *tty, size_t *room_needed)
 {
     struct n_tty_data *ldata = tty->disc_data;
     size_t tail = 0;
     unsigned char c = 0;
     char ch = 0;
     unsigned char num_chars = 0, num_bs = 0;
-    
+    int ret = 0;
+
     tail = ldata->echo_tail;
     while (ldata->echo_commit != tail)
     {
@@ -841,14 +969,20 @@ static size_t __process_echoes(struct tty_struct *tty)
                 }
                 num_bs = 8 - (num_chars & 7);
 
-                while (num_bs--)
                 {
-                    ch = '\b';
-                    rt_device_write((rt_device_t)tty, -1, &ch, 1);
-                    if (ldata->column > 0)
+                    char backspaces[8];
+                    ssize_t written;
+
+                    rt_memset(backspaces, '\b', num_bs);
+                    written = n_tty_device_write_exact(tty, backspaces, num_bs,
+                                                       room_needed);
+                    if (written < 0)
                     {
-                        ldata->column--;
+                        ret = written;
+                        goto stalled;
                     }
+                    ldata->column = ldata->column > num_bs ?
+                                    ldata->column - num_bs : 0;
                 }
                 tail += 3;
                 break;
@@ -868,7 +1002,15 @@ static size_t __process_echoes(struct tty_struct *tty)
 
             case ECHO_OP_START:
                 ch = ECHO_OP_START;
-                rt_device_write((rt_device_t)tty, -1, &ch, 1);
+                {
+                    ssize_t written = n_tty_device_write_exact(tty, &ch, 1,
+                                                               room_needed);
+                    if (written < 0)
+                    {
+                        ret = written;
+                        goto stalled;
+                    }
+                }
                 ldata->column++;
                 tail += 2;
                 break;
@@ -883,10 +1025,16 @@ static size_t __process_echoes(struct tty_struct *tty)
                  * enough space for the whole ctrl pair.
                  *
                  */
-                ch = '^';
-                rt_device_write((rt_device_t)tty, -1, &ch, 1);
-                ch = op ^ 0100;
-                rt_device_write((rt_device_t)tty, -1, &ch, 1);
+                {
+                    char control[2] = {'^', op ^ 0100};
+                    ssize_t written = n_tty_device_write_exact(tty, control, 2,
+                                                               room_needed);
+                    if (written < 0)
+                    {
+                        ret = written;
+                        goto stalled;
+                    }
+                }
                 ldata->column += 2;
                 tail += 2;
             }
@@ -895,24 +1043,39 @@ static size_t __process_echoes(struct tty_struct *tty)
         {
             if (O_OPOST(tty))
             {
-                int retval = do_output_char(c, tty);
+                int retval = do_output_char(c, tty, room_needed);
                 if (retval < 0)
                 {
-                    break;
+                    ret = retval;
+                    goto stalled;
                 }
             }
             else
             {
-                rt_device_write((rt_device_t)tty, -1, &c, 1);
+                {
+                    ssize_t written = n_tty_device_write_exact(tty, &c, 1,
+                                                               room_needed);
+                    if (written < 0)
+                    {
+                        ret = written;
+                        goto stalled;
+                    }
+                }
             }
             tail += 1;
         }
     }
 
+stalled:
     /* If the echo buffer is nearly full (so that the possibility exists
      * of echo overrun before the next commit), then discard enough
-     * data at the tail to prevent a subsequent overrun */
-    while (ldata->echo_commit - tail >= ECHO_DISCARD_WATERMARK)
+     * data at the tail to prevent a subsequent overrun. This must also
+     * run when output stalled above: add_echo_byte() does not bound
+     * echo_head, so a peer that never drains would otherwise let the
+     * ring wrap over unsent echoes. As in Linux, never past echo_commit: an
+     * isig() flush can reset the indices below a stalled tail. */
+    while (ldata->echo_commit > tail &&
+           ldata->echo_commit - tail >= ECHO_DISCARD_WATERMARK)
     {
         if (echo_buf(ldata, tail) == ECHO_OP_START)
         {
@@ -932,7 +1095,7 @@ static size_t __process_echoes(struct tty_struct *tty)
     }
 
     ldata->echo_tail = tail;
-    return 0;
+    return ret;
 }
 
 static void commit_echoes(struct tty_struct *tty)
@@ -955,20 +1118,20 @@ static void commit_echoes(struct tty_struct *tty)
     }
 
     ldata->echo_commit = head;
-    __process_echoes(tty);
+    __process_echoes(tty, RT_NULL);
 }
 
-static void process_echoes(struct tty_struct *tty)
+static int process_echoes(struct tty_struct *tty, size_t *room_needed)
 {
     struct n_tty_data *ldata = tty->disc_data;
 
     if (ldata->echo_mark == ldata->echo_tail)
     {
-        return;
+        return 0;
     }
 
     ldata->echo_commit = ldata->echo_mark;
-    __process_echoes(tty);
+    return __process_echoes(tty, room_needed);
 }
 
 /* NB: echo_mark and echo_head should be equivalent here */
@@ -983,7 +1146,7 @@ static void flush_echoes(struct tty_struct *tty)
     }
 
     ldata->echo_commit = ldata->echo_head;
-    __process_echoes(tty);
+    __process_echoes(tty, RT_NULL);
 }
 /**
  *  n_tty_set_termios   -   termios data changed
@@ -1005,7 +1168,7 @@ static void n_tty_set_termios(struct tty_struct *tty, struct termios *old)
 
     if (!old || (old->c_lflag ^ tty->init_termios.c_lflag) & (ICANON | EXTPROC))
     {
-        rt_memset(ldata->read_flags, 0, RT_TTY_BUF);
+        rt_memset(ldata->read_flags, 0, sizeof(ldata->read_flags));
         ldata->line_start = ldata->read_tail;
         if (!L_ICANON(tty) || !read_cnt(ldata))
         {
@@ -1030,7 +1193,7 @@ static void n_tty_set_termios(struct tty_struct *tty, struct termios *old)
         I_IXON(tty) || L_ISIG(tty) || L_ECHO(tty) ||
         I_PARMRK(tty))
     {
-        rt_memset(ldata->char_map, 0, 256);
+        rt_memset(ldata->char_map, 0, sizeof(ldata->char_map));
         if (I_IGNCR(tty) || I_ICRNL(tty))
         {
             set_bit('\r', (int *)ldata->char_map);
@@ -1095,12 +1258,16 @@ void console_ldata_init(struct tty_struct *tty)
 {
     struct n_tty_data *ldata = RT_NULL;
 
-    ldata = rt_malloc(sizeof(struct n_tty_data));
+    /* Zeroed, with the mutexes n_tty_open() creates: n_tty_open() keeps
+     * this for the console now, and n_tty_close() deletes them. */
+    ldata = rt_calloc(1, sizeof(struct n_tty_data));
     if (ldata == RT_NULL)
     {
         LOG_E("console_ldata_init ldata malloc fail");
         return;
     }
+    ldata->atomic_read_lock = rt_mutex_create("atomic_read_lock", RT_IPC_FLAG_FIFO);
+    ldata->output_lock = rt_mutex_create("output_lock", RT_IPC_FLAG_FIFO);
     tty->disc_data = ldata;
     reset_buffer_flags(ldata);
     ldata->column = 0;
@@ -1115,17 +1282,43 @@ static int n_tty_open(struct dfs_fd *fd)
 {
     int ret = 0;
     struct n_tty_data *ldata = RT_NULL;
-    struct tty_struct *tty = (struct tty_struct*)fd->fnode->data;
+    struct tty_struct *tty = tty_from_fd(fd);
 
-    ldata = rt_malloc(sizeof(struct n_tty_data));
+    /* tty_close() never closes the discipline (the console's receive path
+     * keeps using it), so a later first open of the path finds it here:
+     * start it afresh rather than leaking it and its mutexes. */
+    if (tty->disc_data)
+    {
+        rt_base_t level = rt_hw_interrupt_disable();
+
+        ldata = tty->disc_data;
+        reset_buffer_flags(ldata);
+        ldata->column = 0;
+        ldata->canon_column = 0;
+        ldata->lnext = 0;
+        rt_hw_interrupt_enable(level);
+        n_tty_set_termios(tty, RT_NULL);
+        return 0;
+    }
+
+    ldata = rt_calloc(1, sizeof(struct n_tty_data));
     if (ldata == RT_NULL)
     {
         LOG_E("n_tty_open ldata malloc fail");
-        return -1;
+        return -ENOMEM;
     }
 
     ldata->atomic_read_lock = rt_mutex_create("atomic_read_lock",RT_IPC_FLAG_FIFO);
     ldata->output_lock = rt_mutex_create("output_lock",RT_IPC_FLAG_FIFO);
+    if (!ldata->atomic_read_lock || !ldata->output_lock)
+    {
+        if (ldata->atomic_read_lock)
+            rt_mutex_delete(ldata->atomic_read_lock);
+        if (ldata->output_lock)
+            rt_mutex_delete(ldata->output_lock);
+        rt_free(ldata);
+        return -ENOMEM;
+    }
     tty->disc_data = ldata;
     reset_buffer_flags(ldata);
     ldata->column = 0;
@@ -1299,24 +1492,70 @@ static int canon_copy_from_read_buf(struct tty_struct *tty, char *b, size_t nr)
 
 static int n_tty_close(struct tty_struct *tty)
 {
-    int ret = 0;
-    struct n_tty_data *ldata = RT_NULL;
-    struct tty_struct *o_tty = RT_NULL;
+    struct n_tty_data *ldata = tty->disc_data;
 
-    RT_ASSERT(tty != RT_NULL);
-    if (tty->type == TTY_DRIVER_TYPE_PTY && tty->subtype == PTY_TYPE_MASTER)
+    if (ldata)
     {
-        o_tty = tty->other_struct;
+        if (ldata->atomic_read_lock)
+            rt_mutex_delete(ldata->atomic_read_lock);
+        if (ldata->output_lock)
+            rt_mutex_delete(ldata->output_lock);
+        rt_free(ldata);
+        tty->disc_data = RT_NULL;
     }
+    return 0;
+}
+
+/* Discard @tty's unread input (tcflush(TCIFLUSH), TCSETSF), and wake a PTY
+ * peer's writers waiting for the room. */
+void n_tty_flush_input(struct tty_struct *tty)
+{
+    struct n_tty_data *ldata = tty->disc_data;
+    rt_base_t level;
+
+    if (!ldata)
+        return;
+    level = rt_hw_interrupt_disable();
+    ldata->read_head = ldata->canon_head = ldata->read_tail = 0;
+    ldata->commit_head = 0;
+    ldata->line_start = 0;
+    ldata->erasing = 0;
+    ldata->push = 0;
+    rt_memset(ldata->read_flags, 0, sizeof(ldata->read_flags));
+    rt_hw_interrupt_enable(level);
+    if (tty->type == TTY_DRIVER_TYPE_PTY && tty->other_struct)
+        tty_wakeup_all(&tty->other_struct->write_wait_queue, (void *)POLLOUT);
+}
+
+/* tcflush(): this end's input, and for a PTY its output, which is the
+ * peer's unread input. Other ttys write their output through at once. */
+static int n_tty_tcflsh(struct tty_struct *tty, int queue)
+{
+    if (queue != TCIFLUSH && queue != TCOFLUSH && queue != TCIOFLUSH)
+        return -EINVAL;
+    if (queue != TCOFLUSH)
+        n_tty_flush_input(tty);
+    if (queue != TCIFLUSH && tty->type == TTY_DRIVER_TYPE_PTY && tty->other_struct)
+        n_tty_flush_input(tty->other_struct);
+    return 0;
+}
+
+/* FIONREAD: what read() can return without waiting. */
+static int n_tty_inq(struct tty_struct *tty)
+{
+    struct n_tty_data *ldata = tty->disc_data;
+    rt_base_t level;
+    size_t n;
+
+    if (!ldata)
+        return 0;
+    level = rt_hw_interrupt_disable();
+    if (ldata->icanon && !L_EXTPROC(tty))
+        n = ldata->canon_head - ldata->read_tail;
     else
-    {
-        o_tty = tty;
-    }
-
-    ldata = o_tty->disc_data;
-    rt_free(ldata);
-    o_tty->disc_data = RT_NULL;
-    return ret;
+        n = ldata->commit_head - ldata->read_tail;
+    rt_hw_interrupt_enable(level);
+    return (int)n;
 }
 
 static int n_tty_ioctl(struct dfs_fd *fd, int cmd, void *args)
@@ -1325,7 +1564,7 @@ static int n_tty_ioctl(struct dfs_fd *fd, int cmd, void *args)
     struct tty_struct *real_tty = RT_NULL;
     struct tty_struct *tty = RT_NULL;
 
-    tty = (struct tty_struct *)fd->fnode->data;
+    tty = tty_from_fd(fd);
     RT_ASSERT(tty != RT_NULL);
     if (tty->type == TTY_DRIVER_TYPE_PTY && tty->subtype == PTY_TYPE_MASTER)
     {
@@ -1338,7 +1577,14 @@ static int n_tty_ioctl(struct dfs_fd *fd, int cmd, void *args)
 
     switch(cmd)
     {
-
+    case TCFLSH:
+        /* The file's own end: a master flushes what the slave sent it. */
+        return n_tty_tcflsh(tty, (int)(rt_ubase_t)args);
+    case FIONREAD:
+        if (!args)
+            return -EFAULT;
+        *(int *)args = n_tty_inq(tty);
+        return 0;
     default:
         ret = n_tty_ioctl_extend(real_tty, cmd, args);
         if (ret != -ENOIOCTLCMD)
@@ -1347,11 +1593,14 @@ static int n_tty_ioctl(struct dfs_fd *fd, int cmd, void *args)
         }
     }
 
+    /* Terminal ioctls ('T', 0x54xx) not handled above are not the device
+     * driver's: the UART rejected them with -RT_EINVAL (ECHILD's number) and
+     * logged "Invalid cmd" for every isatty(). Linux answers ENOTTY. */
+    if ((cmd & ~0xff) == 0x5400)
+        return -ENOTTY;
     ret = rt_device_control((rt_device_t)real_tty, cmd, args);
-    if (ret != -ENOIOCTLCMD)
-    {
-        return ret;
-    }
+    if (ret == -ENOIOCTLCMD)
+        ret = -ENOTTY;
     return ret;
 }
 
@@ -1366,7 +1615,7 @@ n_tty_receive_signal_char(struct tty_struct *tty, int signal, unsigned char c)
     }
     else
     {
-        process_echoes(tty);
+        process_echoes(tty, RT_NULL);
     }
     return;
 }
@@ -1395,7 +1644,7 @@ static int n_tty_receive_char_special(struct tty_struct *tty, unsigned char c)
     {
         if (c == START_CHAR(tty)) /*ctrl + p realize missing*/
         {
-            process_echoes(tty);
+            process_echoes(tty, RT_NULL);
             return 0;
         }
         if (c == STOP_CHAR(tty)) /*ctrl + s realize missing*/
@@ -1801,16 +2050,34 @@ int n_tty_receive_buf(struct tty_struct *tty,char *cp, int count)
             break;
         }
 
-        if (!overflow)
-        {
+        /* As in Linux: in canonical overflow (full buffer, no complete
+         * line) each byte overwrites the last slot, so a newline can still
+         * complete the line. Dropping it instead left the reader waiting
+         * forever for a line it could never get. PARMRK can queue two
+         * bytes for one input byte, which the single overflow slot cannot
+         * hold: that mode still drops overflow input. */
+        if (!overflow || !I_PARMRK(tty))
             __receive_buf(tty, cp, n);
-        }
 
         cp += n;
         size -= n;
         rcvd += n;
     }
     return count - size;
+}
+
+static int n_tty_receive_room(struct tty_struct *tty)
+{
+    struct n_tty_data *ldata = tty->disc_data;
+    size_t tail = ldata->read_tail;
+    int room = RT_TTY_BUF - (ldata->read_head - tail);
+
+    if (I_PARMRK(tty))
+        room = (room + 2) / 3;
+    room--;
+    if (room <= 0)
+        room = ldata->icanon && ldata->canon_head == tail;
+    return room;
 }
 
 /**
@@ -1842,9 +2109,10 @@ static int n_tty_read(struct dfs_fd *fd, void *buf, size_t count)
     int wait_ret = 0;
     int retval = 0;
     int c = 0;
+    size_t read_tail_before;
 
     level = rt_hw_interrupt_disable();
-    tty = (struct tty_struct *)fd->fnode->data;
+    tty = tty_from_fd(fd);
     RT_ASSERT(tty != RT_NULL);
     c = job_control(tty);
     if (c < 0)
@@ -1854,6 +2122,7 @@ static int n_tty_read(struct dfs_fd *fd, void *buf, size_t count)
     }
 
     struct n_tty_data *ldata = tty->disc_data;
+    read_tail_before = ldata->read_tail;
 
     lwp = (struct rt_lwp *)(rt_thread_self()->lwp);
     wq = wait_queue_get(lwp, tty);
@@ -1862,13 +2131,15 @@ static int n_tty_read(struct dfs_fd *fd, void *buf, size_t count)
     {
         if ((!input_available_p(tty, 0)))
         {
+            if (tty->type == TTY_DRIVER_TYPE_PTY && tty->pty_hungup)
+                break;
             if (fd->flags & O_NONBLOCK)
             {
                 retval = -EAGAIN;
                 break;
             }
 
-            wait_ret = rt_wqueue_wait_interruptible(wq, 0, RT_WAITING_FOREVER);
+            wait_ret = n_tty_wait_interruptible(wq);
             if (wait_ret != 0)
             {
                 retval = wait_ret;
@@ -1890,29 +2161,65 @@ static int n_tty_read(struct dfs_fd *fd, void *buf, size_t count)
             break;
         }
     }
+    if (ldata->read_tail != read_tail_before && tty->type == TTY_DRIVER_TYPE_PTY)
+        process_echoes(tty->other_struct, RT_NULL);
     rt_hw_interrupt_enable(level);
+    if (ldata->read_tail != read_tail_before && tty->type == TTY_DRIVER_TYPE_PTY)
+        tty_wakeup_all(&tty->other_struct->write_wait_queue, (void *)POLLOUT);
     return retval;
 }
 
 static int n_tty_write(struct dfs_fd *fd, const void *buf, size_t count)
 {
-    int retval = 0;
+    size_t original_count = count;
+    int error = 0;
+    int wait_ret;
+    size_t room_needed = 1;
     char *b = (char *)buf;
     int c = 0;
     struct tty_struct *tty = RT_NULL;
 
-    tty = (struct tty_struct *)fd->fnode->data;
+    tty = tty_from_fd(fd);
     RT_ASSERT(tty != RT_NULL);
-    retval = tty_check_change(tty);
-    if (retval)
+    error = L_TOSTOP(tty) ? tty_check_change(tty) : 0;
+    if (error)
     {
-        return retval;
+        return error;
     }
 
-    process_echoes(tty);
-    retval = count;
-    while(1)
+    for (;;)
     {
+        /* Echo state is shared with the receive path, which processes it
+         * with interrupts off: a PTY peer's write (pty_device_write()), or the
+         * console UART's receive interrupt (console_rx_notify()), which also
+         * writes the echoes from there. Neither output sleeps (the console
+         * UART transmits by polling). Only a console on an interrupt-RX UART:
+         * a console moved to ADB or telnet receives in a thread and writes
+         * through mutexes and the network. Other ttys write to a driver that
+         * may sleep. */
+        if (tty->type == TTY_DRIVER_TYPE_PTY ||
+            (tty->type == TTY_DRIVER_TYPE_CONSOLE && tty->driver &&
+             (tty->driver->open_flag & RT_DEVICE_FLAG_INT_RX)))
+        {
+            rt_base_t level = rt_hw_interrupt_disable();
+
+            error = process_echoes(tty, &room_needed);
+            rt_hw_interrupt_enable(level);
+        }
+        else
+            error = process_echoes(tty, &room_needed);
+        if (error >= 0)
+            break;
+        if (error != -EAGAIN || (fd->flags & O_NONBLOCK))
+            return error;
+        wait_ret = n_tty_wait_for_output(tty, room_needed);
+        if (wait_ret)
+            return wait_ret;
+    }
+    while (count)
+    {
+        error = 0;
+        room_needed = 1;
         if (O_OPOST(tty))
         {
             while (count > 0)
@@ -1920,13 +2227,8 @@ static int n_tty_write(struct dfs_fd *fd, const void *buf, size_t count)
                 ssize_t num = process_output_block(tty, b, count);
                 if (num < 0)
                 {
-                    if (num == -EAGAIN)
-                    {
-                        break;
-                    }
-
-                    retval = num;
-                    goto break_out;
+                    error = num;
+                    break;
                 }
                 b += num;
                 count -= num;
@@ -1936,43 +2238,57 @@ static int n_tty_write(struct dfs_fd *fd, const void *buf, size_t count)
                 }
 
                 c = *b;
-                if (process_output(c, tty) < 0)
+                c = process_output(c, tty, &room_needed);
+                if (c < 0)
                 {
+                    error = c;
                     break;
                 }
 
                 b++;
                 count--;
             }
-            retval -= count;
         }
         else
         {
             while (count > 0)
             {
-                c = rt_device_write((rt_device_t)tty, -1, b, count);
+                c = n_tty_device_write(tty, b, count);
                 if (c < 0)
                 {
-                    retval = c;
-                    goto break_out;
+                    error = c;
+                    break;
+                }
+                if (c == 0)
+                {
+                    error = -EAGAIN;
+                    break;
                 }
                 b += c;
                 count -= c;
             }
-            retval -= count;
         }
 
         if (!count)
-        {
             break;
-        }
+        if (error < 0 && error != -EAGAIN)
+            break;
         if (fd->flags & O_NONBLOCK)
+            break;
+        /* A blocking write waits until all of it is written; only a signal
+         * or hangup ends it early, with the count written so far. */
+        if (tty->type != TTY_DRIVER_TYPE_PTY)
+            break;
+        wait_ret = n_tty_wait_for_output(tty, room_needed);
+        if (wait_ret)
         {
+            error = wait_ret;
             break;
         }
     }
-break_out:
-    return retval;
+    if (count != original_count)
+        return original_count - count;
+    return error;
 }
 
 static int n_tty_flush(struct dfs_fd *fd)
@@ -1993,12 +2309,12 @@ static int n_tty_getdents(struct dfs_fd *fd, struct dirent *dirp, uint32_t count
 static int n_tty_poll(struct dfs_fd *fd, struct rt_pollreq *req)
 {
     rt_base_t level = 0;
-    int mask = POLLOUT;
+    int mask = 0;
     struct tty_struct *tty = RT_NULL;
     struct rt_wqueue *wq = RT_NULL;
     struct rt_lwp *lwp = RT_NULL;
 
-    tty = (struct tty_struct *)fd->fnode->data;
+    tty = tty_from_fd(fd);
     RT_ASSERT(tty != RT_NULL);
 
     RT_ASSERT(tty->init_flag == TTY_INIT_FLAG_INITED);
@@ -2006,7 +2322,20 @@ static int n_tty_poll(struct dfs_fd *fd, struct rt_pollreq *req)
     lwp = (struct rt_lwp *)(rt_thread_self()->lwp);
     wq = wait_queue_get(lwp, tty);
     rt_poll_add(wq, req);
+    if (tty->type == TTY_DRIVER_TYPE_PTY)
+        rt_poll_add(&tty->write_wait_queue, req);
     level = rt_hw_interrupt_disable();
+
+    if (tty->type == TTY_DRIVER_TYPE_PTY)
+    {
+        if (tty->pty_hungup)
+            mask = POLLHUP;
+        else if (tty->other_struct->ldisc->ops->receive_room &&
+                 tty->other_struct->ldisc->ops->receive_room(tty->other_struct) > 0)
+            mask = POLLOUT;
+    }
+    else
+        mask = POLLOUT;
 
     if (input_available_p(tty, 1))
     {
@@ -2032,6 +2361,7 @@ static struct tty_ldisc_ops n_tty_ops = {
     n_tty_poll,
     n_tty_set_termios,
     n_tty_receive_buf,
+    n_tty_receive_room,
     0,
 };
 

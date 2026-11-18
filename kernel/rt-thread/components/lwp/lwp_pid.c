@@ -139,6 +139,9 @@ static void __exit_files(struct rt_lwp *lwp)
         d = lwp->fdt.fds[fd];
         lwp->fdt.fds[fd] = RT_NULL;
         dfs_fd_unlock();
+        /* The exiting process's record locks go with its descriptors. */
+        if (d && d->fnode && d->fnode->locks)
+            dfs_file_lock_release(d->fnode, lwp);
         fd_put(d);
         fd--;
     }
@@ -361,6 +364,8 @@ void lwp_free(struct rt_lwp* lwp)
 
     LOG_D("lwp free: %p\n", lwp);
 
+    lwp_alarm_cleanup(lwp);
+
     if (lwp->args != RT_NULL)
     {
 #ifndef ARCH_MM_MMU
@@ -374,24 +379,13 @@ void lwp_free(struct rt_lwp* lwp)
 
     if (lwp->tty != RT_NULL)
     {
-        struct rt_lwp *old_lwp = RT_NULL;
-
-        if (lwp->session == -1)
-        {
-            struct termios *old_stdin_termios = get_old_termios();
-            tcsetattr(1, 0, old_stdin_termios);
-        }
-
-        level = rt_hw_interrupt_disable();
-        rt_spin_lock(&lwp->tty->spinlock);
-        old_lwp = tty_pop(&lwp->tty->head, RT_NULL);
-        rt_spin_unlock(&lwp->tty->spinlock);
-        if (lwp->tty->foreground == lwp)
-        {
-            lwp->tty->foreground = old_lwp;
-            lwp->tty = RT_NULL;
-        }
-        rt_hw_interrupt_enable(level);
+        struct tty_struct *tty = lwp->tty;
+        int console_foreground = lwp->session == -1 && tty->foreground == lwp;
+        tty_release_lwp(lwp);
+        /* A forked child shares the terminal without owning the foreground.
+         * Restore the shell mode only when the last foreground job returns. */
+        if (console_foreground && !tty->foreground)
+            lwp_restore_console_termios();
     }
 
     if (lwp->fdt.fds != RT_NULL)

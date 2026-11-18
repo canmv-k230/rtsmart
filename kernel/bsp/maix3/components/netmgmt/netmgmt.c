@@ -1180,6 +1180,8 @@ void netdev_update_resolv_conf(void)
         rt_mutex_take(&g_resolv_conf_lock, RT_WAITING_FOREVER) != RT_EOK) {
         return;
     }
+    /* dfs_file_close() acts only on a descriptor with one reference. */
+    fd_init(&fd);
     if (dfs_file_open(&fd, "/etc/resolv.conf",
                       O_CREAT | O_TRUNC | O_WRONLY) != 0) {
         LOG_E("Open /etc/resolv.conf failed.\n");
@@ -1215,6 +1217,7 @@ void netdev_generate_services_file(void)
                                           "domain      53/udp\n"
                                           "ntp         123/udp\n";
 
+    fd_init(&fd);
     if (0x00 != dfs_file_open(&fd, "/etc/services", O_CREAT | O_TRUNC | O_WRONLY)) {
         rt_kprintf("Open /etc/services failed.\n");
         return;

@@ -37,6 +37,7 @@
 #ifdef RT_USING_POSIX
 #include <dfs_posix.h>
 #include <dfs_poll.h>
+#include <devfs.h>
 
 /* it's possible the 'getc/putc' is defined by stdio.h in gcc/newlib. */
 #ifdef getc
@@ -66,7 +67,6 @@ static rt_err_t serial_fops_rx_ind(rt_device_t dev, rt_size_t size)
 /* fops for serial */
 static int serial_fops_open(struct dfs_fd *fd)
 {
-    rt_err_t ret = 0;
     rt_uint16_t flags = 0;
     rt_device_t device;
 
@@ -97,13 +97,8 @@ static int serial_fops_open(struct dfs_fd *fd)
         rt_device_set_rx_indicate(device, serial_fops_rx_ind);
     }
 
-    ret = rt_device_open(device, flags);
-    if (ret == RT_EOK)
-    {
-        return 0;
-    }
-
-    return ret;
+    /* rt_device_open() speaks RT_E*; user space needs an errno. */
+    return devfs_device_open(device, flags);
 }
 
 static int serial_fops_close(struct dfs_fd *fd)

@@ -690,16 +690,28 @@ void* lwp_mmap2(void *addr, size_t length, int prot,
         }
         else
         {
-            ret = (void *)-1;
+            ret = (void *)(rt_base_t)-ENOMEM;
         }
     }
     else
     {
         struct dfs_fd *d;
 
-        d = fd_get(fd);
-        if (d && d->fnode->type == FT_DEVICE)
+        /* Errors as negative errnos (sys_mmap2() returns this to user
+         * space; -1 read as EPERM there). Pinned: a close() from another
+         * thread may run meanwhile. */
+        d = fd_get_ref(fd);
+        if (!d)
         {
+            ret = (void *)(rt_base_t)-EBADF;
+        }
+        else if (d->fnode->type != FT_DEVICE && d->fnode->type != FT_REGULAR)
+        {
+            ret = (void *)(rt_base_t)-ENODEV;
+        }
+        else
+        {
+            int err;
             struct dfs_mmap2_args mmap2;
         
             mmap2.addr = addr;
@@ -709,11 +721,13 @@ void* lwp_mmap2(void *addr, size_t length, int prot,
             mmap2.pgoffset = pgoffset;
             mmap2.ret = (void*) -1;
 
-            if (dfs_file_mmap2(d, &mmap2) == 0)
-            {
+            err = dfs_file_mmap2(d, &mmap2);
+            if (err == 0 && mmap2.ret != (void *)-1)
                 ret = mmap2.ret;
-            }
+            else
+                ret = (void *)(rt_base_t)(err < 0 ? err : -ENOMEM);
         }
+        fd_put(d);
     }
 
     return ret;

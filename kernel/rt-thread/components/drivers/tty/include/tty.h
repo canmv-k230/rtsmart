@@ -30,6 +30,17 @@ struct tty_node
 };
 
 void tty_initstack(struct tty_node *node);
+void tty_release_lwp(struct rt_lwp *lwp);
+void tty_detach_session(struct tty_struct *tty);
+struct tty_node *tty_foreground_alloc(void);
+void tty_foreground_free(struct tty_node *node);
+int tty_foreground_commit_locked(struct tty_struct *tty, struct rt_lwp *previous,
+                                 struct rt_lwp *child, struct tty_node *node,
+                                 struct rt_lwp *parent);
+int tty_push_foreground(struct rt_lwp *parent, struct rt_lwp *child);
+int tty_push_foreground_tty(struct tty_struct *tty, struct rt_lwp *child);
+void tty_wakeup_all(struct rt_wqueue *queue, void *key);
+ssize_t pty_write_exact(struct tty_struct *tty, const void *buffer, size_t size);
 int tty_push(struct tty_node **head, struct rt_lwp *lwp);
 struct rt_lwp *tty_pop(struct tty_node **head, struct rt_lwp *target_lwp);
 /*
@@ -143,6 +154,8 @@ struct tty_struct
     int init_flag;
     int index;  //for pty
     int pts_lock;   //for pty
+    unsigned int pty_open_count; /* open file descriptions, not dup aliases */
+    int pty_hungup;
 
     struct tty_struct *other_struct; //for pty
 
@@ -163,6 +176,7 @@ struct tty_struct
     struct rt_device *driver;
 
     struct rt_wqueue wait_queue;
+    struct rt_wqueue write_wait_queue; /* PTY output room */
 
 #define RT_TTY_BUF 1024
     rt_list_t tty_drivers;
@@ -295,6 +309,7 @@ enum
         typeof(b) _b = b;\
         _a < _b ? _a : _b; })
 
+struct tty_struct *tty_from_fd(struct dfs_fd *fd);
 void tty_set_fops(struct dfs_file_ops *fops);
 void console_set_fops(struct dfs_file_ops *fops);
 void mutex_lock(rt_mutex_t mutex);
@@ -304,7 +319,7 @@ int tty_check_change(struct tty_struct *tty);
 
 rt_inline struct rt_wqueue *wait_queue_get(struct rt_lwp *lwp, struct tty_struct *tty)
 {
-    if (lwp == RT_NULL)
+    if (tty->type == TTY_DRIVER_TYPE_PTY || lwp == RT_NULL)
     {
         return &tty->wait_queue;
     }
@@ -321,7 +336,11 @@ rt_inline void tty_wakeup_check(struct tty_struct *tty)
     struct rt_wqueue *wq = NULL;
 
     wq = wait_queue_current_get(tty->foreground, tty);
-    rt_wqueue_wakeup(wq, (void*)POLLIN);
+    /* PTY readers and pollers share the endpoint queue; wake all of them. */
+    if (tty->type == TTY_DRIVER_TYPE_PTY)
+        tty_wakeup_all(wq, (void*)POLLIN);
+    else
+        rt_wqueue_wakeup(wq, (void*)POLLIN);
 }
 
 rt_inline int set_bit(int nr,int *addr)
@@ -329,7 +348,7 @@ rt_inline int set_bit(int nr,int *addr)
     int mask, retval, level;
 
     addr += nr >> 5;
-    mask = 1 << (nr & 0x1f);
+    mask = 1U << (nr & 0x1f);
     level = rt_hw_interrupt_disable();
     retval = (mask & *addr) != 0;
     *addr |= mask;
@@ -342,7 +361,7 @@ rt_inline int clear_bit(int nr, int *addr)
     int mask, retval, level;
 
     addr += nr >> 5;
-    mask = 1 << (nr & 0x1f);
+    mask = 1U << (nr & 0x1f);
     level = rt_hw_interrupt_disable();
     retval = (mask & *addr) != 0;
     *addr &= ~mask;
@@ -355,7 +374,7 @@ rt_inline int test_bit(int nr, int *addr)
     int mask;
 
     addr += nr >> 5;
-    mask = 1 << (nr & 0x1f);
+    mask = 1U << (nr & 0x1f);
     return ((mask & *addr) != 0);
 }
 
@@ -365,7 +384,7 @@ rt_inline int test_and_clear_bit(int nr, volatile void *addr)
     volatile unsigned int *a = addr;
 
     a += nr >> 5;
-    mask = 1 << (nr & 0x1f);
+    mask = 1U << (nr & 0x1f);
     level = rt_hw_interrupt_disable();
     retval = (mask & *a) != 0;
     *a &= ~mask;
@@ -373,6 +392,9 @@ rt_inline int test_and_clear_bit(int nr, volatile void *addr)
 
     return retval;
 }
+
+/* Bitmap scans must use the storage word width (64 bits on K230). */
+#define BITS_PER_LONG       (__SIZEOF_LONG__ * 8)
 
 rt_inline unsigned long __ffs(unsigned long word)
 {
@@ -412,7 +434,6 @@ rt_inline unsigned long __ffs(unsigned long word)
 
     return num;
 }
-#define BITS_PER_LONG       32
 #define BITOP_WORD(nr)      ((nr) / BITS_PER_LONG)
 
 /*
@@ -486,5 +507,6 @@ int n_tty_ioctl_extend(struct tty_struct *tty, int cmd, void *arg);
 void console_ldata_init(struct tty_struct *tty);
 int n_tty_receive_buf(struct tty_struct *tty, char *cp, int count);
 void n_tty_init(void);
+void n_tty_flush_input(struct tty_struct *tty);
 
 #endif /*__TTY_H__*/

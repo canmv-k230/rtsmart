@@ -29,6 +29,12 @@
 
 #if defined(RT_USING_DFS)
 #include <dfs_posix.h>
+#ifdef RT_USING_TTY
+#include <posix_termios.h>
+#ifdef RT_USING_LWP
+#include <lwp.h>
+#endif
+#endif
 #endif /* RT_USING_DFS */
 
 /* finsh thread */
@@ -416,6 +422,8 @@ static void shell_push_history(struct finsh_shell *shell)
 void finsh_thread_entry(void *parameter)
 {
     int ch;
+    int echoed_pending = 0;
+    int already_echoed;
 
     /* normal is echo mode */
 #ifndef FINSH_ECHO_DISABLE_DEFAULT
@@ -457,6 +465,12 @@ void finsh_thread_entry(void *parameter)
         {
             continue;
         }
+
+        /* Input queued by a foreground tty program has already been
+         * echoed by its line discipline. Keep the typeahead, but do not
+         * print it a second time with FinSH's own editor. */
+        already_echoed = echoed_pending > 0;
+        if (echoed_pending > 0) echoed_pending--;
 
         /*
          * handle control key
@@ -592,7 +606,7 @@ void finsh_thread_entry(void *parameter)
             }
             else
             {
-                if (shell->echo_mode)
+                if (shell->echo_mode && !already_echoed)
                     rt_kprintf("\b \b");
                 shell->line[shell->line_position] = 0;
             }
@@ -607,9 +621,12 @@ void finsh_thread_entry(void *parameter)
             shell_push_history(shell);
 #endif
 
-            if (shell->echo_mode)
+            if (shell->echo_mode && !already_echoed)
                 rt_kprintf("\n");
             msh_exec(shell->line, shell->line_position);
+#if defined(RT_USING_TTY) && defined(RT_USING_LWP)
+            echoed_pending = lwp_take_console_echoed_input();
+#endif
 
             rt_kprintf(FINSH_PROMPT);
 #if defined(CHERRY_USB_DEVICE_ENABLE_CLASS_ADB)
@@ -639,7 +656,7 @@ void finsh_thread_entry(void *parameter)
                        &shell->line[shell->line_curpos],
                        shell->line_position - shell->line_curpos);
             shell->line[shell->line_curpos] = ch;
-            if (shell->echo_mode)
+            if (shell->echo_mode && !already_echoed)
                 rt_kprintf("%s", &shell->line[shell->line_curpos]);
 
             /* move the cursor to new position */
@@ -649,7 +666,7 @@ void finsh_thread_entry(void *parameter)
         else
         {
             shell->line[shell->line_position] = ch;
-            if (shell->echo_mode)
+            if (shell->echo_mode && !already_echoed)
                 rt_kprintf("%c", ch);
         }
 

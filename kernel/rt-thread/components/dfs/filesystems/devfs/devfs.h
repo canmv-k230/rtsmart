@@ -14,4 +14,11 @@
 
 int devfs_init(void);
 
+/*
+ * rt_device_open() for a dfs_file_ops.open callback: returns 0 once the
+ * device is open (rt_device_open()'s RT_EOK, or -RT_ENOSYS from the device's
+ * open op), otherwise a negative POSIX errno for user space.
+ */
+int devfs_device_open(rt_device_t device, rt_uint16_t oflag);
+
 #endif

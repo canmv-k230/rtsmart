@@ -47,7 +47,7 @@ static int pipe_fops_open(struct dfs_fd *fd)
     pipe = (rt_pipe_t *)fd->fnode->data;
     if (!pipe)
     {
-        return -1;
+        return -EINVAL;
     }
 
     rt_mutex_take(&pipe->lock, RT_WAITING_FOREVER);
@@ -66,7 +66,7 @@ static int pipe_fops_open(struct dfs_fd *fd)
         pipe->fifo = rt_ringbuffer_create(pipe->bufsz);
         if (pipe->fifo == RT_NULL)
         {
-            rc = -RT_ENOMEM;
+            rc = -ENOMEM;
             goto __exit;
         }
     }
@@ -537,9 +537,11 @@ int pipe(int fildes[2])
     char dev_name[32];
     int pipeno = 0;
 
+    /* -1 with errno set, as every caller (sys_pipe()) reads it. */
     pipeno = resource_id_get(&id_mgr);
     if (pipeno == -1)
     {
+        rt_set_errno(-EMFILE);
         return -1;
     }
     rt_snprintf(dname, sizeof(dname), "pipe%d", pipeno);
@@ -548,6 +550,7 @@ int pipe(int fildes[2])
     if (pipe == RT_NULL)
     {
         resource_id_put(&id_mgr, pipeno);
+        rt_set_errno(-ENOMEM);
         return -1;
     }
 
@@ -557,13 +560,23 @@ int pipe(int fildes[2])
     fildes[0] = open(dev_name, O_RDONLY, 0);
     if (fildes[0] < 0)
     {
+        /* Nothing has it open: it would stay registered (and its number
+         * taken) for good. open() set errno. */
+        int err = rt_get_errno();
+
+        rt_pipe_delete(dname);      /* returns pipeno too */
+        rt_set_errno(err);
         return -1;
     }
 
     fildes[1] = open(dev_name, O_WRONLY, 0);
     if (fildes[1] < 0)
     {
+        /* The last close of an unnamed pipe deletes it. */
+        int err = rt_get_errno();
+
         close(fildes[0]);
+        rt_set_errno(err);
         return -1;
     }
 

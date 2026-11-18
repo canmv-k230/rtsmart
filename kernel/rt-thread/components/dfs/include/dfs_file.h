@@ -52,7 +52,32 @@ struct dfs_fnode
 
     size_t   size;               /* Size in bytes */
     void *data;                  /* Specific file system data */
+
+    /* Backend opens and closes run without the fnode lock, serialized per
+     * path by these fields, which the fnode lock guards (dfs_file.c). busy is
+     * DFS_FNODE_OPENING while the first open of the path runs and
+     * DFS_FNODE_CLOSING while a close runs, in busy_owner; opens and closes
+     * wait for it. opening counts later opens in flight, at most one thread's
+     * (nested opens of the path by that thread); other opens and closes
+     * wait for them, as a backend tells its last close from ref_count, and
+     * close_waiting counts those closes, which new later opens wait behind.
+     * All zero for fnodes that are not hashed (sockets, channels). */
+    uint8_t busy;
+    uint16_t opening;
+    uint16_t close_waiting;
+    struct rt_thread *busy_owner;
+    /* POSIX record locks (fcntl F_SETLK...), guarded by the fnode lock.
+     * Last: every fnode is allocated zeroed, by DFS, sockets and channels. */
+    struct dfs_flock *locks;
 };
+
+/* fnode->flags: unlink()ed while open. The name is gone for opens and
+ * stat(); the backend unlink runs at the last close (FAT cannot delete an
+ * open file). Guarded by the fnode lock. */
+#define DFS_FNODE_F_UNLINKED 0x1
+
+#define DFS_FNODE_OPENING 1
+#define DFS_FNODE_CLOSING 2
 
 struct dfs_fd
 {
@@ -82,17 +107,37 @@ struct dfs_preallocate_args
     off_t len;
 };
 
+/*
+ * dfs_file_ops.open returns 0 or a negative POSIX errno, which reaches user
+ * space unchanged; -ENXIO is a failure even though -RT_ENOSYS has the same
+ * number. musl reads a syscall result below -4095 as a success, so other
+ * negative codes, such as MPP's K_ERR_*, are reported as -EIO.
+ */
+#define DFS_ERRNO_MAX 4095
+
+rt_inline int dfs_open_errno(int result)
+{
+    return result < -DFS_ERRNO_MAX ? -EIO : result;
+}
+
 void dfs_fnode_mgr_init(void);
 int dfs_file_is_open(const char *pathname);
 int dfs_file_open(struct dfs_fd *fd, const char *path, int flags);
 int dfs_file_close(struct dfs_fd *fd);
+int dfs_file_close_nowait(struct dfs_fd *fd);
+struct flock;
+int dfs_file_lock(struct dfs_fd *fd, int cmd, struct flock *fl);
+void dfs_file_lock_release(struct dfs_fnode *fnode, void *owner);
+void *dfs_file_lock_owner(void);
+int dfs_fd_is_driver_file(struct dfs_fd *d);
+int dfs_fd_lock_cmd(int fildes, struct dfs_fd *d, int cmd, struct flock *fl);
 int dfs_file_ioctl(struct dfs_fd *fd, int cmd, void *args);
 int dfs_file_read(struct dfs_fd *fd, void *buf, size_t len);
 int dfs_file_getdents(struct dfs_fd *fd, struct dirent *dirp, size_t nbytes);
 int dfs_file_unlink(const char *path);
 int dfs_file_write(struct dfs_fd *fd, const void *buf, size_t len);
 int dfs_file_flush(struct dfs_fd *fd);
-int dfs_file_lseek(struct dfs_fd *fd, off_t offset);
+off_t dfs_file_lseek(struct dfs_fd *fd, off_t offset);
 
 int dfs_file_stat(const char *path, struct stat *buf);
 int dfs_file_rename(const char *oldpath, const char *newpath);

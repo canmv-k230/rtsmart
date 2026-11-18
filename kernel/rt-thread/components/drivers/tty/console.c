@@ -33,19 +33,16 @@ static void console_rx_notify(struct rt_device *dev)
     console = (struct tty_struct *)dev;
     RT_ASSERT(console != RT_NULL);
 
-    while (1)
+    /* Up to sizeof(buf) bytes per call; it used to store byte 1025 one past
+     * the end of buf. */
+    while (lens < (int)sizeof(buf))
     {
         len = rt_device_read(console->driver, -1, &ch, 1);
         if (len == 0)
         {
             break;
         }
-        lens += len;
-        buf[lens-1] = ch;
-        if (lens > 1024)
-        {
-            break;
-        }
+        buf[lens++] = ch;
     }
 
     if (console->ldisc->ops->receive_buf)

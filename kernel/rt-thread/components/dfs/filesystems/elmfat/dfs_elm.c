@@ -31,51 +31,81 @@
 
 static rt_device_t disk[_VOLUMES] = {0};
 
+/* FatFs deliberately forbids a second FIL beside a writer. Keep one FIL
+ * per DFS inode instead; independent DFS positions are applied under this
+ * mutex before every operation, including append. Its cache and size then
+ * remain coherent for every descriptor without disabling FatFs locking. */
+struct elm_file
+{
+    FIL fil; /* first: existing helpers consume a FIL pointer */
+    struct rt_mutex lock;
+};
+
+static void elm_lock(struct dfs_fd *file)
+{
+    rt_mutex_take(&((struct elm_file *)file->data)->lock, RT_WAITING_FOREVER);
+}
+
+static void elm_unlock(struct dfs_fd *file)
+{
+    rt_mutex_release(&((struct elm_file *)file->data)->lock);
+}
+
 static int elm_result_to_dfs(FRESULT result)
 {
-    int status = RT_EOK;
-
+    /* Negative errnos for user space; unlisted codes were -1 (EPERM there),
+     * and FR_INVALID_OBJECT read as EEXIST. */
     switch (result)
     {
     case FR_OK:
-        break;
+        return RT_EOK;
 
     case FR_NO_FILE:
     case FR_NO_PATH:
     case FR_NO_FILESYSTEM:
-        status = -ENOENT;
-        break;
+        return -ENOENT;
 
     case FR_INVALID_NAME:
-        status = -EINVAL;
-        break;
+    case FR_MKFS_ABORTED:
+    case FR_INVALID_PARAMETER:
+        return -EINVAL;
 
     case FR_EXIST:
+        return -EEXIST;
+
     case FR_INVALID_OBJECT:
-        status = -EEXIST;
-        break;
+        return -EBADF;
 
     case FR_DISK_ERR:
     case FR_NOT_READY:
     case FR_INT_ERR:
-        status = -EIO;
-        break;
+        return -EIO;
 
     case FR_WRITE_PROTECTED:
-    case FR_DENIED:
-        status = -EROFS;
-        break;
+        return -EROFS;
 
-    case FR_MKFS_ABORTED:
-        status = -EINVAL;
-        break;
+    case FR_DENIED:
+        /* A read-only file opened for writing, a full directory, or a
+         * directory that is not empty (dfs_elm_unlink() tells that one). */
+        return -EACCES;
+
+    case FR_INVALID_DRIVE:
+    case FR_NOT_ENABLED:
+        return -ENODEV;
+
+    case FR_TIMEOUT:
+    case FR_LOCKED:
+        return -EBUSY;
+
+    case FR_NOT_ENOUGH_CORE:
+        return -ENOMEM;
+
+    case FR_TOO_MANY_OPEN_FILES:
+        return -EMFILE;
 
     default:
-        status = -1;
-        break;
+        return -EIO;
     }
-
-    return status;
 }
 
 /* results:
@@ -403,11 +433,39 @@ int dfs_elm_open(struct dfs_fd *file)
     drivers_fn = file->fnode->path;
 #endif
 
-    if (file->flags & O_DIRECTORY)
+    /* POSIX: a directory opens read-only without O_DIRECTORY too (this
+     * gave ENOENT), and is EISDIR for writing. */
+    int as_dir = (file->flags & O_DIRECTORY) != 0 || !strcmp(file->fnode->path, "/");
+    if (!as_dir)
+    {
+        FILINFO fno;
+
+        if (f_stat(drivers_fn, &fno) == FR_OK && (fno.fattrib & AM_DIR))
+        {
+            if ((file->flags & O_ACCMODE) != O_RDONLY)
+            {
+#if _VOLUMES > 1
+                rt_free(drivers_fn);
+#endif
+                return -EISDIR;
+            }
+            as_dir = 1;
+        }
+    }
+
+    if (as_dir)
     {
         DIR *dir;
 
-        if (file->flags & O_CREAT)
+        if ((file->flags & O_ACCMODE) != O_RDONLY)
+        {
+#if _VOLUMES > 1
+            rt_free(drivers_fn);
+#endif
+            return -EISDIR;
+        }
+
+        if ((file->flags & O_CREAT) && (file->flags & O_DIRECTORY))
         {
             result = f_mkdir(drivers_fn);
             if (result != FR_OK)
@@ -430,6 +488,20 @@ int dfs_elm_open(struct dfs_fd *file)
         }
 
         result = f_opendir(dir, drivers_fn);
+        if (result == FR_NO_PATH || result == FR_NO_FILE)
+        {
+            FILINFO fno;
+
+            /* O_DIRECTORY of a file: ENOTDIR, not ENOENT. */
+            if (f_stat(drivers_fn, &fno) == FR_OK && !(fno.fattrib & AM_DIR))
+            {
+#if _VOLUMES > 1
+                rt_free(drivers_fn);
+#endif
+                rt_free(dir);
+                return -ENOTDIR;
+            }
+        }
 #if _VOLUMES > 1
         rt_free(drivers_fn);
 #endif
@@ -455,24 +527,48 @@ int dfs_elm_open(struct dfs_fd *file)
         {
             mode |= FA_WRITE;
         }
-        /* Opens the file, if it is existing. If not, a new file is created. */
+        /* POSIX: only O_CREAT creates. O_EXCL and O_TRUNC used to create the
+         * file on their own (FA_CREATE_NEW/FA_CREATE_ALWAYS). */
         if (file->flags & O_CREAT)
         {
-            mode |= FA_OPEN_ALWAYS;
-        }
-        /* Creates a new file. If the file is existing, it is truncated and overwritten. */
-        if (file->flags & O_TRUNC)
-        {
-            mode |= FA_CREATE_ALWAYS;
-        }
-        /* Creates a new file. The function fails if the file is already existing. */
-        if (file->flags & O_EXCL)
-        {
-            mode |= FA_CREATE_NEW;
+            if (file->flags & O_EXCL)
+                mode |= FA_CREATE_NEW;      /* fails if it exists */
+            else if ((file->flags & O_TRUNC) && (mode & FA_WRITE))
+                mode |= FA_CREATE_ALWAYS;   /* created or truncated */
+            else
+                mode |= FA_OPEN_ALWAYS;
         }
 
-        /* allocate a fd */
-        fd = (FIL *)rt_malloc(sizeof(FIL));
+        if (file->fnode->data)
+        {
+            struct elm_file *shared = file->fnode->data;
+            fd = &shared->fil;
+#if _VOLUMES > 1
+            rt_free(drivers_fn);
+#endif
+            if ((file->flags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL))
+                return -EEXIST;
+            if ((mode & FA_WRITE) && !(fd->flag & FA_WRITE))
+                return -EACCES;
+            file->data = shared;
+            elm_lock(file);
+            result = FR_OK;
+            if ((file->flags & O_TRUNC) && (mode & FA_WRITE))
+            {
+                result = f_lseek(fd, 0);
+                if (result == FR_OK) result = f_truncate(fd);
+                file->fnode->size = f_size(fd);
+            }
+            file->pos = (file->flags & O_APPEND) ? f_size(fd) : 0;
+            elm_unlock(file);
+            return elm_result_to_dfs(result);
+        }
+
+        /* A read-only descriptor may share a later writer's FIL. Honour
+         * FAT read-only attributes by falling back to a read-only FIL.
+         * The first open fixes the shared FIL's write capability until its
+         * last close; after a read-only fallback, later writers get EACCES. */
+        fd = (FIL *)rt_malloc(sizeof(struct elm_file));
         if (fd == RT_NULL)
         {
 #if _VOLUMES > 1
@@ -481,16 +577,29 @@ int dfs_elm_open(struct dfs_fd *file)
             return -ENOMEM;
         }
 
-        result = f_open(fd, drivers_fn, mode);
+        result = f_open(fd, drivers_fn, mode | FA_WRITE);
+        if ((result == FR_DENIED || result == FR_WRITE_PROTECTED) && !(mode & FA_WRITE))
+            result = f_open(fd, drivers_fn, mode);
 #if _VOLUMES > 1
         rt_free(drivers_fn);
 #endif
+        /* O_TRUNC of an existing file opened for writing (without O_CREAT,
+         * or with O_CREAT handled above). */
+        if (result == FR_OK && (file->flags & O_TRUNC) && (mode & FA_WRITE) &&
+            !(mode & FA_CREATE_ALWAYS) && f_size(fd) != 0)
+        {
+            result = f_truncate(fd);
+            if (result != FR_OK)
+                f_close(fd);
+        }
         if (result == FR_OK)
         {
             file->pos  = fd->fptr;
             file->fnode->size = f_size(fd);
             file->fnode->type = FT_REGULAR;
             file->data = fd;
+            file->fnode->data = fd;
+            rt_mutex_init(&((struct elm_file *)fd)->lock, "fatfile", RT_IPC_FLAG_PRIO);
 
             if (file->flags & O_APPEND)
             {
@@ -556,6 +665,15 @@ int dfs_elm_close(struct dfs_fd *file)
         FIL *fd = RT_NULL;
         fd = (FIL *)(file->data);
         RT_ASSERT(fd != RT_NULL);
+        if (file->fnode->ref_count > 1)
+        {
+            elm_lock(file);
+            result = f_sync(fd);
+            elm_unlock(file);
+            file->data = RT_NULL;
+            file->flags |= DFS_F_CLOSE_TERMINAL;
+            return elm_result_to_dfs(result);
+        }
 
 #if _FS_REENTRANT
         fat = fd->obj.fs;
@@ -578,8 +696,10 @@ int dfs_elm_close(struct dfs_fd *file)
         }
 #endif
         /* close is terminal even when flushing or media access failed */
+        rt_mutex_detach(&((struct elm_file *)fd)->lock);
         rt_free(fd);
         file->data = RT_NULL;
+        file->fnode->data = RT_NULL;
     }
 
 #if _FS_REENTRANT
@@ -595,36 +715,44 @@ int dfs_elm_close(struct dfs_fd *file)
     return elm_result_to_dfs(result);
 }
 
-int dfs_elm_ioctl(struct dfs_fd *file, int cmd, void *args)
+static int elm_ioctl_locked(struct dfs_fd *file, int cmd, void *args)
 {
+    /* These treat file->data as a FIL: on a directory it is a DIR, and a user
+     * ftruncate() of a directory fd corrupted kernel memory. */
+    if ((cmd == RT_FIOFTRUNCATE || cmd == RT_FIOPREALLOCATE) &&
+        (file->fnode->type != FT_REGULAR || args == RT_NULL))
+    {
+        return -EINVAL;
+    }
+
     switch (cmd)
     {
     case RT_FIOFTRUNCATE:
         {
+            if ((file->flags & O_ACCMODE) == O_RDONLY) return -EBADF;
             FIL *fd;
-            FSIZE_t fptr, length;
+            FSIZE_t length;
             FRESULT result = FR_OK;
             fd = (FIL *)(file->data);
             RT_ASSERT(fd != RT_NULL);
 
-            /* save file read/write point */
-            fptr = fd->fptr;
             length = *(off_t*)args;
             if (length <= fd->obj.objsize)
             {
-                fd->fptr = length;
-                result = f_truncate(fd);
+                result = f_lseek(fd, length);
+                if (result == FR_OK) result = f_truncate(fd);
             }
             else
             {
                 result = f_lseek(fd, length);
             }
-            /* restore file read/write point */
-            fd->fptr = fptr;
+            /* Logical descriptor positions stay unchanged; the shared FIL
+             * must keep its cluster cursor consistent with its fptr. */
             return elm_result_to_dfs(result);
         }
     case RT_FIOPREALLOCATE:
         {
+            if ((file->flags & O_ACCMODE) == O_RDONLY) return -EBADF;
             FIL *fd;
             const struct dfs_preallocate_args *prealloc;
             unsigned long long target_size;
@@ -687,6 +815,17 @@ int dfs_elm_ioctl(struct dfs_fd *file, int cmd, void *args)
     return -ENOSYS;
 }
 
+int dfs_elm_ioctl(struct dfs_fd *file, int cmd, void *args)
+{
+    int result;
+    if (file->fnode->type != FT_REGULAR)
+        return -EINVAL;
+    elm_lock(file);
+    result = elm_ioctl_locked(file, cmd, args);
+    elm_unlock(file);
+    return result;
+}
+
 int dfs_elm_read(struct dfs_fd *file, void *buf, size_t len)
 {
     FIL *fd;
@@ -698,12 +837,20 @@ int dfs_elm_read(struct dfs_fd *file, void *buf, size_t len)
         return -EISDIR;
     }
 
+    if ((file->flags & O_ACCMODE) == O_WRONLY) return -EBADF;
     fd = (FIL *)(file->data);
     RT_ASSERT(fd != RT_NULL);
 
-    result = f_read(fd, buf, len, &byte_read);
-    /* update position */
-    file->pos  = fd->fptr;
+    elm_lock(file);
+    if ((FSIZE_t)file->pos >= f_size(fd))
+    {
+        elm_unlock(file);
+        return 0;
+    }
+    result = f_lseek(fd, file->pos);
+    if (result == FR_OK) result = f_read(fd, buf, len, &byte_read);
+    file->pos = fd->fptr;
+    elm_unlock(file);
     if (result == FR_OK)
     {
         return byte_read;
@@ -723,15 +870,23 @@ int dfs_elm_write(struct dfs_fd *file, const void *buf, size_t len)
         return -EISDIR;
     }
 
+    if ((file->flags & O_ACCMODE) == O_RDONLY) return -EBADF;
     fd = (FIL *)(file->data);
     RT_ASSERT(fd != RT_NULL);
 
-    result = f_write(fd, buf, len, &byte_write);
+    elm_lock(file);
+    result = f_lseek(fd, (file->flags & O_APPEND) ? f_size(fd) : (FSIZE_t)file->pos);
+    if (result == FR_OK) result = f_write(fd, buf, len, &byte_write);
     /* update position and file size */
     file->pos  = fd->fptr;
     file->fnode->size = f_size(fd);
+    elm_unlock(file);
     if (result == FR_OK)
     {
+        /* FatFs reports a full volume as success with a short count; 0
+         * bytes made stdio retry forever. */
+        if (byte_write == 0 && len > 0)
+            return -ENOSPC;
         return byte_write;
     }
 
@@ -746,10 +901,15 @@ int dfs_elm_flush(struct dfs_fd *file)
     fd = (FIL *)(file->data);
     RT_ASSERT(fd != RT_NULL);
 
+    if (file->fnode->type == FT_DIRECTORY) return 0;
+    elm_lock(file);
     result = f_sync(fd);
+    elm_unlock(file);
     return elm_result_to_dfs(result);
 }
 
+/* DFS_FS_FLAG_LSEEK_POS: 0 on success with the position in file->pos (an
+ * int return cannot hold one past 2 GiB). */
 int dfs_elm_lseek(struct dfs_fd *file, off_t offset)
 {
     FRESULT result = FR_OK;
@@ -761,13 +921,19 @@ int dfs_elm_lseek(struct dfs_fd *file, off_t offset)
         fd = (FIL *)(file->data);
         RT_ASSERT(fd != RT_NULL);
 
-        result = f_lseek(fd, offset);
-        if (result == FR_OK)
+        elm_lock(file);
+        if ((file->flags & O_ACCMODE) == O_RDONLY && (FSIZE_t)offset > f_size(fd))
         {
-            /* return current position */
-            file->pos = fd->fptr;
-            return fd->fptr;
+            file->pos = offset;
+            result = FR_OK;
         }
+        else
+        {
+            result = f_lseek(fd, offset);
+            if (result == FR_OK) file->pos = fd->fptr;
+        }
+        elm_unlock(file);
+        if (result == FR_OK) return 0;
     }
     else if (file->fnode->type == FT_DIRECTORY)
     {
@@ -782,12 +948,13 @@ int dfs_elm_lseek(struct dfs_fd *file, off_t offset)
         {
             /* update file position */
             file->pos = offset;
-            return file->pos;
+            return 0;
         }
     }
 
     return elm_result_to_dfs(result);
 }
+
 
 int dfs_elm_getdents(struct dfs_fd *file, struct dirent *dirp, uint32_t count)
 {
@@ -891,6 +1058,19 @@ int dfs_elm_unlink(struct dfs_filesystem *fs, const char *path)
 #endif
 
     result = f_unlink(drivers_fn);
+    if (result == FR_DENIED)
+    {
+        FILINFO fno;
+
+        /* f_unlink() refuses a directory that is not empty this way. */
+        if (f_stat(drivers_fn, &fno) == FR_OK && (fno.fattrib & AM_DIR))
+        {
+#if _VOLUMES > 1
+            rt_free(drivers_fn);
+#endif
+            return -ENOTEMPTY;
+        }
+    }
 #if _VOLUMES > 1
     rt_free(drivers_fn);
 #endif
@@ -1038,7 +1218,7 @@ static const struct dfs_file_ops dfs_elm_fops =
 const struct dfs_filesystem_ops dfs_elm =
 {
     "elm",
-    DFS_FS_FLAG_DEFAULT,
+    DFS_FS_FLAG_DEFAULT | DFS_FS_FLAG_LSEEK_POS,
     &dfs_elm_fops,
 
     dfs_elm_mount,

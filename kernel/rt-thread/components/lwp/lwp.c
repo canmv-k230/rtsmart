@@ -44,6 +44,24 @@ static const char elf_magic[] = {0x7f, 'E', 'L', 'F'};
 extern char working_directory[];
 #endif
 static struct termios stdin_termios, old_stdin_termios;
+static int console_echoed_input;
+
+int lwp_take_console_echoed_input(void)
+{
+    rt_base_t level = rt_hw_interrupt_disable();
+    int count = console_echoed_input;
+    console_echoed_input = 0;
+    rt_hw_interrupt_enable(level);
+    return count;
+}
+
+void lwp_restore_console_termios(void)
+{
+    int pending = 0;
+    tcsetattr(1, 0, &old_stdin_termios);
+    ioctl(1, FIONREAD, &pending);
+    console_echoed_input = pending;
+}
 
 int load_ldso(struct rt_lwp *lwp, char *exec_name, char *const argv[], char *const envp[]);
 
@@ -1303,7 +1321,9 @@ RT_WEAK int lwp_load(const char *filename, struct rt_lwp *lwp, uint8_t *load_add
         fd = fd_tmp;
         fd_tmp = -1;
 
-        if(_fd_tmp) {
+        /* fd 0 is a valid descriptor: a process with stdin closed gets its
+         * ELF opened there (DFS hands out the lowest free slot). */
+        if(_fd_tmp >= 0) {
             close(_fd_tmp);
         }
         LOG_I("LWP use fast load\n");
@@ -1330,7 +1350,7 @@ _load_elf:
     }
 
 out:
-    if (fd > 0)
+    if (fd >= 0)
     {
         close(fd);
     }
@@ -1458,7 +1478,6 @@ pid_t lwp_execve(char *filename, int debug, int argc, char **argv, char **envp)
     int bg = 0;
     struct process_aux *aux;
     int tid = 0;
-    int ret;
 
     if (filename == RT_NULL)
     {
@@ -1536,18 +1555,53 @@ pid_t lwp_execve(char *filename, int debug, int argc, char **argv, char **envp)
         if (thread != RT_NULL)
         {
             struct rt_lwp *self_lwp;
+            struct tty_node *foreground_node = RT_NULL;
+            struct tty_struct *console_tty = RT_NULL;
+            int console_foreground = 0;
+
+            self_lwp = lwp_self();
+            lwp->__pgrp = lwp->pid;
+            if (self_lwp)
+                lwp->session = self_lwp->session;
+            if (!bg)
+            {
+                foreground_node = tty_foreground_alloc();
+                if (!self_lwp && lwp->session == -1)
+                {
+                    console_tty = (struct tty_struct *)console_tty_get();
+                    console_foreground = 1;
+
+                    if (!foreground_node)
+                    {
+                        thread->cleanup = RT_NULL;
+                        thread->lwp = RT_NULL;
+                        rt_thread_delete(thread);
+                        lwp_tid_put(tid);
+                        lwp_ref_dec(lwp);
+                        LOG_E("malloc fail!\n");
+                        return -ENOMEM;
+                    }
+                }
+                else if (!foreground_node)
+                {
+                    int has_tty;
+
+                    level = rt_hw_interrupt_disable();
+                    has_tty = self_lwp && self_lwp->tty;
+                    rt_hw_interrupt_enable(level);
+                    if (has_tty)
+                        LOG_W("no memory to give %s the terminal foreground\n", thread_name);
+                }
+            }
 
             thread->tid = tid;
             lwp_tid_set_thread(tid, thread);
             LOG_D("lwp kernel => (0x%08x, 0x%08x)\n", (rt_size_t)thread->stack_addr,
                     (rt_size_t)thread->stack_addr + thread->stack_size);
             level = rt_hw_interrupt_disable();
-            self_lwp = lwp_self();
             if (self_lwp)
             {
                 //lwp->tgroup_leader = &thread; //add thread group leader for lwp
-                lwp->__pgrp = tid;
-                lwp->session = self_lwp->session;
                 /* lwp add to children link */
                 lwp->sibling = self_lwp->first_child;
                 self_lwp->first_child = lwp;
@@ -1556,62 +1610,6 @@ pid_t lwp_execve(char *filename, int debug, int argc, char **argv, char **envp)
             else
             {
                 //lwp->tgroup_leader = &thread; //add thread group leader for lwp
-                lwp->__pgrp = tid;
-            }
-            if (!bg)
-            {
-                if (lwp->session == -1)
-                {
-                    struct tty_struct *tty = RT_NULL;
-                    struct rt_lwp *old_lwp;
-                    tty = (struct tty_struct *)console_tty_get();
-                    old_lwp = tty->foreground;
-                    rt_spin_lock(&tty->spinlock);
-                    ret = tty_push(&tty->head, old_lwp);
-                    rt_spin_unlock(&tty->spinlock);
-                    if (ret < 0)
-                    {
-                        lwp_tid_put(tid);
-                        lwp_ref_dec(lwp);
-                        LOG_E("malloc fail!\n");
-                        return -ENOMEM;
-                    }
-
-                    lwp->tty = tty;
-                    lwp->tty->pgrp = lwp->__pgrp;
-                    lwp->tty->session = lwp->session;
-                    lwp->tty->foreground = lwp;
-                    tcgetattr(1, &stdin_termios);
-                    old_stdin_termios = stdin_termios;
-                    stdin_termios.c_lflag |= ICANON | ECHO | ECHOCTL;
-                    tcsetattr(1, 0, &stdin_termios);
-                }
-                else
-                {
-                    if (self_lwp != RT_NULL)
-                    {
-                        rt_spin_lock(&self_lwp->tty->spinlock);
-                        ret = tty_push(&self_lwp->tty->head, self_lwp);
-                        rt_spin_unlock(&self_lwp->tty->spinlock);
-                        if (ret < 0)
-                        {
-                            lwp_tid_put(tid);
-                            lwp_ref_dec(lwp);
-                            LOG_E("malloc fail!\n");
-                            return -ENOMEM;
-                        }
-
-                        lwp->tty = self_lwp->tty;
-                        lwp->tty->pgrp = lwp->__pgrp;
-                        lwp->tty->session = lwp->session;
-                        lwp->tty->foreground = lwp;
-                    }
-                    else
-                    {
-                        lwp->tty = RT_NULL;
-                    }
-
-                }
             }
             thread->lwp = lwp;
 #ifndef ARCH_MM_MMU
@@ -1628,12 +1626,32 @@ pid_t lwp_execve(char *filename, int debug, int argc, char **argv, char **envp)
 #endif /* not defined ARCH_MM_MMU */
             rt_list_insert_after(&lwp->t_grp, &thread->sibling);
 
+            if (!bg)
+            {
+                struct tty_struct *tty = console_foreground ? console_tty :
+                                         (self_lwp ? self_lwp->tty : RT_NULL);
+                struct rt_lwp *previous = console_foreground ? tty->foreground : self_lwp;
+
+                if (tty_foreground_commit_locked(tty, previous, lwp, foreground_node,
+                                                 console_foreground ? RT_NULL : self_lwp))
+                    foreground_node = RT_NULL;
+            }
+
             if (debug && rt_dbg_ops)
             {
                 lwp->debug = debug;
                 rt_thread_control(thread, RT_THREAD_CTRL_BIND_CPU, (void*)0);
             }
             rt_hw_interrupt_enable(level);
+            tty_foreground_free(foreground_node);
+
+            if (console_foreground)
+            {
+                tcgetattr(1, &stdin_termios);
+                old_stdin_termios = stdin_termios;
+                stdin_termios.c_lflag |= ICANON | ECHO | ECHOCTL;
+                tcsetattr(1, 0, &stdin_termios);
+            }
 
             rt_thread_startup(thread);
 

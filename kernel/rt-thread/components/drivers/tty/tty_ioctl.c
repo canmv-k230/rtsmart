@@ -40,12 +40,19 @@ static int set_termios(struct tty_struct *tty, void *arg, int opt)
     struct tty_ldisc *ld = RT_NULL;
     struct termios *new_termios = (struct termios *)arg;
     int level = 0;
-    int retval = tty_check_change(tty);
+    int retval;
 
+    if (new_termios == RT_NULL)
+        return -EFAULT;
+    retval = tty_check_change(tty);
     if (retval)
     {
         return retval;
     }
+    /* TCSETSF (tcsetattr(TCSAFLUSH)): discard pending input first. TCSETSW
+     * has no output to wait for: it is written through synchronously. */
+    if (opt & TERMIOS_FLUSH)
+        n_tty_flush_input(tty);
 
     rt_memcpy(&old_termios, &(tty->init_termios), sizeof(struct termios));
     level = rt_hw_interrupt_disable();
@@ -84,8 +91,8 @@ int n_tty_ioctl_extend(struct tty_struct *tty, int cmd, void *args)
         struct termios *tio = (struct termios *)p;
         if (tio == RT_NULL)
         {
-            return -RT_EINVAL;
-        } 
+            return -EFAULT;
+        }
         
         rt_memcpy(tio, &real_tty->init_termios, sizeof(real_tty->init_termios));
         return ret;

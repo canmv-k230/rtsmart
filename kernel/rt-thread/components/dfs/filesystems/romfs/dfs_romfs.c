@@ -175,6 +175,15 @@ int dfs_romfs_read(struct dfs_fd *file, void *buf, size_t count)
 
 int dfs_romfs_lseek(struct dfs_fd *file, off_t offset)
 {
+    /* A directory's size counts entries; its position is in
+     * sizeof(struct dirent) units (getdents d_off). */
+    if (file->fnode->type == FT_DIRECTORY)
+    {
+        if (offset < 0 || (rt_size_t)offset > file->fnode->size * sizeof(struct dirent))
+            return -EINVAL;
+        file->pos = offset;
+        return (int)file->pos;
+    }
     if (offset <= file->fnode->size)
     {
         file->pos = offset;
@@ -318,12 +327,15 @@ int dfs_romfs_getdents(struct dfs_fd *file, struct dirent *dirp, uint32_t count)
         return -EINVAL;
     }
 
+    /* file->pos counts sizeof(struct dirent) per entry, as on the other
+     * filesystems: lseek()/seekdir() take a getdents d_off. */
     index = 0;
-    for (index = 0; index < count && file->pos < file->fnode->size; index++)
+    for (index = 0; index < count &&
+         (rt_size_t)(file->pos / sizeof(struct dirent)) < file->fnode->size; index++)
     {
         d = dirp + index;
 
-        sub_dirent = &dirent[file->pos];
+        sub_dirent = &dirent[file->pos / sizeof(struct dirent)];
         name = sub_dirent->name;
 
         /* fill dirent */
@@ -337,7 +349,7 @@ int dfs_romfs_getdents(struct dfs_fd *file, struct dirent *dirp, uint32_t count)
         rt_strncpy(d->d_name, name, rt_strlen(name) + 1);
 
         /* move to next position */
-        ++ file->pos;
+        file->pos += sizeof(struct dirent);
     }
 
     return index * sizeof(struct dirent);
