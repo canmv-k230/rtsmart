@@ -31,6 +31,7 @@
 #include <rtthread.h>
 
 #include <dfs_posix.h>
+#include <devfs.h>
 #include <lwp_user_mm.h>
 
 #include "ioremap.h"
@@ -60,8 +61,12 @@
 struct kd_timer_Type {
     kendryte_timer_t* base_addr;
     uint32_t          id;
+    /* Serializes devfs open/close, signal configuration and deferred delivery.
+     * DFS pins the file during I/O; this lock does not serialize register access. */
+    struct rt_mutex lifecycle_lock;
 #if defined(RT_TIMER_IRQ_METHOD_WORKQUEUE)
     struct rt_work send_sig_work;
+    bool irq_pending;
 #endif // RT_TIMER_IRQ_METHOD_WORKQUEUE
     int   pid;
     int   signo;
@@ -137,37 +142,68 @@ static rt_uint32_t kd_timer_get(rt_hwtimer_t* timer)
     return reg->channel[id].current_value;
 }
 
-#if defined(RT_TIMER_IRQ_METHOD_WORKQUEUE)
-static rt_err_t timer_timeout_ind(rt_device_t dev, rt_size_t size)
+static void timer_send_signal(struct kd_timer_Type* kd_timer)
 {
-    rt_hwtimer_t*         timer    = (rt_hwtimer_t*)dev;
-    struct kd_timer_Type* kd_timer = (struct kd_timer_Type*)timer->parent.user_data;
-
-    rt_work_submit(&kd_timer->send_sig_work, 0);
-
-    return RT_EOK;
-}
-
-static void send_sig_work(struct rt_work* work, void* param)
-{
-    struct kd_timer_Type* kd_timer = param;
-#else
-static rt_err_t timer_timeout_ind(rt_device_t dev, rt_size_t size)
-{
-    rt_hwtimer_t*         timer    = (rt_hwtimer_t*)dev;
-    struct kd_timer_Type* kd_timer = (struct kd_timer_Type*)timer->parent.user_data;
-#endif // RT_TIMER_IRQ_METHOD_WORKQUEUE
-
     siginfo_t info;
     rt_memset(&info, 0, sizeof(info));
     info.si_code = SI_TIMER;
     info.si_ptr  = kd_timer->sigval;
 
     lwp_kill_ext(kd_timer->pid, kd_timer->signo, &info);
+}
 
-#if !defined(RT_TIMER_IRQ_METHOD_WORKQUEUE)
+#if defined(RT_TIMER_IRQ_METHOD_WORKQUEUE)
+static void send_sig_work(struct rt_work* work, void* param)
+{
+    struct kd_timer_Type* kd_timer = param;
+    rt_base_t level;
+    bool pending;
+
+    rt_mutex_take(&kd_timer->lifecycle_lock, RT_WAITING_FOREVER);
+    level = rt_hw_interrupt_disable();
+    pending = kd_timer->irq_pending;
+    kd_timer->irq_pending = false;
+    rt_hw_interrupt_enable(level);
+    if (pending)
+        timer_send_signal(kd_timer);
+    rt_mutex_release(&kd_timer->lifecycle_lock);
+}
+#endif
+
+static rt_err_t timer_timeout_ind(rt_device_t dev, rt_size_t size)
+{
+    struct kd_timer_Type* kd_timer = dev->user_data;
+
+#if defined(RT_TIMER_IRQ_METHOD_WORKQUEUE)
+    /* Zero-delay submit has no queue capacity limit. Resubmitting the same
+     * work item coalesces pending expiries. */
+    kd_timer->irq_pending = true;
+    rt_work_submit(&kd_timer->send_sig_work, 0);
+#else
+    timer_send_signal(kd_timer);
+#endif
     return RT_EOK;
-#endif // RT_TIMER_IRQ_METHOD_WORKQUEUE
+}
+
+/* Called with lifecycle_lock held and timer IRQs excluded. A worker that
+ * already left the queue will see no pending expiry for the old config. */
+static void timer_disarm_signal(rt_device_t device)
+{
+    rt_device_set_rx_indicate(device, RT_NULL);
+#if defined(RT_TIMER_IRQ_METHOD_WORKQUEUE)
+    struct kd_timer_Type* kd_timer = device->user_data;
+
+    kd_timer->irq_pending = false;
+    rt_work_cancel(&kd_timer->send_sig_work);
+#endif
+}
+
+static void timer_init_state(struct kd_timer_Type* kd_timer, const char* name)
+{
+    rt_mutex_init(&kd_timer->lifecycle_lock, name, RT_IPC_FLAG_PRIO);
+#if defined(RT_TIMER_IRQ_METHOD_WORKQUEUE)
+    rt_work_init(&kd_timer->send_sig_work, send_sig_work, kd_timer);
+#endif
 }
 
 static rt_err_t kd_timer_ctrl(rt_hwtimer_t* timer, rt_uint32_t cmd, void* arg)
@@ -185,16 +221,28 @@ static rt_err_t kd_timer_ctrl(rt_hwtimer_t* timer, rt_uint32_t cmd, void* arg)
 static int timer_fops_open(struct dfs_fd* fd)
 {
     rt_device_t device = (rt_device_t)fd->fnode->data;
-    int         ret    = rt_device_open(device, RT_DEVICE_OFLAG_RDWR);
+    rt_hwtimer_t* timer = (rt_hwtimer_t*)device;
+    struct kd_timer_Type* kd_timer = (struct kd_timer_Type*)timer->parent.user_data;
 
+    /* The timer is standalone: a second open is -RT_EBUSY, user space
+     * needs EBUSY. */
+    rt_mutex_take(&kd_timer->lifecycle_lock, RT_WAITING_FOREVER);
+    int ret = devfs_device_open(device, RT_DEVICE_OFLAG_RDWR);
+    rt_mutex_release(&kd_timer->lifecycle_lock);
     return ret;
 }
 
 static int timer_fops_close(struct dfs_fd* fd)
 {
     rt_device_t device = (rt_device_t)fd->fnode->data;
-    int         ret    = rt_device_close(device);
+    struct kd_timer_Type* kd_timer = device->user_data;
 
+    rt_mutex_take(&kd_timer->lifecycle_lock, RT_WAITING_FOREVER);
+    rt_base_t level = rt_hw_interrupt_disable();
+    timer_disarm_signal(device);
+    rt_hw_interrupt_enable(level);
+    int ret = rt_device_close(device);
+    rt_mutex_release(&kd_timer->lifecycle_lock);
     return ret;
 }
 
@@ -208,24 +256,22 @@ static int timer_fops_ioctl(struct dfs_fd* fd, int cmd, void* args)
 
     switch (cmd) {
     case HWTIMER_CTRL_IRQ_SET: {
-        hwtimer_irqcfg_t      cfg;
-        struct kd_timer_Type* kd_timer = (struct kd_timer_Type*)timer->parent.user_data;
+        hwtimer_irqcfg_t cfg;
+        struct kd_timer_Type* kd_timer = device->user_data;
 
         lwp_get_from_user(&cfg, args, sizeof(cfg));
 
+        rt_mutex_take(&kd_timer->lifecycle_lock, RT_WAITING_FOREVER);
         rt_base_t level = rt_hw_interrupt_disable();
+        timer_disarm_signal(device);
         if (cfg.enable) {
             kd_timer->pid    = lwp_getpid();
             kd_timer->signo  = cfg.signo;
             kd_timer->sigval = cfg.sigval;
-#if defined(RT_TIMER_IRQ_METHOD_WORKQUEUE)
-            rt_work_init(&kd_timer->send_sig_work, send_sig_work, kd_timer);
-#endif // RT_TIMER_IRQ_METHOD_WORKQUEUE
-            rt_device_set_rx_indicate(&timer->parent, timer_timeout_ind);
-        } else {
-            rt_device_set_rx_indicate(&timer->parent, NULL);
+            rt_device_set_rx_indicate(device, timer_timeout_ind);
         }
         rt_hw_interrupt_enable(level);
+        rt_mutex_release(&kd_timer->lifecycle_lock);
     } break;
     case HWTIMER_CTRL_GET_FREQ: {
         rt_int32_t freq = timer->freq;
@@ -349,6 +395,7 @@ int rt_hw_timer_init(void)
 
     kd_timer0.base_addr = (kendryte_timer_t*)addr;
     kd_timer0.id        = 0;
+    timer_init_state(&kd_timer0, "hwtimer0");
 
     _timer0.info = &_info;
     _timer0.ops  = &_ops;
@@ -364,6 +411,7 @@ int rt_hw_timer_init(void)
 
     kd_timer1.base_addr = (kendryte_timer_t*)addr;
     kd_timer1.id        = 1;
+    timer_init_state(&kd_timer1, "hwtimer1");
 
     _timer1.info = &_info;
     _timer1.ops  = &_ops;
@@ -379,6 +427,7 @@ int rt_hw_timer_init(void)
 
     kd_timer2.base_addr = (kendryte_timer_t*)addr;
     kd_timer2.id        = 2;
+    timer_init_state(&kd_timer2, "hwtimer2");
 
     _timer2.info = &_info;
     _timer2.ops  = &_ops;
@@ -394,6 +443,7 @@ int rt_hw_timer_init(void)
 
     kd_timer3.base_addr = (kendryte_timer_t*)addr;
     kd_timer3.id        = 3;
+    timer_init_state(&kd_timer3, "hwtimer3");
 
     _timer3.info = &_info;
     _timer3.ops  = &_ops;
@@ -409,6 +459,7 @@ int rt_hw_timer_init(void)
 
     kd_timer4.base_addr = (kendryte_timer_t*)addr;
     kd_timer4.id        = 4;
+    timer_init_state(&kd_timer4, "hwtimer4");
 
     _timer4.info = &_info;
     _timer4.ops  = &_ops;
@@ -424,6 +475,7 @@ int rt_hw_timer_init(void)
 
     kd_timer5.base_addr = (kendryte_timer_t*)addr;
     kd_timer5.id        = 5;
+    timer_init_state(&kd_timer5, "hwtimer5");
 
     _timer5.info = &_info;
     _timer5.ops  = &_ops;
