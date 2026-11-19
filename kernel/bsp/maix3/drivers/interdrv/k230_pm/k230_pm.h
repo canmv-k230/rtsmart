@@ -7,8 +7,10 @@
 #ifndef __K230_PM_H__
 #define __K230_PM_H__
 
+#include <errno.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <rtthread.h>
 #include "k230_pm_tables.h"
 
 #include "k230_pm_dev.h"
@@ -17,6 +19,24 @@
 #define K230_PM_EUNDERFLOW  2
 #define K230_PM_ETIMEOUT    3
 #define K230_PM_ECTX        4
+
+/* PM errors overlap both errno namespaces; select the caller's domain. */
+static inline int k230_pm_map_errno(int ret, int timeout, int io)
+{
+    if (ret == 0)
+        return 0;
+    return ret == -K230_PM_ETIMEOUT ? timeout : io;
+}
+
+static inline int k230_pm_errno(int ret)
+{
+    return k230_pm_map_errno(ret, -ETIMEDOUT, -EIO);
+}
+
+static inline rt_err_t k230_pm_rt_errno(int ret)
+{
+    return k230_pm_map_errno(ret, -RT_ETIMEOUT, -RT_EIO);
+}
 
 const struct k230_pm_dev_desc *k230_pm_dev_desc_find(enum k230_pm_dev_id dev);
 

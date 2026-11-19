@@ -38,6 +38,9 @@
 
 #ifdef RT_USING_FINSH
 #include <finsh.h>
+#ifdef RT_BOARD_CHIP_K230
+#include "sdk_version.h"
+#endif
 
 #define LIST_FIND_OBJ_NR 8
 
@@ -57,14 +60,17 @@ static long clear(void)
 }
 MSH_CMD_EXPORT(clear, clear the terminal screen);
 
-extern void rt_show_version(void);
 long version(void)
 {
+#ifdef RT_BOARD_CHIP_K230
+    rt_kprintf("SDK: %s\n", SDK_VERSION_);
+#else
     rt_show_version();
+#endif
 
     return 0;
 }
-MSH_CMD_EXPORT(version, show RT-Thread version information);
+MSH_CMD_EXPORT(version, show firmware version information);
 
 rt_inline void object_split(int len)
 {

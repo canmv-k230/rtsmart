@@ -344,8 +344,14 @@ static rt_err_t fft_device_open(rt_device_t dev, rt_uint16_t oflag)
 
     rt_mutex_take(&fft->lock, RT_WAITING_FOREVER);
     if (fft->pm_vote_held) {
-        rt_mutex_release(&fft->lock);
-        return -RT_EBUSY;
+        /* Last close consumed the device reference but could not drop the vote. */
+        ret = k230_pm_put(K230_PM_DEV_AI);
+        if (ret != 0) {
+            rt_mutex_release(&fft->lock);
+            LOG_E("retry AI/FFT clock release failed ret=%d", ret);
+            return k230_pm_rt_errno(ret);
+        }
+        fft->pm_vote_held = RT_FALSE;
     }
 
     /* FFT belongs to the KPU/AI clock and power/reset domain. */
@@ -353,7 +359,7 @@ static rt_err_t fft_device_open(rt_device_t dev, rt_uint16_t oflag)
     if (ret != 0) {
         rt_mutex_release(&fft->lock);
         LOG_E("enable AI/FFT clock failed ret=%d", ret);
-        return ret;
+        return k230_pm_rt_errno(ret);
     }
 
     fft_disable(fft);
@@ -375,7 +381,7 @@ static rt_err_t fft_device_close(rt_device_t dev)
     rt_mutex_take(&fft->lock, RT_WAITING_FOREVER);
     if (!fft->pm_vote_held) {
         rt_mutex_release(&fft->lock);
-        return -RT_EINVAL;
+        return RT_EOK;
     }
 
     rt_hw_interrupt_mask(FFT_IRQN);
@@ -384,9 +390,12 @@ static rt_err_t fft_device_close(rt_device_t dev)
     ret = k230_pm_put(K230_PM_DEV_AI);
     if (ret == 0)
         fft->pm_vote_held = RT_FALSE;
+    else
+        LOG_E("deferred AI/FFT clock release ret=%d", ret);
     rt_mutex_release(&fft->lock);
 
-    return ret == 0 ? RT_EOK : ret;
+    /* rt_device_close() has consumed the reference. Let the next open retry. */
+    return RT_EOK;
 }
 
 static rt_err_t fft_device_control(rt_device_t dev, int cmd, void* args)

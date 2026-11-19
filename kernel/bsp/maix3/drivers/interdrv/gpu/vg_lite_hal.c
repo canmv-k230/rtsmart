@@ -767,7 +767,7 @@ static int gpu_open(struct dfs_fd *file) {
         ret = k230_pm_get(K230_PM_DEV_GPU2D);
         if (ret != 0) {
             rt_mutex_release(&device->open_lock);
-            return ret;
+            return k230_pm_errno(ret);
         }
         clear_interrupt_state();
         rt_hw_interrupt_umask(irq_num);

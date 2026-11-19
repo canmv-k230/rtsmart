@@ -39,17 +39,10 @@ struct ai_2d_dev_handle {
 };
 
 
-#ifdef  AI2D_LOG_ENABLE
-static int ai_2d_log(const char *fmt, ...)
-{
-    rt_kprintf(fmt);
-    return 0;
-}
+#ifdef AI2D_LOG_ENABLE
+#define ai_2d_log(fmt, ...) rt_kprintf(fmt, ##__VA_ARGS__)
 #else
-static int ai_2d_log(const char *fmt, ...)
-{
-    return 0;
-}
+#define ai_2d_log(fmt, ...)
 #endif
 
 #define ai_2d_info(s...)	do { \
@@ -96,20 +89,20 @@ static int ai_2d_device_open(struct dfs_fd *file)
     handle = rt_malloc(sizeof (struct ai_2d_dev_handle));
     if(handle == RT_NULL) {
         ai_2d_err("malloc failed\n");
-        return -1;
+        return -ENOMEM;
     }
 
     ret = rt_mutex_take(&g_ai_2d_pm_mutex, RT_WAITING_FOREVER);
     if (ret != RT_EOK) {
         rt_free(handle);
-        return -RT_ERROR;
+        return -EINTR;
     }
 
     /* Existing client references must not bypass a thermal admission block. */
     if (k230_pm_thermal_accelerators_blocked()) {
         rt_mutex_release(&g_ai_2d_pm_mutex);
         rt_free(handle);
-        return -RT_EBUSY;
+        return -EBUSY;
     }
 
     if (g_ai_2d_open_count == 0) {
@@ -118,7 +111,7 @@ static int ai_2d_device_open(struct dfs_fd *file)
             if (ret != 0) {
                 rt_mutex_release(&g_ai_2d_pm_mutex);
                 rt_free(handle);
-                return ret;
+                return k230_pm_errno(ret);
             }
             g_ai_2d_pm_vote_held = RT_FALSE;
         }
@@ -127,7 +120,7 @@ static int ai_2d_device_open(struct dfs_fd *file)
         if (ret != 0) {
             rt_mutex_release(&g_ai_2d_pm_mutex);
             rt_free(handle);
-            return ret;
+            return k230_pm_errno(ret);
         }
         g_ai_2d_pm_vote_held = RT_TRUE;
         ai_2d_clear_interrupt();
@@ -141,50 +134,46 @@ static int ai_2d_device_open(struct dfs_fd *file)
     device = (rt_device_t)file->fnode->data;
     handle->wait = &device->wait_queue;
     file->data = (void*)handle;
-    return RT_EOK;
+    return 0;
 }
 
 static int ai_2d_device_close(struct dfs_fd *file)
 {
     struct ai_2d_dev_handle *handle;
     int ret;
-    int pm_ret;
 
     handle = (struct ai_2d_dev_handle *)file->data;
-    if(handle == RT_NULL) {
-        ai_2d_err("try to close a invalid handle");
-		return -RT_EINVAL;
+    if (handle == RT_NULL) {
+        file->flags |= DFS_F_CLOSE_TERMINAL;
+        return -EINVAL;
     }
 
     ret = rt_mutex_take(&g_ai_2d_pm_mutex, RT_WAITING_FOREVER);
-    if (ret != RT_EOK) {
-        rt_free(handle);
-        file->data = RT_NULL;
-        return -RT_ERROR;
-    }
+    if (ret != RT_EOK)
+        return -EINTR;
 
     if (g_ai_2d_open_count == 0) {
-        rt_mutex_release(&g_ai_2d_pm_mutex);
-        rt_free(handle);
-        file->data = RT_NULL;
-        return -RT_EINVAL;
-    }
+        ret = -EINVAL;
+    } else if (--g_ai_2d_open_count == 0) {
+        int pm_ret;
 
-    g_ai_2d_open_count--;
-    if (g_ai_2d_open_count == 0) {
         rt_hw_interrupt_mask(IRQN_AI2D_INTERRUPT);
         ai_2d_clear_interrupt();
         pm_ret = k230_pm_put(K230_PM_DEV_AI);
         if (pm_ret == 0)
             g_ai_2d_pm_vote_held = RT_FALSE;
-    } else {
-        pm_ret = 0;
+        else
+            ai_2d_err("close retained PM vote: %d\n", pm_ret);
+        ret = k230_pm_errno(pm_ret);
     }
     rt_mutex_release(&g_ai_2d_pm_mutex);
 
     rt_free(handle);
     file->data = RT_NULL;
-    return pm_ret == 0 ? RT_EOK : pm_ret;
+    /* The next open retries the PM vote; close cannot retry a freed handle. */
+    if (ret != 0)
+        file->flags |= DFS_F_CLOSE_TERMINAL;
+    return ret;
 }
 
 static int ai_2d_device_ioctl(struct dfs_fd *file, int cmd, void *args)
