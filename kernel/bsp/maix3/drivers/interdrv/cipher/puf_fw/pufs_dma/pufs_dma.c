@@ -34,7 +34,20 @@ struct pufs_dma pufs_dma = { .regs = NULL,
     .write_virt_addr = 0x0,
     .buff_size = 0 };
 
+/*
+ * OTP key slots selected by key_cfg_0, which the guard opens for each direct
+ * run. Like the register it persists across multi-pass operations (sp38a and
+ * sp38d write the key once, then run per chunk), so it is only correct while
+ * dma_write_key_config_0() stays the sole writer of key_cfg_0.
+ */
+static uint32_t dma_cfg_otp_keys;
 #ifdef DMADIRECT
+static size_t dma_quarantined_bytes;
+/* Input (plaintext, MAC message, KDF info) left in the write bounce, scrubbed
+ * once hardware is done with it. */
+static size_t dma_write_bounce_bytes;
+static bool dma_write_quarantined;
+
 static uint8_t pufs_dma_write_bounce[CHUNK_MAXLEN] __attribute__((aligned(64)));
 static uint8_t pufs_dma_read_bounce[CHUNK_MAXLEN] __attribute__((aligned(64)));
 #endif
@@ -153,8 +166,10 @@ static pufs_status_t dma_gen_sg_desc_list(pufs_dma_sg_internal_desc_st* inter_sg
 /*****************************************************************************
  * Internal functions
  ****************************************************************************/
-int dma_write_rwcfg(const uint8_t* out, const uint8_t* in, uint32_t len)
+pufs_status_t dma_write_rwcfg(const uint8_t* out, const uint8_t* in, uint32_t len)
 {
+    if (dma_check_busy_status(NULL))
+        return E_BUSY;
     pufs_dma.regs->dsc_cfg_2 = len;
 
 #ifndef DMADIRECT
@@ -176,26 +191,21 @@ int dma_write_rwcfg(const uint8_t* out, const uint8_t* in, uint32_t len)
     if (len && in) {
         if (len > CHUNK_MAXLEN) {
             LOG_ERROR("DMA input length too large: %u", len);
-            return -EINVAL;
+            return E_OVERFLOW;
         }
-        if ((len & 0x3f) || ((uint64_t)in & 0x3f)) {
-            pufs_dma.write_virt_addr = (uintptr_t)pufs_dma_write_bounce;
-            rvv_memcpy((void*)pufs_dma.write_virt_addr, in, len);
-        } else {
-            pufs_dma.write_virt_addr = (uint64_t)in;
-        }
+        /* Bounded waits may return while DMA still owns its addresses. */
+        pufs_dma.write_virt_addr = (uintptr_t)pufs_dma_write_bounce;
+        rvv_memcpy(pufs_dma_write_bounce, in, len);
+        if (len > dma_write_bounce_bytes)
+            dma_write_bounce_bytes = len;
         rt_hw_cpu_dcache_clean((void*)pufs_dma.write_virt_addr, len);
     }
     if (len && out) {
         if (len > CHUNK_MAXLEN) {
             LOG_ERROR("DMA output length too large: %u", len);
-            return -EINVAL;
+            return E_OVERFLOW;
         }
-        if ((len & 0x3f) || ((uint64_t)out & 0x3f)) {
-            pufs_dma.read_virt_addr = (uintptr_t)pufs_dma_read_bounce;
-        } else {
-            pufs_dma.read_virt_addr = (uint64_t)out;
-        }
+        pufs_dma.read_virt_addr = (uintptr_t)pufs_dma_read_bounce;
         rt_hw_cpu_dcache_invalidate((void*)pufs_dma.read_virt_addr, len);
     }
     pufs_dma.regs->dsc_cfg_0 = (uintptr_t)pufs_dma.write_virt_addr;
@@ -204,27 +214,142 @@ int dma_write_rwcfg(const uint8_t* out, const uint8_t* in, uint32_t len)
     return 0;
 }
 
-int dma_wait_done(void)
+uint32_t dma_key_slots(uint32_t cfg)
 {
-    int ret = -ETIME;
-    uint64_t stop = rt_tick_get() + 1000;
+    if ((cfg & DMA_KEY_CFG_0_KEY_SRC_MASK) != OTPKEY)
+        return 0;
+    return rt_otp_keyslot_mask((cfg & DMA_KEY_CFG_0_KEY_IDX_MASK) >> DMA_KEY_CFG_0_KEY_IDX_BITS,
+                               (cfg & DMA_KEY_CFG_0_KEY_SIZE_MASK) >> DMA_KEY_CFG_0_KEY_SIZE_BITS);
+}
 
-    while (stop > rt_tick_get()) {
-        if (dma_check_busy_status(0) == 0) {
-            ret = 0;
-            break;
+static void dma_drop_staged_input(void);
+
+static pufs_status_t dma_start(uint32_t slots)
+{
+    pufs_status_t check = E_BUSY;
+
+    if (!dma_check_busy_status(NULL)) {
+        check = rt_otp_guard_keyslots(slots, true);
+        if (check == SUCCESS) {
+            pufs_dma.regs->start = 1;
+            return SUCCESS;
         }
     }
+    dma_drop_staged_input();
+    return check;
+}
 
+static pufs_status_t dma_finish(uint32_t slots, uint32_t status)
+{
+    pufs_status_t check = rt_otp_guard_keyslots(slots, false);
+    if (check != SUCCESS)
+        return check;
+    if (status != 0) {
+        LOG_ERROR("DMA status 0: 0x%08" PRIx32 "\n", status);
+        return E_ERROR;
+    }
+    return SUCCESS;
+}
+
+#ifdef DMADIRECT
+static void dma_scrub_bounce(size_t len)
+{
+    rvv_memset(pufs_dma_read_bounce, 0, len);
+    rt_hw_cpu_dcache_clean(pufs_dma_read_bounce, len);
+}
+
+/* Call only while DMA is idle: hardware may still be reading the input. */
+static void dma_scrub_write_bounce(void)
+{
+    if (dma_write_bounce_bytes == 0)
+        return;
+    rvv_memset(pufs_dma_write_bounce, 0, dma_write_bounce_bytes);
+    rt_hw_cpu_dcache_clean(pufs_dma_write_bounce, dma_write_bounce_bytes);
+    dma_write_bounce_bytes = 0;
+}
+#endif
+
+/* The transfer was refused before it started (busy engine, or the OTP guard
+ * denied its key), so do not leave the input staged by dma_write_rwcfg()
+ * until the next run. If the engine is still busy with an earlier timed-out
+ * transfer, scrub once it is idle, as for a timeout. */
+static void dma_drop_staged_input(void)
+{
+#ifdef DMADIRECT
+    if (dma_check_busy_status(NULL))
+        dma_write_quarantined = dma_write_bounce_bytes != 0;
+    else
+        dma_scrub_write_bounce();
+#endif
+}
+
+static bool dma_wait_idle(uint32_t *status, bool bounded)
+{
+    rt_tick_t start = bounded ? rt_tick_get() : 0;
+
+    while (dma_check_busy_status(status)) {
+        if (bounded && (rt_tick_t)(rt_tick_get() - start) >= RT_TICK_PER_SECOND)
+            return false;
+    }
+    return true;
+}
+
+static pufs_status_t dma_timeout(uint32_t slots)
+{
+    LOG_ERROR("DMA wait timeout");
+    pufs_status_t close = rt_otp_guard_keyslots(slots, false);
+    return close == SUCCESS ? E_BUSY : close;
+}
+
+static pufs_status_t dma_wait_direct(uint32_t slots, bool bounded)
+{
+    uint32_t status;
+
+    if (!dma_wait_idle(&status, bounded)) {
+#ifdef DMADIRECT
+        if (pufs_dma.read_virt_addr == (uintptr_t)pufs_dma_read_bounce)
+            dma_quarantined_bytes = pufs_dma.buff_size;
+        dma_write_quarantined = dma_write_bounce_bytes != 0;
+#endif
+        return dma_timeout(slots);
+    }
+
+    pufs_status_t check = dma_finish(slots, status);
+#ifdef DMADIRECT
     if (pufs_dma.read_virt_addr) {
         rt_hw_cpu_dcache_invalidate((void*)pufs_dma.read_virt_addr, pufs_dma.buff_size);
-        if (pufs_dma.read_virt_addr != pufs_dma.read_addr) {
-            rvv_memcpy((void*)pufs_dma.read_addr, (void*)pufs_dma.read_virt_addr, pufs_dma.buff_size);
-            rt_hw_cpu_dcache_clean((void*)pufs_dma.read_addr, pufs_dma.buff_size);
+        if (pufs_dma.read_virt_addr == (uintptr_t)pufs_dma_read_bounce) {
+            if (check == SUCCESS) {
+                rvv_memcpy((void*)pufs_dma.read_addr, pufs_dma_read_bounce, pufs_dma.buff_size);
+                rt_hw_cpu_dcache_clean((void*)pufs_dma.read_addr, pufs_dma.buff_size);
+            }
+            dma_scrub_bounce(pufs_dma.buff_size);
         }
     }
+    dma_scrub_write_bounce();
+#endif
+    return check;
+}
 
-    return ret;
+pufs_status_t dma_run(void)
+{
+    uint32_t slots = dma_cfg_otp_keys;
+    pufs_status_t check = dma_start(slots);
+    return check == SUCCESS ? dma_wait_direct(slots, true) : check;
+}
+
+pufs_status_t dma_run_sg(uint32_t slots, bool *timed_out)
+{
+    uint32_t status;
+    *timed_out = false;
+    pufs_status_t check = dma_start(slots);
+    if (check != SUCCESS)
+        return check;
+    if (!dma_wait_idle(&status, true)) {
+        *timed_out = true;
+        return dma_timeout(slots);
+    }
+    return dma_finish(slots, status);
 }
 
 pufs_status_t dma_write_sgcfg(pufs_dma_sg_desc_st* descs, uint32_t descs_len, pufs_dma_sg_desc_opts_st* opts)
@@ -257,7 +382,7 @@ void clear_dma_read(uint32_t len)
 
 pufs_status_t pufs_dump_rand_dma(uint8_t* rand, uint32_t len, bool entropy)
 {
-    uint32_t val32;
+    pufs_status_t check;
     // check feature
     if ((pufs_dma.regs->feature & DMA_FEATURE_RNG_MASK) == 0)
         return E_UNSUPPORT;
@@ -266,28 +391,27 @@ pufs_status_t pufs_dump_rand_dma(uint8_t* rand, uint32_t len, bool entropy)
         return E_BUSY;
 
     dma_write_config_0(true, false, false);
-    dma_write_rwcfg(rand, NULL, len); // config DMA descriptor
+    if ((check = dma_write_rwcfg(rand, NULL, len)) != SUCCESS)
+        return check;
     dma_write_key_config_0(0, ALGO_TYPE_NONE, 0, 0);
 
-    dma_write_start();
+    if ((check = dma_start(0)) != SUCCESS)
+        return check;
 
     if (entropy)
         pufs_fre_cont_ctrl(true);
     else
         pufs_rng_cont_ctrl(true);
 
-    while (dma_check_busy_status(&val32))
-        ;
+    check = dma_wait_direct(0, false);
 
     if (entropy)
         pufs_fre_cont_ctrl(false);
     else
         pufs_rng_cont_ctrl(false);
 
-    if (val32 != 0) {
-        LOG_ERROR("DMA status 0: 0x%08" PRIx32 "\n", val32);
-        return E_ERROR;
-    }
+    if (check != SUCCESS)
+        return check;
 
     dma_read_output(rand, len);
 
@@ -303,12 +427,9 @@ void dma_read_output(uint8_t* addr, uint32_t len)
 
 void dma_write_key_config_0(pufs_key_type_t keytype, pufs_algo_type_t algo, uint32_t size, uint32_t slot_index)
 {
-    uint32_t value = 0;
-    value |= slot_index << DMA_KEY_CFG_0_KEY_IDX_BITS;
-    value |= size << DMA_KEY_CFG_0_KEY_SIZE_BITS;
-    value |= algo << DMA_KEY_CFG_0_KEY_DST_BITS;
-    value |= keytype;
+    uint32_t value = dma_key_cfg(keytype, algo, size, slot_index);
     pufs_dma.regs->key_cfg_0 = value;
+    dma_cfg_otp_keys = dma_key_slots(value);
 }
 
 void dma_write_config_0(bool rng_enable, bool sgdma_enable, bool no_cypt)
@@ -375,15 +496,23 @@ void dma_write_data_dsc_config(pufs_dma_sg_desc_opts_st* opts, pufs_dma_dsc_attr
     pufs_dma.regs->dsc_cfg_4 = value;
 }
 
-void dma_write_start(void)
-{
-    pufs_dma.regs->start = 0x1;
-}
-
 bool dma_check_busy_status(uint32_t* status)
 {
     uint32_t stat = pufs_dma.regs->status_0;
     bool busy = (stat & DMA_STATUS_0_BUSY_MASK) != 0;
+
+#ifdef DMADIRECT
+    /* A timed-out transfer owns the bounce buffer until hardware is idle. */
+    if (!busy && dma_quarantined_bytes) {
+        rt_hw_cpu_dcache_invalidate(pufs_dma_read_bounce, dma_quarantined_bytes);
+        dma_scrub_bounce(dma_quarantined_bytes);
+        dma_quarantined_bytes = 0;
+    }
+    if (!busy && dma_write_quarantined) {
+        dma_scrub_write_bounce();
+        dma_write_quarantined = false;
+    }
+#endif
 
     if (status != NULL)
         *status = stat;
@@ -395,7 +524,7 @@ pufs_status_t pufs_dma_read_write(uint8_t* out, uint32_t outlen,
     const uint8_t* data, const uint32_t data_length,
     pufs_dma_dsc_attr_st* attr)
 {
-    uint32_t status;
+    pufs_status_t check;
     pufs_dma_sg_desc_opts_st opts = { .head = false, .tail = false, .done_interrupt = true, .done_pause = true, .offset = 0x0 };
 
 #ifdef BAREMETAL
@@ -406,19 +535,13 @@ pufs_status_t pufs_dma_read_write(uint8_t* out, uint32_t outlen,
         return E_BUSY;
 
     dma_write_config_0(false, false, false);
-    dma_write_rwcfg(out, data, data_length);
+    if ((check = dma_write_rwcfg(out, data, data_length)) != SUCCESS)
+        return check;
     dma_write_key_config_0(0, ALGO_TYPE_NONE, 0, 0);
     dma_write_data_dsc_config(&opts, attr, true);
 
-    dma_write_start();
-
-    while (dma_check_busy_status(&status))
-        ;
-
-    if (status != 0) {
-        LOG_ERROR("DMA status 0: 0x%08" PRIx32 "\n", status);
-        return E_ERROR;
-    }
+    if ((check = dma_start(0)) != SUCCESS || (check = dma_wait_direct(0, false)) != SUCCESS)
+        return check;
     dma_read_output(out, outlen);
 
     return SUCCESS;
@@ -429,7 +552,13 @@ pufs_status_t pufs_dma_read_write_sg(pufs_dma_sg_desc_st* descs)
     pufs_dma_sg_internal_desc_st* desc;
     pufs_dma_sg_desc_opts_st opts = { .head = false, .tail = false, .done_interrupt = true, .done_pause = true, .offset = 0x0, .no_crypto = true };
 
+    if (dma_check_busy_status(NULL))
+        return E_BUSY;
     desc = dma_sg_new_data_descriptor();
+    if (desc == NULL) {
+        dma_sg_free_all_descriptor();
+        return E_UNAVAIL;
+    }
     dma_sg_desc_write_addr(desc, descs->write_addr, descs->read_addr, descs->length);
     dma_sg_desc_write_dsc_config(desc, &descs->attr, &opts);
     dma_sg_desc_write_key_config(desc, 0, ALGO_TYPE_NONE, 0, 0);

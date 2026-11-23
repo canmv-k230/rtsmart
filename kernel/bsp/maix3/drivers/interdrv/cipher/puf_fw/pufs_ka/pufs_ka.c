@@ -430,6 +430,47 @@ void ka_cfg_print(void)
         printf("reg[%d] = 0x%x\n", i, *((uint32_t*)ka_regs + i));
     }
 }
+/* Register words are big endian; copy the final partial word as bytes. */
+static void kwp_read_key(uint8_t *key, uint32_t bytes)
+{
+    for (uint32_t off = 0; off < bytes; off += sizeof(uint32_t)) {
+        uint32_t word = be2le(kwp_regs->key[off / sizeof(word)]);
+        uint32_t n = bytes - off;
+        memcpy(key + off, &word, n < sizeof(word) ? n : sizeof(word));
+    }
+}
+
+pufs_status_t pufs_wrapped_key_size(pufs_key_wrap_t keywrap, uint32_t keybits,
+                                  uint32_t *bytes)
+{
+    if (!keybits || keybits > KWP_KEY_MAXLEN * 8)
+        return E_INVALID;
+
+    uint32_t len = b2B(keybits);
+    switch (keywrap) {
+    case AES_CBC_CS2:
+        break;
+    case AES_KW:
+    case AES_KW_INV:
+        if (keybits < 128 || keybits % 64 != 0)
+            return E_INVALID;
+        len += 8;
+        break;
+    case AES_KWP:
+    case AES_KWP_INV:
+        if (keybits % 8 != 0)
+            return E_INVALID;
+        len = 8 * ((len + 15) / 8);
+        break;
+    default:
+        return E_INVALID;
+    }
+    if (len > KWP_KEY_MAXLEN)
+        return E_OVERFLOW;
+    *bytes = len;
+    return SUCCESS;
+}
+
 pufs_status_t pufs_import_plaintext_key(pufs_key_type_t keytype,
     pufs_ka_slot_t slot, const uint8_t* key,
     uint32_t keybits)
@@ -519,9 +560,7 @@ pufs_status_t pufs_export_plaintext_key(
     if ((check = pufs_kwp_start()) != SUCCESS)
         return check;
 
-    uint32_t* key32 = (uint32_t*)key;
-    for (size_t i = 0; i < b2B(keybits) / 4; ++i)
-        key32[i] = be2le(kwp_regs->key[i]);
+    kwp_read_key(key, b2B(keybits));
 
     return SUCCESS;
 }
@@ -544,14 +583,14 @@ pufs_status_t _pufs_import_wrapped_key(
     if ((check = keyslot_check(true, SSKEY, kekslot, kekbits)) != SUCCESS)
         return check;
     // check if the keywrap algorithm is supported
-    if (keywrap >= N_KEYWRAP_T)
-        return E_INVALID;
+    uint32_t inkeylen;
+    if ((check = pufs_wrapped_key_size(keywrap, keybits, &inkeylen)) != SUCCESS)
+        return check;
 
     if (kwp_regs->status & KWP_STATUS_BUSY_MASK)
         return E_BUSY;
 
     uint32_t val32, feature;
-    uint32_t inkeylen = b2B(keybits);
     feature = kwp_regs->feature;
 
     val32 = 0x2 << 0;
@@ -567,19 +606,13 @@ pufs_status_t _pufs_import_wrapped_key(
     case AES_KW_INV:
         if ((feature & KWP_FEATURE_AES_KW_D_MASK) == 0)
             return E_UNSUPPORT;
-        if ((keybits < 128) || ((keybits % 64) != 0))
-            return E_INVALID;
         val32 |= 0x2 << 4;
-        inkeylen += 8;
         break;
     case AES_KWP:
     case AES_KWP_INV:
         if ((feature & KWP_FEATURE_AES_KWP_D_MASK) == 0)
             return E_UNSUPPORT;
-        if ((keybits % 8) != 0)
-            return E_INVALID;
         val32 |= 0x3 << 4;
-        inkeylen = 8 * ((inkeylen + 15) / 8);
         break;
     default:
         return E_FIRMWARE;
@@ -653,14 +686,14 @@ pufs_status_t _pufs_export_wrapped_key(
     if ((check = keyslot_check(true, SSKEY, kekslot, kekbits)) != SUCCESS)
         return check;
     // check if the keywrap algorithm is supported
-    if (keywrap >= N_KEYWRAP_T)
-        return E_INVALID;
+    uint32_t outkeylen;
+    if ((check = pufs_wrapped_key_size(keywrap, keybits, &outkeylen)) != SUCCESS)
+        return check;
 
     if (kwp_regs->status & KWP_STATUS_BUSY_MASK)
         return E_BUSY;
 
     uint32_t val32, feature;
-    uint32_t outkeylen = b2B(keybits);
     feature = kwp_regs->feature;
 
     val32 = 0x3 << 0;
@@ -676,19 +709,13 @@ pufs_status_t _pufs_export_wrapped_key(
     case AES_KW_INV:
         if ((feature & KWP_FEATURE_AES_KW_E_MASK) == 0)
             return E_UNSUPPORT;
-        if ((keybits < 128) || ((keybits % 64) != 0))
-            return E_INVALID;
         val32 |= 0x2 << 4;
-        outkeylen += 8;
         break;
     case AES_KWP:
     case AES_KWP_INV:
         if ((feature & KWP_FEATURE_AES_KWP_E_MASK) == 0)
             return E_UNSUPPORT;
-        if ((keybits % 8) != 0)
-            return E_INVALID;
         val32 |= 0x3 << 4;
-        outkeylen = 8 * ((outkeylen + 15) / 8);
         break;
     default:
         return E_FIRMWARE;
@@ -731,9 +758,7 @@ pufs_status_t _pufs_export_wrapped_key(
     if ((check = pufs_kwp_start()) != SUCCESS)
         return check;
 
-    uint32_t* key32 = (uint32_t*)key;
-    for (size_t i = 0; i < outkeylen / 4; ++i)
-        key32[i] = be2le(kwp_regs->key[i]);
+    kwp_read_key(key, outkeylen);
 
     return SUCCESS;
 }

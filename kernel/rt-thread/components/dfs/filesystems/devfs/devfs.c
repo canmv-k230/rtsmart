@@ -66,7 +66,8 @@ int dfs_device_fs_read(struct dfs_fd *file, void *buf, size_t count)
         return -RT_ENOSYS;
     /* read device data */
     result = rt_device_read(dev_id, file->pos, buf, count);
-    file->pos += result;
+    if (result > 0)
+        file->pos += result;
 
     return result;
 }

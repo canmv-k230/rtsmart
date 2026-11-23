@@ -103,7 +103,29 @@ static int dev_open(struct dfs_fd *fd) { return 0; }
 static int dev_close(struct dfs_fd *fd) { close_calls++; return close_fail ? -EINTR : 0; }
 #define TAG(cmd) (DFS_FCNTL_TAG | (cmd))
 static const struct dfs_file_ops dev_fops = { .open = dev_open, .close = dev_close, .ioctl = dev_ioctl };
-static struct rt_device chardev, pipedev;
+static struct rt_device chardev, pipedev, rngdev;
+static int rng_error = 1;
+
+static rt_size_t rng_read(rt_device_t dev, rt_off_t pos, void *buf, rt_size_t count)
+{
+    CHECK(pos == 0);
+    if (rng_error)
+        return (rt_size_t)-EIO;
+    memset(buf, 0xa5, count);
+    return count;
+}
+static const struct rt_device_ops rng_ops = { .read = rng_read };
+
+static void test_device_read_error(void)
+{
+    unsigned char byte = 0;
+    int fd = k_open("/dev/hwrng", O_RDONLY, 0);
+    CHECK(fd >= 0);
+    CHECK(ERR(k_read(fd, &byte, 1), EIO));
+    rng_error = 0;
+    CHECK(k_read(fd, &byte, 1) == 1 && byte == 0xa5);
+    CHECK(k_close(fd) == 0);
+}
 
 static void test_open_flags(void)
 {
@@ -571,6 +593,9 @@ int main(int argc, char **argv)
     RUN(access_tmpfile);
     RUN(record_locks);
     RUN(getcwd);
+    rngdev.type = RT_Device_Class_Char; rngdev.ops = &rng_ops;
+    test_register_device(&rngdev, "hwrng");
+    RUN(device_read_error);
     if (failures)
     {
         fprintf(stderr, "%u check(s) failed\n", failures);
@@ -602,6 +627,16 @@ def build(directory, dfs_root=base.DFS):
                       'int dfs_register(const struct dfs_filesystem_ops *ops)\n{\n'
                       '    if (strcmp(ops->name, "devfs") != 0) { test_tmpfs_ops = ops; return 0; }\n'
                       '    devfs.path = "/dev";\n    devfs.ops = ops;\n    return 0;\n}')
+    for old, new in (
+        ("rt_device_open(rt_device_t dev, rt_uint16_t oflag) { abort(); }",
+         "rt_device_open(rt_device_t dev, rt_uint16_t oflag) { dev->ref_count++; return RT_EOK; }"),
+        ("rt_device_close(rt_device_t dev) { abort(); }",
+         "rt_device_close(rt_device_t dev) { dev->ref_count--; return RT_EOK; }"),
+        ("rt_device_read(rt_device_t dev, rt_off_t pos, void *b, rt_size_t s) { abort(); }",
+         "rt_device_read(rt_device_t dev, rt_off_t pos, void *b, rt_size_t s) { return dev->ops->read(dev, pos, b, s); }"),
+    ):
+        assert old in env, "device stub changed"
+        env = env.replace(old, new)
     (build_dir / "env.c").write_text(env + ENV_EXTRA)
     (build_dir / "test.c").write_text('#include "stubs.h"\n' + CASES)
     sources = [dfs_root / "src/dfs.c", dfs_root / "src/dfs_file.c", dfs_root / "src/dfs_posix.c",

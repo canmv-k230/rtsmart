@@ -21,12 +21,14 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <rtthread.h>
 #include "pufs_internal.h"
 #include "pufs_ecp_internal.h"
 #include "pufs_ecp_mprog.h"
 #include "pufs_ka_internal.h"
 #include "pufs_kdf_internal.h"
 #include "pufs_ecc_internal.h"
+#include "pufs_rt_internal.h"
 
 struct pufs_ecp_regs* ecp_regs = NULL;
 
@@ -43,6 +45,8 @@ struct pufs_ecp_regs* ecp_regs = NULL;
 
 static pufs_ecp_version_t ecp_version = ECP_UNSUPPORTED;
 static pufs_mp_version_t mp_version = MP_UNSUPPORTED;
+/* Nonzero while RSA private operands still need to be wiped. */
+static uint32_t pending_rsa_elen;
 
 struct ecdp_setting {
     pufs_ecp_mprog_curve_st* mprog;
@@ -55,6 +59,16 @@ static const uint8_t rsa_pss_pad1[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
 /*****************************************************************************
  * Static functions
  ****************************************************************************/
+
+static bool p256_otp_private_key_unsupported(pufs_key_type_t prktype)
+{
+    /* On this revision OTP public-key generation faults and ECDSA signing can
+     * report success with a signature that fails verification for that key.
+     * Checked by every operation that takes an OTP private key: gen_puk,
+     * ECDSA sign and ECDH (SM2 uses its own curve). */
+    return prktype == OTPKEY && ecdp_set.name == NISTP256
+        && ecp_version == ECP_ECF39303 && mp_version == MP_00000000;
+}
 
 // 定义一个函数，用于替换memcpy()
 static inline void* memcpy4b(void* dest, const void* src, int count)
@@ -85,6 +99,19 @@ static void reset_ecp_operand(uint32_t pos, uint32_t elen)
 {
     _write_ecp_operand(pos, NULL, elen);
 }
+
+bool pufs_ecp_is_idle(void)
+{
+    if (ecp_regs->status & ECP_STATUS_BUSY_MASK)
+        return false;
+    if (pending_rsa_elen != 0) {
+        reset_ecp_operand(1, pending_rsa_elen); /* phi */
+        reset_ecp_operand(3, pending_rsa_elen); /* private exponent */
+        pending_rsa_elen = 0;
+    }
+    return true;
+}
+
 /**
  * @brief Write oeprands into SRAM
  *
@@ -126,15 +153,64 @@ static void read_ecp_operand(uint32_t pos, uint8_t* res, uint32_t elen,
  *
  * @return ECCA status register value
  */
-static uint32_t pufs_ecc_start(void)
-{
-    uint32_t ret;
-    ecp_regs->ctrl = 0x01;
-    do {
-        ret = ecp_regs->status;
-    } while ((ret & ECP_STATUS_BUSY_MASK) != 0);
+/*
+ * OTP key slots (bit n = OTPKEY_n) the next ECC run reads. Only correct while
+ * ecp_select_otp_key() is the sole writer of otpkba; pufs_ecc_start() consumes
+ * it, and a path that returns between the two must clear it.
+ */
+static uint32_t ecp_otp_keys;
 
-    return ret;
+/*
+ * Point the ECC engine at an OTP-stored key of @keybits at slot index @idx.
+ * The post-mask guard keeps OTP masked, so pufs_ecc_start() opens these
+ * slots for the run.
+ */
+static void ecp_select_otp_key(uint32_t idx, uint32_t keybits)
+{
+    ecp_regs->otpkba = idx << 4;
+    ecp_otp_keys = rt_otp_keyslot_mask(idx, keybits);
+}
+
+/*
+ * Bound for one microprogram run, only reached if the engine is wedged.
+ * Measured on k230-2 (2026-11-22): RSA-4096 sign 1.9 s with a random private
+ * exponent (RSA-3072 0.8 s, RSA-2048 0.25 s, P-256 sign 20 ms). The slowest
+ * case therefore gets about 5x headroom.
+ */
+#define ECP_WAIT_TICKS (10 * RT_TICK_PER_SECOND)
+/*
+ * Poll without sleeping for this long (P-256 runs take about 20 ms), then
+ * sleep 1 ms between polls so an RSA run or a wedged engine does not hold the
+ * CPU at the caller's priority. Callers hold the PUFS mutex and may sleep.
+ */
+#define ECP_SPIN_TICKS 2
+
+static pufs_status_t pufs_ecc_start(uint32_t *status)
+{
+    uint32_t slots = ecp_otp_keys;
+    ecp_otp_keys = 0;
+    if (ecp_regs->status & ECP_STATUS_BUSY_MASK)
+        return E_BUSY;
+
+    pufs_status_t check = rt_otp_guard_keyslots(slots, true);
+    if (check != SUCCESS)
+        return check;
+
+    ecp_regs->ctrl = 0x01;
+    rt_tick_t start = rt_tick_get();
+    while ((*status = ecp_regs->status) & ECP_STATUS_BUSY_MASK) {
+        rt_tick_t elapsed = rt_tick_get() - start;
+        if (elapsed >= ECP_WAIT_TICKS) {
+            LOG_ERROR("ECC wait timeout");
+            check = E_BUSY;
+            break;
+        }
+        if (elapsed >= ECP_SPIN_TICKS)
+            rt_thread_mdelay(1);
+    }
+
+    pufs_status_t close = rt_otp_guard_keyslots(slots, false);
+    return close == SUCCESS ? check : close;
 }
 /**
  * @brief Get ECP version enum based on version number
@@ -257,8 +333,13 @@ static pufs_status_t pufs_rsa_verify_calc(uint8_t* msg,
     if (pufs_bn_cmp(sig, n, elen) >= 0)
         return E_INVALID;
 
+    if (ecp_regs->status & ECP_STATUS_BUSY_MASK)
+        return E_BUSY;
+
     val32 = field << ECP_ECP_EC_FIELD_BITS;
 
+    /* RSA overwrites the registers that back the cached ECC curve. */
+    ecdp_set.isset = false;
     ecp_regs->ec = val32;
     ecp_regs->e_short = puk;
 
@@ -271,7 +352,9 @@ static pufs_status_t pufs_rsa_verify_calc(uint8_t* msg,
     memcpy4b((void*)ecp_regs->mac, cmac->puk, ECP_MPMAC_SIZE);
     memcpy4b((void*)ecp_regs->program, prog->func->puk, ECP_MPROG_SIZE);
 
-    val32 = pufs_ecc_start();
+    pufs_status_t run = pufs_ecc_start(&val32);
+    if (run != SUCCESS)
+        return run;
 
     if (val32 & ECP_STATUS_MPROG_MASK)
         return E_ECMPROG;
@@ -397,16 +480,23 @@ static pufs_status_t pufs_ecp_set_curve_params_byname(pufs_ec_name_t name, uint3
  */
 pufs_status_t pufs_ecp_set_sm2_curve(void)
 {
-    ecdp_set.name = SM2;
-    ecdp_set.isset = true;
-
-    return pufs_ecp_set_curve_params_byname(SM2, ecp_regs->version);
+    if (ecp_regs->status & ECP_STATUS_BUSY_MASK)
+        return E_BUSY;
+    pufs_status_t check = pufs_ecp_set_curve_params_byname(SM2, ecp_regs->version);
+    if (check == SUCCESS) {
+        ecdp_set.name = SM2;
+        ecdp_set.isset = true;
+    }
+    return check;
 }
 
 pufs_status_t pufs_ecp_sm2_enc_oss(pufs_ec_point_st* puk, pufs_ec_point_st* x1y1, pufs_ec_point_st* x2y2)
 {
     uint32_t val32;
     uint32_t elen = ecc_param[SM2].len;
+
+    if (ecp_regs->status & ECP_STATUS_BUSY_MASK)
+        return E_BUSY;
 
     write_ecp_operand(7, puk->x, elen);
     write_ecp_operand(8, puk->y, elen);
@@ -420,7 +510,9 @@ pufs_status_t pufs_ecp_sm2_enc_oss(pufs_ec_point_st* puk, pufs_ec_point_st* x1y1
     memcpy4b((void*)ecp_regs->mac, cmac->enc_oss, ECP_MPMAC_SIZE);
     memcpy4b((void*)ecp_regs->program, prog->func->enc_oss, ECP_MPROG_SIZE);
 
-    val32 = pufs_ecc_start();
+    pufs_status_t run = pufs_ecc_start(&val32);
+    if (run != SUCCESS)
+        return run;
 
     if (val32 & ECP_STATUS_MPROG_MASK)
         return E_ECMPROG;
@@ -443,6 +535,9 @@ pufs_status_t pufs_ecp_sm2_dec_oss(pufs_ka_slot_t prkslot, pufs_ec_point_st* x1y
     uint32_t val32;
     uint32_t elen = ecc_param[SM2].len;
 
+    if (ecp_regs->status & ECP_STATUS_BUSY_MASK)
+        return E_BUSY;
+
     write_ecp_operand(7, x1y1->x, elen);
     write_ecp_operand(8, x1y1->y, elen);
 
@@ -456,7 +551,9 @@ pufs_status_t pufs_ecp_sm2_dec_oss(pufs_ka_slot_t prkslot, pufs_ec_point_st* x1y
     memcpy4b((void*)ecp_regs->mac, cmac->dec_oss, ECP_MPMAC_SIZE);
     memcpy4b((void*)ecp_regs->program, prog->func->dec_oss, ECP_MPROG_SIZE);
 
-    val32 = pufs_ecc_start();
+    pufs_status_t run = pufs_ecc_start(&val32);
+    if (run != SUCCESS)
+        return run;
 
     if (val32 & ECP_STATUS_MPROG_MASK)
         return E_ECMPROG;
@@ -499,8 +596,8 @@ pufs_status_t pufs_ecp_sm2_sign_dgst(pufs_ecdsa_sig_st* sig,
     {
         val32 = 0x1 << 0;
         ecp_regs->keysel = val32;
-        val32 = get_key_slot_idx(prktype, prkslot) << 4;
-        ecp_regs->otpkba = val32;
+        ecp_select_otp_key(get_key_slot_idx(prktype, prkslot),
+                           ecc_param[ecdp_set.name].fbits);
     }
 
     pufs_sm2_mprog_st* prog = &(sm2_mprog[ecp_version]);
@@ -511,7 +608,9 @@ pufs_status_t pufs_ecp_sm2_sign_dgst(pufs_ecdsa_sig_st* sig,
 
     write_ecp_operand(6, md->dgst, md->dlen);
 
-    val32 = pufs_ecc_start();
+    pufs_status_t run = pufs_ecc_start(&val32);
+    if (run != SUCCESS)
+        return run;
 
     if (val32 & ECP_STATUS_MPROG_MASK)
         return E_ECMPROG;
@@ -554,7 +653,9 @@ pufs_status_t pufs_ecp_sm2_verify_dgst(pufs_ecdsa_sig_st* sig,
     write_ecp_operand(9, sig->r, elen);
     write_ecp_operand(10, sig->s, elen);
 
-    val32 = pufs_ecc_start();
+    pufs_status_t run = pufs_ecc_start(&val32);
+    if (run != SUCCESS)
+        return run;
 
     if (val32 & ECP_STATUS_MPROG_MASK)
         return E_ECMPROG;
@@ -609,7 +710,9 @@ pufs_status_t pufs_ecp_sm2_kekdf(pufs_ec_point_st* key,
     write_ecp_operand(9, pukr->x, elen);
     write_ecp_operand(10, pukr->y, elen);
 
-    val32 = pufs_ecc_start();
+    pufs_status_t run = pufs_ecc_start(&val32);
+    if (run != SUCCESS)
+        return run;
 
     if (val32 & ECP_STATUS_MPROG_MASK)
         return E_ECMPROG;
@@ -687,8 +790,12 @@ pufs_status_t _pufs_rsa_sign(uint8_t* sig,
     if (pufs_bn_cmp(msg, n, elen) >= 0)
         return E_INVALID;
 
+    if (!pufs_ecp_is_idle())
+        return E_BUSY;
+
     val32 = field << ECP_ECP_EC_FIELD_BITS;
 
+    ecdp_set.isset = false;
     ecp_regs->ec = val32;
     ecp_regs->e_short = puk;
 
@@ -714,17 +821,23 @@ pufs_status_t _pufs_rsa_sign(uint8_t* sig,
     memcpy4b((void*)ecp_regs->mac, cmac->prk, ECP_MPMAC_SIZE);
     memcpy4b((void*)ecp_regs->program, prog->func->prk, ECP_MPROG_SIZE);
 
-    val32 = pufs_ecc_start();
+    pufs_status_t run = pufs_ecc_start(&val32);
+    if (run == SUCCESS) {
+        if (val32 & ECP_STATUS_MPROG_MASK)
+            run = E_ECMPROG;
+        else if (val32)
+            run = E_VERFAIL;
+        else
+            read_ecp_operand(2, sig, elen);
+    }
 
-    if (val32 & ECP_STATUS_MPROG_MASK)
-        return E_ECMPROG;
+    /* Wipe now if idle, otherwise defer the SRAM write until the next idle
+     * check under the PUFS lock. The scratch buffer can always be wiped. */
+    pending_rsa_elen = elen;
+    if (!pufs_ecp_is_idle())
+        rvv_memset(pufs_buffer, 0, ((elen + 3) / 4) * 4);
 
-    if (val32)
-        return E_VERFAIL;
-
-    read_ecp_operand(2, sig, elen);
-
-    return SUCCESS;
+    return run;
 }
 /**
  * pufs_rsa_x931_verify()
@@ -1128,10 +1241,10 @@ pufs_status_t pufs_ecp_set_curve_byname(pufs_ec_name_t name)
 {
     if (name >= N_ECNAME_T)
         return E_INVALID;
-    if ((ecdp_set.name == name) && ecdp_set.isset)
-        return SUCCESS;
     if (ecp_regs->status & ECP_STATUS_BUSY_MASK)
         return E_BUSY;
+    if ((ecdp_set.name == name) && ecdp_set.isset)
+        return SUCCESS;
 
     if (name == SM2)
         return pufs_ecp_set_sm2_curve();
@@ -1223,7 +1336,9 @@ pufs_status_t pufs_ecp_gen_sprk(pufs_ka_slot_t slot, pufs_key_type_t keytype,
     val32 |= (get_key_slot_idx(PRKEY, slot) << 1) << 16;
     ecp_regs->keysel = val32;
 
-    val32 = pufs_ecc_start();
+    pufs_status_t run = pufs_ecc_start(&val32);
+    if (run != SUCCESS)
+        return run;
 
     return (val32 & (0x1 << 1)) ? E_ECMPROG : SUCCESS;
 }
@@ -1253,7 +1368,9 @@ pufs_status_t pufs_ecp_gen_eprk(pufs_ka_slot_t slot)
     val32 = (get_key_slot_idx(PRKEY, slot) << 1) << 16;
     ecp_regs->keysel = val32;
 
-    val32 = pufs_ecc_start();
+    pufs_status_t run = pufs_ecc_start(&val32);
+    if (run != SUCCESS)
+        return run;
 
     return (val32 & (0x1 << 1)) ? E_ECMPROG : SUCCESS;
 }
@@ -1274,6 +1391,8 @@ pufs_status_t pufs_ecp_gen_puk(pufs_ec_point_st* puk, pufs_key_type_t prktype,
         return E_INVALID;
     if ((check = keyslot_check(true, prktype, prkslot, ecc_param[ecdp_set.name].fbits)) != SUCCESS)
         return check;
+    if (p256_otp_private_key_unsupported(prktype))
+        return E_UNSUPPORT;
 
     if (ecp_regs->status & ECP_STATUS_BUSY_MASK)
         return E_BUSY;
@@ -1302,11 +1421,13 @@ pufs_status_t pufs_ecp_gen_puk(pufs_ec_point_st* puk, pufs_key_type_t prktype,
     {
         val32 = 0x1 << 0;
         ecp_regs->keysel = val32;
-        val32 = get_key_slot_idx(prktype, prkslot) << 4;
-        ecp_regs->otpkba = val32;
+        ecp_select_otp_key(get_key_slot_idx(prktype, prkslot),
+                           ecc_param[ecdp_set.name].fbits);
     }
 
-    val32 = pufs_ecc_start();
+    pufs_status_t run = pufs_ecc_start(&val32);
+    if (run != SUCCESS)
+        return run;
 
     if (val32 & (0x1 << 1))
         return E_ECMPROG;
@@ -1353,7 +1474,9 @@ pufs_status_t _pufs_ecp_validate_puk(pufs_ec_point_st puk, bool full)
     write_ecp_operand(10, puk.y, elen);
 
     uint32_t val32;
-    val32 = pufs_ecc_start();
+    pufs_status_t run = pufs_ecc_start(&val32);
+    if (run != SUCCESS)
+        return run;
 
     if (val32 & (0x1 << 1))
         return E_ECMPROG;
@@ -1405,7 +1528,9 @@ pufs_status_t _pufs_ecp_ecccdh_2e(pufs_ec_point_st puk,
     write_ecp_operand(6, puk.x, elen);
     write_ecp_operand(7, puk.y, elen);
 
-    val32 = pufs_ecc_start();
+    pufs_status_t run = pufs_ecc_start(&val32);
+    if (run != SUCCESS)
+        return run;
 
     if (val32 & (0x1 << 1))
         return E_ECMPROG;
@@ -1437,6 +1562,10 @@ pufs_status_t _pufs_ecp_ecccdh_2e2s(pufs_ec_point_st puk_e,
         return E_INVALID;
     if ((check = keyslot_check(true, prktype_s, prkslot_s, ecc_param[ecdp_set.name].fbits)) != SUCCESS)
         return check;
+    /* Same OTP private-key path as gen_puk and sign. Untested for ECDH, but a
+     * wrong shared secret could not be detected, so refuse it as well. */
+    if (p256_otp_private_key_unsupported(prktype_s))
+        return E_UNSUPPORT;
     uint32_t elen = ecc_param[ecdp_set.name].len;
     if ((puk_s.qlen != elen) || (puk_e.qlen != elen))
         return E_INVALID;
@@ -1468,8 +1597,8 @@ pufs_status_t _pufs_ecp_ecccdh_2e2s(pufs_ec_point_st puk_e,
     {
         val32 |= 0x1 << 0;
         ecp_regs->keysel = val32;
-        val32 = get_key_slot_idx(prktype_s, prkslot_s) << 4;
-        ecp_regs->otpkba = val32;
+        ecp_select_otp_key(get_key_slot_idx(prktype_s, prkslot_s),
+                           ecc_param[ecdp_set.name].fbits);
     }
 
     write_ecp_operand(6, puk_s.x, elen);
@@ -1477,7 +1606,9 @@ pufs_status_t _pufs_ecp_ecccdh_2e2s(pufs_ec_point_st puk_e,
     write_ecp_operand(8, puk_e.x, elen);
     write_ecp_operand(9, puk_e.y, elen);
 
-    val32 = pufs_ecc_start();
+    pufs_status_t run = pufs_ecc_start(&val32);
+    if (run != SUCCESS)
+        return run;
 
     if (val32 & (0x1 << 1))
         return E_ECMPROG;
@@ -1520,7 +1651,9 @@ pufs_status_t pufs_ecp_ecdsa_verify_dgst(pufs_ecdsa_sig_st sig, pufs_dgst_st md,
     write_ecp_operand(10, sig.s, elen);
 
     uint32_t val32;
-    val32 = pufs_ecc_start();
+    pufs_status_t run = pufs_ecc_start(&val32);
+    if (run != SUCCESS)
+        return run;
 
     if (val32 & (0x1 << 1))
         return E_ECMPROG;
@@ -1578,10 +1711,12 @@ pufs_status_t pufs_ecp_ecdsa_verify_dgst_otpkey(
     write_ecp_operand(10, sig.s, elen);
 
     uint32_t val32;
-    val32 = get_key_slot_idx(OTPKEY, puk) << 4;
-    ecp_regs->otpkba = val32;
+    ecp_select_otp_key(get_key_slot_idx(OTPKEY, puk),
+                       2 * ecc_param[ecdp_set.name].fbits);
 
-    val32 = pufs_ecc_start();
+    pufs_status_t run = pufs_ecc_start(&val32);
+    if (run != SUCCESS)
+        return run;
 
     if (val32 & (0x1 << 1))
         return E_ECMPROG;
@@ -1621,6 +1756,8 @@ pufs_status_t _pufs_ecp_ecdsa_sign_dgst(pufs_ecdsa_sig_st* sig, pufs_dgst_st md,
         return E_INVALID;
     if ((check = keyslot_check(true, prktype, prkslot, ecc_param[ecdp_set.name].fbits)) != SUCCESS)
         return check;
+    if (p256_otp_private_key_unsupported(prktype))
+        return E_UNSUPPORT;
 
     if (ecp_regs->status & ECP_STATUS_BUSY_MASK)
         return E_BUSY;
@@ -1639,8 +1776,8 @@ pufs_status_t _pufs_ecp_ecdsa_sign_dgst(pufs_ecdsa_sig_st* sig, pufs_dgst_st md,
     {
         val32 = 0x1 << 0;
         ecp_regs->keysel = val32;
-        val32 = get_key_slot_idx(prktype, prkslot) << 4;
-        ecp_regs->otpkba = val32;
+        ecp_select_otp_key(get_key_slot_idx(prktype, prkslot),
+                           ecc_param[ecdp_set.name].fbits);
     }
 
     // handle message digest
@@ -1649,8 +1786,10 @@ pufs_status_t _pufs_ecp_ecdsa_sign_dgst(pufs_ecdsa_sig_st* sig, pufs_dgst_st md,
     get_z(ecdp_set.name, z, md.dgst, md.dlen);
     write_ecp_operand(6, z, elen);
     if (k != NULL) {
-        if ((ecdp_set.mpmac->ecdsa_s_ik == NULL) || (ecdp_set.mprog->ecdsa_s_ik == NULL))
+        if ((ecdp_set.mpmac->ecdsa_s_ik == NULL) || (ecdp_set.mprog->ecdsa_s_ik == NULL)) {
+            ecp_otp_keys = 0;   /* no run: drop the selected OTP key slots */
             return E_UNSUPPORT;
+        }
 
         memcpy4b((void*)ecp_regs->mac, ecdp_set.mpmac->ecdsa_s_ik, ECP_MPMAC_SIZE);
         memcpy4b((void*)ecp_regs->program, ecdp_set.mprog->ecdsa_s_ik, ECP_MPROG_SIZE);
@@ -1658,7 +1797,9 @@ pufs_status_t _pufs_ecp_ecdsa_sign_dgst(pufs_ecdsa_sig_st* sig, pufs_dgst_st md,
         write_ecp_operand(7, k, elen);
     }
 
-    val32 = pufs_ecc_start();
+    pufs_status_t run = pufs_ecc_start(&val32);
+    if (run != SUCCESS)
+        return run;
 
     if (val32 & (0x1 << 1))
         return E_ECMPROG;

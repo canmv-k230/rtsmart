@@ -158,6 +158,12 @@ config RT_USING_ZERO
 config RT_USING_RANDOM
     bool "Using RANDOM device drivers"
     default n
+    select RT_USING_MUTEX
+
+config RT_RANDOM_REQUIRE_HWRNG
+    bool
+    help
+        Fail random device reads when hardware entropy is unavailable.
 
 config RT_USING_DEVMEM
     bool "Using DEVMEM device drivers"

@@ -267,18 +267,10 @@ static pufs_status_t ___sp38d_ctx_update(pufs_sp38d_ctx* sp38d_ctx,
     if ((check = sp38d_prepare(sp38d_ctx, out, inlen)) != SUCCESS)
         return check;
 
-    dma_write_rwcfg(out, in, inlen);
-    dma_write_start();
-    if (dma_wait_done()) {
-        LOG_ERROR("pufs dma wait timeout\n");
-        return E_ERROR;
-    }
-    dma_check_busy_status(&val32);
-
-    if (val32 != 0) {
-        LOG_ERROR("DMA status 0: 0x%08" PRIx32 "\n", val32);
-        return E_ERROR;
-    }
+    if ((check = dma_write_rwcfg(out, in, inlen)) != SUCCESS)
+        return check;
+    if ((check = dma_run()) != SUCCESS)
+        return check;
 
     val32 = sp38d_regs->status;
     if ((val32 & SP38D_STATUS_RESP_MASK) != 0) {
@@ -532,22 +524,16 @@ static pufs_status_t sp38d_tag(pufs_sp38d_ctx* sp38d_ctx, uint8_t* tag, uint32_t
     sp38d_regs->block_num = 0;
 
     dma_write_data_block_config(true, true, true, true, 0);
-    dma_write_rwcfg(NULL, NULL, 0);
+    if ((check = dma_write_rwcfg(NULL, NULL, 0)) != SUCCESS)
+        return check;
     dma_write_config_0(false, false, false);
     dma_write_key_config_0(sp38d_ctx->keytype,
         ALGO_TYPE_GCM,
         sp38d_ctx->keybits,
         get_key_slot_idx(sp38d_ctx->keytype, sp38d_ctx->keyslot));
 
-    dma_write_start();
-
-    while (dma_check_busy_status(&val32))
-        ;
-
-    if (val32 != 0) {
-        LOG_ERROR("DMA status 0: 0x%08" PRIx32 "\n", val32);
-        return E_ERROR;
-    }
+    if ((check = dma_run()) != SUCCESS)
+        return check;
 
     val32 = sp38d_regs->status;
     if ((val32 & SP38D_STATUS_RESP_MASK) != 0) {

@@ -40,6 +40,7 @@ source "testcase/kernel/Kconfig"
 config CHIP_K230
     bool
     select ARCH_RISCV64
+    select RT_RANDOM_REQUIRE_HWRNG if RT_USING_PUFS
     select RT_USING_COMPONENTS_INIT
     select RT_USING_USER_MAIN
     select RT_USING_CACHE

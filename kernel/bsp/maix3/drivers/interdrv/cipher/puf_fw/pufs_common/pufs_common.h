@@ -31,6 +31,8 @@ extern "C" {
 #include <stddef.h>
 #include <inttypes.h>
 
+/* All in-tree RT-Smart PUFS builds use this mode. The alternate userspace
+ * bus mapping does not support the driver's private SG snapshots. */
 #define BAREMETAL
 #define DMADIRECT
 /*****************************************************************************

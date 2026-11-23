@@ -273,6 +273,7 @@ pufs_status_t pufs_ecp_gen_eprk(pufs_ka_slot_t slot);
  * @param[in]  prktype  Private key type.
  * @param[in]  prkslot  Private key slot.
  * @return              SUCCESS on success, otherwise an error code.
+ * @retval E_UNSUPPORT  NIST P-256 with OTPKEY on ECF39303 microprogram version 0.
  *
  * @note Only \ref PRKEY and \ref OTPKEY are allowed \em keytype.
  */
@@ -408,6 +409,7 @@ pufs_status_t pufs_ecp_ecdsa_verify_msg_otpkey(pufs_ecdsa_sig_st sig,
  * @param[in] prkslot  Private key slot.
  * @param[in] k        Random k only used in CAVP.
  * @return             SUCCESS on success, otherwise an error code.
+ * @retval E_UNSUPPORT NIST P-256 with OTPKEY on ECF39303 microprogram version 0.
  *
  * @note Only \ref PRKEY and \ref OTPKEY are allowed \em keytype.
  * @remark Use the wrapper function pufs_ecp_ecdsa_sign_dgst() for convenience.

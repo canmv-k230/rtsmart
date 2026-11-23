@@ -38,6 +38,11 @@ extern "C" {
 #define RWLOCK_GROUP_OTP 8
 #define MAX_RWLOCK_GROUPS OTP_LEN / WORD_SIZE / RWLOCK_GROUP_OTP  // a group contains 8 otp blocks
 
+static inline uint32_t otp_chunk_len(uint32_t remaining)
+{
+    return remaining < WORD_SIZE ? remaining : WORD_SIZE;
+}
+
 /*****************************************************************************
  * Variables
  ****************************************************************************/
@@ -48,7 +53,6 @@ extern uintptr_t rt_regs_phys;
 /* CDE OTP area (0x400-0xFFF) */
 #define PUFS_CDE_SEGMENT          128
 #define PIF_CDE_RWLCK_START_INDEX   4
-#define PIF_CDE_RWLCK_MAX_GROUP    24
 
 struct pufs_rt_cde_regs {
     volatile uint32_t otp[768];
@@ -61,6 +65,62 @@ pufs_status_t pufs_program_cde(const uint8_t* inbuf, uint32_t len, uint32_t addr
 pufs_status_t rt_cde_write_lock(uint32_t offset, uint32_t length, pufs_otp_lock_t lock);
 pufs_otp_lock_t rt_cde_read_lock(uint32_t offset);
 pufs_status_t rt_cde_write_mask(uint32_t offset);
+
+/* Shared by the RT and CDE program paths; flat_addr is only for logging. */
+pufs_status_t rt_wait_idle(uint32_t *status);
+
+/* SBI PMP permission for the RT register window (PIF, cfg, masks, RT OTP). */
+pufs_status_t pufs_rt_pmp_set(unsigned long perm);
+pufs_status_t pufs_rt_cde_pmp_set(unsigned long perm);
+pufs_status_t pufs_recover_pmp(void);
+
+/*
+ * True when the calling thread holds the PUFS mutex (drv_pufs.c). The guard's
+ * state and the RT PMP window are shared, so every guarded access needs it.
+ */
+bool pufs_drv_hw_lock_held(void);
+
+/* Post-mask guard (pufs_rt.c): mask all OTP at init, open per access. */
+pufs_status_t pufs_otp_guard_init(void);
+pufs_status_t rt_otp_guard(uint32_t addr, uint32_t len, bool open);
+pufs_status_t rt_otp_guard_keyslots(uint32_t slots, bool open);
+uint32_t rt_otp_keyslot_mask(uint32_t slot, uint32_t keybits);
+void rt_settle_before_remask(pufs_status_t check);
+pufs_status_t rt_pgm_ign_enable(void);   /* RT_PUFS_OTP_WRITE_ENABLE builds only */
+pufs_status_t rt_program_otp_word(volatile uint32_t *reg, uint32_t word,
+    uint32_t flat_addr);
+
+/*
+ * One area of 4-bit lock fields in the PIF registers, 8 fields per register:
+ * RT has one field per OTP word, CDE one per 128-byte segment.
+ */
+struct rt_lock_area {
+    const char *name;           /* "OTP" or "CDE", for logs */
+    uint32_t pif_base;          /* PIF register holding fields 0-7 */
+    uint32_t fields;            /* number of lock fields */
+    uint32_t field_bytes;       /* OTP bytes covered by one field */
+    uint32_t flat_base;         /* flat OTP address of field 0 */
+    pufs_otp_lock_t (*decode)(uint32_t field);
+};
+pufs_status_t rt_set_lock_fields(const struct rt_lock_area *area,
+    uint32_t first, uint32_t last, pufs_otp_lock_t lock);
+
+/*
+ * One OTP data area for the program path: RT (one lock field per word, byte 0
+ * packed into the high byte) or CDE (one lock field per 128-byte segment,
+ * bytes in memory order). Offsets are relative to the area.
+ */
+struct rt_program_area {
+    const char *name;                         /* "OTP" or "CDE", for logs */
+    volatile uint32_t *otp;                   /* data word 0 */
+    uint32_t size;                            /* bytes */
+    uint32_t flat_base;                       /* flat OTP address of word 0 */
+    bool big_endian;                          /* RT word packing */
+    pufs_otp_lock_t (*lock)(uint32_t offset); /* lock state of a word */
+    pufs_status_t (*pmp_set)(unsigned long perm); /* data register window */
+};
+pufs_status_t rt_program_area(const struct rt_program_area *area,
+    const uint8_t *inbuf, uint32_t len, uint32_t offset);
 
 /*****************************************************************************
  * Enumerations

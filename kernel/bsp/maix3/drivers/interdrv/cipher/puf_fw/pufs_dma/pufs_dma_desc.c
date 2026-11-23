@@ -19,15 +19,170 @@
  * IF ANY, THAT YOU HAVE PAID DIRECTLY TO PUFSECURITY FOR THIS SOFTWARE.
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "pufs_internal.h"
 #include "pufs_dma_internal.h"
+#ifdef BAREMETAL
+#include <cache.h>
+#endif
 
 /*****************************************************************************
  * Static variables
  ****************************************************************************/
 struct dma_sg_mem sg_mem = { .base_addr = 0x0 };
 static pufs_dma_sg_internal_desc_st *desc_list_head = NULL, *desc_list_tail = NULL;
+/*
+ * Set when the list being built is incomplete: a descriptor could not be
+ * allocated while the list was non-empty, or NULL was appended (the
+ * sg_append callers do not all check for NULL; appending it is a no-op).
+ * pufs_dma_sg_start() then drops the list instead of submitting it. Cleared
+ * when the list is freed. If a caller gives up after appending NULL to an
+ * empty list, the next submission is dropped once.
+ */
+static bool desc_list_failed;
+#ifdef BAREMETAL
+/* The descriptor pool and all of its target addresses belong to the caller.
+ * Submit a private snapshot so a timeout never extends their lifetime. */
+#define SG_DESC_COUNT 32
+static pufs_dma_sg_internal_desc_st submitted[SG_DESC_COUNT] __attribute__((aligned(64)));
+struct sg_range { uintptr_t lo, hi; size_t offset; };
+static struct sg_range ranges[SG_DESC_COUNT * 2];
+static unsigned int nranges;
+static uint8_t *payload;
+static void *allocation;
+static size_t payload_size;
+static bool quarantined;
+
+static void sg_dispose(void)
+{
+    if (payload_size) {
+        rt_hw_cpu_dcache_invalidate(payload, payload_size);
+        rvv_memset(payload, 0, payload_size);
+        rt_hw_cpu_dcache_clean(payload, payload_size);
+    }
+    free(allocation);
+    allocation = NULL;
+    payload = NULL;
+    payload_size = 0;
+    quarantined = false;
+}
+
+static bool dma_sg_reclaim(void)
+{
+    if (quarantined) {
+        if (dma_check_busy_status(NULL))
+            return false;
+        sg_dispose();
+    }
+    return true;
+}
+
+/* Merge overlaps, including context input/output of different lengths. */
+static bool sg_add_range(uintptr_t lo, uint32_t length)
+{
+    if (!lo || !length)
+        return true;
+    if (length > UINT32_MAX - lo)
+        return false;
+    uintptr_t hi = lo + length;
+    for (unsigned int i = 0; i < nranges; ) {
+        if (hi <= ranges[i].lo || lo >= ranges[i].hi) {
+            ++i;
+            continue;
+        }
+        if (ranges[i].lo < lo) lo = ranges[i].lo;
+        if (ranges[i].hi > hi) hi = ranges[i].hi;
+        ranges[i] = ranges[--nranges];
+        i = 0;
+    }
+    ranges[nranges++] = (struct sg_range){lo, hi, 0};
+    return true;
+}
+
+static uintptr_t sg_address(uintptr_t addr)
+{
+    for (unsigned int i = 0; i < nranges; i++)
+        if (addr >= ranges[i].lo && addr < ranges[i].hi)
+            return (uintptr_t)payload + ranges[i].offset + (addr - ranges[i].lo);
+    return 0;
+}
+
+static pufs_status_t sg_snapshot(void)
+{
+    unsigned int n = 0;
+    if ((uintptr_t)submitted > UINT32_MAX - sizeof(submitted))
+        return E_OVERFLOW;
+    nranges = 0;
+    for (pufs_dma_sg_internal_desc_st *d = desc_list_head; d;
+         d = (void *)(uintptr_t)be2le(d->next)) {
+        uint32_t len = be2le(d->length);
+        if (n == SG_DESC_COUNT)
+            return E_OVERFLOW;
+        if (be2le(d->cfg) & ((1u << DMA_DSC_CFG_4_FIX_READ_BITS) |
+                             (1u << DMA_DSC_CFG_4_FIX_WRITE_BITS)))
+            return E_UNSUPPORT; /* Fixed-address peripheral I/O cannot be staged. */
+        if (!sg_add_range(be2le(d->write_addr), len) || !sg_add_range(be2le(d->read_addr), len))
+            return E_OVERFLOW;
+        submitted[n++] = *d;
+    }
+
+    const size_t limit = 2 * CHUNK_MAXLEN;
+    size_t total = 0;
+    for (unsigned int i = 0; i < nranges; i++) {
+        size_t len = ranges[i].hi - ranges[i].lo;
+        if (len > limit)
+            return E_OVERFLOW;
+        size_t padded = (len + 63) & ~(size_t)63;
+        if (padded > limit - total)
+            return E_OVERFLOW;
+        ranges[i].offset = total;
+        total += padded;
+    }
+    if (total) {
+        allocation = malloc(total + 63);
+        if (!allocation)
+            return E_UNAVAIL;
+        payload = (uint8_t *)(((uintptr_t)allocation + 63) & ~(uintptr_t)63);
+        payload_size = total;
+        if ((uintptr_t)payload > UINT32_MAX - total) {
+            sg_dispose();
+            return E_OVERFLOW;
+        }
+        rvv_memset(payload, 0, total);
+    }
+    for (unsigned int i = 0; i < n; i++) {
+        uintptr_t src = be2le(submitted[i].write_addr);
+        uint32_t len = be2le(submitted[i].length);
+        uintptr_t staged = len ? sg_address(src) : 0;
+        if (staged)
+            rvv_memcpy((void *)staged, (void *)src, len);
+        submitted[i].write_addr = le2be(staged);
+        submitted[i].read_addr = len ? le2be(sg_address(be2le(submitted[i].read_addr))) : 0;
+        submitted[i].next = i + 1 < n ? le2be((uintptr_t)&submitted[i + 1]) : 0;
+    }
+    if (total)
+        rt_hw_cpu_dcache_clean(payload, total);
+    rt_hw_cpu_dcache_clean(submitted, n * sizeof(*submitted));
+    return SUCCESS;
+}
+
+static void sg_copy_output(void)
+{
+    if (!payload_size)
+        return;
+    rt_hw_cpu_dcache_invalidate(payload, payload_size);
+    for (pufs_dma_sg_internal_desc_st *d = desc_list_head; d;
+         d = (void *)(uintptr_t)be2le(d->next)) {
+        uintptr_t dst = be2le(d->read_addr);
+        uint32_t len = be2le(d->length);
+        if (dst && len)
+            rvv_memcpy((void *)dst, (void *)sg_address(dst), len);
+    }
+}
+#else
+static bool dma_sg_reclaim(void) { return true; }
+#endif
 
 /*****************************************************************************
  * Internal Functions
@@ -36,18 +191,25 @@ static pufs_dma_sg_internal_desc_st* dma_sg_new_decriptor(void)
 {
     uint32_t index;
     uintptr_t addr;
-    for (index = 0; index < 32 && (sg_mem.desc_bitmap & (1 << index)) != 0; index++)
+
+    if (!dma_sg_reclaim()) {
+        desc_list_failed |= desc_list_head != NULL;
+        return NULL;
+    }
+
+    for (index = 0; index < 32 && (sg_mem.desc_bitmap & (1u << index)) != 0; index++)
         ;
 
     if (index == 32) {
         LOG_ERROR("%s", "failed to new a descriptor. all descriptors are used");
+        desc_list_failed |= desc_list_head != NULL;
         return NULL;
     }
 
     addr = VIRT_ADDR(sg_mem.base_addr + (SGDMA_DESCRIPTOR_SIZE * index));
     rvv_memset((void*)addr, 0x0, SGDMA_DESCRIPTOR_SIZE);
 
-    sg_mem.desc_bitmap |= (1 << index);
+    sg_mem.desc_bitmap |= (1u << index);
 
     return (pufs_dma_sg_internal_desc_st*)(addr);
 }
@@ -109,12 +271,7 @@ void dma_sg_desc_write_key_config(pufs_dma_sg_internal_desc_st* desc,
     pufs_algo_type_t algo,
     uint32_t size, uint32_t slot_index)
 {
-    uint32_t cfg = 0;
-    cfg |= slot_index << DMA_KEY_CFG_0_KEY_IDX_BITS;
-    cfg |= size << DMA_KEY_CFG_0_KEY_SIZE_BITS;
-    cfg |= algo << DMA_KEY_CFG_0_KEY_DST_BITS;
-    cfg |= keytype;
-    desc->key_cfg = le2be(cfg);
+    desc->key_cfg = le2be(dma_key_cfg(keytype, algo, size, slot_index));
 }
 
 void dma_sg_desc_write_crypto_config(pufs_dma_sg_internal_desc_st* desc, uint32_t cfg0, uint32_t cfg1)
@@ -125,6 +282,10 @@ void dma_sg_desc_write_crypto_config(pufs_dma_sg_internal_desc_st* desc, uint32_
 
 void dma_sg_desc_append_to_list(pufs_dma_sg_internal_desc_st* desc)
 {
+    if (desc == NULL) {
+        desc_list_failed = true;
+        return;
+    }
     if (desc_list_head == NULL) {
         desc_list_head = desc;
         desc_list_tail = desc;
@@ -136,6 +297,8 @@ void dma_sg_desc_append_to_list(pufs_dma_sg_internal_desc_st* desc)
 
 void pufs_dma_sg_init(uintptr_t base_addr)
 {
+    if (!dma_sg_reclaim())
+        return;
     sg_mem.base_addr = base_addr;
 #ifndef BAREMETAL
     uint32_t size = DEFAULT_DESC_MEM_SIZE; // default 2K size
@@ -196,53 +359,93 @@ void dma_sg_free_descriptor(pufs_dma_sg_internal_desc_st* desc)
 {
     uint32_t index;
     index = (PHY_ADDR(((uintptr_t)desc)) - sg_mem.base_addr) / SGDMA_DESCRIPTOR_SIZE;
-    sg_mem.desc_bitmap &= ~(1 << index);
+    sg_mem.desc_bitmap &= ~(1u << index);
+}
+
+static void dma_sg_free_list(pufs_dma_sg_internal_desc_st *head)
+{
+    while (head != NULL) {
+        pufs_dma_sg_internal_desc_st *next = head->next ?
+            (pufs_dma_sg_internal_desc_st *)(uintptr_t)VIRT_ADDR(be2le(head->next)) : NULL;
+        dma_sg_free_descriptor(head);
+        head = next;
+    }
 }
 
 void dma_sg_free_all_descriptor(void)
 {
-    while (desc_list_head != NULL) {
-        dma_sg_free_descriptor(desc_list_head);
-        if (desc_list_head->next == 0x0)
-            desc_list_head = NULL;
-        else
-            desc_list_head = (pufs_dma_sg_internal_desc_st*)(uint64_t)(VIRT_ADDR(be2le(desc_list_head->next)));
-    }
+    dma_sg_free_list(desc_list_head);
+    desc_list_head = desc_list_tail = NULL;
+    desc_list_failed = false;
 }
 
 pufs_status_t pufs_dma_sg_start(void)
 {
-    uint32_t status;
-    pufs_status_t check = SUCCESS;
+    if (!dma_sg_reclaim())
+        return E_BUSY;
+
+    if (desc_list_failed) {
+        dma_sg_free_all_descriptor();
+        return E_UNAVAIL;
+    }
 
     if (desc_list_head == NULL) {
         LOG_DEBUG("%s", "there is no descriptor");
         return SUCCESS;
     }
 
+#ifndef BAREMETAL
+    /* No private bus mapping: a bounded submission could outlive the caller. */
+    dma_sg_free_all_descriptor();
+    return E_UNSUPPORT;
+#else
+    uint32_t slots = 0;
+    bool timed_out;
+    /* Do not touch the descriptor registers while an earlier (timed-out) run
+     * still owns the engine. Nothing was submitted: drop the list, or the next
+     * operation would append to it and submit stale descriptors. */
+    if (dma_check_busy_status(NULL)) {
+        dma_sg_free_all_descriptor();
+        return E_BUSY;
+    }
+    /* Authorize only the keys in the submitted descriptor list. */
+    for (pufs_dma_sg_internal_desc_st *d = desc_list_head; d;
+         d = d->next ? (pufs_dma_sg_internal_desc_st *)(uintptr_t)VIRT_ADDR(be2le(d->next)) : NULL)
+        slots |= dma_key_slots(be2le(d->key_cfg));
+
     dma_write_config_0(false, true, false);
     pufs_dma.regs->dsc_cfg_2 = 0x20;
 
     // mark the last descriptor with done_pause flag
     dma_sg_desc_write_dsc_pause(desc_list_tail);
-    pufs_dma.regs->dsc_cfg_3 = (PHY_ADDR((uintptr_t)desc_list_head));
-
-    dma_write_start();
-    while (dma_check_busy_status(&status))
-        ;
-
-    if (status != 0) {
-        LOG_ERROR("[ERROR] DMA status 0: 0x%08" PRIx32 "\n", status);
-        check = E_ERROR;
+    pufs_status_t check = sg_snapshot();
+    if (check != SUCCESS) {
+        dma_sg_free_all_descriptor();
+        return check;
     }
-
+    pufs_dma.regs->dsc_cfg_3 = (uintptr_t)submitted;
+    check = dma_run_sg(slots, &timed_out);
+    if (timed_out)
+        quarantined = true;
+    else {
+        if (check == SUCCESS)
+            sg_copy_output();
+        sg_dispose();
+    }
     dma_sg_free_all_descriptor();
-
     return check;
+#endif
+}
+
+bool pufs_dma_sg_is_idle(void)
+{
+    return !dma_check_busy_status(NULL) && dma_sg_reclaim();
 }
 
 void pufs_dma_sg_release(void)
 {
+    if (!dma_sg_reclaim())
+        return;
 #ifndef BAREMETAL
     munmap((void*)sg_mem.virt_base_addr, DEFAULT_DESC_MEM_SIZE);
 #endif

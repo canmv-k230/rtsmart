@@ -56,9 +56,6 @@ if GetDepend(['UTEST_I2C_TC']):
     # src += ['i2c_unitest_ov9282.c']
     src += ['i2c_unitest_tmp103.c']
 
-if GetDepend(['UTEST_OTP_TC']):
-    src += ['otp_tc.c']
-
 if GetDepend(['UTEST_WDT_TC']):
     src += ['wdt_irq_tc.c']
     

@@ -74,10 +74,6 @@ menuconfig ENABLE_K230_UTEST
             bool "I2C test"
             default n
 
-        config UTEST_OTP_TC
-            bool "OTP test"
-            default n
-
         config UTEST_WDT_TC
             bool "WatchDog test"
             default n

@@ -19,6 +19,7 @@
 #include <sys/time.h>
 
 #include <lwp.h>
+#include <limits.h>
 #include "tick.h"
 #ifdef RT_USING_USERSPACE
 #include <lwp_user_mm.h>
@@ -5133,68 +5134,65 @@ int sys_setsid(void)
 
 int sys_getrandom(void *buf, size_t buflen, unsigned int flags)
 {
-    int ret = -1;
-    int count = 0;
-    void *kmem = RT_NULL;
-    rt_device_t rd_dev = RT_NULL;
-
-    if (flags & GRND_RANDOM)
-        rd_dev = rt_device_find("random");
-    else
-        rd_dev = rt_device_find("urandom");
-
-    if (rd_dev == RT_NULL)
-    {
+    size_t count = 0;
+    int err = -EIO;
+    if (buflen == 0)
+        return 0;
+    if (buflen > INT_MAX)
+        buflen = INT_MAX;
+    if (!buf)
         return -EFAULT;
-    }
-
-    if (rt_device_open(rd_dev, RT_DEVICE_OFLAG_RDONLY) != RT_EOK)
-    {
-        return -EFAULT;
-    }
-
+#ifdef RT_USING_USERSPACE
     if (!lwp_user_accessable(buf, buflen))
-    {
-        rt_device_close(rd_dev);
         return -EFAULT;
-    }
+#endif
+
+    rt_device_t dev = rt_device_find((flags & GRND_RANDOM) ? "random" : "urandom");
+    if (!dev || rt_device_open(dev, RT_DEVICE_OFLAG_RDONLY) != RT_EOK)
+        return -EIO;
 
 #ifdef RT_USING_USERSPACE
-    kmem = kmem_get(buflen);
-    if (!kmem)
+    size_t capacity = buflen < ARCH_PAGE_SIZE ? buflen : ARCH_PAGE_SIZE;
+    void *scratch = kmem_get(capacity);
+    if (!scratch)
     {
-        rt_device_close(rd_dev);
+        rt_device_close(dev);
         return -ENOMEM;
     }
-
-    while (count < buflen)
-    {
-        ret = rt_device_read(rd_dev, count, (char *)kmem + count, buflen - count);
-        if (ret <= 0)
-            break;
-        count += ret;
-    }
-    rt_device_close(rd_dev);
-
-    ret = count;
-    if (count > 0)
-    {
-        ret = lwp_put_to_user(buf, kmem, count);
-    }
-    kmem_put(kmem);
-#else
-    while (count < buflen)
-    {
-        ret = rt_device_read(rd_dev, count, (char *)kmem + count, buflen - count);
-        if (ret <= 0)
-            break;
-        count += ret;
-    }
-    rt_device_close(rd_dev);
-
-    ret = count;
 #endif
-    return ret;
+    while (count < buflen)
+    {
+        size_t want = buflen - count;
+#ifdef RT_USING_USERSPACE
+        if (want > capacity)
+            want = capacity;
+        void *dst = scratch;
+#else
+        void *dst = (char *)buf + count;
+#endif
+        /* Device counts are unsigned and can encode a negative errno. */
+        rt_size_t got = rt_device_read(dev, count, dst, want);
+        if (!got || got > want)
+            break;
+#ifdef RT_USING_USERSPACE
+        size_t copied = lwp_put_to_user((char *)buf + count, dst, got);
+        count += copied;
+        if (copied != got)
+        {
+            err = -EFAULT;
+            break;
+        }
+#else
+        count += got;
+#endif
+    }
+#ifdef RT_USING_USERSPACE
+    /* The bytes just returned may become a key: do not leave them in the heap. */
+    rt_memset(scratch, 0, capacity);
+    kmem_put(scratch);
+#endif
+    rt_device_close(dev);
+    return count ? (int)count : err;
 }
 
 ssize_t sys_readlink(char* path, char *buf, size_t bufsz)

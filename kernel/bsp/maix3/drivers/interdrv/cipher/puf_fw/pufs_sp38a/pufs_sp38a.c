@@ -351,18 +351,10 @@ static pufs_status_t ___sp38a_ctx_update(pufs_sp38a_ctx* sp38a_ctx,
     if ((check = sp38a_prepare(sp38a_ctx)) != SUCCESS)
         return check;
 
-    dma_write_rwcfg(outbuf, inbuf, inlen);
-    dma_write_start();
-    if (dma_wait_done()) {
-        LOG_ERROR("pufs dma wait timeout\n");
-        return E_ERROR;
-    }
-    dma_check_busy_status(&val32);
-
-    if (val32 != 0) {
-        LOG_ERROR("[ERROR] DMA status 0: 0x%08" PRIx32 "\n", val32);
-        return E_ERROR;
-    }
+    if ((check = dma_write_rwcfg(outbuf, inbuf, inlen)) != SUCCESS)
+        return check;
+    if ((check = dma_run()) != SUCCESS)
+        return check;
 
     val32 = sp38a_regs->status;
     if ((val32 & SP38A_STATUS_ERROR_MASK) != 0) {

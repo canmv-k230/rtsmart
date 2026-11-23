@@ -1,5 +1,6 @@
 #include <rtthread.h>
 
+#include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -42,8 +43,14 @@ static rt_err_t pufs_otp_parse_u32(const char *text, rt_uint32_t *value)
     if (text == RT_NULL || value == RT_NULL)
         return -RT_EINVAL;
 
+    /* Digits only: strtoul also takes leading space, a sign (" -1") and 64-bit
+     * values, which would all silently become a different 32-bit address or
+     * value, and OTP writes cannot be undone. */
+    if (!isdigit((unsigned char)*text))
+        return -RT_EINVAL;
+
     parsed = strtoul(text, &end, 0);
-    if (end == text || *end != '\0')
+    if (end == text || *end != '\0' || parsed > 0xFFFFFFFFul)
         return -RT_EINVAL;
 
     *value = (rt_uint32_t)parsed;
@@ -71,6 +78,7 @@ static void pufs_otp_usage(void)
     rt_kprintf("  pufs_otp write <addr> <val0> [val1...]\n");
     rt_kprintf("  pufs_otp lock query <addr>\n");
     rt_kprintf("  pufs_otp lock set <addr> <len> <RO|RW>\n");
+    rt_kprintf("  pufs_otp mask                 (post-mask guard state)\n");
     rt_kprintf("Notes:\n");
     rt_kprintf("  addr and len use the flat OTP address space (0x000-0xFFF)\n");
     rt_kprintf("  addr must be 4-byte aligned, len must be a non-zero multiple of 4\n");
@@ -123,7 +131,7 @@ static int pufs_otp_read_cmd(int argc, char **argv)
     }
 
     rt_free(buf);
-    return -ret;
+    return ret;
 }
 
 static int pufs_otp_write_cmd(int argc, char **argv)
@@ -179,7 +187,7 @@ static int pufs_otp_write_cmd(int argc, char **argv)
         return 0;
     }
 
-    return -ret;
+    return ret;
 }
 
 static int pufs_otp_lock_cmd(int argc, char **argv)
@@ -205,10 +213,14 @@ static int pufs_otp_lock_cmd(int argc, char **argv)
 
         addr = (pufs_otp_addr_t)raw_addr;
 
+        pufs_otp_lock_t lck;
+
         ret = pufs_drv_hw_lock();
         if (ret != 0) return ret;
-        pufs_otp_lock_t lck = pufs_otp_get_lock(addr);
+        ret = pufs_otp_query_lock(addr, &lck);
         pufs_drv_hw_unlock();
+        if (ret != SUCCESS)
+            return ret;
 
         rt_kprintf("lock state: %s\n", pufs_otp_lock_name(lck));
         return 0;
@@ -250,10 +262,46 @@ static int pufs_otp_lock_cmd(int argc, char **argv)
             return 0;
         }
 
-        return -ret;
+        return ret;
     }
 
     return -RT_EINVAL;
+}
+
+static int pufs_otp_mask_cmd(int argc, char **argv)
+{
+    pufs_otp_postmask_st st;
+    int ret, rt_masked = 0, cde_masked = 0;
+
+    (void)argv;
+    if (argc != 2)
+        return -RT_EINVAL;
+
+    ret = pufs_drv_hw_lock();
+    if (ret != 0)
+        return ret;
+    pufs_otp_get_postmask(&st);
+    pufs_drv_hw_unlock();
+
+    for (int g = 0; g < 32; g++)
+        rt_masked += ((st.otp_psmsk[g / 16] >> ((g % 16) * 2)) & 0x3) != 0;
+    for (int seg = 0; seg < 24; seg++)
+        cde_masked += ((st.cde_psmsk[seg / 16] >> ((seg % 16) * 2)) & 0x3) != 0;
+
+    rt_kprintf("post-mask guard: %s\n", st.guard_failed ? "failed (OTP unavailable)" :
+               st.guard_active ? "active" :
+               st.guard_locked ? "locked (only unmasked OTP accessible)" : "off");
+    if (st.policy_otp[0] | st.policy_otp[1] | st.policy_cde[0] | st.policy_cde[1])
+        rt_kprintf("policy masks (never opened): otp 0x%08x 0x%08x cde 0x%08x 0x%08x\n",
+                   st.policy_otp[0], st.policy_otp[1], st.policy_cde[0], st.policy_cde[1]);
+    rt_kprintf("RT OTP groups masked: %d/32 (otp_psmsk 0x%08x 0x%08x)\n",
+               rt_masked, st.otp_psmsk[0], st.otp_psmsk[1]);
+    rt_kprintf("CDE segments masked:  %d/24 (cde_psmsk 0x%08x 0x%08x)\n",
+               cde_masked, st.cde_psmsk[0], st.cde_psmsk[1]);
+    rt_kprintf("mask registers: %s (puf_psmsk 0x%08x)\n",
+               (st.puf_psmsk & 0xFF000000u) ? "LOCKED until reset" : "unlocked",
+               st.puf_psmsk);
+    return 0;
 }
 
 static void do_pufs_otp(int argc, char **argv)
@@ -271,8 +319,16 @@ static void do_pufs_otp(int argc, char **argv)
         ret = pufs_otp_write_cmd(argc, argv);
     } else if (rt_strcmp(argv[1], "lock") == 0) {
         ret = pufs_otp_lock_cmd(argc, argv);
+    } else if (rt_strcmp(argv[1], "mask") == 0) {
+        ret = pufs_otp_mask_cmd(argc, argv);
     } else {
         pufs_otp_usage();
+        return;
+    }
+
+    /* ret > 0 is a pufs_status_t from the driver; ret < 0 an RT-Thread error. */
+    if (ret > 0) {
+        rt_kprintf("pufs_otp failed: %s (%d)\n", pufs_strstatus(ret), ret);
         return;
     }
 
@@ -281,8 +337,18 @@ static void do_pufs_otp(int argc, char **argv)
         return;
     }
 
+    if (ret == -RT_ENOSYS) {
+        rt_kprintf("pufs_otp failed: PUFS driver not initialized (%d)\n", ret);
+        return;
+    }
+
     if (ret == -RT_ETIMEOUT) {
         rt_kprintf("pufs_otp failed: hardware lock timeout (%d)\n", ret);
+        return;
+    }
+
+    if (ret == -RT_EIO) {
+        rt_kprintf("pufs_otp failed: OTP post-mask guard could not re-mask OTP (%d)\n", ret);
         return;
     }
 
@@ -292,7 +358,7 @@ static void do_pufs_otp(int argc, char **argv)
     }
 
     if (ret != 0)
-        rt_kprintf("pufs_otp failed: %s (%d)\n", pufs_strstatus(-ret), -ret);
+        rt_kprintf("pufs_otp failed: error %d\n", ret);
 }
 
 static void pufs_otp_sec_usage(void)
@@ -320,7 +386,7 @@ static int pufs_otp_sec_query(void)
     pufs_drv_hw_unlock();
 
     if (ret != SUCCESS)
-        return -ret;
+        return ret;
 
     rt_kprintf("disable_spi2axi:    %u\n", state.disable_spi2axi);
     rt_kprintf("disable_jtag:      %u\n", state.disable_jtag);
@@ -386,7 +452,7 @@ static int pufs_otp_sec_write(int argc, char **argv)
     pufs_drv_hw_unlock();
 
     if (ret != SUCCESS)
-        return -ret;
+        return ret;
 
     rt_kprintf("security config programmed\n");
     return 0;
@@ -404,7 +470,7 @@ static int pufs_otp_sec_lock(void)
     pufs_drv_hw_unlock();
 
     if (ret != SUCCESS)
-        return -ret;
+        return ret;
 
     rt_kprintf("security config words locked RO\n");
     return 0;
@@ -434,20 +500,25 @@ static void do_pufs_otp_sec(int argc, char **argv)
         return;
     }
 
+    /* ret > 0 is a pufs_status_t from the driver; ret < 0 an RT-Thread error. */
+    if (ret > 0) {
+        rt_kprintf("pufs_otp_sec failed: %s (%d)\n", pufs_strstatus(ret), ret);
+        return;
+    }
+
     if (ret == -RT_EINVAL) {
         pufs_otp_sec_usage();
         return;
     }
 
-    if (ret != 0) {
-        if (ret == -RT_ETIMEOUT) {
-            rt_kprintf("pufs_otp_sec failed: hardware lock timeout (%d)\n", ret);
-        } else {
-            rt_kprintf("pufs_otp_sec failed: %s (%d)\n",
-                       pufs_strstatus(-ret),
-                       -ret);
-        }
-    }
+    if (ret == -RT_ENOSYS)
+        rt_kprintf("pufs_otp_sec failed: PUFS driver not initialized (%d)\n", ret);
+    else if (ret == -RT_ETIMEOUT)
+        rt_kprintf("pufs_otp_sec failed: hardware lock timeout (%d)\n", ret);
+    else if (ret == -RT_EIO)
+        rt_kprintf("pufs_otp_sec failed: OTP post-mask guard could not re-mask OTP (%d)\n", ret);
+    else if (ret != 0)
+        rt_kprintf("pufs_otp_sec failed: error %d\n", ret);
 }
 
 MSH_CMD_EXPORT_ALIAS(do_pufs_otp_sec, pufs_otp_sec,
@@ -462,7 +533,8 @@ MSH_CMD_EXPORT_ALIAS(do_pufs_otp, pufs_otp,
                      "  read <addr> <len>\n"
                      "  write <addr> <val0> [val1...]\n"
                      "  lock query <addr>\n"
-                     "  lock set <addr> <len> <RO|RW>");
+                     "  lock set <addr> <len> <RO|RW>\n"
+                     "  mask");
 
 #endif
 
@@ -579,7 +651,6 @@ static int pufs_file_hash_run(const char *path, pufs_hash_t hash)
     ret = pufs_hash_init(ctx, hash);
     pufs_drv_hw_unlock();
     if (ret != SUCCESS) {
-        ret = -ret;
         goto cleanup;
     }
 
@@ -591,7 +662,6 @@ static int pufs_file_hash_run(const char *path, pufs_hash_t hash)
         ret = pufs_hash_update(ctx, buf, (uint32_t)read_len);
         pufs_drv_hw_unlock();
         if (ret != SUCCESS) {
-            ret = -ret;
             goto cleanup;
         }
     }
@@ -608,7 +678,6 @@ static int pufs_file_hash_run(const char *path, pufs_hash_t hash)
     ret = pufs_hash_final(ctx, &md);
     pufs_drv_hw_unlock();
     if (ret != SUCCESS) {
-        ret = -ret;
         goto cleanup;
     }
 
@@ -653,8 +722,17 @@ static void do_pufs_file_hash(int argc, char **argv)
     }
 
     ret = pufs_file_hash_run(argv[1], hash);
+    /* ret > 0 is a pufs_status_t from the driver; ret < 0 an RT-Thread error. */
+    if (ret > 0) {
+        rt_kprintf("%s failed: %s (%d)\n", cmd_name, pufs_strstatus(ret), ret);
+        return;
+    }
     if (ret == -RT_ETIMEOUT) {
         rt_kprintf("%s failed: hardware lock timeout (%d)\n", cmd_name, ret);
+        return;
+    }
+    if (ret == -RT_EIO) {
+        rt_kprintf("%s failed: OTP post-mask guard could not re-mask OTP (%d)\n", cmd_name, ret);
         return;
     }
     if (ret == -RT_ENOMEM) {

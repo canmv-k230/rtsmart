@@ -116,8 +116,16 @@ void pufs_dma_sg_init(uintptr_t base_addr);
 /**
  * @brief Start SGDMA.
  *        After appending all SGDMA descriptors, call this function to start SGDMA for crypto execution.
+ *        K230 stages memory descriptors and their payloads. On error no output
+ *        is committed, and callers retain ownership even if hardware is busy.
+ *        Fixed-address I/O and backends without private staging are unsupported.
+ *        Up to 32 descriptors and 128 KiB of cache-line-rounded ranges.
+ *        Staging allocates scratch memory and copies inputs before submission
+ *        and outputs on success. The /dev/pufs GCM ioctl path uses direct DMA
+ *        and does not incur this SG-specific cost.
  */
 pufs_status_t pufs_dma_sg_start(void);
+bool pufs_dma_sg_is_idle(void);
 /**
  * @brief Release allocated memory for SGDMA
  */

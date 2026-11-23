@@ -231,17 +231,9 @@ static pufs_status_t sp38e_postproc(pufs_sp38e_ctx* sp38e_ctx)
 static pufs_status_t pufs_sp38e_start(void)
 {
     uint32_t val32;
-    dma_write_start();
-    if (dma_wait_done()) {
-        LOG_ERROR("pufs dma wait timeout\n");
-        return E_ERROR;
-    }
-    dma_check_busy_status(&val32);
-
-    if (val32 != 0) {
-        LOG_ERROR("DMA status 0: 0x%08" PRIx32 "\n", val32);
-        return E_ERROR;
-    }
+    pufs_status_t check;
+    if ((check = dma_run()) != SUCCESS)
+        return check;
 
     val32 = sp38e_regs->status;
     if ((val32 & SP38E_STATUS_RESP_MASK) != 0) {
@@ -264,11 +256,11 @@ static pufs_status_t sp38e_calculate_tweak(pufs_sp38e_ctx* sp38e_ctx)
 
     dma_write_config_0(false, false, false);
 
-    dma_write_rwcfg(NULL, NULL, 0);
+    pufs_status_t check;
+    if ((check = dma_write_rwcfg(NULL, NULL, 0)) != SUCCESS)
+        return check;
 
     dma_write_data_block_config(true, true, true, true, 0);
-
-    pufs_status_t check;
     if ((check = sp38e_prepare(sp38e_ctx)) != SUCCESS)
         return check;
     if ((check = pufs_sp38e_start()) != SUCCESS)
@@ -307,7 +299,8 @@ static pufs_status_t ___sp38e_ctx_update(pufs_sp38e_ctx* sp38e_ctx,
     if ((check = sp38e_prepare(sp38e_ctx)) != SUCCESS)
         return check;
 
-    dma_write_rwcfg(out, in, inlen);
+    if ((check = dma_write_rwcfg(out, in, inlen)) != SUCCESS)
+        return check;
     if ((check = pufs_sp38e_start()) != SUCCESS)
         return check;
 

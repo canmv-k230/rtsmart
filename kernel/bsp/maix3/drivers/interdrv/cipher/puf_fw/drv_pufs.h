@@ -73,6 +73,11 @@ enum pufs_op_type {
 #define PUFS_RSA_SIGN       _IOWR('P', 0x4E, int)
 #define PUFS_RSA_VERIFY     _IOWR('P', 0x4F, int)
 
+/* Return positive PUFS status codes and negative POSIX errors separately.
+ * Legacy commands continue to negate both. */
+#define PUFS_KEY_INOUT_STATUS   _IOWR('P', 0x12, int)
+#define PUFS_ECC_PRK_GEN_STATUS _IOWR('P', 0x44, int)
+
 /* ===== Ioctl commands: Streaming operations (context-carrying) ===== */
 #define PUFS_HASH_OP        _IOWR('P', 0x60, int)
 #define PUFS_HMAC_OP        _IOWR('P', 0x61, int)
@@ -81,6 +86,8 @@ enum pufs_op_type {
 #define PUFS_SP38D_OP       _IOWR('P', 0x64, int)
 #define PUFS_SP38C_OP       _IOWR('P', 0x65, int)
 #define PUFS_SP38E_OP       _IOWR('P', 0x66, int)
+#define PUFS_CIPHER_CAPS    _IOR('P', 0x67, uint32_t)
+#define PUFS_CIPHER_CAP_HW_SLOT  (1u << 0)
 
 /* ===== Ioctl commands: DRBG (SP800-90A) ===== */
 #define PUFS_DRBG_INIT      _IOWR('P', 0x70, int)
@@ -331,6 +338,13 @@ typedef struct {
     pufs_cmac_ctx_t ctx;
 } pufs_cmac_op_t;
 
+/* Hardware key selector stored in the existing cipher key buffer. */
+#define PUFS_CIPHER_SLOT_PRESENT 1u
+typedef struct {
+    uint32_t slot;
+    uint32_t present;
+} pufs_cipher_slot_t;
+
 typedef struct {
     uint8_t op;
     uint8_t cipher;
@@ -339,7 +353,10 @@ typedef struct {
     uint8_t keytype;
     uint8_t _pad[3];
     uint32_t keybits;
-    uint8_t key[PUFS_SW_KEY_MAXLEN];
+    union {
+        uint8_t key[PUFS_SW_KEY_MAXLEN];
+        pufs_cipher_slot_t hwkey;
+    };
     uint8_t iv[PUFS_BC_BLOCK_SIZE];
     uint32_t ivlen;
     uint32_t inlen;
@@ -355,7 +372,10 @@ typedef struct {
     uint8_t encrypt;
     uint8_t keytype;
     uint32_t keybits;
-    uint8_t key[PUFS_SW_KEY_MAXLEN];
+    union {
+        uint8_t key[PUFS_SW_KEY_MAXLEN];
+        pufs_cipher_slot_t hwkey;
+    };
     uint8_t iv[PUFS_BC_BLOCK_SIZE];
     uint32_t ivlen;
     uint32_t inlen;
@@ -373,7 +393,10 @@ typedef struct {
     uint8_t encrypt;
     uint8_t keytype;
     uint32_t keybits;
-    uint8_t key[PUFS_SW_KEY_MAXLEN];
+    union {
+        uint8_t key[PUFS_SW_KEY_MAXLEN];
+        pufs_cipher_slot_t hwkey;
+    };
     uint8_t nonce[PUFS_BC_BLOCK_SIZE];
     uint32_t noncelen;
     uint64_t ccm_aadlen;
@@ -395,8 +418,14 @@ typedef struct {
     uint8_t keytype2;
     uint8_t _pad[3];
     uint32_t keybits;
-    uint8_t key1[PUFS_SW_KEY_MAXLEN];
-    uint8_t key2[PUFS_SW_KEY_MAXLEN];
+    union {
+        uint8_t key1[PUFS_SW_KEY_MAXLEN];
+        pufs_cipher_slot_t hwkey1;
+    };
+    union {
+        uint8_t key2[PUFS_SW_KEY_MAXLEN];
+        pufs_cipher_slot_t hwkey2;
+    };
     uint8_t iv[PUFS_BC_BLOCK_SIZE];
     uint32_t ivlen;
     uint32_t inlen;

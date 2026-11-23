@@ -23,10 +23,12 @@
 #include "drv_pufs_internal.h"
 
 #include "pufs_dma.h"
+#include "pufs_ecp_internal.h"
 #include "pufs_internal.h"
 #include "pufs_rt.h"
 #include "pufs_rt_internal.h"
 #include "pufs_ka.h"
+#include "pufs_ka_internal.h"
 #include "pufs_crypto.h"
 #include "pufs_crypto_internal.h"
 #include "pufs_hmac.h"
@@ -80,22 +82,41 @@ struct pufs_device {
 };
 
 static struct pufs_device pufs_dev;
-static struct rt_device hwrng_dev;
+/* Set once pufs_device_init() has registered the device; the lock is valid
+ * only then (init failures leave it uninitialized or detached). */
+static bool pufs_ready;
 
-/* Pre-allocated DMA buffers — 64KB, 64-byte aligned for zero-bounce DMA */
+/* Shared ioctl staging buffers, protected by pufs_dev.lock */
 #define PUFS_DMA_BUF_SIZE  65536
 static uint8_t *pufs_dma_in;
 static uint8_t *pufs_dma_out;
 
 /* ===== Per-operation HW lock helpers ===== */
-static inline int pufs_hw_lock(void)
+static inline int pufs_lock_and_recover(void)
 {
     rt_err_t ret;
 
     ret = rt_mutex_take(&pufs_dev.lock, rt_tick_from_millisecond(1000));
     if (ret != RT_EOK)
-        return -RT_ETIMEOUT;
+        return -EBUSY;
 
+    if (rt_otp_guard_keyslots(0, true) != SUCCESS) {
+        rt_mutex_release(&pufs_dev.lock);
+        return -EIO;
+    }
+    return 0;
+}
+
+static inline int pufs_hw_lock(void)
+{
+    int ret = pufs_lock_and_recover();
+    if (ret != 0)
+        return ret;
+    bool ecp_idle = pufs_ecp_is_idle();
+    if (!pufs_dma_sg_is_idle() || !ecp_idle) {
+        rt_mutex_release(&pufs_dev.lock);
+        return -EBUSY;
+    }
     return 0;
 }
 
@@ -104,14 +125,37 @@ static inline void pufs_hw_unlock(void)
     rt_mutex_release(&pufs_dev.lock);
 }
 
+/*
+ * For kernel callers (msh commands, bank voltage check, hwrng), which use
+ * RT-Thread error codes: -RT_ENOSYS if the driver failed to initialize,
+ * -RT_ETIMEOUT if the lock is not free within 1 s, -RT_EIO if the OTP
+ * post-mask guard cannot re-mask after an earlier failure.
+ * The ioctl path uses pufs_hw_lock(), which returns POSIX codes.
+ */
 int pufs_drv_hw_lock(void)
 {
-    return pufs_hw_lock();
+    if (!pufs_ready)
+        return -RT_ENOSYS;
+
+    int ret = pufs_lock_and_recover();
+
+    if (ret == -EBUSY)
+        return -RT_ETIMEOUT;
+    if (ret != 0)
+        return -RT_EIO;
+    /* The kernel-only clients do not use ECP, but can wipe its operands. */
+    (void)pufs_ecp_is_idle();
+    return 0;
 }
 
 void pufs_drv_hw_unlock(void)
 {
     pufs_hw_unlock();
+}
+
+bool pufs_drv_hw_lock_held(void)
+{
+    return pufs_dev.lock.owner == rt_thread_self();
 }
 
 /* ===== User/kernel data copy helpers ===== */
@@ -132,11 +176,15 @@ static int put_to(void *dst, void *src, size_t size)
 /* Ioctl copy-in: declare local var, copy from userspace, break on failure */
 #define IOCTL_COPY_IN(type, var) \
     type var; \
-    if (get_from(&var, args, sizeof(var)) != 0) { ret = -EFAULT; break; }
+    if (!args || get_from(&var, args, sizeof(var)) != 0) { ret = -EFAULT; break; }
 
-/* Ioctl copy-back: write result to userspace on success */
+/* Ioctl copy-back: write result to userspace on success, then clear the
+ * kernel copy (contexts and requests can carry software keys). */
 #define IOCTL_COPY_BACK(var) \
-    if (ret == 0 && put_to(args, &var, sizeof(var)) != 0) ret = -EFAULT
+    do { \
+        if (ret == 0 && put_to(args, &var, sizeof(var)) != 0) ret = -EFAULT; \
+        rvv_memset(&var, 0, sizeof(var)); \
+    } while (0)
 
 /* ===================================================================
  * Context serialization: portable (drv_pufs.h) <-> internal (pufs lib)
@@ -153,6 +201,87 @@ _Static_assert(sizeof(pufs_sp38a_ctx_t) <= sizeof(pufs_sp38a_ctx), "sp38a ctx si
 _Static_assert(sizeof(pufs_sp38d_ctx_t) <= sizeof(pufs_sp38d_ctx), "sp38d ctx size");
 _Static_assert(sizeof(pufs_sp38c_ctx_t) <= sizeof(pufs_sp38c_ctx), "sp38c ctx size");
 _Static_assert(sizeof(pufs_sp38e_ctx_t) <= sizeof(pufs_sp38e_ctx), "sp38e ctx size");
+
+/* ===================================================================
+ * Context validation
+ *
+ * Multi-step contexts live in user memory, so on every UPDATE and FINAL the
+ * kernel gets back whatever the caller wrote. The library trusts these fields:
+ * buflen, minlen and blocklen size copies into the context buffers (here on
+ * the kernel stack), and keytype/keyslot/keybits select the key. Accept only
+ * values init can produce, as far as memory safety and key policy depend on
+ * them; other fields only affect the caller's own output.
+ * =================================================================== */
+
+/* segment() keeps fewer than minlen + blocksize bytes buffered, and copies
+ * whole blocks into the buffer, so both must fit in @buffsize. */
+static bool ctx_buffer_ok(uint32_t buflen, uint32_t minlen, uint32_t blocksize,
+                          uint32_t buffsize)
+{
+    return blocksize != 0 && buffsize % blocksize == 0 &&
+           minlen <= buffsize + 1 - blocksize && buflen < minlen + blocksize;
+}
+
+/* The same key rule as each mode's init: PUF and shared-secret keys are never
+ * usable, a software key fits the context, any other key must pass
+ * keyslot_check(). The userspace HAL builds hash/HMAC/CMAC contexts without
+ * calling init, so this is the only check those keys get. */
+static bool ctx_key_ok(uint32_t keytype, uint32_t keyslot, uint32_t keybits,
+                       uint32_t swkey_bits)
+{
+    if (keytype == PUFKEY || keytype == SHARESEC)
+        return false;
+    if (keytype == SWKEY)
+        return keybits <= swkey_bits;
+    return keyslot_check(true, (pufs_key_type_t)keytype, keyslot, keybits) == SUCCESS;
+}
+
+static bool hmac_ctx_ok(const pufs_hmac_ctx *c)
+{
+    return (c->blocklen == 64 || c->blocklen == 128) &&
+           ctx_buffer_ok(c->buflen, c->minlen, c->blocklen, sizeof(c->buff)) &&
+           ctx_key_ok(c->keytype, c->keyslot, c->keybits, 8 * c->blocklen);
+}
+
+static bool cmac_ctx_ok(const pufs_cmac_ctx *c)
+{
+    return ctx_buffer_ok(c->buflen, c->minlen, CMAC_BLOCK_SIZE, sizeof(c->buff)) &&
+           crypto_check_cmac_algo((pufs_cipher_t)c->cipher, c->keybits) == SUCCESS &&
+           ctx_key_ok(c->keytype, c->keyslot, c->keybits, 8 * sizeof(c->key));
+}
+
+static bool sp38a_ctx_ok(const pufs_sp38a_ctx *c)
+{
+    return ctx_buffer_ok(c->buflen, c->minlen, PUFS_BC_BLOCK_SIZE, sizeof(c->buff)) &&
+           crypto_check_sp38a_algo((pufs_cipher_t)c->cipher, c->keybits) == SUCCESS &&
+           ctx_key_ok(c->keytype, c->keyslot, c->keybits, 8 * sizeof(c->key));
+}
+
+/* CCM buffers at most one block itself rather than through segment(). */
+static bool sp38c_ctx_ok(const pufs_sp38c_ctx *c)
+{
+    return c->op == SP38C_CCM && (unsigned)c->stage <= SP38C_TEXT &&
+           c->currentlen <= c->inlen && c->buflen <= sizeof(c->buff) &&
+           c->taglen >= 4 && c->taglen <= PUFS_BC_BLOCK_SIZE && !(c->taglen & 1) &&
+           c->qlen >= 2 && c->qlen <= 8 &&
+           crypto_check_ccm_algo((pufs_cipher_t)c->cipher, c->keybits) == SUCCESS &&
+           ctx_key_ok(c->keytype, c->keyslot, c->keybits, 8 * sizeof(c->key));
+}
+
+static bool sp38d_ctx_ok(const pufs_sp38d_ctx *c)
+{
+    return ctx_buffer_ok(c->buflen, c->minlen, PUFS_BC_BLOCK_SIZE, sizeof(c->buff)) &&
+           crypto_check_sp38d_algo((pufs_cipher_t)c->cipher, c->keybits) == SUCCESS &&
+           ctx_key_ok(c->keytype, c->keyslot, c->keybits, 8 * sizeof(c->key));
+}
+
+static bool sp38e_ctx_ok(const pufs_sp38e_ctx *c)
+{
+    return ctx_buffer_ok(c->buflen, c->minlen, PUFS_BC_BLOCK_SIZE, sizeof(c->buff)) &&
+           crypto_check_sp38e_algo((pufs_cipher_t)c->cipher, c->keybits) == SUCCESS &&
+           ctx_key_ok(c->keytype1, c->keyslot1, c->keybits, 8 * sizeof(c->key1)) &&
+           ctx_key_ok(c->keytype2, c->keyslot2, c->keybits, 8 * sizeof(c->key2));
+}
 
 /* ===================================================================
  * SP38A init dispatcher (mode -> specific init function)
@@ -197,34 +326,58 @@ static void sp38a_get_ops(const pufs_sp38a_ctx *ctx, sp38a_update_fn *up, sp38a_
     }
 }
 
+static bool cipher_key_addr(pufs_key_type_t keytype, const uint8_t *bytes,
+                            const pufs_cipher_slot_t *hwkey, size_t *keyaddr)
+{
+    if (keytype == SWKEY) {
+        *keyaddr = (uintptr_t)bytes;
+        return true;
+    }
+
+    /* RANDKEY uses the RNG directly and has no slot selector. */
+    if (keytype == RANDKEY) {
+        *keyaddr = 0;
+        return true;
+    }
+
+    /* A legacy hardware-key request did not supply a slot. Do not use slot 0. */
+    if (hwkey->present != PUFS_CIPHER_SLOT_PRESENT)
+        return false;
+    *keyaddr = hwkey->slot;
+    return true;
+}
+
 static int sp38a_do_init(pufs_sp38a_ctx *ctx, const pufs_sp38a_op_t *op)
 {
     pufs_cipher_t cipher = (pufs_cipher_t)op->cipher;
     pufs_key_type_t keytype = (pufs_key_type_t)op->keytype;
-    const uint8_t *key = op->key;
+    size_t keyaddr;
     uint32_t keybits = op->keybits;
     const uint8_t *iv = op->iv;
     uint32_t ivlen = op->ivlen;
     uint8_t mode = op->mode;
     int encrypt = op->encrypt;
 
+    if (!cipher_key_addr(keytype, op->key, &op->hwkey, &keyaddr))
+        return -EINVAL;
+
     if (mode == MODE_ECB) {
-        return encrypt ? pufs_enc_ecb_init(ctx, cipher, keytype, (uint8_t*)key, keybits)
-                       : pufs_dec_ecb_init(ctx, cipher, keytype, (uint8_t*)key, keybits);
+        return encrypt ? pufs_enc_ecb_init(ctx, cipher, keytype, keyaddr, keybits)
+                       : pufs_dec_ecb_init(ctx, cipher, keytype, keyaddr, keybits);
     } else if (mode == MODE_CFB) {
-        return encrypt ? pufs_enc_cfb_init(ctx, cipher, keytype, (uint8_t*)key, keybits, (uint8_t*)iv)
-                       : pufs_dec_cfb_init(ctx, cipher, keytype, (uint8_t*)key, keybits, (uint8_t*)iv);
+        return encrypt ? pufs_enc_cfb_init(ctx, cipher, keytype, keyaddr, keybits, (uint8_t*)iv)
+                       : pufs_dec_cfb_init(ctx, cipher, keytype, keyaddr, keybits, (uint8_t*)iv);
     } else if (mode == MODE_OFB) {
-        return encrypt ? pufs_enc_ofb_init(ctx, cipher, keytype, (uint8_t*)key, keybits, (uint8_t*)iv)
-                       : pufs_dec_ofb_init(ctx, cipher, keytype, (uint8_t*)key, keybits, (uint8_t*)iv);
+        return encrypt ? pufs_enc_ofb_init(ctx, cipher, keytype, keyaddr, keybits, (uint8_t*)iv)
+                       : pufs_dec_ofb_init(ctx, cipher, keytype, keyaddr, keybits, (uint8_t*)iv);
     } else if (mode >= MODE_CBC && mode <= MODE_CBC_CS3) {
         int cs = mode - MODE_CBC;
-        return encrypt ? pufs_enc_cbc_init(ctx, cipher, keytype, (uint8_t*)key, keybits, (uint8_t*)iv, cs)
-                       : pufs_dec_cbc_init(ctx, cipher, keytype, (uint8_t*)key, keybits, (uint8_t*)iv, cs);
+        return encrypt ? pufs_enc_cbc_init(ctx, cipher, keytype, keyaddr, keybits, (uint8_t*)iv, cs)
+                       : pufs_dec_cbc_init(ctx, cipher, keytype, keyaddr, keybits, (uint8_t*)iv, cs);
     } else if (mode >= MODE_CTR_32 && mode <= MODE_CTR) {
         int ctrlen = mode == MODE_CTR_32 ? 32 : mode == MODE_CTR_64 ? 64 : 128;
-        return encrypt ? pufs_enc_ctr_init(ctx, cipher, keytype, (uint8_t*)key, keybits, (uint8_t*)iv, ctrlen)
-                       : pufs_dec_ctr_init(ctx, cipher, keytype, (uint8_t*)key, keybits, (uint8_t*)iv, ctrlen);
+        return encrypt ? pufs_enc_ctr_init(ctx, cipher, keytype, keyaddr, keybits, (uint8_t*)iv, ctrlen)
+                       : pufs_dec_ctr_init(ctx, cipher, keytype, keyaddr, keybits, (uint8_t*)iv, ctrlen);
     }
     return -EINVAL;
 }
@@ -243,9 +396,15 @@ static int hash_op_handler(pufs_hash_op_t *op)
     void *dgst_user;
 
     rvv_memset(ctx, 0, sizeof(*ctx));
-    if (pufs_hw_lock() != 0) return -EBUSY;
+    int lock_err = pufs_hw_lock();
+    if (lock_err != 0) return lock_err;
 
     rvv_memcpy(ctx, &op->ctx, sizeof(op->ctx));
+    if (op->op != PUFS_OP_INIT && !hmac_ctx_ok(ctx)) {
+        rvv_memset(ctx, 0, sizeof(*ctx));
+        pufs_hw_unlock();
+        return -EINVAL;
+    }
     msg_user = (void *)(uintptr_t)op->msg_phys;
     dgst_user = (void *)(uintptr_t)op->dgst_phys;
 
@@ -281,6 +440,7 @@ static int hash_op_handler(pufs_hash_op_t *op)
         rvv_memcpy(&op->ctx, ctx, sizeof(op->ctx));
     }
 
+    rvv_memset(ctx, 0, sizeof(*ctx));
     pufs_hw_unlock();
     return (ret > 0) ? -(int)ret : ret;
 }
@@ -294,17 +454,34 @@ static int hmac_op_handler(pufs_hmac_op_t *op)
     void *dgst_user;
 
     rvv_memset(ctx, 0, sizeof(*ctx));
-    if (pufs_hw_lock() != 0) return -EBUSY;
+    int lock_err = pufs_hw_lock();
+    if (lock_err != 0) return lock_err;
 
     rvv_memcpy(ctx, &op->ctx, sizeof(op->ctx));
+    /* Older HALs initialize a fresh wide-hash HMAC with minlen=128. */
+    if (ctx->op == HMAC_HMAC && ctx->blocklen == 128 && ctx->minlen == 128 &&
+        ctx->hash >= SHA_384 && ctx->hash <= SHA_512_256 &&
+        !ctx->start && !ctx->curlen && !ctx->buflen)
+        ctx->minlen = 1;
+    if (op->op != PUFS_OP_INIT && !hmac_ctx_ok(ctx)) {
+        rvv_memset(ctx, 0, sizeof(*ctx));
+        pufs_hw_unlock();
+        return -EINVAL;
+    }
     msg_user = (void *)(uintptr_t)op->msg_phys;
     dgst_user = (void *)(uintptr_t)op->dgst_phys;
 
     switch (op->op) {
     case PUFS_OP_INIT:
+        /* Init reads (and hashes, if longer than a block) b2B(keybits) bytes
+         * of a software key from ctx->key. */
+        if (op->keytype == SWKEY && op->keybits > 8 * sizeof(ctx->key)) {
+            ret = -EINVAL;
+            break;
+        }
         ret = pufs_hmac_init(ctx, (pufs_hash_t)op->hash,
                              (pufs_key_type_t)op->keytype,
-                             ctx->key, op->keybits);
+                             op->keytype == SWKEY ? (size_t)op->ctx.key : op->ctx.keyslot, op->keybits);
         break;
     case PUFS_OP_UPDATE: {
         if (op->msglen > PUFS_DMA_BUF_SIZE || !msg_user || get_from(pufs_dma_in, msg_user, op->msglen) != 0) {
@@ -334,6 +511,7 @@ static int hmac_op_handler(pufs_hmac_op_t *op)
         rvv_memcpy(&op->ctx, ctx, sizeof(op->ctx));
     }
 
+    rvv_memset(ctx, 0, sizeof(*ctx));
     pufs_hw_unlock();
     return (ret > 0) ? -(int)ret : ret;
 }
@@ -347,9 +525,15 @@ static int cmac_op_handler(pufs_cmac_op_t *op)
     void *dgst_user;
 
     rvv_memset(ctx, 0, sizeof(*ctx));
-    if (pufs_hw_lock() != 0) return -EBUSY;
+    int lock_err = pufs_hw_lock();
+    if (lock_err != 0) return lock_err;
 
     rvv_memcpy(ctx, &op->ctx, sizeof(op->ctx));
+    if (op->op != PUFS_OP_INIT && !cmac_ctx_ok(ctx)) {
+        rvv_memset(ctx, 0, sizeof(*ctx));
+        pufs_hw_unlock();
+        return -EINVAL;
+    }
     msg_user = (void *)(uintptr_t)op->msg_phys;
     dgst_user = (void *)(uintptr_t)op->dgst_phys;
 
@@ -357,7 +541,7 @@ static int cmac_op_handler(pufs_cmac_op_t *op)
     case PUFS_OP_INIT:
         ret = pufs_cmac_init(ctx, (pufs_cipher_t)op->cipher,
                              (pufs_key_type_t)op->keytype,
-                             ctx->key, op->keybits);
+                             op->keytype == SWKEY ? (size_t)op->ctx.key : op->ctx.keyslot, op->keybits);
         break;
     case PUFS_OP_UPDATE: {
         if (op->msglen > PUFS_DMA_BUF_SIZE || !msg_user || get_from(pufs_dma_in, msg_user, op->msglen) != 0) {
@@ -387,6 +571,7 @@ static int cmac_op_handler(pufs_cmac_op_t *op)
         rvv_memcpy(&op->ctx, ctx, sizeof(op->ctx));
     }
 
+    rvv_memset(ctx, 0, sizeof(*ctx));
     pufs_hw_unlock();
     return (ret > 0) ? -(int)ret : ret;
 }
@@ -400,7 +585,8 @@ static int sp38a_op_handler(pufs_sp38a_op_t *op)
     void *out_user = (void *)(uintptr_t)op->out_phys;
 
     rvv_memset(ctx, 0, sizeof(*ctx));
-    if (pufs_hw_lock() != 0) return -EBUSY;
+    int lock_err = pufs_hw_lock();
+    if (lock_err != 0) return lock_err;
 
     switch (op->op) {
     case PUFS_OP_INIT:
@@ -413,6 +599,10 @@ static int sp38a_op_handler(pufs_sp38a_op_t *op)
         uint8_t *outbuf;
 
         rvv_memcpy(ctx, &op->ctx, sizeof(op->ctx));
+        if (!sp38a_ctx_ok(ctx)) {
+            ret = -EINVAL;
+            break;
+        }
         sp38a_get_ops(ctx, &update_fn, &final_fn);
         if (!update_fn) { ret = -EINVAL; break; }
         if (op->inlen > PUFS_DMA_BUF_SIZE || !in_user || get_from(pufs_dma_in, in_user, op->inlen) != 0) {
@@ -432,6 +622,10 @@ static int sp38a_op_handler(pufs_sp38a_op_t *op)
         uint8_t *outbuf;
 
         rvv_memcpy(ctx, &op->ctx, sizeof(op->ctx));
+        if (!sp38a_ctx_ok(ctx)) {
+            ret = -EINVAL;
+            break;
+        }
         sp38a_get_ops(ctx, &update_fn, &final_fn);
         if (!final_fn) { ret = -EINVAL; break; }
         outbuf = out_user ? pufs_dma_out : NULL;
@@ -448,8 +642,25 @@ static int sp38a_op_handler(pufs_sp38a_op_t *op)
         rvv_memcpy(&op->ctx, ctx, sizeof(op->ctx));
     }
 
+    rvv_memset(ctx, 0, sizeof(*ctx));
     pufs_hw_unlock();
     return (ret > 0) ? -(int)ret : ret;
+}
+
+static int sp38d_do_init(pufs_sp38d_ctx *ctx, pufs_sp38d_op_t *op)
+{
+    pufs_cipher_t cipher = (pufs_cipher_t)op->cipher;
+    pufs_key_type_t keytype = (pufs_key_type_t)op->keytype;
+    size_t keyaddr;
+
+    if (op->ivlen > sizeof(op->iv) ||
+        !cipher_key_addr(keytype, op->key, &op->hwkey, &keyaddr))
+        return -EINVAL;
+
+    return op->encrypt ? pufs_enc_gcm_init(ctx, cipher, keytype, keyaddr,
+                                          op->keybits, op->iv, op->ivlen)
+                       : pufs_dec_gcm_init(ctx, cipher, keytype, keyaddr,
+                                          op->keybits, op->iv, op->ivlen);
 }
 
 static int sp38d_op_handler(pufs_sp38d_op_t *op)
@@ -462,28 +673,22 @@ static int sp38d_op_handler(pufs_sp38d_op_t *op)
     void *tag_user = (void *)(uintptr_t)op->tag_phys;
 
     rvv_memset(ctx, 0, sizeof(*ctx));
-    if (pufs_hw_lock() != 0) return -EBUSY;
+    int lock_err = pufs_hw_lock();
+    if (lock_err != 0) return lock_err;
 
     switch (op->op) {
-    case PUFS_OP_INIT: {
-        bool encrypt = op->encrypt;
-        if (encrypt)
-            ret = pufs_enc_gcm_init(ctx, (pufs_cipher_t)op->cipher,
-                                    (pufs_key_type_t)op->keytype,
-                                    (uint8_t*)op->key, op->keybits,
-                                    (uint8_t*)op->iv, op->ivlen);
-        else
-            ret = pufs_dec_gcm_init(ctx, (pufs_cipher_t)op->cipher,
-                                    (pufs_key_type_t)op->keytype,
-                                    (uint8_t*)op->key, op->keybits,
-                                    (uint8_t*)op->iv, op->ivlen);
+    case PUFS_OP_INIT:
+        ret = sp38d_do_init(ctx, op);
         break;
-    }
     case PUFS_OP_UPDATE: {
         uint8_t *inbuf;
         uint8_t *outbuf;
 
         rvv_memcpy(ctx, &op->ctx, sizeof(op->ctx));
+        if (!sp38d_ctx_ok(ctx)) {
+            ret = -EINVAL;
+            break;
+        }
         if (op->inlen > PUFS_DMA_BUF_SIZE || !in_user || get_from(pufs_dma_in, in_user, op->inlen) != 0) {
             ret = -EINVAL;
             break;
@@ -501,6 +706,10 @@ static int sp38d_op_handler(pufs_sp38d_op_t *op)
     case PUFS_OP_FINAL: {
         uint8_t expected_tag[PUFS_BC_BLOCK_SIZE];
         rvv_memcpy(ctx, &op->ctx, sizeof(op->ctx));
+        if (!sp38d_ctx_ok(ctx)) {
+            ret = -EINVAL;
+            break;
+        }
         uint8_t tag[PUFS_BC_BLOCK_SIZE];
         uint8_t *outbuf = out_user ? pufs_dma_out : NULL;
         if (op->taglen > PUFS_BC_BLOCK_SIZE) {
@@ -525,17 +734,7 @@ static int sp38d_op_handler(pufs_sp38d_op_t *op)
         break;
     }
     case PUFS_OP_INIT_UPDATE: {
-        /* Init */
-        if (op->encrypt)
-            ret = pufs_enc_gcm_init(ctx, (pufs_cipher_t)op->cipher,
-                                    (pufs_key_type_t)op->keytype,
-                                    (uint8_t*)op->key, op->keybits,
-                                    (uint8_t*)op->iv, op->ivlen);
-        else
-            ret = pufs_dec_gcm_init(ctx, (pufs_cipher_t)op->cipher,
-                                    (pufs_key_type_t)op->keytype,
-                                    (uint8_t*)op->key, op->keybits,
-                                    (uint8_t*)op->iv, op->ivlen);
+        ret = sp38d_do_init(ctx, op);
         if (ret != SUCCESS) break;
         /* Update */
         op->outlen = 0;
@@ -561,6 +760,10 @@ static int sp38d_op_handler(pufs_sp38d_op_t *op)
         uint32_t update_outlen = 0;
         uint32_t final_outlen = 0;
         rvv_memcpy(ctx, &op->ctx, sizeof(op->ctx));
+        if (!sp38d_ctx_ok(ctx)) {
+            ret = -EINVAL;
+            break;
+        }
         /* Update */
         if (op->inlen > 0) {
             uint8_t *outbuf;
@@ -616,6 +819,7 @@ static int sp38d_op_handler(pufs_sp38d_op_t *op)
         rvv_memcpy(&op->ctx, ctx, sizeof(op->ctx));
     }
 
+    rvv_memset(ctx, 0, sizeof(*ctx));
     pufs_hw_unlock();
     return (ret > 0) ? -(int)ret : ret;
 }
@@ -630,21 +834,26 @@ static int sp38c_op_handler(pufs_sp38c_op_t *op)
     void *tag_user = (void *)(uintptr_t)op->tag_phys;
 
     rvv_memset(ctx, 0, sizeof(*ctx));
-    if (pufs_hw_lock() != 0) return -EBUSY;
+    int lock_err = pufs_hw_lock();
+    if (lock_err != 0) return lock_err;
 
     switch (op->op) {
     case PUFS_OP_INIT: {
-        bool encrypt = op->encrypt;
-        if (encrypt)
+        pufs_key_type_t keytype = (pufs_key_type_t)op->keytype;
+        size_t keyaddr;
+
+        if (!cipher_key_addr(keytype, op->key, &op->hwkey, &keyaddr)) {
+            ret = -EINVAL;
+            break;
+        }
+        if (op->encrypt)
             ret = pufs_enc_ccm_init(ctx, (pufs_cipher_t)op->cipher,
-                                    (pufs_key_type_t)op->keytype,
-                                    (uint8_t*)op->key, op->keybits,
+                                    keytype, keyaddr, op->keybits,
                                     (uint8_t*)op->nonce, op->noncelen,
                                     op->ccm_aadlen, op->ccm_inlen, op->taglen);
         else
             ret = pufs_dec_ccm_init(ctx, (pufs_cipher_t)op->cipher,
-                                    (pufs_key_type_t)op->keytype,
-                                    (uint8_t*)op->key, op->keybits,
+                                    keytype, keyaddr, op->keybits,
                                     (uint8_t*)op->nonce, op->noncelen,
                                     op->ccm_aadlen, op->ccm_inlen, op->taglen);
         break;
@@ -654,6 +863,10 @@ static int sp38c_op_handler(pufs_sp38c_op_t *op)
         uint8_t *outbuf;
 
         rvv_memcpy(ctx, &op->ctx, sizeof(op->ctx));
+        if (!sp38c_ctx_ok(ctx)) {
+            ret = -EINVAL;
+            break;
+        }
         if (op->inlen > PUFS_DMA_BUF_SIZE || !in_user || get_from(pufs_dma_in, in_user, op->inlen) != 0) {
             ret = -EINVAL;
             break;
@@ -671,9 +884,19 @@ static int sp38c_op_handler(pufs_sp38c_op_t *op)
     case PUFS_OP_FINAL: {
         uint8_t expected_tag[PUFS_BC_BLOCK_SIZE];
         rvv_memcpy(ctx, &op->ctx, sizeof(op->ctx));
+        if (!sp38c_ctx_ok(ctx)) {
+            ret = -EINVAL;
+            break;
+        }
         uint8_t tag[PUFS_BC_BLOCK_SIZE];
         uint8_t *outbuf = out_user ? pufs_dma_out : NULL;
         if (ctx->taglen > PUFS_BC_BLOCK_SIZE) {
+            ret = -EINVAL;
+            break;
+        }
+        /* Outside the AAD stage a buffered partial block is processed into
+         * outbuf (and read back from it when decrypting): it must exist. */
+        if (ctx->stage != SP38C_AAD && ctx->buflen > 0 && !outbuf) {
             ret = -EINVAL;
             break;
         }
@@ -702,6 +925,7 @@ static int sp38c_op_handler(pufs_sp38c_op_t *op)
         rvv_memcpy(&op->ctx, ctx, sizeof(op->ctx));
     }
 
+    rvv_memset(ctx, 0, sizeof(*ctx));
     pufs_hw_unlock();
     return (ret > 0) ? -(int)ret : ret;
 }
@@ -715,23 +939,28 @@ static int sp38e_op_handler(pufs_sp38e_op_t *op)
     void *out_user = (void *)(uintptr_t)op->out_phys;
 
     rvv_memset(ctx, 0, sizeof(*ctx));
-    if (pufs_hw_lock() != 0) return -EBUSY;
+    int lock_err = pufs_hw_lock();
+    if (lock_err != 0) return lock_err;
 
     switch (op->op) {
     case PUFS_OP_INIT: {
-        bool encrypt = op->encrypt;
-        if (encrypt)
+        pufs_key_type_t keytype1 = (pufs_key_type_t)op->keytype1;
+        pufs_key_type_t keytype2 = (pufs_key_type_t)op->keytype2;
+        size_t keyaddr1, keyaddr2;
+
+        if (!cipher_key_addr(keytype1, op->key1, &op->hwkey1, &keyaddr1) ||
+            !cipher_key_addr(keytype2, op->key2, &op->hwkey2, &keyaddr2)) {
+            ret = -EINVAL;
+            break;
+        }
+        if (op->encrypt)
             ret = pufs_enc_xts_init(ctx, (pufs_cipher_t)op->cipher,
-                                    (pufs_key_type_t)op->keytype1,
-                                    (uint8_t*)op->key1, op->keybits,
-                                    (pufs_key_type_t)op->keytype2,
-                                    (uint8_t*)op->key2, (uint8_t*)op->iv, 0);
+                                    keytype1, keyaddr1, op->keybits,
+                                    keytype2, keyaddr2, (uint8_t*)op->iv, 0);
         else
             ret = pufs_dec_xts_init(ctx, (pufs_cipher_t)op->cipher,
-                                    (pufs_key_type_t)op->keytype1,
-                                    (uint8_t*)op->key1, op->keybits,
-                                    (pufs_key_type_t)op->keytype2,
-                                    (uint8_t*)op->key2, (uint8_t*)op->iv, 0);
+                                    keytype1, keyaddr1, op->keybits,
+                                    keytype2, keyaddr2, (uint8_t*)op->iv, 0);
         break;
     }
     case PUFS_OP_UPDATE: {
@@ -739,6 +968,10 @@ static int sp38e_op_handler(pufs_sp38e_op_t *op)
         uint8_t *outbuf;
 
         rvv_memcpy(ctx, &op->ctx, sizeof(op->ctx));
+        if (!sp38e_ctx_ok(ctx)) {
+            ret = -EINVAL;
+            break;
+        }
         if (op->inlen > PUFS_DMA_BUF_SIZE || !in_user || get_from(pufs_dma_in, in_user, op->inlen) != 0) {
             ret = -EINVAL;
             break;
@@ -755,6 +988,10 @@ static int sp38e_op_handler(pufs_sp38e_op_t *op)
     }
     case PUFS_OP_FINAL: {
         rvv_memcpy(ctx, &op->ctx, sizeof(op->ctx));
+        if (!sp38e_ctx_ok(ctx)) {
+            ret = -EINVAL;
+            break;
+        }
         uint8_t *outbuf = out_user ? pufs_dma_out : NULL;
         if (ctx->encrypt)
             ret = pufs_enc_xts_final(ctx, outbuf, &op->outlen);
@@ -772,6 +1009,7 @@ static int sp38e_op_handler(pufs_sp38e_op_t *op)
         rvv_memcpy(&op->ctx, ctx, sizeof(op->ctx));
     }
 
+    rvv_memset(ctx, 0, sizeof(*ctx));
     pufs_hw_unlock();
     return (ret > 0) ? -(int)ret : ret;
 }
@@ -785,7 +1023,8 @@ static int uid_get(pufs_uid_get_t *arg)
     int ret;
     pufs_uid_st uid;
 
-    if (pufs_hw_lock() != 0) return -EBUSY;
+    int lock_err = pufs_hw_lock();
+    if (lock_err != 0) return lock_err;
     ret = pufs_get_uid(&uid, arg->slot);
     pufs_hw_unlock();
 
@@ -805,12 +1044,21 @@ static int otp_read_handler(pufs_otp_rw_t *arg)
     if (len > OTP_LEN || !arg->buf)
         return -EINVAL;
 
+    /* Hold off writers so a multi-word read is never half old, half new. */
+    int lock_err = pufs_hw_lock();
+    if (lock_err != 0) return lock_err;
     ret = pufs_otp_read(tmp, len, arg->addr);
+    pufs_hw_unlock();
+
     if (ret != SUCCESS) {
         LOG_D("%s: %s\n", __func__, pufs_strstatus(ret));
-        return -ret;
+        ret = -ret;
+    } else {
+        ret = put_to(arg->buf, tmp, len);
     }
-    return put_to(arg->buf, tmp, len);
+    /* OTP words can be key material. */
+    rvv_memset(tmp, 0, sizeof(tmp));
+    return ret;
 }
 
 static int otp_write_handler(pufs_otp_rw_t *arg)
@@ -822,25 +1070,33 @@ static int otp_write_handler(pufs_otp_rw_t *arg)
     if (len > OTP_LEN || !arg->buf)
         return -EINVAL;
 
-    if (get_from(tmp, arg->buf, len) != 0)
-        return -EFAULT;
+    if (get_from(tmp, arg->buf, len) != 0) {
+        ret = -EFAULT;
+        goto out;
+    }
 
-    if (pufs_hw_lock() != 0) return -EBUSY;
+    ret = pufs_hw_lock();
+    if (ret != 0)
+        goto out;
     ret = pufs_otp_write(tmp, len, arg->addr);
     pufs_hw_unlock();
 
     if (ret != SUCCESS) {
         LOG_D("%s: %s\n", __func__, pufs_strstatus(ret));
-        return -ret;
+        ret = -ret;
     }
-    return 0;
+out:
+    /* The data being burned can be a key. */
+    rvv_memset(tmp, 0, sizeof(tmp));
+    return ret;
 }
 
 static int otp_lock_handler(pufs_otp_lock_op_t *arg)
 {
     int ret;
 
-    if (pufs_hw_lock() != 0) return -EBUSY;
+    int lock_err = pufs_hw_lock();
+    if (lock_err != 0) return lock_err;
     ret = pufs_otp_set_lock(arg->addr, arg->len, (pufs_otp_lock_t)arg->lock);
     pufs_hw_unlock();
 
@@ -851,31 +1107,49 @@ static int otp_lock_handler(pufs_otp_lock_op_t *arg)
     return 0;
 }
 
+/* pufs_rng_fill() lives in drv_hwrng.c with /dev/hwrng. */
 static int rng_read_handler(pufs_rng_read_t *arg)
 {
     uint32_t len = arg->len;
     uint8_t tmp[256];
     uint32_t off = 0;
+    int ret = 0;
 
     if (!arg->buf || len == 0)
         return -EINVAL;
 
-    while (off < len) {
+    while (ret == 0 && off < len) {
         uint32_t chunk = len - off;
         if (chunk > sizeof(tmp))
             chunk = sizeof(tmp);
-        uint32_t nblks = (chunk + 3) / 4;
-        _pufs_rand(tmp, nblks);
-        if (put_to(arg->buf + off, tmp, chunk) != 0)
-            return -EFAULT;
+        if ((ret = pufs_rng_fill(tmp, chunk)) == 0 &&
+            put_to(arg->buf + off, tmp, chunk) != 0)
+            ret = -EFAULT;
         off += chunk;
     }
-    return 0;
+    /* Do not leave random bytes (possibly key material) on the stack. */
+    rvv_memset(tmp, 0, sizeof(tmp));
+    return ret;
 }
 
+/* The ioctl result carries the query status; arg->lock is valid only on 0. */
 static int otp_rwlck_get_handler(pufs_otp_rwlck_get_t *arg)
 {
-    arg->lock = (uint8_t)pufs_otp_get_lock(arg->addr);
+    int ret;
+    pufs_otp_lock_t lock = N_OTP_LOCK_T;
+
+    arg->lock = (uint8_t)N_OTP_LOCK_T;
+
+    int lock_err = pufs_hw_lock();
+    if (lock_err != 0) return lock_err;
+    ret = pufs_otp_query_lock(arg->addr, &lock);
+    pufs_hw_unlock();
+
+    if (ret != SUCCESS) {
+        LOG_D("%s: %s\n", __func__, pufs_strstatus(ret));
+        return -ret;
+    }
+    arg->lock = (uint8_t)lock;
     return 0;
 }
 
@@ -883,7 +1157,8 @@ static int rt_version_handler(pufs_rt_version_t *arg)
 {
     int ret;
 
-    if (pufs_hw_lock() != 0) return -EBUSY;
+    int lock_err = pufs_hw_lock();
+    if (lock_err != 0) return lock_err;
     ret = pufs_rt_version(&arg->version, &arg->features);
     pufs_hw_unlock();
 
@@ -903,28 +1178,34 @@ static int key2otp_handler(pufs_key2otp_t *arg)
     if (!arg->key || keybytes > sizeof(keytmp))
         return -EINVAL;
 
-    if (get_from(keytmp, arg->key, keybytes) != 0)
-        return -EFAULT;
+    if (get_from(keytmp, arg->key, keybytes) != 0) {
+        ret = -EFAULT;
+        goto out;
+    }
 
-    if (pufs_hw_lock() != 0) return -EBUSY;
+    ret = pufs_hw_lock();
+    if (ret != 0)
+        goto out;
     ret = pufs_program_key2otp(arg->slot, keytmp, arg->keybits,
                                (pufs_otp_lock_t)arg->lock);
     pufs_hw_unlock();
 
-    rt_memset(keytmp, 0, keybytes);
-
     if (ret != SUCCESS) {
         LOG_D("%s: %s\n", __func__, pufs_strstatus(ret));
-        return -ret;
+        ret = -ret;
     }
-    return 0;
+out:
+    /* The key being burned is secret, on every path. */
+    rvv_memset(keytmp, 0, sizeof(keytmp));
+    return ret;
 }
 
 static int otp_sec_cfg_handler(pufs_otp_security_cfg_t *arg)
 {
     int ret;
 
-    if (pufs_hw_lock() != 0) return -EBUSY;
+    int lock_err = pufs_hw_lock();
+    if (lock_err != 0) return lock_err;
     ret = pufs_otp_apply_security_config(arg->disable_spi2axi != 0,
                                          arg->disable_jtag != 0,
                                          arg->force_secure_boot != 0,
@@ -944,7 +1225,8 @@ static int otp_sec_lock_handler(pufs_otp_security_cfg_t *arg)
 
     (void)arg;
 
-    if (pufs_hw_lock() != 0) return -EBUSY;
+    int lock_err = pufs_hw_lock();
+    if (lock_err != 0) return lock_err;
     ret = pufs_otp_lock_security_config_words();
     pufs_hw_unlock();
 
@@ -962,7 +1244,8 @@ static int otp_sec_state_handler(pufs_otp_security_state_t *arg)
 
     rvv_memset(&state, 0, sizeof(state));
 
-    if (pufs_hw_lock() != 0) return -EBUSY;
+    int lock_err = pufs_hw_lock();
+    if (lock_err != 0) return lock_err;
     ret = pufs_otp_get_security_config_state(&state);
     pufs_hw_unlock();
 
@@ -998,7 +1281,8 @@ static int drbg_init_handler(pufs_drbg_init_t *arg)
         get_from(pstr_tmp, arg->pstr, pstrlen) != 0)
         return -EFAULT;
 
-    if (pufs_hw_lock() != 0) return -EBUSY;
+    int lock_err = pufs_hw_lock();
+    if (lock_err != 0) return lock_err;
     ret = pufs_drbg_instantiate(arg->mode, arg->security, arg->df,
                                 arg->nonce ? nonce_tmp : NULL, noncelen,
                                 arg->pstr ? pstr_tmp : NULL, pstrlen);
@@ -1021,7 +1305,8 @@ static int drbg_reseed_handler(pufs_drbg_reseed_t *arg)
         get_from(adin_tmp, arg->adin, adinlen) != 0)
         return -EFAULT;
 
-    if (pufs_hw_lock() != 0) return -EBUSY;
+    int lock_err = pufs_hw_lock();
+    if (lock_err != 0) return lock_err;
     ret = pufs_drbg_reseed(arg->df,
                            arg->adin ? adin_tmp : NULL, adinlen);
     pufs_hw_unlock();
@@ -1048,25 +1333,29 @@ static int drbg_generate_handler(pufs_drbg_generate_t *arg)
         get_from(adin_tmp, arg->adin, adinlen) != 0)
         return -EFAULT;
 
-    if (pufs_hw_lock() != 0) return -EBUSY;
+    int lock_err = pufs_hw_lock();
+    if (lock_err != 0) return lock_err;
     ret = _pufs_drbg_generate(out_tmp, arg->outbits, arg->pr, arg->df,
                               arg->adin ? adin_tmp : NULL, adinlen, 0);
     pufs_hw_unlock();
 
     if (ret != SUCCESS) {
         LOG_D("%s: %s\n", __func__, pufs_strstatus(ret));
-        return -ret;
+        ret = -ret;
+    } else if (put_to(arg->out, out_tmp, outbytes) != 0) {
+        ret = -EFAULT;
     }
-    if (put_to(arg->out, out_tmp, outbytes) != 0)
-        return -EFAULT;
-    return 0;
+    /* Like rng_read_handler(): the output may become key material. */
+    rvv_memset(out_tmp, 0, sizeof(out_tmp));
+    return ret;
 }
 
 static int drbg_uninit_handler(void)
 {
     int ret;
 
-    if (pufs_hw_lock() != 0) return -EBUSY;
+    int lock_err = pufs_hw_lock();
+    if (lock_err != 0) return lock_err;
     ret = pufs_drbg_uninstantiate();
     pufs_hw_unlock();
 
@@ -1077,22 +1366,41 @@ static int drbg_uninit_handler(void)
     return 0;
 }
 
-static int key_io(pufs_key_io_t *arg)
+static int key_io(pufs_key_io_t *arg, bool report_status)
 {
     int ret;
-    uint8_t keytmp[SW_KEY_MAXLEN];
+    uint8_t keytmp[KWP_KEY_MAXLEN];
     uint32_t keybits = arg->keybits;
-    uint32_t keybytes;
+    uint32_t keybytes = 0;
+    bool importing = arg->mode == KM_IMPORT_PT || arg->mode == KM_IMPORT_WRAP;
+    bool exporting = arg->mode == KM_EXPORT_PT || arg->mode == KM_EXPORT_WRAP;
 
-    keybits = keybits > SW_KEY_MAXLEN * 8 ? SW_KEY_MAXLEN * 8 : keybits;
-    keybytes = (keybits + 7) >> 3;
+    if (keybits > sizeof(keytmp) * 8)
+        return -EINVAL;
+    if (importing || exporting) {
+        if (!arg->keyaddr)
+            return -EFAULT;
+        if (!keybits)
+            return -EINVAL;
+        if (arg->mode == KM_IMPORT_WRAP || arg->mode == KM_EXPORT_WRAP) {
+            if (pufs_wrapped_key_size(arg->keywrap, keybits, &keybytes) != SUCCESS)
+                return -EINVAL;
+        } else {
+            keybytes = b2B(keybits);
+        }
+    } else if (arg->mode != KM_CLEAR) {
+        return -EINVAL;
+    }
 
     /* Pre-copy key from userspace for import operations */
-    if ((arg->mode == KM_IMPORT_PT || arg->mode == KM_IMPORT_WRAP) &&
-        get_from(keytmp, arg->keyaddr, keybytes) != 0)
-        return -EFAULT;
+    if (importing && get_from(keytmp, arg->keyaddr, keybytes) != 0) {
+        ret = -EFAULT;
+        goto out;
+    }
 
-    if (pufs_hw_lock() != 0) return -EBUSY;
+    ret = pufs_hw_lock();
+    if (ret != 0)
+        goto out;
 
     if (arg->mode == KM_IMPORT_PT) {
         ret = pufs_import_plaintext_key(arg->keytype, arg->keyslot, keytmp, keybits);
@@ -1102,26 +1410,26 @@ static int key_io(pufs_key_io_t *arg)
         ret = pufs_export_plaintext_key(arg->keytype, arg->keyslot, keytmp, keybits);
     } else if (arg->mode == KM_EXPORT_WRAP) {
         ret = pufs_export_wrapped_key(arg->keytype, arg->keyslot, keytmp, keybits, arg->kwslot, arg->kwbits, arg->keywrap);
-    } else if (arg->mode == KM_CLEAR) {
-        ret = pufs_clear_key(arg->keytype, arg->keyslot, keybits);
     } else {
-        ret = -EINVAL;
+        ret = pufs_clear_key(arg->keytype, arg->keyslot, keybits);
     }
 
     pufs_hw_unlock();
 
     /* Copy exported key back to userspace */
-    if (ret == SUCCESS && (arg->mode == KM_EXPORT_PT || arg->mode == KM_EXPORT_WRAP)) {
+    if (ret == SUCCESS && exporting) {
         if (put_to(arg->keyaddr, keytmp, keybytes) != 0)
             ret = -EFAULT;
     }
 
-    rt_memset(keytmp, 0, sizeof(keytmp));
-
     if (ret > 0) {
         LOG_D("%s: %s\n", __func__, pufs_strstatus(ret));
-        return -ret;
+        if (!report_status)
+            ret = -ret;
     }
+out:
+    /* Imported or exported key bytes, on every path. */
+    rvv_memset(keytmp, 0, sizeof(keytmp));
     return ret;
 }
 
@@ -1140,20 +1448,30 @@ static int key_derive(pufs_key_derive_t *arg)
     keybits = keybits > SW_KEY_MAXLEN * 8 ? SW_KEY_MAXLEN * 8 : keybits;
     saltlen = saltlen > DGST_INT_STATE_LEN ? DGST_INT_STATE_LEN : saltlen;
     if (arg->ztype == SWKEY) {
-        if (get_from(keytmp, keyaddr, (keybits + 7) >> 3) != 0)
-            return -EFAULT;
+        if (get_from(keytmp, keyaddr, (keybits + 7) >> 3) != 0) {
+            ret = -EFAULT;
+            goto out;
+        }
         keyaddr = keytmp;
     }
     if (iv) {
-        if (get_from(ivtmp, iv, BC_BLOCK_SIZE) != 0) return -EFAULT;
+        if (get_from(ivtmp, iv, BC_BLOCK_SIZE) != 0) {
+            ret = -EFAULT;
+            goto out;
+        }
         iv = ivtmp;
     }
     if (salt) {
-        if (get_from(salttmp, salt, saltlen) != 0) return -EFAULT;
+        if (get_from(salttmp, salt, saltlen) != 0) {
+            ret = -EFAULT;
+            goto out;
+        }
         salt = salttmp;
     }
 
-    if (pufs_hw_lock() != 0) return -EBUSY;
+    ret = pufs_hw_lock();
+    if (ret != 0)
+        goto out;
     ret = pufs_kdf_base(arg->keytype, arg->keyslot, arg->outbits, arg->method,
                         arg->prf, arg->hash, arg->iter, arg->feedback, iv,
                         arg->ctrpos, arg->ctrlen, arg->ztype,
@@ -1163,12 +1481,15 @@ static int key_derive(pufs_key_derive_t *arg)
 
     if (ret != SUCCESS) {
         LOG_D("%s: %s\n", __func__, pufs_strstatus(ret));
-        return -ret;
+        ret = -ret;
     }
-    return 0;
+out:
+    /* The input key material is secret. */
+    rvv_memset(keytmp, 0, sizeof(keytmp));
+    return ret;
 }
 
-static int ecc_prk_gen(pufs_ecc_prk_gen_t *arg)
+static int ecc_prk_gen(pufs_ecc_prk_gen_t *arg, bool report_status)
 {
     int ret;
     uint8_t keytmp[SW_KEY_MAXLEN];
@@ -1179,12 +1500,16 @@ static int ecc_prk_gen(pufs_ecc_prk_gen_t *arg)
 
     /* Pre-copy key from userspace before taking HW lock */
     if (!arg->is_ephemeral && arg->keytype == SWKEY) {
-        if (get_from(keytmp, keyaddr, (keybits + 7) >> 3) != 0)
-            return -EFAULT;
+        if (get_from(keytmp, keyaddr, (keybits + 7) >> 3) != 0) {
+            ret = -EFAULT;
+            goto out;
+        }
         keyaddr = keytmp;
     }
 
-    if (pufs_hw_lock() != 0) return -EBUSY;
+    ret = pufs_hw_lock();
+    if (ret != 0)
+        goto out;
 
     ret = pufs_ecp_set_curve_byname(arg->ecctype);
     if (ret != SUCCESS) goto exit;
@@ -1198,11 +1523,15 @@ static int ecc_prk_gen(pufs_ecc_prk_gen_t *arg)
     }
 exit:
     pufs_hw_unlock();
-    if (ret != SUCCESS) {
+    if (ret > 0) {
         LOG_D("%s: %s\n", __func__, pufs_strstatus(ret));
-        return -ret;
+        if (!report_status)
+            ret = -ret;
     }
-    return 0;
+out:
+    /* The private key is derived from this secret. */
+    rvv_memset(keytmp, 0, sizeof(keytmp));
+    return ret;
 }
 
 static int ecc_puk_gen(pufs_ecc_puk_gen_t *arg)
@@ -1210,7 +1539,8 @@ static int ecc_puk_gen(pufs_ecc_puk_gen_t *arg)
     int ret;
     pufs_ec_point_st puk;
 
-    if (pufs_hw_lock() != 0) return -EBUSY;
+    int lock_err = pufs_hw_lock();
+    if (lock_err != 0) return lock_err;
 
     ret = pufs_ecp_set_curve_byname(arg->ecctype);
     if (ret != SUCCESS) goto exit;
@@ -1234,7 +1564,8 @@ static int ecc_puk_verify(pufs_ecc_puk_verify_t *arg)
 
     if (get_from(&puk, arg->puk, sizeof(puk)) != 0)
         return -EFAULT;
-    if (pufs_hw_lock() != 0) return -EBUSY;
+    int lock_err = pufs_hw_lock();
+    if (lock_err != 0) return lock_err;
 
     ret = pufs_ecp_set_curve_byname(arg->ecctype);
     if (ret != SUCCESS) goto exit;
@@ -1261,7 +1592,8 @@ static int ecc_cdh(pufs_ecc_cdh_t *arg)
     if (!arg->is_ephemeral && get_from(&puk_s, arg->puk_s, sizeof(puk_s)) != 0)
         return -EFAULT;
 
-    if (pufs_hw_lock() != 0) return -EBUSY;
+    int lock_err = pufs_hw_lock();
+    if (lock_err != 0) return lock_err;
 
     ret = pufs_ecp_set_curve_byname(arg->ecctype);
     if (ret != SUCCESS) goto exit;
@@ -1296,7 +1628,8 @@ static int ecdsa_sign(pufs_ecdsa_sign_t *arg)
     if (!md_user || get_from(md.dgst, md_user, md.dlen) != 0)
         return -EINVAL;
 
-    if (pufs_hw_lock() != 0) return -EBUSY;
+    int lock_err = pufs_hw_lock();
+    if (lock_err != 0) return lock_err;
 
     ret = pufs_ecp_set_curve_byname(arg->ecctype);
     if (ret != SUCCESS) goto exit;
@@ -1328,7 +1661,8 @@ static int ecdsa_verify(pufs_ecdsa_verify_t *arg)
     if (arg->otpslot > OTPKEY_31 && (!puk_user || get_from(&puk, puk_user, sizeof(puk)) != 0))
         return -EINVAL;
 
-    if (pufs_hw_lock() != 0) return -EBUSY;
+    int lock_err = pufs_hw_lock();
+    if (lock_err != 0) return lock_err;
 
     ret = pufs_ecp_set_curve_byname(arg->ecctype);
     if (ret != SUCCESS) goto exit;
@@ -1362,11 +1696,9 @@ static int sm2_sign(pufs_sm2_sign_t *arg)
     if (arg->msglen > 0 && (!msg_user || get_from(pufs_dma_in + arg->idlen, msg_user, arg->msglen) != 0))
         return -EINVAL;
 
-    if (pufs_hw_lock() != 0) return -EBUSY;
     ret = pufs_sm2_sign(&sig, pufs_dma_in + arg->idlen, arg->msglen,
                     pufs_dma_in, arg->idlen,
                     arg->prktype, arg->prkslot);
-    pufs_hw_unlock();
 
     if (ret != SUCCESS) {
         LOG_D("%s: %s\n", __func__, pufs_strstatus(ret));
@@ -1397,9 +1729,7 @@ static int sm2_verify(pufs_sm2_verify_t *arg)
     if (arg->msglen > 0 && (!msg_user || get_from(pufs_dma_in + arg->idlen, msg_user, arg->msglen) != 0))
         return -EINVAL;
 
-    if (pufs_hw_lock() != 0) return -EBUSY;
     ret = pufs_sm2_verify(sig, pufs_dma_in + arg->idlen, arg->msglen, pufs_dma_in, arg->idlen, puk);
-    pufs_hw_unlock();
 
     if (ret != SUCCESS) {
         LOG_D("%s: %s\n", __func__, pufs_strstatus(ret));
@@ -1426,9 +1756,7 @@ static int sm2_enc(pufs_sm2_enc_t *arg)
     if (get_from(pufs_dma_in, arg->in, arg->inlen) != 0)
         return -EFAULT;
 
-    if (pufs_hw_lock() != 0) return -EBUSY;
     ret = pufs_sm2_enc(pufs_dma_out, &outlen, pufs_dma_in, arg->inlen, puk, arg->format);
-    pufs_hw_unlock();
 
     if (ret != SUCCESS) {
         LOG_D("%s: %s\n", __func__, pufs_strstatus(ret));
@@ -1452,10 +1780,8 @@ static int sm2_dec(pufs_sm2_dec_t *arg)
     if (get_from(pufs_dma_in, arg->in, arg->inlen) != 0)
         return -EFAULT;
 
-    if (pufs_hw_lock() != 0) return -EBUSY;
     ret = pufs_sm2_dec(pufs_dma_out, &outlen, pufs_dma_in, arg->inlen, arg->prkslot,
                        arg->format);
-    pufs_hw_unlock();
 
     if (ret != SUCCESS) {
         LOG_D("%s: %s\n", __func__, pufs_strstatus(ret));
@@ -1474,7 +1800,7 @@ static int sm2_kex(pufs_sm2_kex_t *arg)
     pufs_ec_point_st pukr, tpukr;
     uint32_t keylen = arg->keybits / 8;
 
-    if (arg->idllen + arg->idrlen > PUFS_DMA_BUF_SIZE ||
+    if ((uint64_t)arg->idllen + arg->idrlen > PUFS_DMA_BUF_SIZE ||
         keylen > PUFS_DMA_BUF_SIZE)
         return -EINVAL;
 
@@ -1487,13 +1813,11 @@ static int sm2_kex(pufs_sm2_kex_t *arg)
         get_from(pufs_dma_in + arg->idllen, arg->idr, arg->idrlen) != 0)
         return -EFAULT;
 
-    if (pufs_hw_lock() != 0) return -EBUSY;
     ret = pufs_sm2_kex(&s2, &s3, pufs_dma_out, arg->keybits,
                        pufs_dma_in, arg->idllen,
                        pufs_dma_in + arg->idllen, arg->idrlen,
                        arg->prkslotl, arg->tprkslotl,
                        pukr, tpukr, arg->init);
-    pufs_hw_unlock();
 
     if (ret != SUCCESS) {
         LOG_D("%s: %s\n", __func__, pufs_strstatus(ret));
@@ -1517,7 +1841,7 @@ static int rsa_sign(pufs_rsa_sign_t *arg)
     uint32_t msg_input_len = (mode == RSA_BASE) ? elen : arg->msglen;
     uint32_t prk_off = elen;
     uint32_t msg_off = elen * 2;
-    uint32_t salt_off = msg_off + msg_input_len;
+    size_t salt_off = (size_t)msg_off + msg_input_len;
     void *n_user = (void *)(uintptr_t)arg->n_phys;
     void *prk_user = (void *)(uintptr_t)arg->prk_phys;
     void *msg_user = (void *)(uintptr_t)arg->msg_phys;
@@ -1526,16 +1850,13 @@ static int rsa_sign(pufs_rsa_sign_t *arg)
 
     if ((uint64_t)salt_off + arg->saltlen > PUFS_DMA_BUF_SIZE || !n_user || !prk_user || !sig_user)
         return -EINVAL;
-    if (get_from(pufs_dma_in, n_user, elen) != 0 || get_from(pufs_dma_in + prk_off, prk_user, elen) != 0)
+    if (get_from(pufs_dma_in, n_user, elen) != 0 || get_from(pufs_dma_in + prk_off, prk_user, elen) != 0 ||
+        (msg_input_len > 0 && (!msg_user || get_from(pufs_dma_in + msg_off, msg_user, msg_input_len) != 0)) ||
+        (arg->saltlen > 0 && (!salt_user || get_from(pufs_dma_in + salt_off, salt_user, arg->saltlen) != 0))) {
+        rvv_memset(pufs_dma_in + prk_off, 0, elen);
         return -EINVAL;
-    if (msg_input_len > 0 && (!msg_user || get_from(pufs_dma_in + msg_off, msg_user, msg_input_len) != 0))
-        return -EINVAL;
-    if (arg->saltlen > 0 && (!salt_user || get_from(pufs_dma_in + salt_off, salt_user, arg->saltlen) != 0))
-        return -EINVAL;
-
-    if (pufs_hw_lock() != 0) {
-        return -EBUSY;
     }
+
 
     if (mode == RSA_BASE) {
         ret = pufs_rsa_sign(pufs_dma_out, type, pufs_dma_in, arg->puk,
@@ -1557,7 +1878,8 @@ static int rsa_sign(pufs_rsa_sign_t *arg)
         ret = -EINVAL;
     }
 
-    pufs_hw_unlock();
+    /* The private exponent must not stay in the shared staging buffer. */
+    rvv_memset(pufs_dma_in + prk_off, 0, elen);
     if (ret > 0) {
         LOG_D("%s: %s\n", __func__, pufs_strstatus(ret));
         ret = -ret;
@@ -1575,7 +1897,7 @@ static int rsa_verify(pufs_rsa_verify_t *arg)
     uint32_t elen = (type + 1) * 128;
     uint32_t msg_input_len = (mode == RSA_BASE) ? elen : arg->msglen;
     uint32_t msg_off = elen;
-    uint32_t sig_off = elen + msg_input_len;
+    size_t sig_off = (size_t)elen + msg_input_len;
     void *n_user = (void *)(uintptr_t)arg->n_phys;
     void *msg_user = (void *)(uintptr_t)arg->msg_phys;
     void *sig_user = (void *)(uintptr_t)arg->sig_phys;
@@ -1587,9 +1909,6 @@ static int rsa_verify(pufs_rsa_verify_t *arg)
         get_from(pufs_dma_in + sig_off, sig_user, elen) != 0)
         return -EINVAL;
 
-    if (pufs_hw_lock() != 0) {
-        return -EBUSY;
-    }
 
     if (mode == RSA_BASE) {
         ret = pufs_rsa_verify(pufs_dma_in + sig_off, type, pufs_dma_in, arg->puk,
@@ -1608,7 +1927,6 @@ static int rsa_verify(pufs_rsa_verify_t *arg)
         ret = -EINVAL;
     }
 
-    pufs_hw_unlock();
     if (ret > 0) {
         LOG_D("%s: %s\n", __func__, pufs_strstatus(ret));
         ret = -ret;
@@ -1668,6 +1986,12 @@ static rt_err_t pufs_control(rt_device_t dev, int cmd, void *args)
         IOCTL_COPY_IN(pufs_sp38e_op_t, op);
         ret = sp38e_op_handler(&op);
         IOCTL_COPY_BACK(op);
+        break;
+    }
+    case PUFS_CIPHER_CAPS: {
+        uint32_t caps = PUFS_CIPHER_CAP_HW_SLOT;
+        ret = 0;
+        IOCTL_COPY_BACK(caps);
         break;
     }
     /* --- Atomic operations --- */
@@ -1737,9 +2061,11 @@ static rt_err_t pufs_control(rt_device_t dev, int cmd, void *args)
         IOCTL_COPY_BACK(arg);
         break;
     }
-    case PUFS_KEY_INOUT: {
+    case PUFS_KEY_INOUT:
+    case PUFS_KEY_INOUT_STATUS: {
         IOCTL_COPY_IN(pufs_key_io_t, arg);
-        ret = key_io(&arg);
+        /* Match the int-sized command, as the switch does. */
+        ret = key_io(&arg, cmd == (int)PUFS_KEY_INOUT_STATUS);
         IOCTL_COPY_BACK(arg);
         break;
     }
@@ -1749,9 +2075,10 @@ static rt_err_t pufs_control(rt_device_t dev, int cmd, void *args)
         IOCTL_COPY_BACK(arg);
         break;
     }
-    case PUFS_ECC_PRK_GEN: {
+    case PUFS_ECC_PRK_GEN:
+    case PUFS_ECC_PRK_GEN_STATUS: {
         IOCTL_COPY_IN(pufs_ecc_prk_gen_t, arg);
-        ret = ecc_prk_gen(&arg);
+        ret = ecc_prk_gen(&arg, cmd == (int)PUFS_ECC_PRK_GEN_STATUS);
         IOCTL_COPY_BACK(arg);
         break;
     }
@@ -1787,43 +2114,64 @@ static rt_err_t pufs_control(rt_device_t dev, int cmd, void *args)
     }
     case PUFS_SM2_SIGN: {
         IOCTL_COPY_IN(pufs_sm2_sign_t, arg);
+        int lock_err = pufs_hw_lock();
+        if (lock_err != 0) return lock_err;
         ret = sm2_sign(&arg);
+        pufs_hw_unlock();
         IOCTL_COPY_BACK(arg);
         break;
     }
     case PUFS_SM2_VERIFY: {
         IOCTL_COPY_IN(pufs_sm2_verify_t, arg);
+        int lock_err = pufs_hw_lock();
+        if (lock_err != 0) return lock_err;
         ret = sm2_verify(&arg);
+        pufs_hw_unlock();
         IOCTL_COPY_BACK(arg);
         break;
     }
     case PUFS_SM2_ENC: {
         IOCTL_COPY_IN(pufs_sm2_enc_t, arg);
+        int lock_err = pufs_hw_lock();
+        if (lock_err != 0) return lock_err;
         ret = sm2_enc(&arg);
+        pufs_hw_unlock();
         IOCTL_COPY_BACK(arg);
         break;
     }
     case PUFS_SM2_DEC: {
         IOCTL_COPY_IN(pufs_sm2_dec_t, arg);
+        int lock_err = pufs_hw_lock();
+        if (lock_err != 0) return lock_err;
         ret = sm2_dec(&arg);
+        pufs_hw_unlock();
         IOCTL_COPY_BACK(arg);
         break;
     }
     case PUFS_SM2_KEX: {
         IOCTL_COPY_IN(pufs_sm2_kex_t, arg);
+        int lock_err = pufs_hw_lock();
+        if (lock_err != 0) return lock_err;
         ret = sm2_kex(&arg);
+        pufs_hw_unlock();
         IOCTL_COPY_BACK(arg);
         break;
     }
     case PUFS_RSA_SIGN: {
         IOCTL_COPY_IN(pufs_rsa_sign_t, arg);
+        int lock_err = pufs_hw_lock();
+        if (lock_err != 0) return lock_err;
         ret = rsa_sign(&arg);
+        pufs_hw_unlock();
         IOCTL_COPY_BACK(arg);
         break;
     }
     case PUFS_RSA_VERIFY: {
         IOCTL_COPY_IN(pufs_rsa_verify_t, arg);
+        int lock_err = pufs_hw_lock();
+        if (lock_err != 0) return lock_err;
         ret = rsa_verify(&arg);
+        pufs_hw_unlock();
         IOCTL_COPY_BACK(arg);
         break;
     }
@@ -1883,38 +2231,6 @@ static const struct rt_device_ops pufs_ops = {
 };
 
 /* ===================================================================
- * HW RNG device
- * =================================================================== */
-
-static rt_size_t hwrng_read(rt_device_t dev, rt_off_t pos, void *buffer, rt_size_t size)
-{
-    (void)dev; (void)pos;
-    rt_size_t len = size;
-
-    while (((uint64_t)buffer & 0x3) && len) {
-        *(uint8_t *)buffer = rt_regs->rn;
-        buffer = (uint8_t *)buffer + 1;
-        len--;
-    }
-    while (len >= 4) {
-        *(uint32_t *)buffer = rt_regs->rn;
-        buffer += 4;
-        len -= 4;
-    }
-    while (len) {
-        *(uint8_t *)buffer = rt_regs->rn;
-        buffer = (uint8_t *)buffer + 1;
-        len--;
-    }
-
-    return size;
-}
-
-static const struct rt_device_ops hwrng_ops = {
-    .read = hwrng_read,
-};
-
-/* ===================================================================
  * Device initialization
  * =================================================================== */
 
@@ -1945,9 +2261,11 @@ int pufs_device_init(void)
         goto unmap_base;
     }
 
-    /* Pre-allocate aligned DMA buffers for zero-bounce one-shot operations */
+    /* Pre-allocate shared ioctl staging buffers */
     pufs_dma_in = rt_malloc_align(PUFS_DMA_BUF_SIZE, 64);
-    pufs_dma_out = rt_malloc_align(PUFS_DMA_BUF_SIZE, 64);
+    /* CCM's final update also flushes up to one buffered block on top of a
+     * full PUFS_DMA_BUF_SIZE input. */
+    pufs_dma_out = rt_malloc_align(PUFS_DMA_BUF_SIZE + 64, 64);
     if (!pufs_dma_in || !pufs_dma_out) {
         LOG_E("failed to allocate DMA buffers\n");
         if (pufs_dma_in) rt_free_align(pufs_dma_in);
@@ -1955,13 +2273,6 @@ int pufs_device_init(void)
         pufs_dma_in = pufs_dma_out = NULL;
         ret = -RT_ENOMEM;
         goto detach_lock;
-    }
-
-    pufs_dev.dev.ops = &pufs_ops;
-    ret = rt_device_register(&pufs_dev.dev, "pufs", RT_DEVICE_FLAG_RDWR);
-    if (ret != RT_EOK) {
-        LOG_E("failed to register pufs device\n");
-        goto free_dma;
     }
 
     pufs_module_init((uintptr_t)pufs_dev.base, SECURITY_BASE_ADDR, SECURITY_IO_SIZE);
@@ -1981,13 +2292,28 @@ int pufs_device_init(void)
     pufs_drbg_module_init(SP90A_ADDR_OFFSET);
     pufs_rt_cde_init(CDE_ADDR_OFFSET);
 
-    hwrng_dev.ops = &hwrng_ops;
-    ret = rt_device_register(&hwrng_dev, "hwrng", RT_DEVICE_FLAG_RDWR);
-    if (ret != RT_EOK) {
-        /* PUFS remains usable when another random provider owns this name. */
-        LOG_W("failed to register hwrng device: %d\n", ret);
-        return RT_EOK;
+    /* Post-mask all OTP and CDE; the driver opens only what each access needs.
+     * The guard requires the PUFS mutex, even this early. */
+    ret = pufs_lock_and_recover();
+    if (ret != 0) {
+        LOG_E("OTP post-mask guard initialization failed: %s\n",
+              ret == -EBUSY ? "PUFS lock timeout" : "OTP re-mask failed");
+    } else {
+        if (pufs_otp_guard_init() != SUCCESS)
+            LOG_E("OTP post-mask guard initialization failed: OTP access denied\n");
+        pufs_hw_unlock();
     }
+
+    pufs_dev.dev.ops = &pufs_ops;
+    ret = rt_device_register(&pufs_dev.dev, "pufs", RT_DEVICE_FLAG_RDWR);
+    if (ret != RT_EOK) {
+        LOG_E("failed to register pufs device\n");
+        goto free_dma;
+    }
+    pufs_ready = true;
+
+    /* PUFS remains usable when another random provider owns "hwrng". */
+    (void)pufs_hwrng_init();
 
     return RT_EOK;
 

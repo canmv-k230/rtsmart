@@ -44,6 +44,9 @@ extern "C" {
 extern struct pufs_ka_regs  *ka_regs;
 extern struct pufs_kwp_regs *kwp_regs;
 
+pufs_status_t pufs_wrapped_key_size(pufs_key_wrap_t keywrap, uint32_t keybits,
+                                  uint32_t *bytes);
+
 /*****************************************************************************
  * Internal functions
  ****************************************************************************/

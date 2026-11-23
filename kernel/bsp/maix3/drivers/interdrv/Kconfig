@@ -21,12 +21,6 @@ menu "InterDriver"
         default n
 
         if RT_USING_CIPHER
-            config RT_USING_AES
-                bool "Use HW AES accelerator"
-                default n
-            config RT_USING_HASH
-                bool "Use HW SHA256 accelerator"
-                default n
             menuconfig RT_USING_PUFS
                 bool "Use HW PUFS accelerator"
                 default n
@@ -35,7 +29,7 @@ menu "InterDriver"
                 if RT_USING_PUFS
                     config RT_USING_PUFS_FILE_HASH
                         bool "Enable calculate file hash with pufs"
-                        default n
+                        default y
                         depends on RT_USING_MSH
                         help
                             Enable the PUFS file-hash MSH commands for calculating a
@@ -73,6 +67,19 @@ menu "InterDriver"
 
                             User-accessible OTP range: 0x100-0x3FF (OTPKEY_8..31).
                             Addresses below 0x100 are reserved for system keys.
+
+                    config RT_PUFS_OTP_POSTMASK_GUARD_DISABLE
+                        bool "Disable the OTP post-mask guard"
+                        default n
+                        help
+                            By default the PUFS driver post-masks every RT OTP group
+                            (32 bytes) and CDE segment (128 bytes) at boot, and opens
+                            only the range a read, write, lock or OTP-key crypto
+                            operation needs, re-masking it afterwards. A stray or
+                            mistaken access then hits a masked (no-access) region
+                            instead of a fuse. The mask registers stay unlocked.
+
+                            Select this to leave OTP and CDE unmasked at runtime.
                 endif
         endif
 

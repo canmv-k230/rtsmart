@@ -3,6 +3,8 @@
  *
  * SPDX-License-Identifier: Apache-2.0
  */
+#include <rtthread.h>
+
 #include "usbh_core.h"
 #include "usbh_rtl8152.h"
 
@@ -2402,6 +2404,27 @@ static bool rtl8152_valid_mac(const uint8_t *mac)
     return any != 0 && !(mac[0] & 1);
 }
 
+/* Random bits for a generated MAC address. Read the system RNG device
+ * ("hwrng", the PUFS TRNG), which refuses reads before the RNG is ready or
+ * while its output is stuck, rather than the raw RNG register. */
+static uint32_t rtl8152_random(struct usbh_rtl8152 *tp)
+{
+    uint32_t value = 0;
+    rt_device_t dev = rt_device_find("hwrng");
+
+    if (dev && rt_device_open(dev, RT_DEVICE_OFLAG_RDONLY) == RT_EOK) {
+        rt_size_t got = rt_device_read(dev, 0, &value, sizeof(value));
+
+        rt_device_close(dev);
+        if (got == sizeof(value))
+            return value;
+    }
+    /* No usable RNG: still avoid one fixed address for every adapter. */
+    USB_LOG_WRN("hwrng unavailable, MAC address from tick and USB address\r\n");
+    return ((uint32_t)rt_tick_get() * 2654435761u) ^
+           (((uint32_t)tp->hport->dev_addr << 16) | ((uint32_t)tp->hport->port << 8));
+}
+
 static int rtl8152_read_mac(struct usbh_rtl8152 *tp, uint16_t reg, uint8_t *mac)
 {
     uint8_t addr[8] = { 0 };
@@ -2411,9 +2434,9 @@ static int rtl8152_read_mac(struct usbh_rtl8152 *tp, uint16_t reg, uint8_t *mac)
         return ret;
     if (!rtl8152_valid_mac(addr)) {
         /* As in Linux, retain a valid adapter address and generate one
-         * only as a fallback. Use the existing K230 TRNG with a locally
-         * administered unicast prefix, not Realtek's global OUI. */
-        uint32_t random = *(volatile uint32_t *)0x91213300;
+         * only as a fallback, with a locally administered unicast prefix,
+         * not Realtek's global OUI. */
+        uint32_t random = rtl8152_random(tp);
         addr[0] = 0x02;
         addr[1] = 0xe0;
         addr[2] = 0x4c;

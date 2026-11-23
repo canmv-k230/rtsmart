@@ -40,6 +40,7 @@ int bank_voltage_check_is_failed(void) { return g_bank_voltage_check_failed; }
 
 #include "drv_fpioa.h"
 #include "pufs_rt.h"
+#include "drv_pufs_internal.h"
 
 #define OTP_BOOT_CFG_ADDR            ((pufs_otp_addr_t)0x0018)
 #define OTP_BOOT_CFG_VALID_BIT       (1u << 0)
@@ -164,6 +165,7 @@ static int bank_voltage_check_init(void)
     int           required_msc[BANK_GROUP_COUNT];
     const char*   required_source[BANK_GROUP_COUNT];
     pufs_status_t status;
+    int           lock_ret;
 
     g_bank_voltage_check_failed = 0;
 
@@ -172,7 +174,21 @@ static int bank_voltage_check_init(void)
         required_source[index] = RT_NULL;
     }
 
+    /* A guarded OTP read opens and re-masks OTP, so serialize PUFS access.
+     * Like an OTP read error, a lock failure (including a PUFS driver that
+     * failed to initialize) skips this advisory check; without the boot
+     * configuration we cannot report a bank mismatch. */
+    lock_ret = pufs_drv_hw_lock();
+    if (lock_ret != 0) {
+        LOG_W("skip bank voltage check: %s reading otp boot cfg 0x%04x",
+              lock_ret == -RT_ENOSYS     ? "PUFS driver not initialized"
+              : lock_ret == -RT_ETIMEOUT ? "PUFS lock timeout"
+                                         : "OTP re-mask failure",
+              (unsigned int)OTP_BOOT_CFG_ADDR);
+        return 0;
+    }
     status = pufs_otp_read(word_bytes, sizeof(word_bytes), OTP_BOOT_CFG_ADDR);
+    pufs_drv_hw_unlock();
     if (status != SUCCESS) {
         LOG_W("read otp boot cfg 0x%04x failed (%d)", (unsigned int)OTP_BOOT_CFG_ADDR, status);
         return 0;

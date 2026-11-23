@@ -1006,7 +1006,7 @@ static rt_err_t supplicant_random(rt_uint8_t *data, rt_size_t length)
         rt_size_t count = rt_device_read(random, 0, data + received,
                                          length - received);
 
-        if (!count)
+        if (!count || count > length - received)
         {
             result = -RT_EIO;
             break;

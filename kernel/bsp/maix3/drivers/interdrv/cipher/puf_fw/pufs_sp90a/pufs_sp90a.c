@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "pufs_internal.h"
+#include "drv_pufs_internal.h"
 #include "pufs_sp38a_internal.h"
 #include "pufs_sp90a_internal.h"
 #include "pufs_rt_internal.h"
@@ -327,7 +328,9 @@ pufs_status_t pufs_drbg_instantiate(pufs_drbg_t mode,
         pufs_status_t check;
 
         if (pufs_drbg_is_testmode() == false) {
-            pufs_rand(intent, INT_ENTROPY_MAXLEN / 4);
+            intentlen = 0;
+            if (pufs_rng_fill(intent, INT_ENTROPY_MAXLEN) != 0)
+                return E_ERROR;
             intentlen = INT_ENTROPY_MAXLEN;
         }
         if ((check = bc_df(&dflen, algo, true, nonce,
@@ -369,7 +372,9 @@ pufs_status_t pufs_drbg_reseed(bool df, const uint8_t* adin, uint32_t adinlen)
         pufs_status_t check;
 
         if (pufs_drbg_is_testmode() == false) {
-            pufs_rand(intent, INT_ENTROPY_MAXLEN / 4);
+            intentlen = 0;
+            if (pufs_rng_fill(intent, INT_ENTROPY_MAXLEN) != 0)
+                return E_ERROR;
             intentlen = INT_ENTROPY_MAXLEN;
         }
         if ((check = bc_df(&dflen, algo, true,

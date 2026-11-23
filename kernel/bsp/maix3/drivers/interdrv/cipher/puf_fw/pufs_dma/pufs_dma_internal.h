@@ -127,16 +127,31 @@ void dma_read_output(uint8_t* addr, uint32_t len);
 #define dma_read_output(...)
 #endif /* DMADIRECT */
 
-int dma_write_rwcfg(const uint8_t *out, const uint8_t *in, uint32_t len);
+pufs_status_t dma_write_rwcfg(const uint8_t *out, const uint8_t *in, uint32_t len);
 pufs_status_t dma_write_sgcfg(pufs_dma_sg_desc_st *descs, uint32_t descs_len, pufs_dma_sg_desc_opts_st *opts);
 void dma_write_key_config_0(pufs_key_type_t keytype, pufs_algo_type_t algo, uint32_t size, uint32_t slot_index);
+uint32_t dma_key_slots(uint32_t cfg);
 void dma_write_cl_config_0(uint32_t value);
 void dma_write_config_0(bool rng_enable, bool sgdma_enable, bool no_cypt);
 void dma_write_data_block_config(bool head, bool tail, bool dn_intrpt, bool dn_pause, uint32_t offset);
 void dma_write_data_dsc_config(pufs_dma_sg_desc_opts_st *opts, pufs_dma_dsc_attr_st *attr, bool no_crypto);
-void dma_write_start(void);
+pufs_status_t dma_run(void);
+pufs_status_t dma_run_sg(uint32_t slots, bool *timed_out);
+
+/*
+ * key_cfg_0 encoding. Each field is masked to its width, so an out-of-range
+ * size or slot cannot spill into the key source bits and select a different
+ * key than the one validated (the guard opens slots decoded from this value).
+ */
+static inline uint32_t dma_key_cfg(pufs_key_type_t keytype, pufs_algo_type_t algo,
+    uint32_t size, uint32_t slot_index)
+{
+    return ((slot_index << DMA_KEY_CFG_0_KEY_IDX_BITS) & DMA_KEY_CFG_0_KEY_IDX_MASK) |
+           ((size << DMA_KEY_CFG_0_KEY_SIZE_BITS) & DMA_KEY_CFG_0_KEY_SIZE_MASK) |
+           (((uint32_t)algo << DMA_KEY_CFG_0_KEY_DST_BITS) & DMA_KEY_CFG_0_KEY_DST_MASK) |
+           ((uint32_t)keytype & DMA_KEY_CFG_0_KEY_SRC_MASK);
+}
 bool dma_check_busy_status(uint32_t *status);
-int dma_wait_done(void);
 
 pufs_dma_sg_internal_desc_st *dma_sg_new_read_ctx_descriptor(uintptr_t crypto_ctx);
 pufs_dma_sg_internal_desc_st *dma_sg_new_data_descriptor(void);

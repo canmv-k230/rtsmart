@@ -127,6 +127,20 @@ static bool hmac_check_sgdma_descriptors(uint32_t block_size, pufs_dma_sg_desc_s
  * @param[in] keybits   The key length in bits.
  * @return              SUCCESS on success, otherwise an error code.
  */
+/*
+ * The HMAC engine takes software keys of at most 512 bits: a larger key size
+ * makes the DMA fail (status 0x00601000 on k230-2), and capping the size used
+ * only the first 64 bytes. Keys of 65-128 bytes with SHA-384/512 (longer ones
+ * are hashed first) therefore cannot be computed, so refuse them.
+ */
+#define HMAC_SWKEY_MAXBITS 512
+
+static bool hmac_swkey_unsupported(const pufs_hmac_ctx* hmac_ctx)
+{
+    return hmac_ctx->op == HMAC_HMAC && hmac_ctx->keytype == SWKEY &&
+           hmac_ctx->keybits > HMAC_SWKEY_MAXBITS;
+}
+
 static pufs_status_t hmac_ctx_init(hmac_op op,
     pufs_hmac_ctx* hmac_ctx,
     pufs_hash_t hash,
@@ -198,6 +212,9 @@ static pufs_status_t hmac_ctx_init(hmac_op op,
         }
     }
 
+    if (op == HMAC_HMAC && keytype == SWKEY && keybits > HMAC_SWKEY_MAXBITS)
+        return E_UNSUPPORT;
+
     // initialize for hash
     hmac_ctx->buflen = 0;
     hmac_ctx->keybits = keybits;
@@ -249,6 +266,8 @@ static pufs_status_t ___hmac_ctx_update(pufs_hmac_ctx* hmac_ctx,
 
     if (last && (md == NULL))
         return E_INVALID;
+    if (hmac_swkey_unsupported(hmac_ctx))
+        return E_UNSUPPORT;
 
     if (dma_check_busy_status(NULL))
         return E_BUSY;
@@ -278,18 +297,10 @@ static pufs_status_t ___hmac_ctx_update(pufs_hmac_ctx* hmac_ctx,
     hmac_regs->cfg = val32;
     hmac_regs->plen = hmac_ctx->curlen;
 
-    dma_write_rwcfg(NULL, msg, msglen);
-    dma_write_start();
-    if (dma_wait_done()) {
-        LOG_ERROR("pufs dma wait timeout\n");
-        return E_ERROR;
-    }
-    dma_check_busy_status(&val32);
-
-    if (val32 != 0) {
-        LOG_ERROR("[ERROR] DMA status 0: 0x%08" PRIx32 "\n", val32);
-        return E_ERROR;
-    }
+    if ((check = dma_write_rwcfg(NULL, msg, msglen)) != SUCCESS)
+        return check;
+    if ((check = dma_run()) != SUCCESS)
+        return check;
 
     val32 = hmac_regs->status;
     if (val32 != 0) {
@@ -390,6 +401,8 @@ static pufs_status_t hmac_ctx_sg_append(hmac_op op,
 
     if (hmac_ctx->op != op)
         return E_UNAVAIL;
+    if (hmac_swkey_unsupported(hmac_ctx))
+        return E_UNSUPPORT;
 
     if (hmac_check_sgdma_descriptors(hmac_ctx->blocklen, descs, descs_len) != true)
         return E_INVALID;

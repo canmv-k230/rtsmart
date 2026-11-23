@@ -97,11 +97,24 @@ static void clear_ctx_buffer(pufs_sp38c_ctx* ctx)
     ctx->buflen = 0x0;
 }
 
+/*
+ * aadlen counts the declared AAD bytes still to come. In stage NONE buff can
+ * only hold a partly built B1 block. Text or final before all declared AAD is
+ * in would process AAD bytes as text or authenticate the wrong AAD, so both
+ * are refused.
+ */
+static bool ccm_aad_incomplete(const pufs_sp38c_ctx* ctx)
+{
+    return ctx->aadlen > 0 || (ctx->stage == SP38C_NONE && ctx->buflen > 0);
+}
+
 /**
  * @brief setup key configuration.
  */
-static void sp38c_setup_key(pufs_sp38c_ctx* ctx)
+static pufs_status_t sp38c_setup_key(pufs_sp38c_ctx* ctx)
 {
+    if (dma_check_busy_status(NULL))
+        return E_BUSY;
     if (ctx->keytype == SWKEY)
         crypto_write_sw_key(ctx->key, SW_KEY_MAXLEN);
 
@@ -109,6 +122,7 @@ static void sp38c_setup_key(pufs_sp38c_ctx* ctx)
         ALGO_TYPE_CCM,
         ctx->keybits,
         get_key_slot_idx(ctx->keytype, ctx->keyslot));
+    return SUCCESS;
 }
 
 static pufs_status_t _sp38c_ctx_update(pufs_sp38c_ctx* ctx,
@@ -148,18 +162,10 @@ static pufs_status_t _sp38c_ctx_update(pufs_sp38c_ctx* ctx,
 
     sp38c_regs->cfg = val32;
 
-    dma_write_rwcfg(cbcmac ? NULL : out, in, inlen);
-    dma_write_start();
-    if (dma_wait_done()) {
-        LOG_ERROR("pufs dma wait timeout\n");
-        return E_ERROR;
-    }
-    dma_check_busy_status(&val32);
-
-    if (val32 != 0) {
-        LOG_ERROR("DMA status 0: 0x%08" PRIx32 "\n", val32);
-        return E_ERROR;
-    }
+    if ((check = dma_write_rwcfg(cbcmac ? NULL : out, in, inlen)) != SUCCESS)
+        return check;
+    if ((check = dma_run()) != SUCCESS)
+        return check;
 
     val32 = sp38c_regs->status;
     if ((val32 & SP38C_STATUS_RESP_MASK) != 0) {
@@ -304,8 +310,9 @@ static pufs_status_t initialize_cbcmac(pufs_sp38c_ctx* ctx,
         return E_FIRMWARE;
 
     rvv_memset(ctx->cbcmac, 0x0, BC_BLOCK_SIZE);
-    if (sp38c_ctx_update(ctx, ctx->cbcmac, NULL, ctx->buff, BC_BLOCK_SIZE, false, ctx->cbcmac) != SUCCESS)
-        return E_FIRMWARE;
+    pufs_status_t status = sp38c_ctx_update(ctx, ctx->cbcmac, NULL, ctx->buff, BC_BLOCK_SIZE, false, ctx->cbcmac);
+    if (status != SUCCESS)
+        return status;
 
     clear_ctx_buffer(ctx);
     return SUCCESS;
@@ -383,7 +390,8 @@ static pufs_status_t sp38c_ctx_init(pufs_sp38c_ctx* ctx,
     else
         ctx->keyslot = (uint32_t)keyaddr;
 
-    sp38c_setup_key(ctx);
+    if (sp38c_setup_key(ctx) != SUCCESS)
+        return E_BUSY;
     if ((ret = initialize_cbcmac(ctx, nonce, noncelen)) != SUCCESS)
         return ret;
 
@@ -635,6 +643,10 @@ static pufs_status_t pufs_ccm_aad_update(pufs_sp38c_ctx* ctx,
     size_t len = 0;
     uint32_t offset = 0, blocks = 0;
 
+    // More AAD than declared (including any AAD when none was declared).
+    if (inlen > ctx->aadlen)
+        return E_INVALID;
+
     switch (ctx->stage) {
     case SP38C_NONE:
         // Do nothing if there is no aad data.
@@ -658,8 +670,12 @@ static pufs_status_t pufs_ccm_aad_update(pufs_sp38c_ctx* ctx,
     case SP38C_AAD:
         if (ctx->buflen > 0) {
             offset = fill_incomplete_block(ctx, in, inlen);
-            if (ctx->buflen == BC_BLOCK_SIZE && (status = sp38c_ctx_update(ctx, ctx->cbcmac, NULL, ctx->buff, BC_BLOCK_SIZE, false, ctx->cbcmac)) != SUCCESS)
-                return status;
+            ctx->aadlen -= offset;
+            if (ctx->buflen == BC_BLOCK_SIZE) {
+                if ((status = sp38c_ctx_update(ctx, ctx->cbcmac, NULL, ctx->buff, BC_BLOCK_SIZE, false, ctx->cbcmac)) != SUCCESS)
+                    return status;
+                clear_ctx_buffer(ctx);
+            }
         }
         break;
     case SP38C_TEXT:
@@ -674,6 +690,7 @@ static pufs_status_t pufs_ccm_aad_update(pufs_sp38c_ctx* ctx,
         return SUCCESS;
     }
 
+    ctx->aadlen -= len;
     blocks = cut_blocks(ctx, in + offset, len);
     if (blocks) {
         if ((status = sp38c_ctx_update(ctx, ctx->cbcmac, NULL, in + offset, blocks * BC_BLOCK_SIZE, false, ctx->cbcmac)) != SUCCESS)
@@ -711,8 +728,13 @@ static pufs_status_t pufs_ccm_text_update(pufs_sp38c_ctx* ctx,
 
     switch (ctx->stage) {
     case SP38C_NONE:
+        // The AAD declared at init has not all been supplied.
+        if (ccm_aad_incomplete(ctx))
+            return E_INVALID;
         break;
     case SP38C_AAD:
+        if (ccm_aad_incomplete(ctx))
+            return E_INVALID;
         // update the last block of aad when stage is changed from AAD to TEXT.
         if (ctx->buflen > 0 && (status = pufs_ccm_aad_final(ctx)) != SUCCESS)
             return status;
@@ -743,20 +765,16 @@ static pufs_status_t pufs_ccm_text_update(pufs_sp38c_ctx* ctx,
     }
 
     len = inlen - offset;
-    if (len <= 0) {
-        ctx->stage = SP38C_TEXT;
-        return SUCCESS;
-    }
-
-    blocks = cut_blocks(ctx, in + offset, len);
+    if (len)
+        blocks = cut_blocks(ctx, in + offset, len);
 
     if (blocks) {
         bool last = (ctx->buflen == 0) ? true : false;
-        out = previous_updated ? out + BC_BLOCK_SIZE : out;
-        if ((status = sp38c_ctx_update(ctx, NULL, ctx->ctri, in + offset, blocks * BC_BLOCK_SIZE, last, out)) != SUCCESS)
+        uint8_t *block_out = previous_updated ? out + BC_BLOCK_SIZE : out;
+        if ((status = sp38c_ctx_update(ctx, NULL, ctx->ctri, in + offset, blocks * BC_BLOCK_SIZE, last, block_out)) != SUCCESS)
             return status;
 
-        uint8_t* cbcmac_src = ctx->encrypt ? (uint8_t*)in + offset : out + offset;
+        uint8_t* cbcmac_src = ctx->encrypt ? (uint8_t*)in + offset : block_out;
         if ((status = sp38c_ctx_update(ctx, ctx->cbcmac, NULL, cbcmac_src, blocks * BC_BLOCK_SIZE, last, ctx->cbcmac)) != SUCCESS)
             return status;
 
@@ -800,7 +818,15 @@ static pufs_status_t pufs_ccm_text_final(pufs_sp38c_ctx* ctx,
     uint32_t* outlen)
 {
     pufs_status_t status;
+    if (ctx->stage != SP38C_TEXT && ccm_aad_incomplete(ctx))
+        return E_INVALID;
+    if (ctx->stage == SP38C_AAD) {
+        *outlen = 0;
+        return pufs_ccm_aad_final(ctx);
+    }
     if (ctx->buflen > 0) {
+        if (out == NULL)
+            return E_INVALID;
         if ((status = sp38c_ctx_update(ctx, NULL, ctx->ctri, ctx->buff, ctx->buflen, true, out)) != SUCCESS)
             return status;
 
@@ -862,20 +888,14 @@ static pufs_status_t pufs_ccm_tag(pufs_sp38c_ctx* ctx,
     sp38c_regs->block_num = 0;
 
     // dma_print();
-    dma_write_rwcfg(NULL, NULL, 0);
+    if ((check = dma_write_rwcfg(NULL, NULL, 0)) != SUCCESS)
+        return check;
     dma_write_data_block_config(true, true, true, true, 0);
     dma_write_config_0(false, false, false);
     // dma_print();
 
-    dma_write_start();
-
-    while (dma_check_busy_status(&val32))
-        ;
-
-    if (val32 != 0) {
-        LOG_ERROR("DMA status 0: 0x%08" PRIx32 "\n", val32);
-        return E_ERROR;
-    }
+    if ((check = dma_run()) != SUCCESS)
+        return check;
 
     val32 = sp38c_regs->status;
 
@@ -894,12 +914,12 @@ static pufs_status_t pufs_ccm_tag(pufs_sp38c_ctx* ctx,
     return SUCCESS;
 }
 
-static void sp38c_release_phybuf(pufs_sp38c_ctx* ctx)
+static void sp38c_release_phybuf(pufs_sp38c_ctx* ctx, bool writeback)
 {
     sp38c_phybuf_record_st *cur = ctx->phybuf_list, *tmp;
 
     while (cur != NULL) {
-        if (cur->writeback_addr != 0) {
+        if (writeback && cur->writeback_addr != 0) {
             rvv_memcpy((void*)DMA_RBUF_VIRT_ADDR(cur->writeback_addr), (void*)VIRT_ADDR(cur->buf_addr),
                 cur->size);
         }
@@ -922,12 +942,13 @@ static pufs_status_t sp38c_ctx_sg_done(pufs_sp38c_ctx* ctx, uint8_t* tag)
 {
     pufs_status_t check;
 
-    sp38c_release_phybuf(ctx);
+    if ((check = sp38c_setup_key(ctx)) != SUCCESS)
+        return check;
+    sp38c_release_phybuf(ctx, true);
 
     crypto_io_read_dgest(ctx->crypto_io_ctx, ctx->cbcmac, BC_BLOCK_SIZE);
     crypto_write_dgst(ctx->cbcmac, BC_BLOCK_SIZE);
 
-    sp38c_setup_key(ctx);
     check = pufs_ccm_tag(ctx, tag, true);
 
     crypto_free_crypto_io_ctx(ctx->crypto_io_ctx);
@@ -969,6 +990,9 @@ pufs_sp38c_ctx* pufs_sp38c_ctx_new(void)
 void pufs_sp38c_ctx_free(pufs_sp38c_ctx* ctx)
 {
     if (ctx != NULL) {
+        sp38c_release_phybuf(ctx, false);
+        if (ctx->crypto_io_ctx != NULL)
+            crypto_free_crypto_io_ctx(ctx->crypto_io_ctx);
         rvv_memset(ctx, 0, sizeof(pufs_sp38c_ctx));
         ctx->op = SP38C_AVAILABLE;
     }
@@ -1009,7 +1033,8 @@ pufs_status_t pufs_enc_ccm_update(pufs_sp38c_ctx* sp38c_ctx,
     const uint8_t* in,
     uint32_t inlen)
 {
-    sp38c_setup_key(sp38c_ctx);
+    if (sp38c_setup_key(sp38c_ctx) != SUCCESS)
+        return E_BUSY;
 
     if (out == NULL)
         return pufs_ccm_aad_update(sp38c_ctx, in, inlen);
@@ -1038,7 +1063,8 @@ static pufs_status_t ccm_enc_final(pufs_sp38c_ctx* ctx,
     bool from_reg)
 {
     pufs_status_t status;
-    sp38c_setup_key(ctx);
+    if (sp38c_setup_key(ctx) != SUCCESS)
+        return E_BUSY;
 
     if ((status = pufs_ccm_text_final(ctx, out, outlen)) != SUCCESS)
         goto release;
@@ -1133,7 +1159,8 @@ pufs_status_t pufs_dec_ccm_update(pufs_sp38c_ctx* sp38c_ctx,
     const uint8_t* in,
     uint32_t inlen)
 {
-    sp38c_setup_key(sp38c_ctx);
+    if (sp38c_setup_key(sp38c_ctx) != SUCCESS)
+        return E_BUSY;
 
     if (out == NULL)
         return pufs_ccm_aad_update(sp38c_ctx, in, inlen);
@@ -1172,7 +1199,8 @@ pufs_status_t pufs_dec_ccm_final_tag(pufs_sp38c_ctx* sp38c_ctx,
 {
     pufs_status_t status;
 
-    sp38c_setup_key(sp38c_ctx);
+    if (sp38c_setup_key(sp38c_ctx) != SUCCESS)
+        return E_BUSY;
     if ((status = pufs_ccm_text_final(sp38c_ctx, out, outlen)) != SUCCESS)
         goto release;
 

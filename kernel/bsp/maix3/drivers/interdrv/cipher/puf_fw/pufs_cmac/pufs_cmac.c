@@ -181,18 +181,10 @@ static pufs_status_t ___cmac_ctx_update(pufs_cmac_ctx* cmac_ctx,
 
     cmac_regs->cfg = val32;
 
-    dma_write_rwcfg(NULL, msg, msglen);
-    dma_write_start();
-    if (dma_wait_done()) {
-        LOG_ERROR("pufs dma wait timeout\n");
-        return E_ERROR;
-    }
-    dma_check_busy_status(&val32);
-
-    if (val32 != 0) {
-        LOG_ERROR("DMA status 0: 0x%08" PRIx32 "\n", val32);
-        return E_ERROR;
-    }
+    if ((check = dma_write_rwcfg(NULL, msg, msglen)) != SUCCESS)
+        return check;
+    if ((check = dma_run()) != SUCCESS)
+        return check;
 
     val32 = cmac_regs->status;
 

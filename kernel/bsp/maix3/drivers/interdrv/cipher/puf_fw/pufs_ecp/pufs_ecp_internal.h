@@ -63,6 +63,9 @@ typedef enum {
  * Internal Functions
  ****************************************************************************/
 
+/* Check for idle and wipe deferred RSA private operands; hold the PUFS lock. */
+bool pufs_ecp_is_idle(void);
+
 /**
  * @brief   Set SM2 curve domain parameters.
  * @return  SUCCESS on success, otherwise an error code.

@@ -168,6 +168,23 @@ typedef struct {
  * @brief OTP addressing type.
  */
 typedef uint16_t pufs_otp_addr_t;
+/**
+ * @brief Post-mask state (see the post-mask guard in pufs_rt.c).
+ *
+ * Two bits per RT OTP group (32 bytes) in otp_psmsk[0..1] and per CDE segment
+ * (128 bytes) in cde_psmsk[0..1]; 0b00 = accessible, otherwise masked.
+ * puf_psmsk bits 31:24 lock all of these registers until reset.
+ */
+typedef struct {
+    bool guard_active;
+    bool guard_failed;
+    bool guard_locked;      /* registers locked: the hardware masks decide */
+    uint32_t policy_otp[2]; /* masks the guard never opens (set before boot */
+    uint32_t policy_cde[2]; /* or by pufs_post_mask()/rt_cde_write_mask())  */
+    uint32_t otp_psmsk[2];
+    uint32_t cde_psmsk[2];
+    uint32_t puf_psmsk;
+} pufs_otp_postmask_st;
 
 /*****************************************************************************
  * API functions
@@ -277,6 +294,13 @@ pufs_status_t pufs_zeroize(pufs_rt_slot_t slot);
  *       of the PUF slots/OTP key slots. For example, if PUFSLOT_1 and OTPKEY_2
  *       is designed to be masked, the input is \n
  *        MASK_BIT(PUFSLOT_1) | MASK_BIT(OTPKEY_2)
+ * @note This also locks every post-mask register until reset. The post-mask
+ *       guard (the default, see RT_PUFS_OTP_POSTMASK_GUARD_DISABLE) first drops
+ *       its own masks, so afterwards exactly the requested slots and earlier
+ *       policy masks stay masked (CDE: rt_cde_write_mask()). Everything else
+ *       is left unmasked and the guard can no longer re-mask it until reset.
+ *       Pass every OTPKEY bit to keep all of RT OTP masked.
+ * @note The caller must hold the PUFS lock.
  */
 pufs_status_t pufs_post_mask(uint64_t maskslots);
 /**
@@ -298,6 +322,8 @@ pufs_otp_lock_t pufs_get_otp_rwlck(pufs_otp_addr_t addr);
  * @brief Unified OTP read (flat 0-4095 address space)
  *
  * Dispatches to RT (0x000-0x3FF) or CDE (0x400-0xFFF).
+ * RT word bytes are returned most-significant first; CDE word bytes are
+ * returned least-significant first. A read cannot cross the RT/CDE boundary.
  *
  * @param[out] outbuf  OTP data.
  * @param[in]  len     The length of data in bytes.
@@ -309,7 +335,10 @@ pufs_status_t pufs_otp_read(uint8_t* outbuf, uint32_t len, pufs_otp_addr_t addr)
  * @brief Unified OTP write (flat 0-4095 address space)
  *
  * Dispatches to RT (0x000-0x3FF) or CDE (0x400-0xFFF).
- * BROM patch area (0x400-0xAFF) is write-protected.
+ * BROM patch area (0x400-0xBFF) is write-protected. A write cannot cross the
+ * RT/CDE boundary. Data uses the same byte order as pufs_otp_read(), and
+ * bytes past len in the final word are left unchanged.
+ * With RT_PUFS_OTP_WRITE_ENABLE disabled, success only means validation passed.
  *
  * @param[in] inbuf  The data to be written.
  * @param[in] len    The length of data in bytes.
@@ -319,12 +348,31 @@ pufs_status_t pufs_otp_read(uint8_t* outbuf, uint32_t len, pufs_otp_addr_t addr)
 pufs_status_t pufs_otp_write(const uint8_t* inbuf, uint32_t len,
                              pufs_otp_addr_t addr);
 /**
+ * @brief Unified OTP lock query (flat 0-4095 address space)
+ *
+ * RT addresses must be word aligned; a CDE address reports the lock of its
+ * 128-byte segment.
+ *
+ * @param[in]  addr  The address (0-4095).
+ * @param[out] lock  The lock state on SUCCESS (N_OTP_LOCK_T if the field
+ *                   holds an unrecognized encoding); N_OTP_LOCK_T on error.
+ * @return SUCCESS, E_OVERFLOW, E_ALIGN, or E_BUSY if a program is in flight.
+ */
+pufs_status_t pufs_otp_query_lock(pufs_otp_addr_t addr, pufs_otp_lock_t *lock);
+/**
  * @brief Unified OTP lock get (flat 0-4095 address space)
  *
+ * Compatibility wrapper for pufs_otp_query_lock(): any error, including a
+ * busy controller, reads as N_OTP_LOCK_T. Prefer pufs_otp_query_lock().
+ *
  * @param[in] addr  The address (0-4095).
- * @return          The lock state.
+ * @return          The lock state, or N_OTP_LOCK_T.
  */
 pufs_otp_lock_t pufs_otp_get_lock(pufs_otp_addr_t addr);
+/**
+ * @brief Read the post-mask registers and whether the guard is active.
+ */
+void pufs_otp_get_postmask(pufs_otp_postmask_st *st);
 /**
  * @brief Unified OTP lock set (flat 0-4095 address space)
  *

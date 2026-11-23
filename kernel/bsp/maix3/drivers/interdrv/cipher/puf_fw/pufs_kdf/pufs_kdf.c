@@ -275,7 +275,8 @@ static pufs_status_t pufs_kdf_cfg_dma(pufs_key_type_t keytype,
     dma_write_data_block_config(true, true, true, true, 0);
     minfo = NULL;
     if (cutlen == 0) {
-        dma_write_rwcfg(out, info, infolen);
+        if ((check = dma_write_rwcfg(out, info, infolen)) != SUCCESS)
+            return check;
     } else {
         uint32_t minfolen = infolen + ctrlen;
         if (minfolen > MINFOLEN)
@@ -287,7 +288,11 @@ static pufs_status_t pufs_kdf_cfg_dma(pufs_key_type_t keytype,
         rvv_memcpy(minfo, info, cutlen);
         rvv_memset(minfo + cutlen, 0, ctrlen);
         rvv_memcpy(minfo + cutlen + ctrlen, info + cutlen, infolen - cutlen);
-        dma_write_rwcfg(out, minfo, minfolen);
+        if ((check = dma_write_rwcfg(out, minfo, minfolen)) != SUCCESS) {
+            free(minfo);
+            minfo = NULL;
+            return check;
+        }
     }
 
     // DMA key
@@ -327,22 +332,13 @@ static pufs_status_t pufs_kdf_start(uint32_t cfg, uint32_t cnt, uint32_t outbits
         }
     }
 
-    dma_write_start();
-    val32 = dma_wait_done();
+    pufs_status_t check = dma_run();
     if (minfo != NULL) {
         free(minfo);
         minfo = NULL;
     }
-    if (val32) {
-        LOG_ERROR("pufs dma wait timeout\n");
-        return E_ERROR;
-    }
-    dma_check_busy_status(&val32);
-
-    if (val32 != 0) {
-        LOG_ERROR("DMA status 0: 0x%08" PRIx32 "\n", val32);
-        return E_ERROR;
-    }
+    if (check != SUCCESS)
+        return check;
 
     val32 = kdf_regs->status;
     if (val32 != 0) {
