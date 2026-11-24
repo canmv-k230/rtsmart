@@ -22,6 +22,7 @@
  * NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+#include <errno.h>
 #include <rtthread.h>
 
 #include <ioremap.h>
@@ -46,15 +47,15 @@
 #endif
 
 /* Linked from the MPP kernel module. Hand-written mirrors of mpp
- * kernel/ext_inc/gsdma_ext.h and mmz_ext.h: keep the signatures in sync.
- * mmz_ext_phys_range_put(NULL) is a no-op. */
+ * kernel/ext_inc/gsdma_ext.h and vb_ext.h: keep the signatures in sync.
+ * vb_dma_buf_put(NULL) is a no-op. */
 extern int  gsdma_sdma_reserve_channel(uint8_t ch_num);
 extern int  gsdma_sdma_abort_channel(uint8_t ch_num);
 extern void gsdma_sdma_release_channel(uint8_t ch_num);
 extern int  gsdma_sdma_ch_submit(uint8_t ch_num, uint32_t ch_cfg_value, uint32_t llt_phys_addr,
                                  void (*callback)(void* arg), void* arg);
-extern void* mmz_ext_phys_range_get(uint64_t phys_addr, uint64_t size);
-extern void  mmz_ext_phys_range_put(void* handle);
+extern void* vb_dma_buf_get(uint64_t phys_addr, uint64_t len);
+extern void  vb_dma_buf_put(void* buf);
 
 /* ---- Hardware constants ---- */
 #define UGZIP_BASE 0x80808000UL
@@ -280,23 +281,25 @@ static int gzip_decomp_release_resources(struct gzip_decomp_dev* dev)
         return -RT_EBUSY;
     }
 
-    if (dev->held.wr_reserved)
-        gsdma_sdma_release_channel(ZIP_WR_CH);
+    /* Read channel first: its dec_en keeps both channels in handshake mode,
+     * and releasing a channel may start a queued SDMA transfer on it. */
     if (dev->held.rd_reserved)
         gsdma_sdma_release_channel(ZIP_RD_CH);
+    if (dev->held.wr_reserved)
+        gsdma_sdma_release_channel(ZIP_WR_CH);
     dev->held.rd_reserved = dev->held.wr_reserved = 0;
     if (dev->held.wr_llt)
         rt_free_align(dev->held.wr_llt);
     if (dev->held.rd_llt)
         rt_free_align(dev->held.rd_llt);
     dev->held.rd_llt = dev->held.wr_llt = RT_NULL;
-    mmz_ext_phys_range_put(dev->held.dst_pin);
-    mmz_ext_phys_range_put(dev->held.src_pin);
+    vb_dma_buf_put(dev->held.dst_pin);
+    vb_dma_buf_put(dev->held.src_pin);
     dev->held.src_pin = dev->held.dst_pin = RT_NULL;
     if (dev->held.pm_held) {
         int ret = k230_pm_put(K230_PM_DEV_GZIP);
         if (ret != 0)
-            return ret;
+            return k230_pm_rt_errno(ret); /* PM codes overlap RT-Thread's */
         dev->held.pm_held = 0;
     }
     return RT_EOK;
@@ -420,9 +423,9 @@ out:
 
 /*
  * The reserved channels take raw descriptors that GSDMA cannot check, so the
- * same rule as for every other SDMA transfer is applied here: both buffers
- * come from user space as physical addresses and must lie in one allocated
- * MMZ buffer each, padded to the whole 128KB nodes the DMA reads and writes.
+ * user buffer rule is applied here: both physical ranges must lie in an
+ * in-use VB block or a user-allocated MMZ buffer, padded to the whole 128KB
+ * nodes the DMA reads and writes.
  * They stay pinned until both channels stop, including a failed STOP; the
  * kernel also reads the source header, so pin before validating it.
  */
@@ -443,11 +446,11 @@ static int gzip_decomp_do_gunzip(struct gzip_decomp_dev* dev, uint64_t src_phys,
     if (ret != RT_EOK)
         goto out;
 
-    src_pin = mmz_ext_phys_range_get(src_phys, src_span);
-    dst_pin = src_pin ? mmz_ext_phys_range_get(dst_phys, dst_span) : RT_NULL;
+    src_pin = vb_dma_buf_get(src_phys, src_span);
+    dst_pin = src_pin ? vb_dma_buf_get(dst_phys, dst_span) : RT_NULL;
     if (!dst_pin) {
-        mmz_ext_phys_range_put(src_pin);
-        LOG_E("buffers not in MMZ: src=0x%lx+%lu dst=0x%lx+%lu", (unsigned long)src_phys, (unsigned long)src_span,
+        vb_dma_buf_put(src_pin);
+        LOG_E("invalid user buffers: src=0x%lx+%lu dst=0x%lx+%lu", (unsigned long)src_phys, (unsigned long)src_span,
               (unsigned long)dst_phys, (unsigned long)dst_span);
         ret = -RT_EINVAL;
         goto out;
@@ -462,6 +465,27 @@ out:
     return ret;
 }
 
+/* The ioctl result becomes the caller's errno, so it must be POSIX. The
+ * driver works in RT-Thread codes, which mean other things as errno values:
+ * -RT_EBUSY is 7, E2BIG. */
+static int gzip_decomp_posix_errno(int ret)
+{
+    switch (ret) {
+    case RT_EOK:
+        return 0;
+    case -RT_EBUSY:
+        return -EBUSY;
+    case -RT_EINVAL:
+        return -EINVAL;
+    case -RT_ENOMEM:
+        return -ENOMEM;
+    case -RT_ETIMEOUT:
+        return -ETIMEDOUT;
+    default:
+        return -EIO;
+    }
+}
+
 static rt_err_t gzip_decomp_control(rt_device_t dev, int cmd, void* args)
 {
     struct gzip_decomp_dev*    ddev = rt_container_of(dev, struct gzip_decomp_dev, dev);
@@ -472,16 +496,14 @@ static rt_err_t gzip_decomp_control(rt_device_t dev, int cmd, void* args)
     case RT_GZIP_DECOMP_GUNZIP:
         if (lwp_get_from_user_ex(&user_args, args, sizeof(user_args)) != 0) {
             LOG_E("Failed to copy args from user");
-            return -RT_ERROR;
+            return -EFAULT;
         }
         ret = gzip_decomp_do_gunzip(ddev, user_args.src_phys, user_args.src_len, user_args.dst_phys, user_args.dst_len,
                                     user_args.timeout_ms);
-        break;
+        return gzip_decomp_posix_errno(ret);
     default:
-        ret = -RT_EINVAL;
-        break;
+        return -ENOTTY;
     }
-    return ret;
 }
 
 static rt_err_t gzip_decomp_open(rt_device_t dev, rt_uint16_t oflag) { return RT_EOK; }

@@ -67,17 +67,11 @@ static int uvc_usb_to_errno(int ret)
 #define MAX_UVC_BUFFER (32)
 
 #if VB_VERSION
-extern k_s32 vb_create_pool(k_u32 *pool_id, k_u32 blk_cnt, k_u64 blk_size,
-                            const char *mmz_name, const char *buf_name,
-                            k_vb_remap_mode vb_remap_mode);
-extern k_s32 vb_destroy_pool(k_u32 pool_id);
-extern k_vb_blk_handle vb_get_blk_by_size_and_pool_id(k_u32 pool_id, k_u64 blk_size, k_u32 uid);
-extern k_s32 vb_put_blk(k_u32 pool_id, k_u64 phys_addr);
-extern k_u64 vb_blk_handle_to_phys(k_vb_blk_handle handle);
-extern k_u32 vb_blk_handle_to_pool_id(k_vb_blk_handle handle);
-extern void *vb_blk_handle_to_kern(k_vb_blk_handle handle);
-extern k_s32 vb_user_sub(k_u32 pool_id, k_u64 phys_addr, k_u32 uid);
-extern k_s32 vb_inquire_user_cnt(k_vb_blk_handle handle);
+#include "k_vb_kernel.h"
+
+/* The driver's references on the blocks of its pool, one per buffer, from
+ * REQBUFS until the buffers are released. */
+static vb_holder uvc_vb;
 #endif
 
 struct uvc_buffer {
@@ -572,20 +566,30 @@ static void uvc_release_buffers(void)
 #if VB_VERSION
     for (int i = 0; i < MAX_UVC_BUFFER + 1; i++) {
         if (uvc_queue.buffer[i].handle != VB_INVALID_HANDLE) {
-            int ret = vb_user_sub(uvc_queue.buffer[i].pool_id,
-                                  uvc_queue.buffer[i].blk_phys_addr,
-                                  VB_UID_V_VI);
+            int ret = vb_ref_put(&uvc_vb, uvc_queue.buffer[i].pool_id,
+                                 uvc_queue.buffer[i].blk_phys_addr);
             if (ret != K_SUCCESS) {
                 USB_LOG_ERR("put blk[%d] fail\n", i);
             }
             uvc_queue.buffer[i].handle = VB_INVALID_HANDLE;
         }
     }
+    /* Each buffer had one; a reference left over is a bookkeeping bug. */
+    if (vb_holder_refs(&uvc_vb) != 0) {
+        USB_LOG_ERR("%u uvc block references left\n", vb_holder_release_all(&uvc_vb));
+    }
 
+    /*
+     * Another module may still hold a block: VDEC keeps a VB_UID_VDEC
+     * reference on a stream block until the MVX firmware returns the input
+     * buffer. VB frees the pool when that block comes back; the id is VB's
+     * from here on and may name a new pool, so it is cleared below.
+     */
     if (uvc_queue.buffer[0].pool_id != VB_INVALID_POOLID) {
-        if (vb_destroy_pool(uvc_queue.buffer[0].pool_id) != 0) {
-            USB_LOG_ERR("fail to destroyed pool %d: %s %d\n",
-                        uvc_queue.buffer[0].pool_id, __func__, __LINE__);
+        k_s32 ret = vb_pool_put(uvc_queue.buffer[0].pool_id);
+
+        if (ret != K_SUCCESS) {
+            USB_LOG_ERR("give up uvc pool %u fail: 0x%x\n", uvc_queue.buffer[0].pool_id, ret);
         }
     }
 #else
@@ -1260,6 +1264,11 @@ static struct rt_mutex io_mutex;
 
 int uvc_iomutex_init(void)
 {
+#if VB_VERSION
+    /* The frames captured and handed out: one pool at most. */
+    if (vb_holder_init(&uvc_vb, VB_UID_V_VI, "uvc host", MAX_UVC_BUFFER + 1) != K_SUCCESS)
+        USB_LOG_ERR("uvc host: could not initialize VB holder\n");
+#endif
     return rt_mutex_init(&io_mutex, "io_mutex", RT_IPC_FLAG_PRIO);
 }
 
@@ -1967,6 +1976,10 @@ static rt_err_t uvc_control(rt_device_t dev, int cmd, void *args)
         k_u32 pool_id;
         int alloc_size = buffer_size + VDEC_ALIGN_SIZE;
 
+        if (!uvc_vb.capacity) {
+            ret = -ENODEV;
+            goto out;
+        }
         USB_LOG_DBG("alloc_size = 0x%x\n", alloc_size);
         if (vb_create_pool(&pool_id, request->count + 1, alloc_size,
                            RT_NULL, "uvc", VB_REMAP_MODE_CACHED) != 0) {
@@ -1998,23 +2011,22 @@ static rt_err_t uvc_control(rt_device_t dev, int cmd, void *args)
             rt_wqueue_init(&uvc_queue.buffer[i].wait_queue);
 
 #if VB_VERSION
-            uvc_queue.buffer[i].handle =
-                vb_get_blk_by_size_and_pool_id(pool_id, alloc_size, VB_UID_V_VI);
-            if (uvc_queue.buffer[i].handle == VB_INVALID_HANDLE) {
+            vb_ref_t ref;
+
+            if (vb_holder_get_blk(&uvc_vb, pool_id, alloc_size, &ref) != K_SUCCESS) {
                 USB_LOG_ERR("Can't get buffer from pool: %s %d\n", __func__, __LINE__);
                 ret = -ENOMEM;
                 goto release;
             }
-            uvc_queue.buffer[i].blk_phys_addr =
-                vb_blk_handle_to_phys(uvc_queue.buffer[i].handle);
+            uvc_queue.buffer[i].handle = ref.handle;
+            uvc_queue.buffer[i].blk_phys_addr = ref.phys_addr;
             uvc_queue.buffer[i].blk_virt_addr =
                 vb_blk_handle_to_kern(uvc_queue.buffer[i].handle);
             uvc_queue.buffer[i].phys_addr =
                 ALIGN_UP(uvc_queue.buffer[i].blk_phys_addr, VDEC_ALIGN_SIZE);
             uvc_queue.buffer[i].virt_addr =
                 (void *)ALIGN_UP((k_u64)uvc_queue.buffer[i].blk_virt_addr, VDEC_ALIGN_SIZE);
-            uvc_queue.buffer[i].pool_id =
-                vb_blk_handle_to_pool_id(uvc_queue.buffer[i].handle);
+            uvc_queue.buffer[i].pool_id = ref.pool_id;
             USB_LOG_DBG("phys[%d] = 0x%lx, virt[%d] = 0x%p, pool_id = %d\n",
                        i, uvc_queue.buffer[i].phys_addr, i,
                        uvc_queue.buffer[i].virt_addr, uvc_queue.buffer[i].pool_id);

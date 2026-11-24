@@ -7,7 +7,8 @@ stubs. Covers the CherryUSB/RT-Thread to POSIX errno mapping, errno returned
 by ioctls, a camera unplugged while streaming (the open fd turns dead and stays
 dead after re-enumeration, poll wakes, the stream is stopped once under the I/O
 lock, the cleared device slot is never read), bounded isochronous
-packet counts, and selecting between two attached cameras.
+packet counts, and a stream pool VDEC still holds a block of at close being
+given up to VB (vb_pool_put()), which frees it when the block comes back.
 Run with python3 -B kernel/bsp/maix3/testcase/host/test_uvc_host.py
 [path/to/usbh_uvc_thr.c].
 """
@@ -169,8 +170,6 @@ MODEL = r"""
 #include "dfs_poll.h"
 #include "dfs_posix.h"
 #include "cache.h"
-#include "vb_ext.h"
-
 
 rt_mmu_info mmu_info;
 
@@ -302,17 +301,21 @@ static int run_work(void)
     return 1;
 }
 
-/* ---- VB: referenced blocks keep their pool busy until released ---- */
+/* ---- VB: a block lives while it has references (driver, or VDEC), a pool
+ * while its owner has not given it up or one of its blocks lives ---- */
 #define BLKS 40
 #define POOLS 8
 static void *blk[BLKS];
 static int blk_refs[BLKS];
 static k_u32 blk_pool[BLKS];
 static k_bool pool_live[POOLS];
+static k_bool pool_given_up[POOLS];
 static int pools;   /* pools whose memory is still allocated */
+static int pool_create_calls;
 k_s32 vb_create_pool(k_u32 *pool_id, k_u32 blk_cnt, k_u64 blk_size, const char *mmz_name,
                      const char *buf_name, k_vb_remap_mode mode)
 {
+    pool_create_calls++;
     for (k_u32 id = 0; id < POOLS; id++) {
         if (!pool_live[id]) {
             pool_live[id] = K_TRUE;
@@ -329,21 +332,19 @@ static void pool_free_if_idle(k_u32 pool_id)
         if (blk[i] && blk_pool[i] == pool_id)
             return;
     pool_live[pool_id] = K_FALSE;
+    pool_given_up[pool_id] = K_FALSE;
     pools--;
 }
-k_s32 vb_destroy_pool(k_u32 pool_id)
+k_s32 vb_pool_put(k_u32 pool_id)
 {
     assert(mutex_held && !irq_off);
-    if (pool_id >= POOLS || !pool_live[pool_id])
+    if (pool_id >= POOLS || !pool_live[pool_id] || pool_given_up[pool_id])
         return K_ERR_VB_UNEXIST;
-    for (int i = 0; i < BLKS; i++) {
-        if (blk[i] && blk_pool[i] == pool_id)
-            return K_ERR_VB_BUSY;
-    }
+    pool_given_up[pool_id] = K_TRUE;
     pool_free_if_idle(pool_id);
     return 0;
 }
-k_vb_blk_handle vb_get_blk_by_size_and_pool_id(k_u32 pool_id, k_u64 blk_size, k_u32 uid)
+static k_vb_blk_handle take_blk(k_u32 pool_id, k_u64 blk_size)
 {
     for (int i = 0; i < BLKS; i++) {
         if (blk[i] == NULL) {
@@ -360,24 +361,80 @@ static void blk_unref(int i)
     if (--blk_refs[i] == 0) {
         free(blk[i]);
         blk[i] = NULL;
+        if (pool_given_up[blk_pool[i]])
+            pool_free_if_idle(blk_pool[i]);
     }
 }
-k_u64 vb_blk_handle_to_phys(k_vb_blk_handle handle) { return (k_u64)(uintptr_t)blk[handle]; }
-void *vb_blk_handle_to_kern(k_vb_blk_handle handle) { return blk[handle]; }
-k_u32 vb_blk_handle_to_pool_id(k_vb_blk_handle handle) { return blk_pool[handle]; }
-k_s32 vb_inquire_user_cnt(k_vb_blk_handle handle) { return 1; }
-k_s32 vb_user_sub(k_u32 pool_id, k_u64 phys_addr, k_u32 uid)
+/* VDEC's channel holder takes a reference on a stream block (the first one queued). */
+static int vdec_hold(void)
 {
     for (int i = 0; i < BLKS; i++) {
-        if (blk[i] && (k_u64)(uintptr_t)blk[i] == phys_addr) {
-            blk_unref(i);
-            return K_SUCCESS;
+        if (blk[i]) {
+            blk_refs[i]++;
+            return i;
         }
     }
     assert(0);
     return -1;
 }
-k_s32 vb_put_blk(k_u32 pool_id, k_u64 phys_addr) { return 0; }
+k_u64 vb_blk_handle_to_phys(k_vb_blk_handle handle) { return (k_u64)(uintptr_t)blk[handle]; }
+void *vb_blk_handle_to_kern(k_vb_blk_handle handle) { return blk[handle]; }
+k_u32 vb_blk_handle_to_pool_id(k_vb_blk_handle handle) { return blk_pool[handle]; }
+k_s32 vb_inquire_user_cnt(k_vb_blk_handle handle) { return 1; }
+/* The driver's holder: which blocks it has a reference on. */
+static vb_holder *blk_holder[BLKS];
+k_s32 vb_holder_init(vb_holder *h, k_u32 uid, const char *name, k_u32 capacity)
+{
+    h->slots = NULL;
+    h->capacity = capacity;
+    h->uid = uid;
+    h->refs = 0;
+    h->name = name;
+    return K_SUCCESS;
+}
+void vb_holder_deinit(vb_holder *h) { assert(h->refs == 0); }
+k_s32 vb_holder_get_blk(vb_holder *h, k_u32 pool_id, k_u64 blk_size, vb_ref_t *ref)
+{
+    k_vb_blk_handle i = take_blk(pool_id, blk_size);
+    if (i == VB_INVALID_HANDLE)
+        return K_ERR_VB_NOBUF;
+    blk_holder[i] = h;
+    h->refs++;
+    ref->handle = i;
+    ref->pool_id = pool_id;
+    ref->phys_addr = (k_u64)(uintptr_t)blk[i];
+    ref->blk_size = blk_size;
+    ref->alloc_gen = 1;
+    return K_SUCCESS;
+}
+k_s32 vb_ref_put(vb_holder *h, k_u32 pool_id, k_u64 phys_addr)
+{
+    for (int i = 0; i < BLKS; i++) {
+        if (blk[i] && blk_holder[i] == h && blk_pool[i] == pool_id &&
+            (k_u64)(uintptr_t)blk[i] == phys_addr) {
+            blk_holder[i] = NULL;
+            h->refs--;
+            blk_unref(i);
+            return K_SUCCESS;
+        }
+    }
+    return K_ERR_VB_NOT_PERM;   /* not this holder's */
+}
+k_u32 vb_holder_refs(vb_holder *h) { return h->refs; }
+k_u32 vb_holder_release_all(vb_holder *h)
+{
+    k_u32 n = 0;
+    for (int i = 0; i < BLKS; i++) {
+        if (blk[i] && blk_holder[i] == h) {
+            blk_holder[i] = NULL;
+            h->refs--;
+            blk_unref(i);
+            n++;
+        }
+    }
+    return n;
+}
+
 /* ---- CherryUSB (usbh_video.c and the host controller) ---- */
 static struct usb_endpoint_descriptor iso_ep = {
     .bLength = 7, .bEndpointAddress = 0x81, .bmAttributes = 0x05,
@@ -580,6 +637,19 @@ int main(void)
         assert(strstr(klog, "Unsupported interval") != NULL);
     }
 
+    /* Without a VB holder (vb_holder_init failed, leaving capacity zero)
+     * REQBUFS fails with ENODEV before creating a pool. */
+    {
+        struct uvc_requestbuffers req = { .count = 3 };
+        int before = pool_create_calls;
+        k_u32 capacity = uvc_vb.capacity;
+
+        uvc_vb.capacity = 0;
+        assert(fops->ioctl(&fd, VIDIOC_REQBUFS, &req) == -ENODEV);
+        assert(pool_create_calls == before);
+        uvc_vb.capacity = capacity;
+    }
+
     /* A USB I/O error starting the stream reaches user space as EIO. */
     start(&fd, 64 * 1024);
     open_ret = -USB_ERR_IO;
@@ -658,6 +728,33 @@ int main(void)
     kills = closes = 0;
     assert(fops->close(&fd2) == 0 && kills == 5 && closes == 1 && pools == 0);
 
+    /* VDEC still holds a stream block when the app closes: the driver gives
+     * the pool up all the same, and nothing of the driver's runs again; the
+     * pool goes once VDEC lets go. */
+    {
+        int held;
+
+        assert(xopen(&fd2) == 0);
+        start(&fd2, 1 << 20);
+        assert(fops->ioctl(&fd2, VIDIOC_STREAMON, NULL) == 0);
+        held = vdec_hold();
+        klog[0] = 0;
+        assert(fops->close(&fd2) == 0 && pools == 1);
+        assert(!strstr(klog, "fail") && !strstr(klog, "left"));
+        /* Close dropped the driver's references only: VDEC's block lives. */
+        for (int i = 0; i < BLKS; i++)
+            assert(!blk_holder[i]);
+        assert(blk[held] && blk_refs[held] == 1);
+        assert(pending_work == NULL);               /* no retry */
+        /* A new session meanwhile gets its own pool and frees it normally. */
+        assert(xopen(&fd2) == 0);
+        start(&fd2, 1 << 20);
+        assert(pools == 2 && fops->close(&fd2) == 0 && pools == 1);
+        blk_unref(held);                            /* the MVX firmware returned it */
+        assert(pools == 0);
+        assert(run_work() == 0);
+    }
+
     /* Another thread's fops call holds io_mutex longer than a timed wait
      * (a slow control transfer). Close waits for it and succeeds: a failed
      * close would leave the fd to DFS, which closes it again later from
@@ -709,8 +806,7 @@ def main():
               "-I", str(build), "-I", str(CANMV_USB), "-I", str(USB / "class/video"),
               "-I", str(USB / "common"), "-I", str(RTT / "include"),
               "-I", str(RTT / "components/drivers/include"),
-              "-I", str(MPP / "include"), "-I", str(MPP / "include/comm"),
-              "-I", str(MPP / "kernel/ext_inc")]
+              "-I", str(MPP / "include"), "-I", str(MPP / "include/comm")]
         binary = build / "test"
         subprocess.run([*cc, str(build / "test.c"), "-o", str(binary)], check=True)
         subprocess.run([str(binary)], check=True, timeout=10)

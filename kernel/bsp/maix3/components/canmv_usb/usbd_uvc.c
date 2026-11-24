@@ -35,8 +35,6 @@
 #include "lwp.h"
 #include "lwp_user_mm.h"
 
-#include "comm/k_vb_comm.h"
-
 #include "usbd_desc.h"
 
 #define DBG_TAG "usbd_video"
@@ -44,6 +42,8 @@
 #include <rtdbg.h>
 
 #if defined(CHERRY_USB_DEVICE_FUNC_UVC)
+
+#include "k_vb_kernel.h"
 
 ///////////////////////////////////////////////////////////////////////////////
 // Private Varibales //////////////////////////////////////////////////////////
@@ -66,16 +66,6 @@ static volatile uint16_t uvc_payload_size = UVC_FS_MAX_PAYLOAD_SIZE;
 #define IOCTL_USBD_VIDEO_STREAM_ON   _IOW('v', 0x05, void*)
 #define IOCTL_USBD_VIDEO_STREAM_OFF  _IOW('v', 0x06, void*)
 #define IOCTL_USBD_VIDEO_DEV_STATE   _IOR('v', 0x07, int*)
-
-extern k_s32           vb_create_pool(k_u32* pool_id, k_u32 blk_cnt, k_u64 blk_size, const char* mmz_name, const char* buf_name,
-                                      k_vb_remap_mode vb_remap_mode);
-extern k_s32           vb_destroy_pool(k_u32 pool_id);
-extern k_vb_blk_handle vb_get_blk_by_size_and_pool_id(k_u32 pool_id, k_u64 blk_size, k_u32 uid);
-extern k_s32           vb_put_blk(k_u32 pool_id, k_u64 phys_addr);
-extern k_u64           vb_blk_handle_to_phys(k_vb_blk_handle handle);
-extern void*           vb_blk_handle_to_kern(k_vb_blk_handle handle);
-extern k_s32           vb_user_sub(k_u32 pool_id, k_u64 phys_addr, k_u32 uid);
-extern k_s32           vb_inquire_user_cnt(k_vb_blk_handle handle);
 
 struct usbd_video_frame_t {
     uint32_t handle;
@@ -104,6 +94,8 @@ struct usbd_video_inst_t {
     int stream_state; // 0: off, 1: on, 2: exit
 
     struct usbd_video_frame_t* frames;
+    /* One reference per frame, from create pool to release pool. */
+    vb_holder vb;
 
     rt_list_t free_list, ready_list;
 };
@@ -139,7 +131,7 @@ static inline __attribute__((always_inline)) void _usbd_video_release_pool(struc
     for (int i = 0; i < inst->buffer_cnt; i++) {
         frame = &inst->frames[i];
 
-        if (0x00 != vb_user_sub(frame->pool_id, frame->phys_addr, VB_UID_V_VI)) {
+        if (0x00 != vb_ref_put(&inst->vb, frame->pool_id, frame->phys_addr)) {
             LOG_E("Put vb block failed");
         }
 
@@ -151,9 +143,7 @@ static inline __attribute__((always_inline)) void _usbd_video_release_pool(struc
     rt_list_init(&inst->free_list);
     rt_list_init(&inst->ready_list);
 
-    if (VB_INVALID_POOLID != pool_id) {
-        vb_destroy_pool(pool_id);
-    }
+    vb_pool_put(pool_id);
     inst->buffer_pool_id = VB_INVALID_POOLID;
 }
 
@@ -238,8 +228,8 @@ static inline __attribute__((always_inline)) rt_err_t _usbd_video_ioctl_create_p
         ret = RT_ERROR;
         goto _exit;
     }
-
-    /* Let error cleanup release the pool and each block acquired so far. */
+    /* From here on _usbd_video_release_pool() undoes what was set up: the
+     * pool, and the first buffer_cnt frames. */
     inst->buffer_pool_id = pool_id;
 
     inst->frames = rt_malloc(sizeof(struct usbd_video_frame_t) * cfg.buffer_count);
@@ -253,15 +243,18 @@ static inline __attribute__((always_inline)) rt_err_t _usbd_video_ioctl_create_p
     for (int i = 0; i < cfg.buffer_count; i++) {
         frame = &inst->frames[i];
 
-        if (VB_INVALID_HANDLE == (frame->handle = vb_get_blk_by_size_and_pool_id(pool_id, pool_blk_size, VB_UID_V_VI))) {
+        vb_ref_t ref;
+
+        if (K_SUCCESS != vb_holder_get_blk(&inst->vb, pool_id, pool_blk_size, &ref)) {
             LOG_E("No blk");
 
             ret = RT_ENOMEM;
             goto _error;
         }
 
+        frame->handle    = ref.handle;
         frame->pool_id   = pool_id;
-        frame->phys_addr = vb_blk_handle_to_phys(frame->handle);
+        frame->phys_addr = ref.phys_addr;
         frame->k_addr    = vb_blk_handle_to_kern(frame->handle);
         frame->u_addr    = NULL;
 
@@ -751,6 +744,11 @@ static void usbd_uvc_device_init(void)
 
     if (_init_flag == 0) {
         rt_memset(&usbd_video_dev, 0, sizeof(struct usbd_video_inst_t));
+        /* The frames queued for the host: one pool at most. */
+        if (vb_holder_init(&usbd_video_dev.vb, VB_UID_V_VI, "uvc device", USBD_VIDEO_MAX_BUFFER_CNT) != K_SUCCESS) {
+            LOG_E("Could not initialize UVC device VB holder");
+            return;
+        }
 #ifdef RT_USING_DEVICE_OPS
         usbd_video_dev.device.ops = &usbd_video_dev_ops;
 #else

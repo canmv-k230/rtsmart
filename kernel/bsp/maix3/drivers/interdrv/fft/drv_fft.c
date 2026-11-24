@@ -97,6 +97,7 @@ typedef struct {
 static fft_device_t g_fft_dev;
 
 extern int32_t sdma_send_transfer(k_sdma_transfer_cfg_t* cfg);
+extern int32_t sdma_send_user_transfer(k_sdma_transfer_cfg_t* cfg, k_bool src_user, k_bool dst_user);
 
 static rt_uint32_t fft_timeout_to_ticks(uint32_t timeout_ms)
 {
@@ -184,7 +185,10 @@ static void fft_disable(fft_device_t* dev)
     writeq(0, &dev->reg->enable);
 }
 
-static int fft_start_input_dma(const k_fft_run_request* req)
+/* user: the request came from the ioctl, so its buffers are user space's and
+ * must be checked and held; kernel callers of k230_fft_run() are trusted. The
+ * FIFO end is always our register. */
+static int fft_start_input_dma(const k_fft_run_request* req, k_bool user)
 {
     k_sdma_transfer_cfg_t cfg = {
         .src_addr              = (void*)(uintptr_t)req->input_phy_addr,
@@ -201,10 +205,10 @@ static int fft_start_input_dma(const k_fft_run_request* req)
 
     LOG_D("start input dma phy=0x%lx len=%u timeout=%u", (unsigned long)req->input_phy_addr, req->input_len, req->timeout_ms);
 
-    return sdma_send_transfer(&cfg);
+    return user ? sdma_send_user_transfer(&cfg, K_TRUE, K_FALSE) : sdma_send_transfer(&cfg);
 }
 
-static int fft_start_output_dma(const k_fft_run_request* req)
+static int fft_start_output_dma(const k_fft_run_request* req, k_bool user)
 {
     k_sdma_transfer_cfg_t cfg = {
         .src_addr              = (void*)FFT_FIFO_REG_ADDR,
@@ -222,10 +226,10 @@ static int fft_start_output_dma(const k_fft_run_request* req)
     LOG_D("start output dma phy=0x%lx len=%u timeout=%u", (unsigned long)req->output_phy_addr, req->output_len,
           req->timeout_ms);
 
-    return sdma_send_transfer(&cfg);
+    return user ? sdma_send_user_transfer(&cfg, K_FALSE, K_TRUE) : sdma_send_transfer(&cfg);
 }
 
-static int fft_run_locked(fft_device_t* dev, const k_fft_run_request* req)
+static int fft_run_locked(fft_device_t* dev, const k_fft_run_request* req, k_bool user)
 {
     rt_uint32_t      event = 0;
     k_fft_cfg_reg_st cfg_reg;
@@ -257,7 +261,7 @@ static int fft_run_locked(fft_device_t* dev, const k_fft_run_request* req)
     dev->armed = RT_TRUE;
     writeq(1, &dev->reg->enable);
 
-    ret = fft_start_input_dma(req);
+    ret = fft_start_input_dma(req, user);
     if (ret != 0) {
         LOG_E("input dma failed ret=%d", ret);
         fft_disable(dev);
@@ -292,7 +296,7 @@ static int fft_run_locked(fft_device_t* dev, const k_fft_run_request* req)
         return -RT_ETIMEOUT;
     }
 
-    ret = fft_start_output_dma(req);
+    ret = fft_start_output_dma(req, user);
     if (ret != 0) {
         LOG_E("output dma failed ret=%d", ret);
     }
@@ -301,7 +305,7 @@ static int fft_run_locked(fft_device_t* dev, const k_fft_run_request* req)
     return ret;
 }
 
-int k230_fft_run(const k_fft_run_request* req)
+static int fft_run(const k_fft_run_request* req, k_bool user)
 {
     fft_device_t* dev = &g_fft_dev;
     int           ret;
@@ -326,12 +330,14 @@ int k230_fft_run(const k_fft_run_request* req)
         LOG_E("run rejected: FFT device is not open");
         return -EIO;
     }
-    ret = fft_run_locked(dev, req);
+    ret = fft_run_locked(dev, req, user);
     rt_mutex_release(&dev->lock);
     LOG_D("run complete ret=%d", ret);
 
     return ret;
 }
+
+int k230_fft_run(const k_fft_run_request* req) { return fft_run(req, K_FALSE); }
 
 static rt_err_t fft_device_open(rt_device_t dev, rt_uint16_t oflag)
 {
@@ -422,7 +428,7 @@ static rt_err_t fft_device_control(rt_device_t dev, int cmd, void* args)
               req.mode, req.input_mode, req.output_mode, req.shift, req.timeout_ms, (unsigned long)req.input_phy_addr,
               req.input_len, (unsigned long)req.output_phy_addr, req.output_len);
 
-        return k230_fft_run(&req);
+        return fft_run(&req, K_TRUE);
     default:
         LOG_W("unsupported ioctl cmd=0x%x expected=0x%x", cmd, KD_IOC_CMD_FFT_RUN);
         return -RT_EINVAL;
@@ -505,8 +511,7 @@ int k230_fft_dev_init(void)
         return -RT_ENOMEM;
     }
 
-    LOG_D("init reg=%p base=0x%lx size=0x%lx sdma_send_transfer=%p", dev->reg, (unsigned long)FFT_BASE_ADDR,
-          (unsigned long)FFT_IO_SIZE, sdma_send_transfer);
+    LOG_D("init reg=%p base=0x%lx size=0x%lx", dev->reg, (unsigned long)FFT_BASE_ADDR, (unsigned long)FFT_IO_SIZE);
 
     dev->parent.type      = RT_Device_Class_Char;
     dev->parent.user_data = dev;
