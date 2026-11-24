@@ -49,7 +49,7 @@
 /* Linked from the MPP kernel module. Hand-written mirrors of mpp
  * kernel/ext_inc/gsdma_ext.h and vb_ext.h: keep the signatures in sync.
  * vb_dma_buf_put(NULL) is a no-op. */
-extern int  gsdma_sdma_reserve_channel(uint8_t ch_num);
+extern int  gsdma_sdma_reserve_channel_wait(uint8_t ch_num, int32_t timeout_ms);
 extern int  gsdma_sdma_abort_channel(uint8_t ch_num);
 extern void gsdma_sdma_release_channel(uint8_t ch_num);
 extern int  gsdma_sdma_ch_submit(uint8_t ch_num, uint32_t ch_cfg_value, uint32_t llt_phys_addr,
@@ -78,6 +78,30 @@ extern void  vb_dma_buf_put(void* buf);
  * the one template the engine checks, which ordinary streams do) say nothing
  * about failure. */
 #define DECOMP_STATUS_CRC_OK    (0x1u << 10)
+#define DECOMP_STATUS_STATE(s)  ((s) & 0xf)
+#define DECOMP_STATE_IDLE       0
+#define DECOMP_STATE_CRC_CHECK  8
+
+/* While waiting, look at the engine this often. A good stream leaves IDLE as
+ * soon as its first bytes arrive, passes CRC_CHECK at once and ends in IDLE
+ * with crc_ok. A corrupt one stops in CRC_CHECK or drops back to IDLE without
+ * crc_ok, an invalid first block within microseconds, long before the first
+ * look; the write channel then never completes.
+ *
+ * GZIP_STALL_MS does not grow with the output. With backpressure_en the engine
+ * waits for the write channel, so (as we read it; no RTL at hand) it is at
+ * most the 4 SRAM_WR lines, 512 KB, ahead: at CRC_CHECK no more is left to
+ * write, and 100 ms for that would mean under 5 MB/s. On k230-2 (2026-11-24),
+ * 16 MiB outputs under four concurrent 16 MiB SDMA copies took 52-118 ms with
+ * no false failure in 105 rounds, nor in some 1400 rounds of 1 MiB, and no
+ * 10 ms look caught a good stream in IDLE without crc_ok. */
+#define GZIP_POLL_MS            10
+#define GZIP_STALL_MS           100
+
+/* Driver result for a corrupt stream, beside the RT-Thread codes used
+ * elsewhere. The ioctl reports it as EBADMSG: bad data, not worth a retry,
+ * unlike EIO. */
+#define GZIP_ECORRUPT           1000
 
 /* SRAM addresses used by UGZIP hardware for intermediate data.
  * UGZIP is hardwired to read compressed input from SRAM_RD and write
@@ -265,6 +289,71 @@ static struct sdma_llt* build_wr_llt(uint32_t dst_phys, uint32_t dst_len, uint32
     return llt;
 }
 
+/* The milliseconds left of a budget of ticks that began at start, 0 once it
+ * is spent. */
+static int32_t gzip_ms_left(rt_tick_t start, rt_tick_t budget)
+{
+    rt_tick_t used = rt_tick_get() - start;
+
+    if (used >= budget)
+        return 0;
+    return (int32_t)(((uint64_t)(budget - used) * 1000 + RT_TICK_PER_SECOND - 1) / RT_TICK_PER_SECOND);
+}
+
+static int gzip_wait_done(struct gzip_decomp_dev* dev, struct rt_semaphore* wr_done_sem, rt_tick_t start,
+                          rt_tick_t budget)
+{
+    rt_tick_t engine_start = rt_tick_get();
+    rt_tick_t crc_since = 0;
+    int       left_idle = 0;
+    uint32_t  status;
+
+    for (;;) {
+        if (rt_sem_take(wr_done_sem, rt_tick_from_millisecond(GZIP_POLL_MS)) == RT_EOK) {
+            status = readl(&dev->reg->decomp_status);
+            if (status & DECOMP_STATUS_CRC_OK) {
+                LOG_D("CRC OK: decomp_status=0x%08x", status);
+                return RT_EOK;
+            }
+            LOG_E("CRC mismatch: decomp_status=0x%08x", status);
+            return -GZIP_ECORRUPT;
+        }
+
+        status = readl(&dev->reg->decomp_status);
+        switch (DECOMP_STATUS_STATE(status)) {
+        case DECOMP_STATE_IDLE:
+            crc_since = 0;
+            /* IDLE without a good CRC after it ran, or still IDLE long after
+             * the start (it stopped before the first look): the output will
+             * never complete. */
+            if (!(status & DECOMP_STATUS_CRC_OK) &&
+                (left_idle || rt_tick_get() - engine_start >= rt_tick_from_millisecond(GZIP_STALL_MS))) {
+                LOG_E("Corrupt stream: decomp_status=0x%08x", status);
+                return -GZIP_ECORRUPT;
+            }
+            break;
+        case DECOMP_STATE_CRC_CHECK:
+            left_idle = 1;
+            if (!crc_since) {
+                crc_since = rt_tick_get() | 1;
+            } else if (rt_tick_get() - crc_since >= rt_tick_from_millisecond(GZIP_STALL_MS)) {
+                LOG_E("Corrupt stream, stuck in CRC check: decomp_status=0x%08x", status);
+                return -GZIP_ECORRUPT;
+            }
+            break;
+        default:
+            left_idle = 1;
+            crc_since = 0;
+            break;
+        }
+
+        if (rt_tick_get() - start >= budget) {
+            LOG_E("Timeout: decomp_status=0x%08x", status);
+            return -RT_ETIMEOUT;
+        }
+    }
+}
+
 /* Called with dev->mutex held. No descriptor or pin may be released until
  * both channels acknowledge STOP; resetting shared GSDMA would abort other
  * clients as well. A permanently stuck channel retains its resources. */
@@ -310,7 +399,10 @@ static int gzip_decomp_run(struct gzip_decomp_dev* dev, uint64_t src_phys, uint3
 {
     struct rt_semaphore wr_done_sem;
     uint32_t            rd_count = 0, wr_count = 0;
-    uint32_t            decomp_intstat;
+    /* One budget for the whole request: both channel waits and the
+     * decompression share it. */
+    rt_tick_t           budget = rt_tick_from_millisecond(timeout_ms > 0 ? timeout_ms : GZIP_DEFAULT_TIMEOUT_MS);
+    rt_tick_t           start;
     int                 sem_initialized = 0;
     int                 ret, cleanup_ret;
 
@@ -329,19 +421,23 @@ static int gzip_decomp_run(struct gzip_decomp_dev* dev, uint64_t src_phys, uint3
     }
     dev->held.pm_held = 1;
 
-    /* 2. Reserve SDMA CH0 (read) and CH1 (write) */
-    if (gsdma_sdma_reserve_channel(ZIP_RD_CH) != 0) {
+    /* 2. Reserve SDMA CH0 (read) and CH1 (write). Ordinary SDMA transfers
+     * may be running on them: let those finish, scheduling no new ones. */
+    start = rt_tick_get();
+    if (gsdma_sdma_reserve_channel_wait(ZIP_RD_CH, gzip_ms_left(start, budget)) != 0) {
         LOG_E("Failed to reserve SDMA CH%d", ZIP_RD_CH);
         ret = -RT_EBUSY;
         goto out;
     }
     dev->held.rd_reserved = 1;
-    if (gsdma_sdma_reserve_channel(ZIP_WR_CH) != 0) {
+    if (gsdma_sdma_reserve_channel_wait(ZIP_WR_CH, gzip_ms_left(start, budget)) != 0) {
         LOG_E("Failed to reserve SDMA CH%d", ZIP_WR_CH);
         ret = -RT_EBUSY;
         goto out_release;
     }
     dev->held.wr_reserved = 1;
+    if (rt_tick_get() != start)
+        LOG_D("waited %u ticks for SDMA CH%d/CH%d", (unsigned)(rt_tick_get() - start), ZIP_RD_CH, ZIP_WR_CH);
 
     /* 3. Build SDMA LLI chains */
     dev->held.rd_llt = build_rd_llt((uint32_t)src_phys, src_len, &rd_count);
@@ -364,7 +460,12 @@ static int gzip_decomp_run(struct gzip_decomp_dev* dev, uint64_t src_phys, uint3
     }
     sem_initialized = 1;
 
-    /* 5. Prepare UGZIP: set src_size with bit31 to reset internal state */
+    /* 5. The write channel overwrites whole lines from dst_phys on. Write
+     * back dirty cache lines there first, so none is evicted over the output
+     * while the DMA runs; they are invalidated once it is done. */
+    rt_hw_cpu_dcache_clean((void*)(uintptr_t)(dst_phys - PV_OFFSET), gzip_dma_span(dst_len));
+
+    /* Prepare UGZIP: set src_size with bit31 to reset internal state */
     writel(0x80000000, &dev->reg->gzip_src_size);
 
     /* 6. Submit SDMA channels via GSDMA driver workflow:
@@ -384,22 +485,9 @@ static int gzip_decomp_run(struct gzip_decomp_dev* dev, uint64_t src_phys, uint3
     writel(dst_len, &dev->reg->dma_out_size);
     writel(0x3, &dev->reg->decomp_start);
 
-    /* 8. Wait for write channel completion via IRQ callback */
-    ret = rt_sem_take(&wr_done_sem, rt_tick_from_millisecond(timeout_ms > 0 ? timeout_ms : GZIP_DEFAULT_TIMEOUT_MS));
-
-    if (ret == RT_EOK) {
-        decomp_intstat = readl(&dev->reg->decomp_status);
-        if (decomp_intstat & DECOMP_STATUS_CRC_OK) {
-            LOG_D("CRC OK: decomp_intstat=0x%08x", decomp_intstat);
-            ret = RT_EOK;
-        } else {
-            LOG_E("Decompression failed: decomp_intstat=0x%08x", decomp_intstat);
-            ret = -RT_ERROR;
-        }
-    } else {
-        LOG_E("Timeout: decomp_intstat=0x%08x", readl(&dev->reg->decomp_status));
-        ret = -RT_ETIMEOUT;
-    }
+    /* 8. Wait for write channel completion via IRQ callback, giving up early
+     * once the engine shows the stream is corrupt. */
+    ret = gzip_wait_done(dev, &wr_done_sem, start, budget);
 
     /* 9. Invalidate destination cache */
     rt_hw_cpu_dcache_invalidate((void*)(uintptr_t)(dst_phys - PV_OFFSET), dst_len);
@@ -466,8 +554,8 @@ out:
 }
 
 /* The ioctl result becomes the caller's errno, so it must be POSIX. The
- * driver works in RT-Thread codes, which mean other things as errno values:
- * -RT_EBUSY is 7, E2BIG. */
+ * driver works in RT-Thread codes (and GZIP_ECORRUPT), which mean other things
+ * as errno values: -RT_EBUSY is 7, E2BIG. */
 static int gzip_decomp_posix_errno(int ret)
 {
     switch (ret) {
@@ -481,6 +569,8 @@ static int gzip_decomp_posix_errno(int ret)
         return -ENOMEM;
     case -RT_ETIMEOUT:
         return -ETIMEDOUT;
+    case -GZIP_ECORRUPT:
+        return -EBADMSG;
     default:
         return -EIO;
     }

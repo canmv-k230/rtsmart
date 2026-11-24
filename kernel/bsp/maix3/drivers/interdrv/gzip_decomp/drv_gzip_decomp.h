@@ -35,7 +35,8 @@ struct rt_gzip_decomp_args {
     uint32_t src_len;       /* compressed data length */
     uint64_t dst_phys;      /* output buffer physical address */
     uint32_t dst_len;       /* expected decompressed length */
-    int32_t  timeout_ms;    /* timeout in ms, -1 = infinite */
+    int32_t  timeout_ms;    /* for the whole call, waiting for the SDMA channels
+                             * included; <= 0 = default (5000 ms) */
 };
 
 #endif /* __DRV_GZIP_DECOMP_H__ */
