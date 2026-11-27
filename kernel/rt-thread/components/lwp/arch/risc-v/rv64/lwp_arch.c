@@ -24,8 +24,15 @@
 #include <mmu.h>
 #include <page.h>
 #include <lwp_mm_area.h>
+#include <lwp_mm.h>
 #include <lwp_user_mm.h>
 #include <lwp_arch.h>
+#include <lwp_signal.h>
+#include <lwp_syscall.h>
+
+#define DBG_TAG "LWP.arch"
+#define DBG_LVL DBG_WARNING
+#include <rtdbg.h>
 
 #include <stack.h>
 #include <cpuport.h>
@@ -259,6 +266,177 @@ void lwp_exec_user(void *args, void *kernel_stack, void *user_entry)
 void *arch_get_usp_from_uctx(struct rt_user_context *uctx)
 {
     return uctx->sp;
+}
+
+extern void rt_hw_sync_cache_local(void *addr, int size);
+extern char lwp_sigreturn[];
+extern char lwp_sigreturn_end[];
+
+static void __attribute__((noreturn))
+signal_kill_bad_context(const char *reason, rt_ubase_t addr)
+{
+    rt_thread_t thread = rt_thread_self();
+
+    LOG_E("User Fault, killing thread: %s, tid: %d (%s: 0x%lx)",
+          thread->name, thread->tid, reason, (unsigned long)addr);
+    lwp_terminate_with_status(lwp_self(), LWP_WAIT_STATUS_SIGNAL(SIGSEGV));
+    sys_exit(-1);
+    for (;;)
+        ;
+}
+
+/**
+ * Prepare a user signal handler frame without ever switching kernel sp to
+ * user space. Validates that the user stack range is in user space and
+ * writable (demand-paging the main stack region if needed), copies the saved
+ * context, trampoline, and siginfo via lwp_put_to_user(), and saves the
+ * trusted sstatus in kernel memory (uctx->flag).
+ */
+void arch_signal_prepare(struct rt_hw_stack_frame *frame)
+{
+    rt_ubase_t user_sp = frame->user_sp_exc_stack;
+    rt_ubase_t frame_addr = 0, sigret_addr = 0, siginfo_addr = 0;
+    size_t sigret_size = (size_t)(lwp_sigreturn_end - lwp_sigreturn);
+    size_t needed = sizeof(*frame) + sigret_size + sizeof(siginfo_t) + 32;
+    siginfo_t kinfo;
+    lwp_sighandler_t handler;
+    rt_ubase_t page_start, page_end, va;
+    int sig;
+
+    if (user_sp >= (rt_ubase_t)USER_VADDR_START + needed &&
+        user_sp <= (rt_ubase_t)USER_VADDR_TOP)
+    {
+        frame_addr = user_sp - sizeof(*frame);
+        sigret_addr = (frame_addr - sigret_size) & ~(rt_ubase_t)7;
+        siginfo_addr = (sigret_addr - sizeof(siginfo_t)) & ~(rt_ubase_t)15;
+        if (siginfo_addr < (rt_ubase_t)USER_VADDR_START)
+        {
+            frame_addr = 0;
+        }
+    }
+
+    for (;;)
+    {
+        sig = lwp_signal_backup((void *)frame_addr, RT_NULL,
+                                (void *)frame->sstatus);
+        if (sig == 0)
+        {
+            return;
+        }
+        if (sig < 0)
+        {
+            signal_kill_bad_context("signal nesting limit exceeded", user_sp);
+        }
+
+        rt_memset(&kinfo, 0, sizeof(kinfo));
+        handler = lwp_sighandler_get(sig, &kinfo);
+        if (!handler)
+        {
+            lwp_signal_restore();
+            continue;
+        }
+        break;
+    }
+
+    if (!frame_addr)
+    {
+        signal_kill_bad_context("invalid signal stack", user_sp);
+    }
+
+    page_start = siginfo_addr & ~PAGE_OFFSET_MASK;
+    page_end = (user_sp - 1) & ~PAGE_OFFSET_MASK;
+    for (va = page_start; ; va += PAGE_SIZE)
+    {
+        if (!lwp_user_accessable((void *)va, 1) &&
+            !arch_expand_user_stack((void *)va))
+        {
+            signal_kill_bad_context("unmapped signal stack", va);
+        }
+        if (va == page_end)
+        {
+            break;
+        }
+    }
+
+#ifdef ENABLE_VECTOR
+    if (!(frame->sstatus & SSTATUS_VS_CLEAN))
+    {
+        if (!(frame->sstatus & SSTATUS_VS))
+        {
+            rt_memset(frame->v, 0, sizeof(frame->v));
+        }
+        else
+        {
+            /*
+             * SAVE_ALL saved vector state for VS_INITIAL, but RESTORE_ALL only
+             * restores vectors when SSTATUS_VS_CLEAN is set. Promote so
+             * rvv_memcpy() inside lwp_put_to_user() cannot leave dirty
+             * hardware vector registers visible to user mode.
+             */
+            frame->sstatus = (frame->sstatus & ~SSTATUS_VS) | SSTATUS_VS_CLEAN;
+        }
+    }
+#endif
+
+    if (lwp_put_to_user((void *)frame_addr, frame, sizeof(*frame)) != sizeof(*frame) ||
+        lwp_put_to_user((void *)sigret_addr, lwp_sigreturn, sigret_size) != sigret_size ||
+        lwp_put_to_user((void *)siginfo_addr, &kinfo, sizeof(kinfo)) != sizeof(kinfo))
+    {
+        signal_kill_bad_context("unwritable signal stack", user_sp);
+    }
+
+    rt_hw_sync_cache_local((void *)sigret_addr, (int)sigret_size);
+
+    frame->epc = (rt_ubase_t)handler;
+    frame->ra = sigret_addr;
+    frame->user_sp_exc_stack = siginfo_addr;
+    frame->a0 = (rt_ubase_t)sig;
+    frame->a1 = siginfo_addr;
+    frame->a2 = 0;
+    frame->sstatus &= ~(SSTATUS_SPP | SSTATUS_SIE);
+    frame->sstatus |= SSTATUS_SPIE;
+}
+
+/**
+ * Restore the pre-signal user frame from user memory onto the kernel stack
+ * via lwp_get_from_user(), never trusting user-controlled sstatus or running
+ * RESTORE_ALL/SAVE_ALL on user sp.
+ */
+void arch_signal_restore(struct rt_hw_stack_frame *frame)
+{
+    struct rt_user_context *uctx;
+    void *user_frame_va;
+    rt_ubase_t saved_sstatus;
+    size_t copied;
+
+    uctx = lwp_signal_restore();
+    if (!uctx)
+    {
+        signal_kill_bad_context("unexpected sigreturn", 0);
+    }
+
+    user_frame_va = arch_get_usp_from_uctx(uctx);
+    saved_sstatus = (rt_ubase_t)uctx->flag;
+
+    rt_mm_lock();
+    copied = lwp_get_from_user(frame, user_frame_va, sizeof(*frame));
+    rt_mm_unlock();
+    if (copied != sizeof(*frame))
+    {
+        signal_kill_bad_context("unreadable sigreturn frame",
+                                (rt_ubase_t)user_frame_va);
+    }
+
+    /* Restore sstatus from the kernel-saved copy, never from user memory. */
+    saved_sstatus &= ~(SSTATUS_SPP | SSTATUS_SIE);
+    saved_sstatus |= SSTATUS_SPIE;
+#ifdef ENABLE_VECTOR
+    if ((saved_sstatus & SSTATUS_VS) == SSTATUS_VS_INITIAL)
+    {
+        saved_sstatus = (saved_sstatus & ~SSTATUS_VS) | SSTATUS_VS_CLEAN;
+    }
+#endif
+    frame->sstatus = saved_sstatus;
 }
 
 #endif /* RT_USING_USERSPACE */

@@ -4203,6 +4203,11 @@ int sys_sigaction(int sig, const struct k_sigaction *act,
     }
 
     ret = lwp_sigaction(sig, pkact, pkoact, sigsetsize);
+    if (ret < 0)
+    {
+        SET_ERRNO(EINVAL);
+        goto out;
+    }
 #ifdef ARCH_MM_MMU
     if (ret == 0 && oact)
     {

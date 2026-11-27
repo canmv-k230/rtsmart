@@ -98,147 +98,29 @@ ret_to_user_exit:
     sret
 
 /**
- * Restore user context from exception frame stroraged in ustack
+ * Restore user context from exception frame stored in ustack
  * And handle pending signals;
  */
 arch_signal_quit:
-    call lwp_signal_restore
-    bnez a0, 1f
-    li a0, -1
-    call sys_exit
-0:
-    j 0b
-1:
-    call arch_get_usp_from_uctx
-    // return value is user sp
-    mv sp, a0
-
-    // restore user sp before enter trap
-    addi a0, sp, CTX_REG_NR * REGBYTES 
-    csrw sscratch, a0
-
-    RESTORE_ALL
-    SAVE_ALL
+    mv a0, sp
+    call arch_signal_restore
+    CLOSE_INTERRUPT
     j arch_ret_to_user
 
 /**
  * Prepare and enter user signal handler
- * Move user exception frame and setup signal return
- * routine in user stack
+ * Copy user exception frame, trampoline, and siginfo to user stack from kernel
+ * stack via C helper, then return through ret_to_user_exit.
  */
 user_do_signal:
-    /* prefetch ustack to avoid corrupted status in RESTORE/STORE pair below */
-    LOAD t0, FRAME_OFF_SP(sp)
-    addi t1, t0, -CTX_REG_NR * REGBYTES
-    LOAD t2, (t0)
-    li t3, -0x1000
-1:
-    add t0, t0, t3
-    LOAD t2, (t0)
-    bgt t0, t1, 1b
-
-    /** restore and backup kernel sp carefully to avoid leaking */
-    addi t0, sp, CTX_REG_NR * REGBYTES
-    csrw sscratch, t0
-
-    RESTORE_ALL
-    SAVE_ALL
-
-    /**
-     * save lwp_sigreturn in user memory
-     */
-    mv s0, sp
-    la t0, lwp_sigreturn
-    la t1, lwp_sigreturn_end
-    // t1 <- size
-    sub t1, t1, t0
-    // s0 <- dst
-    sub s0, s0, t1
-    mv s2, t1
-lwp_sigreturn_copy_loop:
-    addi t2, t1, -1
-    add t3, t0, t2
-    add t4, s0, t2
-    lb t5, 0(t3)
-    sb t5, 0(t4)
-    mv t1, t2
-    bnez t1, lwp_sigreturn_copy_loop
-
-    /**
-     * 1. clear sscratch & restore kernel sp to 
-     *    enter kernel mode routine
-     * 2. storage exp frame address to restore context, 
-     *    by calling to lwp_signal_backup
-     * 3. storage lwp_sigreturn entry address
-     * 4. get signal id as param for signal handler
-     */
-    mv s1, sp
-    csrrw sp, sscratch, x0
-
-    /**
-     * synchronize dcache & icache if target is
-     * a Harvard Architecture machine, otherwise
-     * do nothing
-     */
-    mv a0, s0
-    mv a1, s2
-    call rt_hw_sync_cache_local
-
-    /**
-     * backup user sp (point to saved exception frame, skip sigreturn routine)
-     * And get signal id
-
-     * a0: user sp 
-     * a1: user_pc (not used, marked as 0 to avoid abuse)
-     * a2: user_flag (not used, marked as 0 to avoid abuse)
-     */
-    mv a0, s1
-    mv a1, zero
-    mv a2, zero
-    call lwp_signal_backup
-
-    /**
-     * backup signal id in s2, 
-     * and get sighandler by signal id
-     */
-    mv s2, a0
-    mv a0, s0
-    call siginfo_push
-    mv s3, a0
-    mv a0, s2
-    mv a1, s3
-    call lwp_sighandler_get
-
-    /**
-     * set regiter RA to user signal handler
-     * set sp to user sp & save kernel sp in sscratch
-     */
-    mv ra, s0
-    csrw sscratch, sp
-    mv sp, s3
-
-    /**
-     * a0 is signal_handler,
-     * s1 = s0 == NULL ? lwp_sigreturn : s0;
-     */
-    mv s1, s0
-    beqz a0, skip_user_signal_handler
-    mv s1, a0
-
-skip_user_signal_handler:
-    // enter user mode and enable interrupt when return to user mode
-    li t0, SSTATUS_SPP
-    csrc sstatus, t0
-    li t0, SSTATUS_SPIE
-    csrs sstatus, t0
-
-    // sepc <- signal_handler
-    csrw sepc, s1
-    // a0 <- signal id
-    mv a0, s2
-    mv a1, s3
-    mv a2, zero
-    sret
+    mv a0, sp
+    call arch_signal_prepare
+    CLOSE_INTERRUPT
+    call lwp_check_exit_request
+    beqz a0, ret_to_user_exit
+    mv a0, x0
+    call sys_exit
+    j ret_to_user_exit
 
 .align 3
 lwp_debugreturn:
@@ -246,11 +128,13 @@ lwp_debugreturn:
     ecall
 
 .align 3
+.global lwp_sigreturn
 lwp_sigreturn:
     li a7, 0xfe
     ecall
 
 .align 3
+.global lwp_sigreturn_end
 lwp_sigreturn_end:
 
 .align 3

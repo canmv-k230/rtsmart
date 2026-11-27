@@ -209,6 +209,19 @@ int lwp_signal_backup(void *user_sp, void *user_pc, void* user_flag)
     signal = __builtin_ffsll(set.sig[0]);
     if (signal)
     {
+        if (thread->signal_in_process >= _LWP_NSIG)
+        {
+            lwp = (struct rt_lwp *)thread->lwp;
+            rt_hw_interrupt_enable(level);
+            LOG_E("signal nesting limit exceeded: thread %s, tid %d",
+                  thread->name, thread->tid);
+            if (lwp)
+            {
+                lwp_terminate_with_status(lwp, LWP_WAIT_STATUS_SIGNAL(SIGSEGV));
+            }
+            sys_exit(-1);
+            return -1;
+        }
         thread->user_ctx[thread->signal_in_process].sp = user_sp;
         thread->user_ctx[thread->signal_in_process].pc = user_pc;
         thread->user_ctx[thread->signal_in_process].flag = user_flag;
@@ -263,7 +276,7 @@ lwp_sighandler_t lwp_sighandler_get(int sig, siginfo_t *info)
     rt_thread_t thread;
     rt_base_t level;
 
-    if (sig == 0 || sig > _LWP_NSIG)
+    if (sig <= 0 || sig > _LWP_NSIG)
     {
         return func;
     }
@@ -306,7 +319,7 @@ void lwp_sighandler_set(int sig, lwp_sighandler_t func)
 {
     rt_base_t level;
 
-    if (sig == 0 || sig > _LWP_NSIG)
+    if (sig <= 0 || sig > _LWP_NSIG)
         return;
     if (sig == SIGKILL || sig == SIGSTOP)
         return;
@@ -320,7 +333,7 @@ void lwp_thread_sighandler_set(int sig, lwp_sighandler_t func)
 {
     rt_base_t level;
 
-    if (sig == 0 || sig > _LWP_NSIG)
+    if (sig <= 0 || sig > _LWP_NSIG)
         return;
     level = rt_hw_interrupt_disable();
     rt_thread_self()->signal_handler[sig - 1] = func;
@@ -335,6 +348,15 @@ int lwp_sigaction(int sig, const struct lwp_sigaction *act,
     struct rt_lwp *lwp;
     int ret = -RT_EINVAL;
     lwp_sigset_t newset;
+
+    if (sig <= 0 || sig > _LWP_NSIG)
+    {
+        return -RT_EINVAL;
+    }
+    if (act && (sig == SIGKILL || sig == SIGSTOP))
+    {
+        return -RT_EINVAL;
+    }
 
     level = rt_hw_interrupt_disable();
     lwp = (struct rt_lwp*)rt_thread_self()->lwp;

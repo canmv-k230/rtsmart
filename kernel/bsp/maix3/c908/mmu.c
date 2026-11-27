@@ -157,6 +157,11 @@ static size_t find_vaddr(rt_mmu_info *mmu_info, int pages)
     return 0;
 }
 
+static inline int _sv39_is_canonical(rt_size_t va)
+{
+    return (rt_size_t)((rt_base_t)(va << 25) >> 25) == va;
+}
+
 //check whether the range of virtual address are free
 static int check_vaddr(rt_mmu_info *mmu_info,void *va,rt_size_t pages)
 {
@@ -176,19 +181,39 @@ static int check_vaddr(rt_mmu_info *mmu_info,void *va,rt_size_t pages)
 
     while(pages--)
     {
+        if (!_sv39_is_canonical(loop_va))
+        {
+            return -1;
+        }
         l1_off = GET_L1(loop_va);
+        /*
+         * Map only inside the L1 range this mmu_info manages. A process table
+         * starts as a copy of the kernel's, so a user hint outside it (mmap,
+         * shmat, an ELF segment) would write into lower-level tables the
+         * kernel and every process share.
+         */
+        if (l1_off < mmu_info->vstart || l1_off > mmu_info->vend)
+        {
+            return -1;
+        }
         l2_off = GET_L2(loop_va);
         l3_off = GET_L3(loop_va);
         mmu_l1 = ((rt_size_t *)mmu_info -> vtable) + l1_off;
 
         if(PTE_USED(*mmu_l1))
         {
-            RT_ASSERT(!PAGE_IS_LEAF(*mmu_l1));
+            if (PAGE_IS_LEAF(*mmu_l1))
+            {
+                return -1;
+            }
             mmu_l2 = (rt_size_t *)PPN_TO_VPN(GET_PADDR(*mmu_l1),mmu_info -> pv_off) + l2_off;
 
             if(PTE_USED(*mmu_l2))
             {
-                RT_ASSERT(!PAGE_IS_LEAF(*mmu_l2));
+                if (PAGE_IS_LEAF(*mmu_l2))
+                {
+                    return -1;
+                }
                 mmu_l3 = (rt_size_t *)PPN_TO_VPN(GET_PADDR(*mmu_l2),mmu_info -> pv_off) + l3_off;
 
                 if(PTE_USED(*mmu_l3))
@@ -560,30 +585,29 @@ void *_rt_hw_mmu_v2p(rt_mmu_info *mmu_info, void *v_addr)
 {
     rt_size_t l1_off, l2_off, l3_off;
     rt_size_t *mmu_l1, *mmu_l2, *mmu_l3;
-    rt_size_t pa;
+
+    if (!mmu_info || !_sv39_is_canonical((rt_size_t)v_addr))
+    {
+        return RT_NULL;
+    }
 
     l1_off = GET_L1((rt_size_t)v_addr);
     l2_off = GET_L2((rt_size_t)v_addr);
     l3_off = GET_L3((rt_size_t)v_addr);
-
-    if (!mmu_info)
-    {
-        return RT_NULL;
-    }
 
     mmu_l1 = ((rt_size_t *)mmu_info->vtable) + l1_off;
 
     if (PTE_USED(*mmu_l1))
     {
         if (*mmu_l1 & PTE_XWR_MASK)
-            return (void *)(GET_PADDR(*mmu_l1) | ((rt_size_t)v_addr & ((1 << 30) - 1)));
+            return (void *)(GET_PADDR(*mmu_l1) | ((rt_size_t)v_addr & ((1UL << 30) - 1)));
 
         mmu_l2 = (rt_size_t *)PPN_TO_VPN(GET_PADDR(*mmu_l1), mmu_info->pv_off);
 
         if (PTE_USED(*(mmu_l2 + l2_off)))
         {
             if (*(mmu_l2 + l2_off) & PTE_XWR_MASK)
-                return (void *)(GET_PADDR(*(mmu_l2 + l2_off)) | ((rt_size_t)v_addr & ((1 << 21) - 1)));
+                return (void *)(GET_PADDR(*(mmu_l2 + l2_off)) | ((rt_size_t)v_addr & ((1UL << 21) - 1)));
 
             mmu_l3 = (rt_size_t *)PPN_TO_VPN(GET_PADDR(*(mmu_l2 + l2_off)), mmu_info->pv_off);
 
@@ -608,13 +632,13 @@ void *rt_hw_mmu_v2p(rt_mmu_info *mmu_info,void *v_addr)
     return ret;
 }
 
-static int _rt_hw_mmu_user_writable(rt_mmu_info *mmu_info, void *v_addr)
+static int _rt_hw_mmu_user_access(rt_mmu_info *mmu_info, void *v_addr, rt_size_t req_attr)
 {
     rt_size_t l1_off, l2_off, l3_off;
     rt_size_t *mmu_l1, *mmu_l2, *mmu_l3;
     rt_size_t pte;
 
-    if (!mmu_info)
+    if (!mmu_info || !_sv39_is_canonical((rt_size_t)v_addr))
         return 0;
 
     l1_off = GET_L1((rt_size_t)v_addr);
@@ -626,19 +650,19 @@ static int _rt_hw_mmu_user_writable(rt_mmu_info *mmu_info, void *v_addr)
     if (!PTE_USED(pte))
         return 0;
     if (PAGE_IS_LEAF(pte))
-        return (pte & (PTE_U | PTE_W)) == (PTE_U | PTE_W);
+        return (pte & req_attr) == req_attr;
 
     mmu_l2 = (rt_size_t *)PPN_TO_VPN(GET_PADDR(pte), mmu_info->pv_off);
     pte = *(mmu_l2 + l2_off);
     if (!PTE_USED(pte))
         return 0;
     if (PAGE_IS_LEAF(pte))
-        return (pte & (PTE_U | PTE_W)) == (PTE_U | PTE_W);
+        return (pte & req_attr) == req_attr;
 
     mmu_l3 = (rt_size_t *)PPN_TO_VPN(GET_PADDR(pte), mmu_info->pv_off);
     pte = *(mmu_l3 + l3_off);
     return PTE_USED(pte) && PAGE_IS_LEAF(pte) &&
-           (pte & (PTE_U | PTE_W)) == (PTE_U | PTE_W);
+           (pte & req_attr) == req_attr;
 }
 
 int rt_hw_mmu_user_writable(rt_mmu_info *mmu_info, void *v_addr)
@@ -647,7 +671,18 @@ int rt_hw_mmu_user_writable(rt_mmu_info *mmu_info, void *v_addr)
     int writable;
 
     level = rt_hw_interrupt_disable();
-    writable = _rt_hw_mmu_user_writable(mmu_info, v_addr);
+    writable = _rt_hw_mmu_user_access(mmu_info, v_addr, PTE_U | PTE_W);
     rt_hw_interrupt_enable(level);
     return writable;
+}
+
+int rt_hw_mmu_user_readable(rt_mmu_info *mmu_info, void *v_addr)
+{
+    rt_base_t level;
+    int readable;
+
+    level = rt_hw_interrupt_disable();
+    readable = _rt_hw_mmu_user_access(mmu_info, v_addr, PTE_U | PTE_R);
+    rt_hw_interrupt_enable(level);
+    return readable;
 }

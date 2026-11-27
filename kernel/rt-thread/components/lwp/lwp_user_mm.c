@@ -792,7 +792,38 @@ size_t lwp_get_from_user(void *dst, void *src, size_t size)
     }
     m_info = &lwp->mmu_info;
 
+#ifdef RT_HW_MMU_USER_READABLE
+    {
+        size_t rem = size;
+        char *addr_start = (char *)src;
+        size_t checked = 0;
+
+        while (rem > 0)
+        {
+            size_t page_off = (size_t)addr_start & (ARCH_PAGE_SIZE - 1);
+            size_t len = ARCH_PAGE_SIZE - page_off;
+
+            if (len > rem)
+            {
+                len = rem;
+            }
+            if (!rt_hw_mmu_user_readable(m_info, addr_start))
+            {
+                break;
+            }
+            addr_start += len;
+            checked += len;
+            rem -= len;
+        }
+        if (!checked)
+        {
+            return 0;
+        }
+        return lwp_data_get(m_info, dst, src, checked);
+    }
+#else
     return lwp_data_get(m_info, dst, src, size);
+#endif
 }
 
 int lwp_get_from_user_ex(void *dst, void *src, size_t size)
@@ -910,7 +941,9 @@ int lwp_put_to_user_ex(void *dst, void *src, size_t size)
 int lwp_user_accessable(void *addr, size_t size)
 {
     void *addr_start = RT_NULL, *addr_end = RT_NULL, *next_page = RT_NULL;
+#ifndef RT_HW_MMU_USER_READABLE
     void *tmp_addr = RT_NULL;
+#endif
     struct rt_lwp *lwp = lwp_self();
     rt_mmu_info *mmu_info = RT_NULL;
 
@@ -935,11 +968,18 @@ int lwp_user_accessable(void *addr, size_t size)
         {
             len = size;
         }
+#ifdef RT_HW_MMU_USER_READABLE
+        if (!rt_hw_mmu_user_readable(mmu_info, addr_start))
+        {
+            return 0;
+        }
+#else
         tmp_addr = rt_hw_mmu_v2p(mmu_info, addr_start);
         if (!tmp_addr)
         {
             return 0;
         }
+#endif
         addr_start = (void *)((char *)addr_start + len);
         size -= len;
         if (addr_start < addr_end)
